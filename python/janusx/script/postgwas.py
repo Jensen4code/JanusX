@@ -2123,7 +2123,8 @@ def _postgwas_match_prepared_variants_to_bim(
             # A named variant that cannot be found by ID is not proven by a
             # coordinate fallback when BIM contains real IDs.
             raise FineMapSkip(
-                f"prepared SNP ID {prepared_snp!r} is not present in BIM"
+                f"prepared SNP ID {prepared_snp!r} is not present in BIM; "
+                "variant identity cannot be proven"
             )
         if prepared_pair is not None:
             if not (has_allele0 and has_allele1):
@@ -3747,6 +3748,59 @@ def _postgwas_align_finemap_locus(
     return aligned, np.asarray(retained_bed_indices, dtype=np.int64), counters
 
 
+def _postgwas_canonicalize_raw_finemap_rows(
+    prepared: pd.DataFrame,
+    bfile: object,
+) -> pd.DataFrame:
+    """Canonicalize every raw-route summary row against its BIM identity.
+
+    This is deliberately a metadata-only pass.  It runs after the LD route has
+    been selected and before raw LD clumping, so folded rows cannot carry
+    summary-provided SNP labels into credible-set expansion and no genotype
+    matrix is allocated merely to establish variant identity.
+    """
+    prepared_source = prepared.reset_index(drop=True)
+    bim_rows = _postgwas_read_bim_identity_rows(bfile)
+    selected_bim_indices = _postgwas_match_prepared_variants_to_bim(
+        prepared_source,
+        bim_rows,
+    )
+    selected_bim_meta = pd.DataFrame(
+        {
+            "chrom": [bim_rows[index][0] for index in selected_bim_indices],
+            "pos": [bim_rows[index][1] for index in selected_bim_indices],
+            "snp": [bim_rows[index][2] for index in selected_bim_indices],
+            "allele0": [bim_rows[index][3] for index in selected_bim_indices],
+            "allele1": [bim_rows[index][4] for index in selected_bim_indices],
+        }
+    )
+    selected_site_counts: dict[tuple[str, int], int] = {}
+    for chrom, pos, _snp, _allele0, _allele1 in (
+        bim_rows[index] for index in selected_bim_indices
+    ):
+        site = (_postgwas_finemap_normalize_chr(chrom), int(pos))
+        selected_site_counts[site] = selected_site_counts.get(site, 0) + 1
+    ambiguous_sites = {
+        site for site, count in selected_site_counts.items() if count > 1
+    }
+    aligned, aligned_bim_indices, alignment_counts = _postgwas_align_finemap_locus(
+        prepared_source,
+        selected_bim_meta,
+        ambiguous_bim_sites=ambiguous_sites,
+    )
+    expected_indices = np.arange(len(prepared_source), dtype=np.int64)
+    if len(aligned) != len(prepared_source) or not np.array_equal(
+        aligned_bim_indices, expected_indices
+    ):
+        raise FineMapSkip(
+            "raw-route BIM identity alignment changed prepared row order or dropped rows"
+        )
+    aligned = aligned.reset_index(drop=True)
+    aligned.attrs["_janusx_finemap_alignment_counts"] = dict(alignment_counts)
+    aligned.attrs["_janusx_finemap_bed_rows"] = int(len(selected_bim_indices))
+    return aligned
+
+
 _POSTGWAS_FINEMAP_OUTPUT_COLUMNS = [
     "locus",
     "chrom",
@@ -4534,7 +4588,15 @@ def _postgwas_run_susie_finemap_body(
 
         prepared_source = prepared.reset_index(drop=True)
         effective_locus_r: Optional[np.ndarray] = None
-        if ld_route == "fvlmm":
+        if ld_route == "raw":
+            # Establish canonical BIM identity for every regional row before
+            # raw clumping can form folded groups.  This metadata-only pass is
+            # intentionally after route selection and before any raw LD use.
+            prepared_source = _postgwas_canonicalize_raw_finemap_rows(
+                prepared_source,
+                args.bfile,
+            )
+        else:
             if sidecar is None:
                 raise FineMapSkip("FvLMM fine-mapping requires matched sidecar metadata")
             # Build the effective matrix on every verified regional row before
@@ -8221,6 +8283,11 @@ def _ldclump_significant_snps(
             )
         except FineMapSkip:
             raise
+        except MemoryError as exc:
+            raise FineMapSkip(
+                "LD-clump memory allocation was unavailable during preload: "
+                f"{exc}"
+            ) from exc
         except _PostGWASExpectedCompatibilityError as exc:
             preload_error = exc
         except (OSError, EOFError, UnicodeError, pd.errors.ParserError) as exc:
@@ -8363,6 +8430,11 @@ def _ldclump_significant_snps(
                                 warn_count += 1
                         except FineMapSkip:
                             raise
+                        except MemoryError as exc:
+                            raise FineMapSkip(
+                                "LD-clump memory allocation was unavailable during streaming: "
+                                f"{exc}"
+                            ) from exc
                         except _PostGWASExpectedCompatibilityError as exc:
                             if warn_count < warn_limit:
                                 logger.warning(
