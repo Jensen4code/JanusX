@@ -1914,13 +1914,13 @@ _POSTGWAS_FINEMAP_OUTPUT_COLUMNS = [
 _POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS = [
     "locus",
     "cs",
+    "coverage",
     "chrom",
     "pos",
     "snp",
     "allele0",
     "allele1",
     "pip",
-    "coverage",
     "representative_snp",
     "is_representative",
 ]
@@ -1969,7 +1969,10 @@ def _postgwas_build_finemap_credible_sets(
     credible_sets: list[tuple[int, tuple[int, ...], float]] = []
     selected_sets: set[frozenset[int]] = set()
     for effect_index in range(int(n_effects)):
-        if prior_array[effect_index] <= prior_tolerance:
+        if (
+            not np.isfinite(prior_array[effect_index])
+            or prior_array[effect_index] <= prior_tolerance
+        ):
             continue
 
         row = alpha_array[effect_index]
@@ -2081,19 +2084,39 @@ def _postgwas_expand_finemap_credible_sets(
             representative_row = fitted.iloc[fitted_index]
             representative_key = _row_key(representative_row)
             group = fold_groups.get(representative_key)
-            if not group or representative_key in seen_groups:
+            if representative_key in seen_groups:
                 continue
-            representative_source_index = int(group[0])
-            if (
-                representative_source_index < 0
-                or representative_source_index >= len(prepared)
-            ):
+            if not group:
                 raise ValueError(
-                    "Fine-mapping credible-set fold-group representative index is "
-                    "outside the prepared table."
+                    "Fine-mapping credible-set representative "
+                    f"{representative_key[0]}:{representative_key[1]} has no fold group."
                 )
-            if _row_key(prepared.iloc[representative_source_index]) != representative_key:
-                continue
+            group_indices = tuple(int(index) for index in group)
+            invalid_group_indices = tuple(
+                index
+                for index in group_indices
+                if index < 0 or index >= len(prepared)
+            )
+            if invalid_group_indices:
+                raise ValueError(
+                    "Fine-mapping credible-set fold-group member index is outside "
+                    "the prepared table."
+                )
+            matching_representative_indices = tuple(
+                index
+                for index in group_indices
+                if _row_key(prepared.iloc[index]) == representative_key
+            )
+            if not matching_representative_indices:
+                raise ValueError(
+                    "Fine-mapping credible-set fold group does not contain "
+                    f"representative {representative_key[0]}:{representative_key[1]}."
+                )
+            if matching_representative_indices[0] != group_indices[0]:
+                raise ValueError(
+                    "Fine-mapping credible-set representative identity mismatch "
+                    f"for {representative_key[0]}:{representative_key[1]}."
+                )
 
             representative_snp = _snp_value(representative_row)
             cs_rows.append(
@@ -2107,9 +2130,9 @@ def _postgwas_expand_finemap_credible_sets(
                 )
             )
             member_indices = sorted(
-                {int(index) for index in group[1:]},
+                {int(index) for index in group_indices[1:]},
                 key=lambda index: (
-                    _postgwas_finemap_normalize_chr(prepared.iloc[index]["chrom"]),
+                    _chrom_sort_key(prepared.iloc[index]["chrom"]),
                     int(prepared.iloc[index]["pos"]),
                     str(_snp_value(prepared.iloc[index])),
                     index,
@@ -2564,12 +2587,6 @@ def _postgwas_run_susie_finemap_body(
             raise RuntimeError(
                 f"SuSiE locus {locus_label} solver returned non-finite posterior mean."
             )
-        if not bool(np.all(np.isfinite(alpha))) or not bool(
-            np.all(np.isfinite(prior_variance))
-        ):
-            raise RuntimeError(
-                f"SuSiE locus {locus_label} solver returned non-finite alpha or prior variance."
-            )
 
         try:
             credible_sets = _postgwas_build_finemap_credible_sets(
@@ -2583,14 +2600,19 @@ def _postgwas_run_susie_finemap_body(
             ) from exc
 
         retained_meta = bed_meta.iloc[bed_indices].reset_index(drop=True)
-        cs_locus_output = _postgwas_expand_finemap_credible_sets(
-            retained_meta,
-            prepared_source,
-            fold_groups,
-            pip,
-            credible_sets,
-            locus=locus_label,
-        )
+        try:
+            cs_locus_output = _postgwas_expand_finemap_credible_sets(
+                retained_meta,
+                prepared_source,
+                fold_groups,
+                pip,
+                credible_sets,
+                locus=locus_label,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} credible-set expansion failed: {exc}"
+            ) from exc
         locus_output = pd.DataFrame(
             {
                 "locus": [locus_label] * len(aligned),
@@ -2636,7 +2658,35 @@ def _postgwas_run_susie_finemap_body(
             bool(fit.get("converged", False)),
             len(locus_output),
         )
-        del locus_r, z, fit, pip, posterior_mean, bed_meta, aligned
+        del (
+            locus_gwas,
+            prepared_source,
+            prepared,
+            fold_groups,
+            selected_pos,
+            selected_chrom,
+            selected_bim_pos,
+            ambiguous_bim_sites,
+            range_chrom,
+            bed_chrom,
+            bed_pos,
+            bed_snp,
+            bed_allele0,
+            bed_allele1,
+            bed_meta,
+            aligned,
+            bed_indices,
+            locus_r,
+            z,
+            fit,
+            pip,
+            posterior_mean,
+            alpha,
+            prior_variance,
+            retained_meta,
+            cs_locus_output,
+            locus_output,
+        )
 
     if len(output_frames) == 0:
         raise RuntimeError("SuSiE fine-mapping produced no successful locus.")
@@ -2680,7 +2730,15 @@ def _postgwas_run_susie_finemap_body(
             if backed_up[index]:
                 try:
                     os.replace(str(backup_paths[index]), final_paths[index])
-                except OSError:
+                except Exception as rollback_exc:
+                    logger.warning(
+                        "SuSiE fine-mapping rollback restore failed for backup %s "
+                        "to final %s: %s; the original publication error is "
+                        "preserved and the backup is retained.",
+                        str(backup_paths[index]),
+                        final_paths[index],
+                        rollback_exc,
+                    )
                     continue
                 backed_up[index] = False
             elif published[index] and not had_prior[index]:
