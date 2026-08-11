@@ -1910,6 +1910,20 @@ _POSTGWAS_FINEMAP_OUTPUT_COLUMNS = [
     "posterior_mean",
 ]
 
+_POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS = [
+    "locus",
+    "cs",
+    "chrom",
+    "pos",
+    "snp",
+    "allele0",
+    "allele1",
+    "pip",
+    "coverage",
+    "representative_snp",
+    "is_representative",
+]
+
 _POSTGWAS_FINEMAP_CS_COVERAGE = 0.95
 _POSTGWAS_FINEMAP_PRIOR_TOL = 1e-9
 
@@ -1981,6 +1995,153 @@ def _postgwas_build_finemap_credible_sets(
         )
 
     return credible_sets
+
+
+def _postgwas_expand_finemap_credible_sets(
+    aligned_representatives: pd.DataFrame,
+    prepared_rows: pd.DataFrame,
+    fold_groups: dict[tuple[str, int], tuple[int, ...]],
+    pip: object,
+    credible_sets: object,
+    *,
+    locus: str,
+) -> pd.DataFrame:
+    """Restore clumped prepared rows into deterministic credible-set rows."""
+    fitted = aligned_representatives.reset_index(drop=True)
+    prepared = prepared_rows.reset_index(drop=True)
+    pip_array = np.asarray(pip, dtype=np.float64).reshape(-1)
+    if pip_array.shape != (len(fitted),):
+        raise ValueError(
+            "Fine-mapping credible-set expansion PIP length does not match "
+            f"aligned representatives: got {pip_array.shape[0]}, expected {len(fitted)}."
+        )
+    for frame_name, frame, required in (
+        (
+            "aligned representative",
+            fitted,
+            ("chrom", "pos", "snp", "allele0", "allele1"),
+        ),
+        ("prepared",
+            prepared,
+            ("chrom", "pos", "snp"),
+        ),
+    ):
+        missing = [column for column in required if column not in frame.columns]
+        if missing:
+            raise ValueError(
+                f"Fine-mapping {frame_name} metadata is missing column(s): "
+                + ", ".join(missing)
+            )
+
+    def _row_key(row: pd.Series) -> tuple[str, int]:
+        return (
+            _postgwas_finemap_normalize_chr(row["chrom"]),
+            int(row["pos"]),
+        )
+
+    def _snp_value(row: pd.Series) -> object:
+        return row["snp"] if "snp" in row.index else ""
+
+    def _metadata_row(
+        row: pd.Series,
+        *,
+        cs_name: str,
+        representative_snp: object,
+        representative: bool,
+        representative_pip: float,
+        coverage: float,
+    ) -> dict[str, object]:
+        return {
+            "locus": locus,
+            "cs": cs_name,
+            "chrom": row["chrom"],
+            "pos": int(row["pos"]),
+            "snp": _snp_value(row),
+            "allele0": row["allele0"] if "allele0" in row.index else "",
+            "allele1": row["allele1"] if "allele1" in row.index else "",
+            "pip": float(representative_pip),
+            "coverage": float(coverage),
+            "representative_snp": representative_snp,
+            "is_representative": bool(representative),
+        }
+
+    rows: list[dict[str, object]] = []
+    next_cs_number = 1
+    for _effect_index, representative_indices, achieved_coverage in credible_sets:
+        cs_rows: list[dict[str, object]] = []
+        seen_groups: set[tuple[str, int]] = set()
+        for fitted_index_raw in representative_indices:
+            fitted_index = int(fitted_index_raw)
+            if fitted_index < 0 or fitted_index >= len(fitted):
+                raise ValueError(
+                    "Fine-mapping credible-set representative index is outside "
+                    "the aligned representative table."
+                )
+            representative_row = fitted.iloc[fitted_index]
+            representative_key = _row_key(representative_row)
+            group = fold_groups.get(representative_key)
+            if not group or representative_key in seen_groups:
+                continue
+            representative_source_index = int(group[0])
+            if (
+                representative_source_index < 0
+                or representative_source_index >= len(prepared)
+            ):
+                raise ValueError(
+                    "Fine-mapping credible-set fold-group representative index is "
+                    "outside the prepared table."
+                )
+            if _row_key(prepared.iloc[representative_source_index]) != representative_key:
+                continue
+
+            representative_snp = _snp_value(representative_row)
+            cs_rows.append(
+                _metadata_row(
+                    representative_row,
+                    cs_name="",
+                    representative_snp=representative_snp,
+                    representative=True,
+                    representative_pip=float(pip_array[fitted_index]),
+                    coverage=float(achieved_coverage),
+                )
+            )
+            member_indices = sorted(
+                {int(index) for index in group[1:]},
+                key=lambda index: (
+                    _postgwas_finemap_normalize_chr(prepared.iloc[index]["chrom"]),
+                    int(prepared.iloc[index]["pos"]),
+                    str(_snp_value(prepared.iloc[index])),
+                    index,
+                ),
+            )
+            for member_index in member_indices:
+                if member_index < 0 or member_index >= len(prepared):
+                    raise ValueError(
+                        "Fine-mapping credible-set fold-group member index is "
+                        "outside the prepared table."
+                    )
+                member_row = prepared.iloc[member_index]
+                cs_rows.append(
+                    _metadata_row(
+                        member_row,
+                        cs_name="",
+                        representative_snp=representative_snp,
+                        representative=False,
+                        representative_pip=float(pip_array[fitted_index]),
+                        coverage=float(achieved_coverage),
+                    )
+                )
+            seen_groups.add(representative_key)
+
+        if not cs_rows:
+            continue
+        cs_name = f"CS_{next_cs_number}"
+        for row in cs_rows:
+            row["cs"] = cs_name
+        rows.extend(cs_rows)
+        next_cs_number += 1
+
+    return pd.DataFrame(rows, columns=_POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS)
 
 
 _POSTGWAS_FINEMAP_INDEX_CHROM_COLUMN = "_janusx_finemap_chrom_norm"
@@ -2093,7 +2254,9 @@ def _postgwas_scan_finemap_bim_rows(
     return selected_chrom, selected_bim_pos, ambiguous_sites
 
 
-def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger) -> str:
+def _postgwas_run_susie_finemap_body(
+    args: argparse.Namespace, logger: logging.Logger
+) -> str:
     """Run SuSiE-RSS serially for each requested PLINK-backed locus."""
     gwas_files = [str(path) for path in list(getattr(args, "gwasfile", []) or [])]
     if len(gwas_files) != 1:
@@ -2129,12 +2292,16 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
     out_dir = str(getattr(args, "out", ".") or ".")
     out_stem = str(getattr(args, "prefix", "JanusX") or "JanusX").strip() or "JanusX"
     output_path = os.path.join(out_dir, f"{out_stem}.susie.pip.tsv")
+    cs_output_path = os.path.join(out_dir, f"{out_stem}.susie.cs.tsv")
     temporary_path = f"{output_path}.tmp"
+    cs_temporary_path = f"{cs_output_path}.tmp"
     os.makedirs(out_dir, mode=0o755, exist_ok=True)
-    if os.path.exists(temporary_path):
-        os.remove(temporary_path)
+    for stale_path in (temporary_path, cs_temporary_path):
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
 
     output_frames: list[pd.DataFrame] = []
+    cs_output_frames: list[pd.DataFrame] = []
     warned_assumed_direction = False
     gwas_has_allele_columns = {"allele0", "allele1"}.issubset(gwas.columns)
 
@@ -2160,8 +2327,9 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
             )
             continue
 
-        prepared, clump_counts, _clump_groups = _postgwas_finemap_ldclump(
-            prepared,
+        prepared_source = prepared.reset_index(drop=True)
+        prepared, clump_counts, fold_groups = _postgwas_finemap_ldclump(
+            prepared_source,
             genofile=str(args.bfile),
             locus=locus_tuple,
             logger=logger,
@@ -2342,6 +2510,10 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
             posterior_mean = np.asarray(
                 fit["posterior_mean"], dtype=np.float64
             ).reshape(-1)
+            alpha = np.asarray(fit["alpha"], dtype=np.float64)
+            prior_variance = np.asarray(
+                fit["prior_variance"], dtype=np.float64
+            ).reshape(-1)
         except Exception as exc:
             raise RuntimeError(
                 f"SuSiE locus {locus_label} solver returned invalid result arrays."
@@ -2349,6 +2521,15 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
         if pip.shape != (len(aligned),) or posterior_mean.shape != (len(aligned),):
             raise RuntimeError(
                 f"SuSiE locus {locus_label} solver result length mismatch."
+            )
+        if (
+            alpha.ndim != 2
+            or alpha.shape[1] != len(aligned)
+            or prior_variance.shape != (alpha.shape[0],)
+        ):
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} solver alpha/prior variance dimensions "
+                "do not agree with the fitted representatives."
             )
         if not bool(np.all(np.isfinite(pip))) or bool(np.any((pip < 0.0) | (pip > 1.0))):
             raise RuntimeError(
@@ -2358,8 +2539,33 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
             raise RuntimeError(
                 f"SuSiE locus {locus_label} solver returned non-finite posterior mean."
             )
+        if not bool(np.all(np.isfinite(alpha))) or not bool(
+            np.all(np.isfinite(prior_variance))
+        ):
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} solver returned non-finite alpha or prior variance."
+            )
+
+        try:
+            credible_sets = _postgwas_build_finemap_credible_sets(
+                alpha,
+                prior_variance,
+                n_variants=len(aligned),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} credible-set construction failed: {exc}"
+            ) from exc
 
         retained_meta = bed_meta.iloc[bed_indices].reset_index(drop=True)
+        cs_locus_output = _postgwas_expand_finemap_credible_sets(
+            retained_meta,
+            prepared_source,
+            fold_groups,
+            pip,
+            credible_sets,
+            locus=locus_label,
+        )
         locus_output = pd.DataFrame(
             {
                 "locus": [locus_label] * len(aligned),
@@ -2386,6 +2592,7 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
         )
         locus_output = locus_output.iloc[output_order].reset_index(drop=True)
         output_frames.append(locus_output)
+        cs_output_frames.append(cs_locus_output)
         logger.info(
             "SuSiE locus %s: GWAS=%d invalid=%d BED=%d monomorphic=%d matched=%d "
             "flips=%d conflicts=%d assumed_direction=%d unresolved=%d iterations=%d "
@@ -2410,6 +2617,7 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
         raise RuntimeError("SuSiE fine-mapping produced no successful locus.")
 
     merged = pd.concat(output_frames, ignore_index=True)
+    merged_cs = pd.concat(cs_output_frames, ignore_index=True)
     try:
         merged.to_csv(
             temporary_path,
@@ -2419,13 +2627,40 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
             float_format=_postgwas_format_finemap_float,
             lineterminator="\n",
         )
+        merged_cs.to_csv(
+            cs_temporary_path,
+            sep="\t",
+            index=False,
+            columns=_POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS,
+            float_format=_postgwas_format_finemap_float,
+            lineterminator="\n",
+        )
         os.replace(temporary_path, output_path)
+        os.replace(cs_temporary_path, cs_output_path)
     except Exception:
-        if os.path.exists(temporary_path):
-            os.remove(temporary_path)
+        for temporary_output in (temporary_path, cs_temporary_path):
+            if os.path.exists(temporary_output):
+                os.remove(temporary_output)
         raise
     logger.info("SuSiE fine-mapping output: %s", format_path_for_display(output_path))
+    logger.info("SuSiE credible-set output: %s", format_path_for_display(cs_output_path))
     return output_path
+
+
+def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger) -> str:
+    """Run fine-mapping and remove both unpublished artifacts on any failure."""
+    out_dir = str(getattr(args, "out", ".") or ".")
+    out_stem = str(getattr(args, "prefix", "JanusX") or "JanusX").strip() or "JanusX"
+    output_path = os.path.join(out_dir, f"{out_stem}.susie.pip.tsv")
+    cs_output_path = os.path.join(out_dir, f"{out_stem}.susie.cs.tsv")
+    temporary_paths = (f"{output_path}.tmp", f"{cs_output_path}.tmp")
+    try:
+        return _postgwas_run_susie_finemap_body(args, logger)
+    except Exception:
+        for temporary_path in temporary_paths:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        raise
 
 
 def _parse_bimrange(value: object, logger: logging.Logger) -> tuple[str, int, int]:
