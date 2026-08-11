@@ -495,12 +495,6 @@ def validate_sidecar_dependencies(
     )
 
     requested_prefix = _normalize_genotype_prefix(bfile)
-    recorded_prefix = _normalize_genotype_prefix(record.genotype_prefix)
-    if recorded_prefix != requested_prefix:
-        raise FineMapSkip(
-            "supplied -bfile does not match sidecar genotype prefix: "
-            f"{requested_prefix} != {recorded_prefix}"
-        )
 
     genotype_suffixes = (".bed", ".bim", ".fam")
     if len(record.genotype_files) != len(genotype_suffixes):
@@ -509,37 +503,58 @@ def validate_sidecar_dependencies(
         )
     for suffix, expected in zip(genotype_suffixes, record.genotype_files):
         genotype_path = Path(f"{requested_prefix}{suffix}")
-        if Path(expected.canonical_path).expanduser().resolve() != genotype_path:
-            raise FineMapSkip(
-                f"sidecar {suffix[1:].upper()} fingerprint does not match "
-                "supplied -bfile"
-            )
         _validate_current_fingerprint(
             expected,
             genotype_path,
             f"genotype {suffix[1:].upper()}",
+            allow_moved=True,
         )
 
-    _validate_current_fingerprint(
+    dependency_roots = _dependency_search_roots(result_path, requested_prefix)
+    phenotype_path = _resolve_dependency_path(
         record.phenotype_file,
-        record.phenotype_file.canonical_path,
+        dependency_roots,
         "phenotype",
     )
+    _validate_current_fingerprint(
+        record.phenotype_file,
+        phenotype_path,
+        "phenotype",
+        allow_moved=True,
+    )
     if record.covariate_file is not None:
-        _validate_current_fingerprint(
+        covariate_path = _resolve_dependency_path(
             record.covariate_file,
-            record.covariate_file.canonical_path,
+            dependency_roots,
             "covariate",
         )
-    _validate_current_fingerprint(
+        _validate_current_fingerprint(
+            record.covariate_file,
+            covariate_path,
+            "covariate",
+            allow_moved=True,
+        )
+    kinship_path = _resolve_dependency_path(
         record.kinship_file,
-        record.kinship_file.canonical_path,
+        dependency_roots,
         "GRM",
     )
     _validate_current_fingerprint(
+        record.kinship_file,
+        kinship_path,
+        "GRM",
+        allow_moved=True,
+    )
+    kinship_id_path = _resolve_dependency_path(
         record.kinship_id_file,
-        record.kinship_id_file.canonical_path,
+        dependency_roots,
         "GRM ID",
+    )
+    _validate_current_fingerprint(
+        record.kinship_id_file,
+        kinship_id_path,
+        "GRM ID",
+        allow_moved=True,
     )
 
 
@@ -551,6 +566,69 @@ def _normalize_genotype_prefix(path: str | Path) -> Path:
             text = text[: -len(suffix)]
             break
     return Path(text).resolve()
+
+
+def _dependency_search_roots(
+    result_path: str | Path, genotype_prefix: str | Path
+) -> tuple[Path, ...]:
+    roots = {
+        Path(result_path).expanduser().resolve().parent,
+        _normalize_genotype_prefix(genotype_prefix).parent,
+    }
+    return tuple(sorted(roots, key=str))
+
+
+def _resolve_dependency_path(
+    expected: FileFingerprintV1,
+    search_roots: Iterable[Path],
+    label: str,
+) -> Path:
+    """Resolve a dependency by exact path, then unique sibling identity."""
+
+    exact_path = Path(expected.canonical_path).expanduser().resolve()
+    exact_path_present = exact_path.exists()
+    if _fingerprint_matches(expected, exact_path):
+        return exact_path
+
+    expected_basename = Path(expected.basename)
+    if expected_basename.name != expected.basename:
+        raise FineMapSkip(
+            f"{label} dependency has an invalid basename: {expected.basename!r}"
+        )
+
+    candidates: list[Path] = []
+    for root in search_roots:
+        candidate = (Path(root) / expected.basename).resolve()
+        if candidate == exact_path or candidate in candidates:
+            continue
+        if _fingerprint_matches(expected, candidate):
+            candidates.append(candidate)
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        rendered = ", ".join(str(path) for path in candidates)
+        raise FineMapSkip(
+            f"{label} dependency is ambiguous among matching siblings: {rendered}"
+        )
+    if exact_path_present:
+        raise FineMapSkip(f"{label} fingerprint mismatch: {exact_path}")
+    raise FineMapSkip(
+        f"{label} dependency matching basename/fingerprint was not found: "
+        f"{expected.basename}"
+    )
+
+
+def _fingerprint_matches(expected: FileFingerprintV1, path: str | Path) -> bool:
+    try:
+        current = fingerprint_file(path)
+    except (OSError, ValueError):
+        return False
+    return (
+        current.basename == expected.basename
+        and current.size_bytes == expected.size_bytes
+        and current.sha256.lower() == expected.sha256.lower()
+    )
 
 
 def _validate_current_fingerprint(
@@ -855,6 +933,21 @@ def _validate_record(record: GwasNullModelSidecarV1) -> None:
     _validate_string_sequence(record.z_columns, "z_columns", length=2)
     _validate_string_sequence(record.covariate_columns, "covariate_columns")
     _validate_string_sequence(record.fixed_effect_columns, "fixed_effect_columns")
+    if record.phenotype_trait_column != record.trait:
+        raise SidecarFormatError(
+            "phenotype_trait_column must match trait"
+        )
+    if tuple(record.z_columns) != ("beta", "se"):
+        raise SidecarFormatError("z columns must be exactly ('beta', 'se')")
+    if record.covariate_columns and record.covariate_file is None:
+        raise SidecarFormatError(
+            "nonempty covariate columns require a covariate dependency"
+        )
+    expected_fixed_effect_columns = ("Intercept",) + tuple(record.covariate_columns)
+    if tuple(record.fixed_effect_columns) != expected_fixed_effect_columns:
+        raise SidecarFormatError(
+            "fixed-effect columns must be Intercept plus covariate columns"
+        )
     _validate_positive_int(record.effective_snp_count, "effective_snp_count")
     _validate_positive_int(record.sample_count, "sample_count")
     _validate_positive_shape(record.kinship_shape, "kinship_shape")

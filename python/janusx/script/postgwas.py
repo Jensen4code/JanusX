@@ -11540,7 +11540,12 @@ def main(argv: Optional[list[str]] = None):
                     "Genotype FILE site metadata for LD/LDclump",
                 )
             )
-    if args.bfile:
+    mixed_model_finemap = (
+        bool(getattr(args, "finemap_requested", False))
+        and len(check_gwas_files) == 1
+        and _postgwas_finemap_result_model(check_gwas_files[0]) is not None
+    )
+    if args.bfile and not mixed_model_finemap:
         checks.append(ensure_plink_prefix_exists(logger, args.bfile, "Genotype PLINK prefix"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
