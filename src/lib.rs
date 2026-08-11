@@ -82,6 +82,8 @@ mod splmm_approx;
 mod spreml;
 #[path = "stats/common.rs"]
 mod stats_common;
+#[path = "stats/susie.rs"]
+mod susie;
 #[allow(dead_code)]
 #[path = "stats/top.rs"]
 mod top;
@@ -263,9 +265,9 @@ use heritability::{
 };
 use kmer::{kmer_count_run_py, kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py};
 use ld::{
-    bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_mask_to_plink_rust,
-    bed_prune_selected_to_plink_rust, bed_prune_to_plink_rust, packed_prune_kernel_stats,
-    scan_plink_selected_snp_indices_from_bim_rust,
+    bed_ld_corr_rust, bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority,
+    bed_prune_mask_to_plink_rust, bed_prune_selected_to_plink_rust, bed_prune_to_plink_rust,
+    packed_prune_kernel_stats, scan_plink_selected_snp_indices_from_bim_rust,
 };
 use lm_trait::{lm_trait_assoc_bed_matrix_to_tsv, lm_trait_assoc_bed_to_tsv};
 use lmm::{
@@ -318,6 +320,7 @@ use spreml::{
     spreml_sparse_fastgwa_fixed_vp_brent_from_jxgrm, spreml_sparse_reml_brent_from_jxgrm,
     spreml_sparse_reml_grid_from_jxgrm,
 };
+use susie::susie_rss_f64;
 use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};
 use tree::{
     geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
@@ -797,6 +800,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_stream_empirical_stats_subset_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
     m.add_function(wrap_pyfunction!(bed_ldblock_r2_rust, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_ld_corr_rust, m)?)?;
     m.add_function(wrap_pyfunction!(
         scan_plink_selected_snp_indices_from_bim_rust,
         m
@@ -849,6 +853,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(spreml_sparse_reml_grid_from_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spreml_sparse_reml_brent_from_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(susie_rss_f64, m)?)?;
     m.add_function(wrap_pyfunction!(king::king_unrelated_set_from_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_packed, m)?)?;

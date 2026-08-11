@@ -16,9 +16,13 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::bedmath::{decode_row_centered_full_lut, packed_byte_lut, packed_pair_lut};
+use crate::bedmath::{
+    decode_row_centered_full_lut, decode_row_centered_full_lut_f64, packed_byte_lut,
+    packed_pair_lut,
+};
 use crate::blas::{
-    cblas_ssyrk_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
+    cblas_dsyrk_dispatch, cblas_ssyrk_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
+    CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::math_ld::{
     build_bitplanes_u64, build_row_bitplanes_u64_with_aux, classify_ld_pair_by_maf,
@@ -1195,6 +1199,130 @@ fn ld_r2_matrix_from_packed_rows_blas(
         }
     }
     Ok(out)
+}
+
+fn ld_corr_matrix_from_packed_rows_blas(
+    packed_rows: &[u8],
+    m: usize,
+    bytes_per_snp: usize,
+    n_samples: usize,
+    threads: usize,
+) -> Result<(Vec<f64>, Vec<usize>), String> {
+    if m == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if packed_rows.len() != m.saturating_mul(bytes_per_snp) {
+        return Err(format!(
+            "packed row length mismatch: got {}, expected {}",
+            packed_rows.len(),
+            m.saturating_mul(bytes_per_snp)
+        ));
+    }
+    if n_samples == 0 {
+        return Err("n_samples must be > 0".to_string());
+    }
+
+    let total_threads = effective_threads(threads);
+    let pool = get_cached_pool(total_threads).map_err(|e| e.to_string())?;
+    let byte_lut = packed_byte_lut();
+    let code4_lut = &byte_lut.code4;
+    // Keep the centered genotype rows in f64 so the correlation matrix remains
+    // numerically PSD for highly duplicated loci.  The compacted row buffer is
+    // reused directly by DSYRK; unlike the old f32 path this avoids both a
+    // lower-precision Gram matrix and a second dense centered-row allocation.
+    let mut decoded = vec![0.0_f64; m.saturating_mul(n_samples)];
+    let mut sumsq = vec![0.0_f64; m];
+    {
+        let mut run = || {
+            decoded
+                .par_chunks_mut(n_samples)
+                .zip(sumsq.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (out_row, ss))| {
+                    let row = &packed_rows[i * bytes_per_snp..(i + 1) * bytes_per_snp];
+                    let st = compute_packed_row_stats(row, n_samples, byte_lut);
+                    let mean_g = st.mean;
+                    let value_lut = [-mean_g, 0.0_f64, 1.0_f64 - mean_g, 2.0_f64 - mean_g];
+                    decode_row_centered_full_lut_f64(
+                        row, n_samples, code4_lut, &value_lut, out_row,
+                    );
+                    *ss = out_row.iter().map(|&value| value * value).sum();
+                });
+        };
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    }
+
+    let retained: Vec<usize> = sumsq
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &ss)| (ss.is_finite() && ss > 0.0).then_some(idx))
+        .collect();
+    let kept_m = retained.len();
+    if kept_m == 0 {
+        return Ok((Vec::new(), retained));
+    }
+
+    for (kept_idx, &source_idx) in retained.iter().enumerate() {
+        let dst_start = kept_idx * n_samples;
+        let src_start = source_idx * n_samples;
+        if dst_start != src_start {
+            decoded.copy_within(src_start..src_start + n_samples, dst_start);
+        }
+    }
+    decoded.truncate(kept_m.saturating_mul(n_samples));
+
+    let mut gram_col_major = vec![0.0_f64; kept_m.saturating_mul(kept_m)];
+    let _blas_guard = OpenBlasThreadGuard::enter(total_threads.max(1));
+    unsafe {
+        cblas_dsyrk_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_UPPER,
+            CBLAS_TRANS,
+            kept_m as CblasInt,
+            n_samples as CblasInt,
+            1.0,
+            decoded.as_ptr(),
+            n_samples as CblasInt,
+            0.0,
+            gram_col_major.as_mut_ptr(),
+            kept_m as CblasInt,
+        );
+    }
+
+    let mut diag = vec![0.0_f64; kept_m];
+    for i in 0..kept_m {
+        let value = gram_col_major[i + i * kept_m];
+        if !(value.is_finite() && value > 0.0) {
+            return Err(format!("non-finite or zero signed LD diagonal at row {i}"));
+        }
+        diag[i] = value;
+    }
+
+    for col in 0..kept_m {
+        for row in 0..=col {
+            let corr = if row == col {
+                1.0_f64
+            } else {
+                let corr = gram_col_major[row + col * kept_m] / (diag[row] * diag[col]).sqrt();
+                if !corr.is_finite() {
+                    return Err(format!(
+                        "non-finite signed LD correlation at rows {row} and {col}"
+                    ));
+                }
+                corr.clamp(-1.0, 1.0)
+            };
+            // A fully mirrored symmetric matrix has identical row-major and
+            // column-major byte layouts, so the column-major BLAS buffer can
+            // be returned directly without another m x m allocation.
+            gram_col_major[row + col * kept_m] = corr;
+            gram_col_major[col + row * kept_m] = corr;
+        }
+    }
+    Ok((gram_col_major, retained))
 }
 
 fn ld_r2_matrix_from_packed_rows(
@@ -4808,4 +4936,202 @@ pub fn bed_ldblock_r2_rust<'py>(
     )
     .into_bound();
     Ok((out, selected_chr, selected_pos))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    bfile,
+    chrom_ranges,
+    start_bp,
+    end_bp,
+    selected_chrom=None,
+    selected_pos=None,
+    threads=0
+))]
+pub fn bed_ld_corr_rust<'py>(
+    py: Python<'py>,
+    bfile: String,
+    chrom_ranges: Vec<String>,
+    start_bp: Vec<i64>,
+    end_bp: Vec<i64>,
+    selected_chrom: Option<Vec<String>>,
+    selected_pos: Option<Vec<i64>>,
+    threads: usize,
+) -> PyResult<(
+    Bound<'py, PyArray2<f64>>,
+    Vec<String>,
+    Vec<i64>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+)> {
+    let prefix = normalize_plink_prefix(&bfile);
+    if prefix.is_empty() {
+        return Err(PyRuntimeError::new_err("bfile must not be empty"));
+    }
+
+    let bimrange_map =
+        build_bimrange_map(&chrom_ranges, &start_bp, &end_bp).map_err(map_err_string_to_py)?;
+    let selected_sites: Option<HashSet<(String, i64)>> = match (selected_chrom, selected_pos) {
+        (None, None) => None,
+        (Some(ch), Some(ps)) => {
+            if ch.len() != ps.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "selected_chrom/selected_pos length mismatch: {} vs {}",
+                    ch.len(),
+                    ps.len()
+                )));
+            }
+            let mut set = HashSet::<(String, i64)>::with_capacity(ch.len());
+            for i in 0..ch.len() {
+                set.insert((normalize_chr_token(&ch[i]), ps[i]));
+            }
+            Some(set)
+        }
+        _ => {
+            return Err(PyRuntimeError::new_err(
+                "selected_chrom and selected_pos must be provided together",
+            ))
+        }
+    };
+
+    let (total_snps, selected_idx, _, _) =
+        select_bim_indices_for_ld(&prefix, &bimrange_map, selected_sites.as_ref())
+            .map_err(map_err_string_to_py)?;
+    if selected_idx.is_empty() {
+        let out = PyArray2::<f64>::zeros(py, [0, 0], false).into_bound();
+        return Ok((
+            out,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+
+    let (chrom, pos, snp, allele0, allele1) =
+        crate::gfcore::read_bim_columns(&prefix, Some(&selected_idx))
+            .map_err(map_err_string_to_py)?;
+    let n_samples = crate::gfcore::read_fam(&prefix)
+        .map_err(map_err_string_to_py)?
+        .len();
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err(
+            "empty PLINK input (no samples in .fam)",
+        ));
+    }
+    let bytes_per_snp = (n_samples + 3) / 4;
+
+    let (r, retained) = py
+        .detach(|| -> Result<(Vec<f64>, Vec<usize>), String> {
+            let packed_rows =
+                read_selected_bed_rows(&prefix, n_samples, total_snps, &selected_idx)?;
+            ld_corr_matrix_from_packed_rows_blas(
+                &packed_rows,
+                selected_idx.len(),
+                bytes_per_snp,
+                n_samples,
+                threads,
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let kept_m = retained.len();
+    let filter_metadata = |values: &[String]| -> Vec<String> {
+        retained.iter().map(|&idx| values[idx].clone()).collect()
+    };
+    let kept_pos: Vec<i64> = retained.iter().map(|&idx| pos[idx] as i64).collect();
+    let out = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((kept_m, kept_m), r)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok((
+        out,
+        filter_metadata(&chrom),
+        kept_pos,
+        filter_metadata(&snp),
+        filter_metadata(&allele0),
+        filter_metadata(&allele1),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack_test_dosage_rows(rows: &[Vec<f64>]) -> Vec<u8> {
+        let n_samples = rows.first().map_or(0, Vec::len);
+        let bytes_per_snp = (n_samples + 3) / 4;
+        let mut packed = vec![0u8; rows.len() * bytes_per_snp];
+        for (row_idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), n_samples);
+            for (sample_idx, &dosage) in row.iter().enumerate() {
+                let code = match dosage {
+                    0.0 => 0b00,
+                    1.0 => 0b10,
+                    2.0 => 0b11,
+                    _ => panic!("test dosage must be 0, 1, or 2"),
+                };
+                packed[row_idx * bytes_per_snp + sample_idx / 4] |= code << ((sample_idx % 4) * 2);
+            }
+        }
+        packed
+    }
+
+    fn pack_test_plink_codes(rows: &[Vec<u8>]) -> Vec<u8> {
+        let n_samples = rows.first().map_or(0, Vec::len);
+        let bytes_per_snp = (n_samples + 3) / 4;
+        let mut packed = vec![0u8; rows.len() * bytes_per_snp];
+        for (row_idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), n_samples);
+            for (sample_idx, &code) in row.iter().enumerate() {
+                assert!(matches!(code, 0b00 | 0b01 | 0b10 | 0b11));
+                packed[row_idx * bytes_per_snp + sample_idx / 4] |= code << ((sample_idx % 4) * 2);
+            }
+        }
+        packed
+    }
+
+    #[test]
+    fn signed_ld_preserves_negative_correlation_and_drops_monomorphic_rows() {
+        let dosage = vec![
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0],
+            vec![2.0, 2.0, 1.0, 1.0, 0.0, 0.0],
+            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        ];
+        let packed = pack_test_dosage_rows(&dosage);
+        let (r, retained) =
+            ld_corr_matrix_from_packed_rows_blas(&packed, 3, (6 + 3) / 4, 6, 1).unwrap();
+        assert_eq!(retained, vec![0, 1]);
+        assert_eq!(r, vec![1.0, -1.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn signed_ld_mean_imputes_missing_genotypes_and_preserves_matrix_invariants() {
+        let missing_fixture =
+            pack_test_plink_codes(&[vec![0b00, 0b01, 0b11, 0b11], vec![0b00, 0b00, 0b11, 0b11]]);
+        let (missing_r, missing_retained) =
+            ld_corr_matrix_from_packed_rows_blas(&missing_fixture, 2, 1, 4, 1).unwrap();
+        assert_eq!(missing_retained, vec![0, 1]);
+        assert!((missing_r[1] - 0.816_496_58).abs() < 1e-6);
+
+        let nontrivial = pack_test_dosage_rows(&[
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0],
+            vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            vec![2.0, 1.0, 0.0, 2.0, 1.0, 0.0],
+        ]);
+        let (r, retained) = ld_corr_matrix_from_packed_rows_blas(&nontrivial, 3, 2, 6, 1).unwrap();
+        assert_eq!(retained, vec![0, 1, 2]);
+        for row in 0..3 {
+            assert_eq!(r[row * 3 + row], 1.0);
+            for col in 0..3 {
+                assert!(r[row * 3 + col].is_finite());
+                assert!((-1.0..=1.0).contains(&r[row * 3 + col]));
+                assert_eq!(r[row * 3 + col], r[col * 3 + row]);
+            }
+        }
+    }
 }
