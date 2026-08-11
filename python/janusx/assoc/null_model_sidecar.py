@@ -110,6 +110,10 @@ class GwasNullModelSidecarV1:
     qmatrix_file: FileFingerprintV1 | None = None
     qmatrix_columns: tuple[str, ...] = ()
     phenotype_trait_index: int | None = None
+    # Raw phenotype data-column index before any -n/--ncol subset or reorder.
+    # The existing phenotype_trait_index is retained for old records and is
+    # populated with this same raw index for newly emitted records.
+    phenotype_trait_source_index: int | None = None
 
 
 __all__ = [
@@ -181,6 +185,7 @@ def build_fvlmm_sidecar(
     grm_trace_mean: float,
     effective_snp_count: int,
     phenotype_trait_index: int | None = None,
+    phenotype_trait_source_index: int | None = None,
 ) -> GwasNullModelSidecarV1:
     """Build one FvLMM sidecar from the finalized result and fitted null."""
 
@@ -261,6 +266,11 @@ def build_fvlmm_sidecar(
             None
             if phenotype_trait_index is None
             else int(phenotype_trait_index)
+        ),
+        phenotype_trait_source_index=(
+            None
+            if phenotype_trait_source_index is None
+            else int(phenotype_trait_source_index)
         ),
     )
     _validate_record(record)
@@ -751,6 +761,9 @@ def _parse_record(raw_payload: str) -> GwasNullModelSidecarV1:
             phenotype_trait_index=_optional_nonnegative_int_field(
                 payload, "phenotype_trait_index"
             ),
+            phenotype_trait_source_index=_optional_nonnegative_int_field(
+                payload, "phenotype_trait_source_index"
+            ),
         )
     except SidecarFormatError:
         raise
@@ -1059,6 +1072,15 @@ def _validate_record(record: GwasNullModelSidecarV1) -> None:
         ):
             raise SidecarFormatError(
                 "phenotype_trait_index must be a nonnegative integer or null"
+            )
+    if record.phenotype_trait_source_index is not None:
+        if (
+            isinstance(record.phenotype_trait_source_index, bool)
+            or not isinstance(record.phenotype_trait_source_index, int)
+            or record.phenotype_trait_source_index < 0
+        ):
+            raise SidecarFormatError(
+                "phenotype_trait_source_index must be a nonnegative integer or null"
             )
 
 

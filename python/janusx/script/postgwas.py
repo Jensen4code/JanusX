@@ -95,6 +95,7 @@ import numpy as np
 from scipy.stats import beta
 import argparse
 import difflib
+import inspect
 import heapq
 import re
 import shlex
@@ -1631,6 +1632,29 @@ class FvLMMFineMapContext:
     sidecar: GwasNullModelSidecarV1
 
 
+class _PostGWASExpectedCompatibilityError(Exception):
+    """Explicit source-adapter sentinel for expected compatibility failures."""
+
+
+def _postgwas_skip_for_expected_source_error(
+    exc: BaseException,
+    label: str,
+    *,
+    value_markers: Sequence[str] = (),
+    runtime_markers: Sequence[str] = (),
+) -> None:
+    """Convert only an explicit/recognized source failure into FineMapSkip."""
+    if isinstance(exc, _PostGWASExpectedCompatibilityError):
+        raise FineMapSkip(f"{label} is incompatible: {exc}") from exc
+    if isinstance(exc, (OSError, EOFError, UnicodeError, pd.errors.ParserError)):
+        raise FineMapSkip(f"{label} could not be reconstructed: {exc}") from exc
+    message = str(exc).lower()
+    if type(exc) is ValueError and any(marker in message for marker in value_markers):
+        raise FineMapSkip(f"{label} contains malformed user data: {exc}") from exc
+    if type(exc) is RuntimeError and any(marker in message for marker in runtime_markers):
+        raise FineMapSkip(f"{label} is unavailable in this runtime: {exc}") from exc
+
+
 def _postgwas_validate_fvlmm_sidecar(
     record: GwasNullModelSidecarV1,
 ) -> None:
@@ -1711,6 +1735,16 @@ def _postgwas_resolve_fvlmm_dependency(
         raise FineMapSkip(f"{label} dependency is unavailable: {exc}") from exc
 
 
+def _postgwas_require_nonempty_source(path: Path, label: str) -> None:
+    try:
+        if path.stat().st_size <= 0:
+            raise FineMapSkip(f"{label} file is empty: {path}")
+    except FineMapSkip:
+        raise
+    except OSError as exc:
+        raise FineMapSkip(f"{label} file could not be inspected: {exc}") from exc
+
+
 def _postgwas_fvlmm_genotype_fam_path(
     record: GwasNullModelSidecarV1,
     genotype_prefix: Optional[str | os.PathLike[str]],
@@ -1740,7 +1774,7 @@ def _postgwas_load_qmatrix_source(
                 raise KeyError("NPZ must contain sample_ids and qmatrix")
             sample_ids_raw = np.asarray(source["sample_ids"])
             qmatrix_raw = np.asarray(source["qmatrix"])
-    except (OSError, EOFError, KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
+    except (OSError, EOFError, KeyError, ValueError, zipfile.BadZipFile) as exc:
         raise FineMapSkip(f"Q/PC matrix could not be reconstructed: {exc}") from exc
 
     if sample_ids_raw.ndim != 1 or qmatrix_raw.ndim != 2:
@@ -1766,6 +1800,206 @@ def _postgwas_load_qmatrix_source(
     if not np.all(np.isfinite(qmatrix)):
         raise FineMapSkip("Q/PC matrix source conversion produced non-finite values")
     return sample_ids, qmatrix
+
+
+def _postgwas_read_npy_storage_header(
+    handle: object,
+    label: str,
+) -> tuple[tuple[int, ...], np.dtype]:
+    """Read an NPY shape/dtype header without touching its data payload."""
+    try:
+        version = np.lib.format.read_magic(handle)
+        if version == (1, 0):
+            shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(handle)
+        elif version == (2, 0):
+            shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(handle)
+        elif version == (3, 0):
+            reader = getattr(np.lib.format, "read_array_header_3_0", None)
+            if reader is None:
+                raise ValueError("NumPy does not provide a v3 header reader")
+            shape, _fortran_order, dtype = reader(handle)
+        else:
+            raise ValueError(f"unsupported NPY header version {version!r}")
+    except (OSError, EOFError, ValueError, TypeError) as exc:
+        raise FineMapSkip(f"{label} storage header is malformed: {exc}") from exc
+    try:
+        normalized_shape = tuple(int(dimension) for dimension in shape)
+        normalized_dtype = np.dtype(dtype)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FineMapSkip(f"{label} storage header has invalid shape/dtype") from exc
+    if any(dimension < 0 for dimension in normalized_shape):
+        raise FineMapSkip(f"{label} storage header has a negative dimension")
+    return normalized_shape, normalized_dtype
+
+
+def _postgwas_inspect_qmatrix_storage_header(
+    path: Path,
+    expected_columns: Sequence[object],
+) -> tuple[int, int]:
+    """Inspect Q/PC NPZ member headers without loading numeric arrays."""
+    if path.suffix.lower() != ".npz":
+        raise FineMapSkip("Q/PC source has no safe header-only inspector")
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            members = set(archive.namelist())
+            shapes: dict[str, tuple[int, ...]] = {}
+            dtypes: dict[str, np.dtype] = {}
+            for key in ("sample_ids", "qmatrix"):
+                member = f"{key}.npy"
+                if member not in members:
+                    raise ValueError(f"NPZ is missing {key}")
+                with archive.open(member, "r") as member_handle:
+                    shapes[key], dtypes[key] = _postgwas_read_npy_storage_header(
+                        member_handle,
+                        f"Q/PC {key}",
+                    )
+    except FineMapSkip:
+        raise
+    except (OSError, EOFError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+        raise FineMapSkip(f"Q/PC storage header is malformed: {exc}") from exc
+
+    if len(shapes["sample_ids"]) != 1 or len(shapes["qmatrix"]) != 2:
+        raise FineMapSkip("Q/PC storage header has invalid array dimensions")
+    q_rows, q_columns = shapes["qmatrix"]
+    if shapes["sample_ids"][0] != q_rows:
+        raise FineMapSkip("Q/PC storage header IDs and rows disagree")
+    if q_columns != len(tuple(expected_columns)):
+        raise FineMapSkip("Q/PC storage header columns disagree with sidecar metadata")
+    if dtypes["sample_ids"].kind not in {"U", "S"}:
+        raise FineMapSkip("Q/PC sample ID storage dtype is not a safe string type")
+    try:
+        if not np.issubdtype(dtypes["qmatrix"], np.number):
+            raise ValueError("Q/PC storage dtype is not numeric")
+    except TypeError as exc:
+        raise FineMapSkip("Q/PC storage dtype is invalid") from exc
+    return int(shapes["sample_ids"][0]), int(q_columns)
+
+
+def _postgwas_inspect_grm_storage_header(path: Path) -> tuple[int, int]:
+    """Inspect supported dense GRM storage shape without materializing it."""
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        try:
+            with path.open("rb") as handle:
+                shape, dtype = _postgwas_read_npy_storage_header(handle, "GRM")
+        except OSError as exc:
+            raise FineMapSkip(f"GRM storage header could not be read: {exc}") from exc
+        if len(shape) != 2 or shape[0] != shape[1] or shape[0] <= 0:
+            raise FineMapSkip(f"GRM storage header is not a non-empty square: {shape!r}")
+        try:
+            if not np.issubdtype(dtype, np.number):
+                raise ValueError("GRM storage dtype is not numeric")
+        except TypeError as exc:
+            raise FineMapSkip("GRM storage dtype is invalid") from exc
+        return int(shape[0]), int(shape[1])
+    if suffix not in {".txt", ".tsv", ".csv"}:
+        raise FineMapSkip(
+            f"GRM format {suffix or '<none>'!r} has no safe header-only inspector"
+        )
+
+    row_count = 0
+    column_count: Optional[int] = None
+    try:
+        with path.open("rt", encoding="utf-8", errors="replace") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if line == "":
+                    continue
+                tokens = line.replace(",", " ").split()
+                if column_count is None:
+                    column_count = len(tokens)
+                if len(tokens) != column_count:
+                    raise ValueError(
+                        f"GRM text row width mismatch at row {line_number}"
+                    )
+                for token in tokens:
+                    float(token)
+                row_count += 1
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise FineMapSkip(f"GRM text storage header is malformed: {exc}") from exc
+    if column_count is None or row_count <= 0 or row_count != column_count:
+        raise FineMapSkip(
+            f"GRM text storage is not a non-empty square: ({row_count}, {column_count})"
+        )
+    return int(row_count), int(column_count)
+
+
+def _postgwas_inspect_id_storage(path: Path, label: str) -> int:
+    """Count and validate ID rows without constructing a matrix."""
+    count = 0
+    seen: set[str] = set()
+    try:
+        with path.open("rt", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                tokens = raw_line.split()
+                if not tokens:
+                    continue
+                sample_id = str(tokens[0])
+                if sample_id in seen:
+                    raise ValueError(f"duplicate sample ID {sample_id!r}")
+                seen.add(sample_id)
+                count += 1
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise FineMapSkip(f"{label} storage is malformed: {exc}") from exc
+    if count <= 0:
+        raise FineMapSkip(f"{label} storage is empty")
+    return count
+
+
+def _postgwas_validate_kernel_valid_indices(
+    raw_indices: object,
+    upper_bound: int,
+) -> np.ndarray:
+    """Validate raw kernel indices before any narrowing integer cast."""
+    try:
+        values = np.asarray(raw_indices)
+    except (TypeError, ValueError) as exc:
+        raise FineMapSkip(f"kernel valid_indices are not an array: {exc}") from exc
+    if values.ndim != 1 or values.size == 0:
+        raise FineMapSkip("kernel valid_indices must be a non-empty one-dimensional array")
+    kind = values.dtype.kind
+    int64_limit = 1 << 63
+    if kind == "b":
+        raise FineMapSkip("kernel valid_indices must contain exact integers, not booleans")
+    if kind in "iu":
+        if kind == "i" and np.any(values < 0):
+            raise FineMapSkip("kernel valid_indices contain a negative index")
+        if kind == "u" and np.any(values > np.uint64(int64_limit - 1)):
+            raise FineMapSkip("kernel valid_indices exceed int64 range")
+        indices = np.asarray(values, dtype=np.int64)
+    elif kind == "f":
+        if not np.all(np.isfinite(values)):
+            raise FineMapSkip("kernel valid_indices must be finite")
+        if np.any(values != np.trunc(values)):
+            raise FineMapSkip("kernel valid_indices must be exact integers")
+        if np.any(values < 0) or np.any(values >= float(int64_limit)):
+            raise FineMapSkip("kernel valid_indices are outside int64 range")
+        indices = np.asarray(values, dtype=np.int64)
+    else:
+        converted: list[int] = []
+        for value in values.tolist():
+            if isinstance(value, (bool, np.bool_)):
+                raise FineMapSkip("kernel valid_indices must contain exact integers")
+            if isinstance(value, (int, np.integer)):
+                integer = int(value)
+            elif isinstance(value, (float, np.floating)):
+                numeric = float(value)
+                if not np.isfinite(numeric) or numeric != np.trunc(numeric):
+                    raise FineMapSkip("kernel valid_indices must be finite exact integers")
+                if numeric < 0 or numeric >= float(int64_limit):
+                    raise FineMapSkip("kernel valid_indices are outside int64 range")
+                integer = int(numeric)
+            else:
+                raise FineMapSkip("kernel valid_indices contain non-numeric values")
+            if integer < 0 or integer >= int64_limit:
+                raise FineMapSkip("kernel valid_indices are outside int64 range")
+            converted.append(integer)
+        indices = np.asarray(converted, dtype=np.int64)
+    if np.any(indices >= int(upper_bound)):
+        raise FineMapSkip("kernel valid_indices contain an out-of-range index")
+    if np.unique(indices).size != indices.size:
+        raise FineMapSkip("kernel valid_indices contain duplicate indices")
+    return np.ascontiguousarray(indices, dtype=np.int64)
 
 
 def _postgwas_variant_token(value: object, *, allele: bool = False) -> str | None:
@@ -1995,6 +2229,7 @@ def _postgwas_reconstruct_fvlmm_context(
         "phenotype",
         roots,
     )
+    _postgwas_require_nonempty_source(phenotype_path, "phenotype")
     try:
         phenotype = load_phenotype(
             str(phenotype_path),
@@ -2003,8 +2238,25 @@ def _postgwas_reconstruct_fvlmm_context(
             id_col=0,
             use_spinner=False,
         )
-    except (OSError, KeyError, TypeError, ValueError) as exc:
-        raise FineMapSkip(f"phenotype could not be reconstructed: {exc}") from exc
+    except _PostGWASExpectedCompatibilityError as exc:
+        _postgwas_skip_for_expected_source_error(exc, "phenotype")
+        raise
+    except (OSError, EOFError, UnicodeError, pd.errors.ParserError) as exc:
+        _postgwas_skip_for_expected_source_error(exc, "phenotype")
+        raise
+    except ValueError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "phenotype",
+            value_markers=(
+                "failed to read phenotype",
+                "phenotype file is empty",
+                "no phenotype data",
+                "requested phenotype selector",
+                "no phenotype selector",
+            ),
+        )
+        raise
 
     qmatrix_ids: Optional[np.ndarray] = None
     qmatrix_values: Optional[np.ndarray] = None
@@ -2027,6 +2279,7 @@ def _postgwas_reconstruct_fvlmm_context(
             "covariate",
             roots,
         )
+        _postgwas_require_nonempty_source(covariate_path, "covariate")
         try:
             covariate_ids_raw, covariate_values_raw = _read_cov_file_flexible(
                 str(covariate_path),
@@ -2034,8 +2287,24 @@ def _postgwas_reconstruct_fvlmm_context(
                 log,
                 label="Covariate",
             )
-        except (OSError, KeyError, TypeError, ValueError) as exc:
-            raise FineMapSkip(f"covariates could not be reconstructed: {exc}") from exc
+        except _PostGWASExpectedCompatibilityError as exc:
+            _postgwas_skip_for_expected_source_error(exc, "covariate")
+            raise
+        except (OSError, EOFError, UnicodeError, pd.errors.ParserError) as exc:
+            _postgwas_skip_for_expected_source_error(exc, "covariate")
+            raise
+        except ValueError as exc:
+            _postgwas_skip_for_expected_source_error(
+                exc,
+                "covariate",
+                value_markers=(
+                    "file is empty",
+                    "at least 2 columns",
+                    "must include sample ids",
+                    "numeric-only matrix",
+                ),
+            )
+            raise
         covariate_ids = np.asarray(covariate_ids_raw, dtype=str).reshape(-1)
         covariate_values = np.asarray(covariate_values_raw, dtype=np.float32)
         if covariate_values.ndim == 1:
@@ -2101,7 +2370,23 @@ def _postgwas_reconstruct_fvlmm_context(
                 id_col=1,
                 use_spinner=False,
             )
-        except (OSError, KeyError, TypeError, ValueError, IndexError):
+        except _PostGWASExpectedCompatibilityError as exc:
+            _postgwas_skip_for_expected_source_error(exc, "alternate phenotype")
+            phenotype_alt = None
+        except (OSError, EOFError, UnicodeError, pd.errors.ParserError, IndexError):
+            phenotype_alt = None
+        except ValueError as exc:
+            _postgwas_skip_for_expected_source_error(
+                exc,
+                "alternate phenotype",
+                value_markers=(
+                    "failed to read phenotype",
+                    "phenotype file is empty",
+                    "no phenotype data",
+                    "requested phenotype selector",
+                    "no phenotype selector",
+                ),
+            )
             phenotype_alt = None
         if phenotype_alt is not None:
             alt_sets = [set(fam_id_list), set(str(value) for value in phenotype_alt.index)]
@@ -2126,9 +2411,14 @@ def _postgwas_reconstruct_fvlmm_context(
         np.asarray(common_ids, dtype=str),
     )
     trait_selector: object = record.phenotype_trait_column
-    if record.phenotype_trait_index is not None:
+    raw_trait_index = (
+        record.phenotype_trait_source_index
+        if record.phenotype_trait_source_index is not None
+        else record.phenotype_trait_index
+    )
+    if raw_trait_index is not None:
         trait_selector = _TraitRef(
-            col_idx=int(record.phenotype_trait_index),
+            col_idx=int(raw_trait_index),
             label=str(record.phenotype_trait_column),
         )
     try:
@@ -2136,7 +2426,7 @@ def _postgwas_reconstruct_fvlmm_context(
             aligned_pheno,
             trait_selector,
         )
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+    except (KeyError, IndexError, ValueError) as exc:
         raise FineMapSkip(
             "phenotype trait metadata disagrees with the FvLMM sidecar"
         ) from exc
@@ -2230,8 +2520,26 @@ def _postgwas_reconstruct_fvlmm_context(
         )
     except FineMapSkip:
         raise
-    except (OSError, ValueError, TypeError) as exc:
-        raise FineMapSkip(f"GRM could not be aligned by its ID file: {exc}") from exc
+    except _PostGWASExpectedCompatibilityError as exc:
+        _postgwas_skip_for_expected_source_error(exc, "GRM")
+        raise
+    except (OSError, EOFError, UnicodeError, pd.errors.ParserError) as exc:
+        _postgwas_skip_for_expected_source_error(exc, "GRM")
+        raise
+    except ValueError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "GRM",
+            value_markers=(
+                "shape",
+                "square",
+                "id",
+                "missing target",
+                "nan/inf",
+                "matrix",
+            ),
+        )
+        raise
     kinship = np.ascontiguousarray(np.asarray(kinship_raw, dtype=np.float64), dtype=np.float64)
     if kinship.shape != (sample_ids.size, sample_ids.size):
         raise FineMapSkip(
@@ -2291,6 +2599,7 @@ def _postgwas_fvlmm_memory_components(
     fixed_effect_columns: int | Sequence[object],
     bfile_samples: Optional[int] = None,
     grm_samples: Optional[int] = None,
+    qmatrix_rows: Optional[int] = None,
     susie_l: int = 5,
     existing_bytes: int = 0,
 ) -> dict[str, int]:
@@ -2299,6 +2608,11 @@ def _postgwas_fvlmm_memory_components(
     n = _postgwas_memory_count(n_samples)
     n_bfile = max(n, _postgwas_memory_count(bfile_samples or 0))
     n_grm = max(n, _postgwas_memory_count(grm_samples or 0))
+    n_q_source = (
+        _postgwas_memory_count(qmatrix_rows)
+        if qmatrix_rows is not None
+        else n_bfile
+    )
     if isinstance(fixed_effect_columns, (int, np.integer)):
         q = _postgwas_memory_count(fixed_effect_columns)
     else:
@@ -2331,8 +2645,8 @@ def _postgwas_fvlmm_memory_components(
         "rotated_genotype": _postgwas_memory_product(mn, f64),
         "residual_genotype": _postgwas_memory_product(mn, f64),
         "fixed_effects_f64": _postgwas_memory_product(qq, f64),
-        "fixed_effect_source_f32": _postgwas_memory_product(n_bfile, q, f32),
-        "qmatrix_source_f64": _postgwas_memory_product(n_bfile, q, f64),
+        "fixed_effect_source_f32": _postgwas_memory_product(n_q_source, q, f32),
+        "qmatrix_source_f64": _postgwas_memory_product(n_q_source, q, f64),
         "whitened_fixed_effects": _postgwas_memory_product(qq, f64),
         "projected_coefficients": _postgwas_memory_product(mq, f64),
         "projected_gram_ld": _postgwas_memory_product(mm, f64),
@@ -2372,6 +2686,7 @@ def _postgwas_estimate_fvlmm_memory_bytes(
     *,
     bfile_samples: Optional[int] = None,
     grm_samples: Optional[int] = None,
+    qmatrix_rows: Optional[int] = None,
     susie_l: int = 5,
     existing_bytes: int = 0,
 ) -> int:
@@ -2383,6 +2698,7 @@ def _postgwas_estimate_fvlmm_memory_bytes(
             fixed_effect_columns=fixed_effect_columns,
             bfile_samples=bfile_samples,
             grm_samples=grm_samples,
+            qmatrix_rows=qmatrix_rows,
             susie_l=susie_l,
             existing_bytes=existing_bytes,
         ).values()
@@ -2418,8 +2734,56 @@ def _postgwas_build_fvlmm_effective_ld(
         bfile_samples = _postgwas_count_plink_samples(requested_prefix)
         if int(bfile_samples) <= 0:
             raise ValueError("PLINK FAM contains no samples")
-    except (OSError, ValueError, TypeError, OverflowError) as exc:
+    except (OSError, ValueError, OverflowError) as exc:
         raise FineMapSkip(f"FvLMM memory preflight could not inspect FAM: {exc}") from exc
+
+    dependency_roots = _dependency_search_roots(
+        record.result.canonical_path,
+        requested_prefix,
+    )
+    grm_path = _postgwas_resolve_fvlmm_dependency(
+        record.kinship_file,
+        "GRM",
+        dependency_roots,
+    )
+    actual_grm_shape = _postgwas_inspect_grm_storage_header(grm_path)
+    expected_grm_shape = tuple(int(value) for value in record.kinship_shape)
+    if actual_grm_shape != expected_grm_shape:
+        raise FineMapSkip(
+            "GRM storage header shape disagrees with sidecar metadata: "
+            f"actual={actual_grm_shape}, sidecar={expected_grm_shape}"
+        )
+    grm_id_path = _postgwas_resolve_fvlmm_dependency(
+        record.kinship_id_file,
+        "GRM ID",
+        dependency_roots,
+    )
+    actual_grm_id_count = _postgwas_inspect_id_storage(grm_id_path, "GRM ID")
+    if actual_grm_id_count != actual_grm_shape[0]:
+        raise FineMapSkip(
+            "GRM ID storage count disagrees with the actual GRM header: "
+            f"ids={actual_grm_id_count}, matrix={actual_grm_shape[0]}"
+        )
+    if int(record.sample_count) > int(bfile_samples) or int(record.sample_count) > actual_grm_shape[0]:
+        raise FineMapSkip(
+            "FvLMM sidecar sample count exceeds verified FAM/GRM dimensions"
+        )
+    qmatrix_rows: Optional[int] = None
+    if record.qmatrix_file is not None:
+        qmatrix_path = _postgwas_resolve_fvlmm_dependency(
+            record.qmatrix_file,
+            "Q/PC matrix",
+            dependency_roots,
+        )
+        qmatrix_rows, _qmatrix_columns = _postgwas_inspect_qmatrix_storage_header(
+            qmatrix_path,
+            record.qmatrix_columns,
+        )
+        if qmatrix_rows != int(bfile_samples):
+            raise FineMapSkip(
+                "Q/PC storage header row count disagrees with verified FAM IDs: "
+                f"q_rows={qmatrix_rows}, fam_rows={bfile_samples}"
+            )
     existing_bytes = int(
         prepared.memory_usage(deep=True, index=True).sum()
     )
@@ -2430,7 +2794,8 @@ def _postgwas_build_fvlmm_effective_ld(
             n_samples=int(record.sample_count),
             fixed_effect_columns=record.fixed_effect_columns,
             bfile_samples=bfile_samples,
-            grm_samples=int(record.kinship_shape[0]),
+            grm_samples=actual_grm_shape[0],
+            qmatrix_rows=qmatrix_rows,
             susie_l=susie_l,
             existing_bytes=existing_bytes,
         )
@@ -2467,10 +2832,6 @@ def _postgwas_build_fvlmm_effective_ld(
     )
     prepared_source = prepared.reset_index(drop=True)
 
-    dependency_roots = _dependency_search_roots(
-        record.result.canonical_path,
-        requested_prefix,
-    )
     context = _postgwas_reconstruct_fvlmm_context(
         record,
         genotype_prefix=requested_prefix,
@@ -2520,6 +2881,23 @@ def _postgwas_build_fvlmm_effective_ld(
     genotype_chunks: list[np.ndarray] = []
     returned_sites: list[object] = []
     try:
+        loader_signature = inspect.signature(load_genotype_chunks)
+    except (TypeError, ValueError) as exc:
+        raise FineMapSkip(
+            "regional genotype loader signature is unavailable; exact SNP selection cannot be proven"
+        ) from exc
+    loader_parameters = loader_signature.parameters
+    if (
+        "snp_indices" not in loader_parameters
+        and not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in loader_parameters.values()
+        )
+    ):
+        raise FineMapSkip(
+            "regional genotype loader does not support exact SNP selection"
+        )
+    try:
         genotype_iter = load_genotype_chunks(
             str(requested_prefix),
             chunk_size=max(1, min(20_000, len(selected_bim_indices))),
@@ -2540,8 +2918,44 @@ def _postgwas_build_fvlmm_effective_ld(
                 )
             genotype_chunks.append(np.ascontiguousarray(block, dtype=np.float32))
             returned_sites.extend(list(sites))
-    except (OSError, ValueError, TypeError) as exc:
-        raise FineMapSkip(f"regional genotype could not be reconstructed: {exc}") from exc
+    except _PostGWASExpectedCompatibilityError as exc:
+        _postgwas_skip_for_expected_source_error(exc, "regional genotype")
+        raise
+    except (OSError, EOFError, UnicodeError, pd.errors.ParserError) as exc:
+        _postgwas_skip_for_expected_source_error(exc, "regional genotype")
+        raise
+    except RuntimeError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "regional genotype",
+            runtime_markers=(
+                "snp selection",
+                "snp_indices",
+                "does not support exact",
+                "selection unavailable",
+            ),
+        )
+        raise
+    except TypeError as exc:
+        if "snp_indices" in str(exc).lower() and "keyword" in str(exc).lower():
+            raise FineMapSkip(
+                f"regional genotype loader does not support exact SNP selection: {exc}"
+            ) from exc
+        raise
+    except ValueError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "regional genotype",
+            value_markers=(
+                "snp_indices is empty",
+                "invalid snp_",
+                "genotype source",
+                "genotype chunk",
+                "site metadata",
+                "malformed",
+            ),
+        )
+        raise
     if len(genotype_chunks) == 0:
         raise FineMapSkip("regional genotype loader returned no variants")
     if len(returned_sites) != len(selected_bim_indices):
@@ -2585,9 +2999,13 @@ def _postgwas_build_fvlmm_effective_ld(
     )
     aligned_input = prepared_source.reset_index(drop=True)
 
+    from janusx.assoc import workflow as workflow_module
+    if not hasattr(workflow_module.jxrs, "rust_eigh_from_array_f64"):
+        raise FineMapSkip(
+            "FvLMM Rust EVD symbol rust_eigh_from_array_f64 is unavailable"
+        )
     try:
-        from janusx.assoc.workflow import _gwas_eigh_from_grm
-
+        _gwas_eigh_from_grm = workflow_module._gwas_eigh_from_grm
         eigvals, eigvecs, _eigh_backend, _eigh_elapsed = _gwas_eigh_from_grm(
             context.kinship,
             threads=max(1, int(getattr(args, "thread", 1))),
@@ -2596,8 +3014,32 @@ def _postgwas_build_fvlmm_effective_ld(
             require_rust=True,
             diag_ridge=_POSTGWAS_FVLMM_DIAG_RIDGE,
         )
-    except (ValueError, TypeError) as exc:
-        raise FineMapSkip(f"FvLMM GRM eigendecomposition failed: {exc}") from exc
+    except _PostGWASExpectedCompatibilityError as exc:
+        _postgwas_skip_for_expected_source_error(exc, "FvLMM GRM eigendecomposition")
+        raise
+    except RuntimeError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "FvLMM GRM eigendecomposition",
+            runtime_markers=(
+                "rust_eigh_from_array_f64",
+                "rust evd symbol",
+                "missing rust evd",
+                "symbol is unavailable",
+            ),
+        )
+        raise
+    except ValueError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "FvLMM GRM eigendecomposition",
+            value_markers=(
+                "non-empty square grm",
+                "grm shape",
+                "grm matrix",
+            ),
+        )
+        raise
     eigvals = np.ascontiguousarray(np.asarray(eigvals, dtype=np.float64).reshape(-1))
     eigvecs = np.asarray(eigvecs, dtype=np.float64)
     if (
@@ -2619,10 +3061,16 @@ def _postgwas_build_fvlmm_effective_ld(
             context.lambda_null,
             threads=max(1, int(getattr(args, "thread", 1))),
         )
-    except (ValueError, TypeError) as exc:
-        raise FineMapSkip(
-            f"FvLMM effective-LD kernel rejected the reconstructed context: {exc}"
-        ) from exc
+    except _PostGWASExpectedCompatibilityError as exc:
+        _postgwas_skip_for_expected_source_error(exc, "FvLMM effective-LD kernel")
+        raise
+    except ValueError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "FvLMM effective-LD kernel",
+            value_markers=("shape", "finite", "rank", "lambda_null"),
+        )
+        raise
     if not isinstance(kernel_result, dict):
         raise FineMapSkip("FvLMM effective-LD kernel returned a non-mapping result")
     try:
@@ -2630,12 +3078,13 @@ def _postgwas_build_fvlmm_effective_ld(
             np.asarray(kernel_result["r"], dtype=np.float64),
             dtype=np.float64,
         )
-        valid_indices = np.asarray(
-            kernel_result["valid_indices"],
-            dtype=np.int64,
-        ).reshape(-1)
+        raw_valid_indices = kernel_result["valid_indices"]
     except (KeyError, TypeError, ValueError) as exc:
         raise FineMapSkip("FvLMM effective-LD kernel returned invalid arrays") from exc
+    valid_indices = _postgwas_validate_kernel_valid_indices(
+        raw_valid_indices,
+        int(genotypes.shape[0]),
+    )
     try:
         diagnostic_fixed_columns = kernel_result["fixed_effect_columns"]
         diagnostic_rank = kernel_result["fixed_effect_rank"]
@@ -2651,7 +3100,7 @@ def _postgwas_build_fvlmm_effective_ld(
             or not isinstance(diagnostic_rank, (int, np.integer))
             or int(diagnostic_rank) < 1
             or int(diagnostic_rank) > int(diagnostic_fixed_columns)
-            or int(diagnostic_rank) > int(context.sample_ids.size)
+            or int(diagnostic_rank) >= int(context.sample_ids.size)
             or not np.isfinite(diagnostic_rank_tolerance)
             or diagnostic_rank_tolerance <= 0.0
             or not np.isfinite(diagnostic_min_projected_diag)

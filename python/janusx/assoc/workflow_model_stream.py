@@ -52,6 +52,7 @@ from .workflow import (
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _safe_trait_file_label,
+    _phenotype_source_column_index,
     _trait_values_and_mask,
     build_rich_progress,
     detect_effective_threads,
@@ -91,8 +92,9 @@ def _emit_fvlmm_sidecar_after_publication(
     *,
     context: Optional[GwasSidecarRunContext],
     result_file: str,
-    trait: str,
+    trait: object,
     phenotype_trait_index: Optional[int] = None,
+    phenotype: Optional[pd.DataFrame] = None,
     sample_ids: object,
     mod: object,
     effective_snp_count: int,
@@ -101,11 +103,17 @@ def _emit_fvlmm_sidecar_after_publication(
     if context is None:
         return
     try:
+        raw_trait_index = phenotype_trait_index
+        if phenotype is not None:
+            source_index = _phenotype_source_column_index(phenotype, trait)
+            if source_index is not None:
+                raw_trait_index = int(source_index)
         record = build_fvlmm_sidecar(
             context=context,
             result_file=result_file,
             trait=trait,
-            phenotype_trait_index=phenotype_trait_index,
+            phenotype_trait_index=raw_trait_index,
+            phenotype_trait_source_index=raw_trait_index,
             sample_ids=sample_ids,
             lambda_null=float(getattr(mod, "lbd_null")),
             sigma_g2=(
@@ -1870,8 +1878,9 @@ def run_chunked_gwas_lmm_lm(
             _emit_fvlmm_sidecar_after_publication(
                 context=null_sidecar_context,
                 result_file=out_tsv,
-                trait=str(pname),
+                trait=pname,
                 phenotype_trait_index=getattr(pname, "col_idx", None),
+                phenotype=pheno_aligned,
                 sample_ids=trait_ids,
                 mod=mod,
                 effective_snp_count=int(done_snps),
@@ -1931,7 +1940,7 @@ def run_chunked_gwas_lmm_lm(
 
 def run_chunked_gwas_streaming_shared(
     model_names: list[str],
-    trait_name: str,
+    trait_name: object,
     genofile: str,
     pheno: pd.DataFrame,
     ids: np.ndarray,
@@ -2006,7 +2015,8 @@ def run_chunked_gwas_streaming_shared(
     # phenotype has already been aligned to `ids` order.
     pheno_aligned = pheno
     ids = np.asarray(ids, dtype=str).reshape(-1)
-    pname = str(trait_name)
+    trait_selector = trait_name
+    pname = str(trait_selector)
     y_full, sameidx = _trait_values_and_mask(pheno_aligned, trait_name)
     keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
     n_idv = int(keep_idx.shape[0])
@@ -2856,8 +2866,9 @@ def run_chunked_gwas_streaming_shared(
                 _emit_fvlmm_sidecar_after_publication(
                     context=null_sidecar_context,
                     result_file=out_tsv,
-                    trait=str(pname),
-                    phenotype_trait_index=getattr(pname, "col_idx", None),
+                    trait=trait_selector,
+                    phenotype_trait_index=getattr(trait_selector, "col_idx", None),
+                    phenotype=pheno_aligned,
                     sample_ids=trait_ids,
                     mod=ctx.get("mod"),
                     effective_snp_count=int(done_snps),

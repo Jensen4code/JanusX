@@ -1442,6 +1442,36 @@ def _trait_exact_match_indices(
     return out
 
 
+def _phenotype_source_column_index(
+    pheno_aligned: pd.DataFrame,
+    trait_name: object,
+) -> int | None:
+    """Return the raw phenotype data-column index for a trait selector.
+
+    ``_TraitRef.col_idx`` addresses the currently loaded frame, which may be
+    a reordered/subset view created by ``-n/--ncol``.  ``load_phenotype`` keeps
+    the original data-column positions in ``selected_ncol``; use that mapping
+    before any selector is stringified.
+    """
+    trait_ref = _trait_ref_from_selector(pheno_aligned, trait_name)
+    if trait_ref is None:
+        resolved = _resolve_trait_iter(pheno_aligned, [trait_name])
+        if len(resolved) != 1 or not isinstance(resolved[0], _TraitRef):
+            return None
+        trait_ref = resolved[0]
+    local_index = int(trait_ref.col_idx)
+    selected_ncol = pheno_aligned.attrs.get("selected_ncol")
+    if isinstance(selected_ncol, (list, tuple, np.ndarray)):
+        if len(selected_ncol) == int(pheno_aligned.shape[1]) and 0 <= local_index < len(selected_ncol):
+            try:
+                raw_index = int(selected_ncol[local_index])
+            except (TypeError, ValueError, OverflowError):
+                return local_index
+            if raw_index >= 0:
+                return raw_index
+    return local_index
+
+
 def _trait_values_and_mask(
     pheno_aligned: pd.DataFrame,
     trait_name: object,
