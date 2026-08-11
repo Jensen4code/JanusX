@@ -101,6 +101,7 @@ import shlex
 import time
 import socket
 import sys
+import zipfile
 import colorsys
 import concurrent.futures as cf
 import multiprocessing as mp
@@ -113,6 +114,7 @@ from janusx import janusx as jxrs
 from janusx.assoc.null_model_sidecar import (
     FineMapSkip,
     GwasNullModelSidecarV1,
+    SidecarFormatError,
     _dependency_search_roots,
     _resolve_dependency_path,
     discover_matching_sidecar,
@@ -1600,6 +1602,13 @@ _POSTGWAS_FINEMAP_DEFAULT_MEMORY_GB = 8.0
 _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES = int(_POSTGWAS_FINEMAP_DEFAULT_MEMORY_GB * 1024**3)
 _POSTGWAS_FINEMAP_MEMORY_RESERVE_BYTES = 512 * 1024**2
 _POSTGWAS_FVLMM_DIAG_RIDGE = 1e-6
+# Effective-LD validation tolerances.  Symmetry and unit diagonal use an
+# absolute tolerance of 1e-10.  PSD accepts only round-off-scale negative
+# eigenvalues: max(1e-10, 1e-8 * max(1, max_abs_eigenvalue)).
+_POSTGWAS_FVLMM_LD_SYMMETRY_ATOL = 1e-10
+_POSTGWAS_FVLMM_LD_UNIT_DIAGONAL_ATOL = 1e-10
+_POSTGWAS_FVLMM_LD_PSD_ATOL = 1e-10
+_POSTGWAS_FVLMM_LD_PSD_RTOL = 1e-8
 _POSTGWAS_FINEMAP_LDCLUMP_R2 = 0.99
 _POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES = (
     (".fvlmm.tsv", "fvlmm"),
@@ -1632,7 +1641,7 @@ def _postgwas_validate_fvlmm_sidecar(
         # Reuse the schema's complete semantic validation, including the
         # fixed-effect/covariate relationship established by Task 3.
         serialize_sidecar_block(record)
-    except Exception as exc:
+    except (SidecarFormatError, TypeError, ValueError) as exc:
         raise FineMapSkip(f"sidecar metadata is incompatible: {exc}") from exc
 
     if record.model != "fvlmm":
@@ -1641,10 +1650,15 @@ def _postgwas_validate_fvlmm_sidecar(
         )
     fixed_columns = tuple(str(column) for column in record.fixed_effect_columns)
     covariate_columns = tuple(str(column) for column in record.covariate_columns)
+    qmatrix_columns = tuple(str(column) for column in record.qmatrix_columns)
     if fixed_columns != ("Intercept",) + covariate_columns:
         raise FineMapSkip(
             "sidecar fixed-effect metadata disagrees with its covariate columns"
         )
+    if qmatrix_columns and record.qmatrix_file is None:
+        raise FineMapSkip("sidecar Q/PC columns have no numerical source")
+    if record.qmatrix_file is not None and not qmatrix_columns:
+        raise FineMapSkip("sidecar Q/PC source has no column identity")
     try:
         lambda_null = float(record.lambda_null)
     except (TypeError, ValueError) as exc:
@@ -1711,6 +1725,216 @@ def _postgwas_fvlmm_genotype_fam_path(
     return Path(f"{prefix}.fam")
 
 
+def _postgwas_load_qmatrix_source(
+    path: Path,
+    expected_columns: Sequence[object],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load and validate the persisted Q/PC source used by GWAS."""
+
+    try:
+        source = np.load(path, allow_pickle=False)
+        if not isinstance(source, np.lib.npyio.NpzFile):
+            raise ValueError("Q/PC source is not the required NPZ format")
+        with source:
+            if "sample_ids" not in source or "qmatrix" not in source:
+                raise KeyError("NPZ must contain sample_ids and qmatrix")
+            sample_ids_raw = np.asarray(source["sample_ids"])
+            qmatrix_raw = np.asarray(source["qmatrix"])
+    except (OSError, EOFError, KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
+        raise FineMapSkip(f"Q/PC matrix could not be reconstructed: {exc}") from exc
+
+    if sample_ids_raw.ndim != 1 or qmatrix_raw.ndim != 2:
+        raise FineMapSkip("Q/PC matrix source has invalid array dimensions")
+    if qmatrix_raw.shape[0] != sample_ids_raw.size:
+        raise FineMapSkip("Q/PC matrix source IDs and rows disagree")
+    if qmatrix_raw.shape[1] != len(tuple(expected_columns)):
+        raise FineMapSkip(
+            "Q/PC matrix source column count disagrees with sidecar metadata"
+        )
+    try:
+        numeric = np.issubdtype(qmatrix_raw.dtype, np.number)
+    except TypeError as exc:
+        raise FineMapSkip("Q/PC matrix source is not numeric") from exc
+    if not numeric or not np.all(np.isfinite(qmatrix_raw)):
+        raise FineMapSkip("Q/PC matrix source contains non-finite/non-numeric values")
+    sample_ids = np.asarray(sample_ids_raw, dtype=str).reshape(-1)
+    if sample_ids.size == 0 or len(set(sample_ids.tolist())) != sample_ids.size:
+        raise FineMapSkip("Q/PC matrix source contains duplicate or empty IDs")
+    qmatrix = np.ascontiguousarray(
+        np.asarray(qmatrix_raw, dtype=np.float64), dtype=np.float64
+    )
+    if not np.all(np.isfinite(qmatrix)):
+        raise FineMapSkip("Q/PC matrix source conversion produced non-finite values")
+    return sample_ids, qmatrix
+
+
+def _postgwas_variant_token(value: object, *, allele: bool = False) -> str | None:
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if text == "" or text.lower() in {".", "nan", "none"}:
+        return None
+    return text.upper() if allele else text
+
+
+def _postgwas_read_bim_identity_rows(
+    genotype_prefix: object,
+) -> list[tuple[str, int, str | None, str | None, str | None]]:
+    """Read BIM rows in source order without collapsing duplicate coordinates."""
+
+    prefix = _normalize_plink_prefix(genotype_prefix)
+    bim_path = Path(f"{prefix}.bim")
+    rows: list[tuple[str, int, str | None, str | None, str | None]] = []
+    try:
+        with bim_path.open("rt", encoding="utf-8", errors="replace") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                tokens = line.split()
+                if not tokens:
+                    continue
+                if len(tokens) < 6:
+                    raise ValueError(f"Malformed BIM row at {bim_path}:{line_number}")
+                chrom = _normalize_chr(tokens[0])
+                try:
+                    pos = int(float(tokens[3]))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Invalid BIM position at {bim_path}:{line_number}"
+                    ) from exc
+                rows.append(
+                    (
+                        chrom,
+                        pos,
+                        _postgwas_variant_token(tokens[1]),
+                        _postgwas_variant_token(tokens[4], allele=True),
+                        _postgwas_variant_token(tokens[5], allele=True),
+                    )
+                )
+    except (OSError, ValueError) as exc:
+        raise FineMapSkip(f"BIM variant identity could not be read: {exc}") from exc
+    if not rows:
+        raise FineMapSkip("BIM variant identity is empty")
+    return rows
+
+
+def _postgwas_variant_allele_pair(
+    allele0: str | None,
+    allele1: str | None,
+) -> frozenset[str] | None:
+    if allele0 is None or allele1 is None:
+        return None
+    return frozenset((allele0, allele1))
+
+
+def _postgwas_match_prepared_variants_to_bim(
+    prepared: pd.DataFrame,
+    bim_rows: Sequence[tuple[str, int, str | None, str | None, str | None]],
+) -> list[int]:
+    """Return one unambiguous BIM row per prepared row, preserving order."""
+
+    prepared_indices: list[int] = []
+    used: set[int] = set()
+    has_snp = "snp" in prepared.columns
+    has_allele0 = "allele0" in prepared.columns
+    has_allele1 = "allele1" in prepared.columns
+    for row_number, (_index, row) in enumerate(prepared.iterrows()):
+        chrom = _normalize_chr(row["chrom"])
+        try:
+            pos_float = float(pd.to_numeric(row["pos"], errors="coerce"))
+        except (TypeError, ValueError):
+            pos_float = float("nan")
+        if not np.isfinite(pos_float) or pos_float != np.floor(pos_float):
+            raise FineMapSkip(
+                f"FvLMM variant identity has an invalid position at row {row_number}"
+            )
+        pos = int(pos_float)
+        candidates = [
+            index
+            for index, bim_row in enumerate(bim_rows)
+            if bim_row[0] == chrom and bim_row[1] == pos
+        ]
+        if not candidates:
+            raise FineMapSkip(
+                f"no BIM variant matches prepared row {row_number} at {chrom}:{pos}"
+            )
+
+        prepared_snp = (
+            _postgwas_variant_token(row["snp"]) if has_snp else None
+        )
+        prepared_a0 = (
+            _postgwas_variant_token(row["allele0"], allele=True)
+            if has_allele0
+            else None
+        )
+        prepared_a1 = (
+            _postgwas_variant_token(row["allele1"], allele=True)
+            if has_allele1
+            else None
+        )
+        prepared_pair = _postgwas_variant_allele_pair(prepared_a0, prepared_a1)
+        id_matches = (
+            [index for index in candidates if bim_rows[index][2] == prepared_snp]
+            if prepared_snp is not None
+            else []
+        )
+        if id_matches:
+            candidates = id_matches
+        elif prepared_snp is not None and any(
+            bim_rows[index][2] is not None for index in candidates
+        ):
+            # A named variant that cannot be found by ID is not proven by a
+            # coordinate fallback when BIM contains real IDs.
+            if prepared_pair is None:
+                raise FineMapSkip(
+                    f"prepared SNP ID {prepared_snp!r} is not present in BIM"
+                )
+        if prepared_pair is not None:
+            if not (has_allele0 and has_allele1):
+                raise FineMapSkip(
+                    f"prepared variant row {row_number} has incomplete allele identity"
+                )
+            candidates = [
+                index
+                for index in candidates
+                if _postgwas_variant_allele_pair(
+                    bim_rows[index][3], bim_rows[index][4]
+                )
+                == prepared_pair
+            ]
+        if len(candidates) != 1:
+            raise FineMapSkip(
+                "variant identity is ambiguous; exact BIM alignment cannot be proven "
+                f"for prepared row {row_number} at {chrom}:{pos}"
+            )
+        bim_index = candidates[0]
+        if bim_index in used:
+            raise FineMapSkip("prepared variants resolve to the same BIM row")
+        used.add(bim_index)
+        prepared_indices.append(bim_index)
+    return prepared_indices
+
+
+def _postgwas_site_identity_signature(site: object) -> tuple[str, int, frozenset[str] | None]:
+    try:
+        chrom = _normalize_chr(getattr(site, "chrom"))
+        pos = int(getattr(site, "pos"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise FineMapSkip("genotype loader returned invalid site metadata") from exc
+    allele0 = _postgwas_variant_token(
+        getattr(site, "ref_allele", getattr(site, "allele0", None)),
+        allele=True,
+    )
+    allele1 = _postgwas_variant_token(
+        getattr(site, "alt_allele", getattr(site, "allele1", None)),
+        allele=True,
+    )
+    return chrom, pos, _postgwas_variant_allele_pair(allele0, allele1)
+
+
 def _postgwas_reconstruct_fvlmm_context(
     record: GwasNullModelSidecarV1,
     *,
@@ -1729,6 +1953,7 @@ def _postgwas_reconstruct_fvlmm_context(
     log = logger if isinstance(logger, logging.Logger) else logging.getLogger(__name__)
 
     from janusx.assoc.workflow import (
+        _TraitRef,
         _align_pheno_to_sample_order,
         _read_cov_file_flexible,
         _trait_values_and_mask,
@@ -1778,8 +2003,21 @@ def _postgwas_reconstruct_fvlmm_context(
             id_col=0,
             use_spinner=False,
         )
-    except Exception as exc:
+    except (OSError, KeyError, TypeError, ValueError) as exc:
         raise FineMapSkip(f"phenotype could not be reconstructed: {exc}") from exc
+
+    qmatrix_ids: Optional[np.ndarray] = None
+    qmatrix_values: Optional[np.ndarray] = None
+    if record.qmatrix_file is not None:
+        qmatrix_path = _postgwas_resolve_fvlmm_dependency(
+            record.qmatrix_file,
+            "Q/PC matrix",
+            roots,
+        )
+        qmatrix_ids, qmatrix_values = _postgwas_load_qmatrix_source(
+            qmatrix_path,
+            record.qmatrix_columns,
+        )
 
     covariate_ids: Optional[np.ndarray] = None
     covariate_values: Optional[np.ndarray] = None
@@ -1796,7 +2034,7 @@ def _postgwas_reconstruct_fvlmm_context(
                 log,
                 label="Covariate",
             )
-        except Exception as exc:
+        except (OSError, KeyError, TypeError, ValueError) as exc:
             raise FineMapSkip(f"covariates could not be reconstructed: {exc}") from exc
         covariate_ids = np.asarray(covariate_ids_raw, dtype=str).reshape(-1)
         covariate_values = np.asarray(covariate_values_raw, dtype=np.float32)
@@ -1808,11 +2046,14 @@ def _postgwas_reconstruct_fvlmm_context(
             )
         if len(set(str(value) for value in covariate_ids.tolist())) != covariate_ids.size:
             raise FineMapSkip("covariate file contains duplicate sample IDs")
-        if covariate_values.shape[1] != len(record.covariate_columns):
+        external_covariate_columns = tuple(
+            record.covariate_columns[len(record.qmatrix_columns) :]
+        )
+        if covariate_values.shape[1] != len(external_covariate_columns):
             raise FineMapSkip(
                 "covariate column count disagrees with the FvLMM sidecar metadata"
             )
-    elif len(record.covariate_columns) != 0:
+    elif len(record.covariate_columns) > len(record.qmatrix_columns):
         raise FineMapSkip(
             "FvLMM sidecar declares covariates but has no covariate file"
         )
@@ -1843,6 +2084,8 @@ def _postgwas_reconstruct_fvlmm_context(
     # then apply the exact single-trait ~isnan phenotype mask.
     source_sets = [set(fam_id_list), set(str(value) for value in phenotype.index)]
     source_sets.append(set(grm_id_list))
+    if qmatrix_ids is not None:
+        source_sets.append(set(str(value) for value in qmatrix_ids.tolist()))
     if covariate_ids is not None:
         source_sets.append(set(str(value) for value in covariate_ids.tolist()))
     common = set.intersection(*source_sets)
@@ -1858,11 +2101,13 @@ def _postgwas_reconstruct_fvlmm_context(
                 id_col=1,
                 use_spinner=False,
             )
-        except Exception:
+        except (OSError, KeyError, TypeError, ValueError, IndexError):
             phenotype_alt = None
         if phenotype_alt is not None:
             alt_sets = [set(fam_id_list), set(str(value) for value in phenotype_alt.index)]
             alt_sets.append(set(grm_id_list))
+            if qmatrix_ids is not None:
+                alt_sets.append(set(str(value) for value in qmatrix_ids.tolist()))
             if covariate_ids is not None:
                 alt_sets.append(set(str(value) for value in covariate_ids.tolist()))
             alt_common = set.intersection(*alt_sets)
@@ -1880,12 +2125,18 @@ def _postgwas_reconstruct_fvlmm_context(
         phenotype,
         np.asarray(common_ids, dtype=str),
     )
+    trait_selector: object = record.phenotype_trait_column
+    if record.phenotype_trait_index is not None:
+        trait_selector = _TraitRef(
+            col_idx=int(record.phenotype_trait_index),
+            label=str(record.phenotype_trait_column),
+        )
     try:
         _trait_values, phenotype_keep = _trait_values_and_mask(
             aligned_pheno,
-            record.phenotype_trait_column,
+            trait_selector,
         )
-    except Exception as exc:
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise FineMapSkip(
             "phenotype trait metadata disagrees with the FvLMM sidecar"
         ) from exc
@@ -1913,9 +2164,33 @@ def _postgwas_reconstruct_fvlmm_context(
         dtype=np.int64,
     )
 
-    if covariate_values is None:
-        fixed_effects = np.ones((sample_ids.size, 1), dtype=np.float64)
-    else:
+    fixed_effect_columns_data: list[np.ndarray] = [
+        np.ones((sample_ids.size,), dtype=np.float64)
+    ]
+    if qmatrix_ids is not None and qmatrix_values is not None:
+        qmatrix_index = {
+            str(sample_id): index
+            for index, sample_id in enumerate(qmatrix_ids.tolist())
+        }
+        try:
+            q_take = np.asarray(
+                [qmatrix_index[str(value)] for value in sample_ids.tolist()],
+                dtype=np.int64,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FineMapSkip(
+                "Q/PC matrix IDs do not cover reconstructed FvLMM samples"
+            ) from exc
+        q_subset = np.ascontiguousarray(
+            qmatrix_values[q_take],
+            dtype=np.float64,
+        )
+        if q_subset.ndim != 2 or q_subset.shape[1] != len(record.qmatrix_columns):
+            raise FineMapSkip("reconstructed Q/PC matrix shape is invalid")
+        fixed_effect_columns_data.extend(
+            q_subset[:, index] for index in range(q_subset.shape[1])
+        )
+    if covariate_values is not None:
         covariate_index = {
             str(sample_id): index
             for index, sample_id in enumerate(covariate_ids.tolist())
@@ -1928,12 +2203,12 @@ def _postgwas_reconstruct_fvlmm_context(
             covariate_values[cov_take],
             dtype=np.float64,
         )
-        fixed_effects = np.ascontiguousarray(
-            np.column_stack(
-                [np.ones((sample_ids.size,), dtype=np.float64), cov_subset]
-            ),
-            dtype=np.float64,
+        fixed_effect_columns_data.extend(
+            cov_subset[:, index] for index in range(cov_subset.shape[1])
         )
+    fixed_effects = np.ascontiguousarray(
+        np.column_stack(fixed_effect_columns_data), dtype=np.float64
+    )
     if fixed_effects.shape != (sample_ids.size, len(record.fixed_effect_columns)):
         raise FineMapSkip(
             "reconstructed fixed-effect shape disagrees with the FvLMM sidecar"
@@ -1976,6 +2251,39 @@ def _postgwas_reconstruct_fvlmm_context(
     )
 
 
+_POSTGWAS_MEMORY_INT_MAX = sys.maxsize
+
+
+def _postgwas_memory_count(value: object) -> int:
+    try:
+        integer = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return _POSTGWAS_MEMORY_INT_MAX
+    return min(_POSTGWAS_MEMORY_INT_MAX, max(0, integer))
+
+
+def _postgwas_memory_product(*values: int) -> int:
+    result = 1
+    for raw_value in values:
+        value = _postgwas_memory_count(raw_value)
+        if value == 0:
+            return 0
+        if result > _POSTGWAS_MEMORY_INT_MAX // value:
+            return _POSTGWAS_MEMORY_INT_MAX
+        result *= value
+    return result
+
+
+def _postgwas_memory_sum(*values: int) -> int:
+    result = 0
+    for raw_value in values:
+        value = _postgwas_memory_count(raw_value)
+        if result > _POSTGWAS_MEMORY_INT_MAX - value:
+            return _POSTGWAS_MEMORY_INT_MAX
+        result += value
+    return result
+
+
 def _postgwas_fvlmm_memory_components(
     *,
     n_variants: int,
@@ -1987,41 +2295,71 @@ def _postgwas_fvlmm_memory_components(
     existing_bytes: int = 0,
 ) -> dict[str, int]:
     """Return a conservative complete peak working-set accounting."""
-    m = max(0, int(n_variants))
-    n = max(0, int(n_samples))
-    n_bfile = max(n, int(bfile_samples or 0))
-    n_grm = max(n, int(grm_samples or 0))
+    m = _postgwas_memory_count(n_variants)
+    n = _postgwas_memory_count(n_samples)
+    n_bfile = max(n, _postgwas_memory_count(bfile_samples or 0))
+    n_grm = max(n, _postgwas_memory_count(grm_samples or 0))
     if isinstance(fixed_effect_columns, (int, np.integer)):
-        q = max(0, int(fixed_effect_columns))
+        q = _postgwas_memory_count(fixed_effect_columns)
     else:
-        q = max(0, len(fixed_effect_columns))
-    l = max(1, min(max(1, int(susie_l)), max(1, m)))
+        q = _postgwas_memory_count(len(fixed_effect_columns))
+    l = max(1, min(max(1, _postgwas_memory_count(susie_l)), max(1, m)))
     f64 = 8
     f32 = 4
+    mn = _postgwas_memory_product(m, n)
+    nn = _postgwas_memory_product(n, n)
+    mm = _postgwas_memory_product(m, m)
+    qq = _postgwas_memory_product(n, q)
+    mq = _postgwas_memory_product(m, q)
     components = {
-        "existing_gwas_frame": max(0, int(existing_bytes)),
-        "grm_source_full": n_grm * n_grm * f64,
-        "grm_subset": n * n * f64,
-        "eigh_input_copy": n * n * f64,
-        "eigensystem": n * n * f64 + n * f64,
-        "regional_genotype_f32": m * n * f32,
-        "regional_genotype_f64": m * n * f64,
-        "regional_bed_packed": m * ((n_bfile + 3) // 4),
-        "rotated_genotype": m * n * f64,
-        "residual_genotype": m * n * f64,
-        "fixed_effects_f64": n * q * f64,
-        "whitened_fixed_effects": n * q * f64,
-        "projected_coefficients": m * q * f64,
-        "projected_gram_ld": m * m * f64,
-        # PyO3's NumPy argument conversion may retain/copy each f64 input and
-        # the returned LD matrix; count those copies independently.
-        "pyo3_genotype_copy": m * n * f64,
-        "pyo3_eigvals_copy": n * f64,
-        "pyo3_u_t_copy": n * n * f64,
-        "pyo3_fixed_effect_copy": n * q * f64,
-        "pyo3_ld_output_copy": m * m * f64,
-        "susie_ld_copy": m * m * f64,
-        "susie_vectors": (l + 4) * m * f64 + l * f64,
+        "existing_gwas_frame": _postgwas_memory_count(existing_bytes),
+        "grm_source_full": _postgwas_memory_product(n_grm, n_grm, f64),
+        "grm_subset": _postgwas_memory_product(nn, f64),
+        "eigh_input_copy": _postgwas_memory_product(nn, f64),
+        "eigensystem": _postgwas_memory_sum(
+            _postgwas_memory_product(nn, f64),
+            _postgwas_memory_product(n, f64),
+        ),
+        # The Python list retains all decoded chunks while vstack creates a
+        # second full f32 matrix.  Selection then creates a live f64 matrix.
+        "regional_genotype_chunks_f32": _postgwas_memory_product(mn, f32),
+        "regional_genotype_vstack_f32": _postgwas_memory_product(mn, f32),
+        "regional_genotype_f32": _postgwas_memory_product(mn, f32),
+        "regional_genotype_f64": _postgwas_memory_product(mn, f64),
+        "selected_genotype_f64": _postgwas_memory_product(mn, f64),
+        "regional_bed_packed": _postgwas_memory_product(m, (n_bfile + 3) // 4),
+        "rotated_genotype": _postgwas_memory_product(mn, f64),
+        "residual_genotype": _postgwas_memory_product(mn, f64),
+        "fixed_effects_f64": _postgwas_memory_product(qq, f64),
+        "fixed_effect_source_f32": _postgwas_memory_product(n_bfile, q, f32),
+        "qmatrix_source_f64": _postgwas_memory_product(n_bfile, q, f64),
+        "whitened_fixed_effects": _postgwas_memory_product(qq, f64),
+        "projected_coefficients": _postgwas_memory_product(mq, f64),
+        "projected_gram_ld": _postgwas_memory_product(mm, f64),
+        # Rust's PyO3 wrapper first materializes row-major Vec values and then
+        # copies each Vec into a nalgebra DMatrix.  u_t is already a Python
+        # transpose, so count that matrix plus both Rust copies.
+        "u_t_transpose_f64": _postgwas_memory_product(nn, f64),
+        "pyo3_vec_genotype": _postgwas_memory_product(mn, f64),
+        "pyo3_dmatrix_genotype": _postgwas_memory_product(mn, f64),
+        "pyo3_vec_eigvals": _postgwas_memory_product(n, f64),
+        "pyo3_dmatrix_eigvals": _postgwas_memory_product(n, f64),
+        "pyo3_vec_u_t": _postgwas_memory_product(nn, f64),
+        "pyo3_dmatrix_u_t": _postgwas_memory_product(nn, f64),
+        "pyo3_vec_fixed_effects": _postgwas_memory_product(qq, f64),
+        "pyo3_dmatrix_fixed_effects": _postgwas_memory_product(qq, f64),
+        "pyo3_genotype_copy": _postgwas_memory_product(mn, f64),
+        "pyo3_eigvals_copy": _postgwas_memory_product(n, f64),
+        "pyo3_u_t_copy": _postgwas_memory_product(nn, f64),
+        "pyo3_fixed_effect_copy": _postgwas_memory_product(qq, f64),
+        "pyo3_ld_output_copy": _postgwas_memory_product(mm, f64),
+        "diagnostic_symmetrized_ld": _postgwas_memory_product(mm, f64),
+        "diagnostic_eigenvalues": _postgwas_memory_product(m, f64),
+        "susie_ld_copy": _postgwas_memory_product(mm, f64),
+        "susie_vectors": _postgwas_memory_sum(
+            _postgwas_memory_product(l + 4, m, f64),
+            _postgwas_memory_product(l, f64),
+        ),
         "reserve": _POSTGWAS_FINEMAP_MEMORY_RESERVE_BYTES,
     }
     return components
@@ -2038,18 +2376,16 @@ def _postgwas_estimate_fvlmm_memory_bytes(
     existing_bytes: int = 0,
 ) -> int:
     """Estimate the complete FvLMM effective-LD/SuSiE peak in bytes."""
-    return int(
-        sum(
-            _postgwas_fvlmm_memory_components(
-                n_variants=n_variants,
-                n_samples=n_samples,
-                fixed_effect_columns=fixed_effect_columns,
-                bfile_samples=bfile_samples,
-                grm_samples=grm_samples,
-                susie_l=susie_l,
-                existing_bytes=existing_bytes,
-            ).values()
-        )
+    return _postgwas_memory_sum(
+        *_postgwas_fvlmm_memory_components(
+            n_variants=n_variants,
+            n_samples=n_samples,
+            fixed_effect_columns=fixed_effect_columns,
+            bfile_samples=bfile_samples,
+            grm_samples=grm_samples,
+            susie_l=susie_l,
+            existing_bytes=existing_bytes,
+        ).values()
     )
 
 
@@ -2080,24 +2416,39 @@ def _postgwas_build_fvlmm_effective_ld(
         requested_prefix = record.genotype_prefix
     try:
         bfile_samples = _postgwas_count_plink_samples(requested_prefix)
-    except (OSError, ValueError) as exc:
+        if int(bfile_samples) <= 0:
+            raise ValueError("PLINK FAM contains no samples")
+    except (OSError, ValueError, TypeError, OverflowError) as exc:
         raise FineMapSkip(f"FvLMM memory preflight could not inspect FAM: {exc}") from exc
     existing_bytes = int(
         prepared.memory_usage(deep=True, index=True).sum()
     )
-    susie_l = int(getattr(args, "finemap_l", 5))
-    estimated_bytes = _postgwas_estimate_fvlmm_memory_bytes(
-        n_variants=len(prepared),
-        n_samples=int(record.sample_count),
-        fixed_effect_columns=record.fixed_effect_columns,
-        bfile_samples=bfile_samples,
-        grm_samples=int(record.kinship_shape[0]),
-        susie_l=susie_l,
-        existing_bytes=existing_bytes,
-    )
-    memory_limit_bytes = int(
-        getattr(args, "finemap_memory_bytes", _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES)
-    )
+    try:
+        susie_l = int(getattr(args, "finemap_l", 5))
+        estimated_bytes = _postgwas_estimate_fvlmm_memory_bytes(
+            n_variants=len(prepared),
+            n_samples=int(record.sample_count),
+            fixed_effect_columns=record.fixed_effect_columns,
+            bfile_samples=bfile_samples,
+            grm_samples=int(record.kinship_shape[0]),
+            susie_l=susie_l,
+            existing_bytes=existing_bytes,
+        )
+        memory_limit_bytes = min(
+            _POSTGWAS_MEMORY_INT_MAX,
+            max(
+                0,
+                int(
+                    getattr(
+                        args,
+                        "finemap_memory_bytes",
+                        _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES,
+                    )
+                ),
+            ),
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FineMapSkip(f"FvLMM memory preflight inputs are invalid: {exc}") from exc
     if estimated_bytes > max(0, memory_limit_bytes):
         raise FineMapSkip(
             "FvLMM memory preflight rejected the locus before loading the full "
@@ -2127,19 +2478,28 @@ def _postgwas_build_fvlmm_effective_ld(
         logger=logger,
     )
 
-    site_keys: list[tuple[str, int]] = []
-    for row_index, row in prepared_source.iterrows():
-        chrom = str(row["chrom"])
-        pos_value = pd.to_numeric(row["pos"], errors="coerce")
-        try:
-            pos_float = float(pos_value)
-        except (TypeError, ValueError):
-            pos_float = float("nan")
-        if not np.isfinite(pos_float) or pos_float != np.floor(pos_float):
+    bim_rows = _postgwas_read_bim_identity_rows(requested_prefix)
+    selected_bim_indices = _postgwas_match_prepared_variants_to_bim(
+        prepared_source,
+        bim_rows,
+    )
+    selected_signatures = [
+        (
+            bim_rows[index][0],
+            bim_rows[index][1],
+            _postgwas_variant_allele_pair(bim_rows[index][3], bim_rows[index][4]),
+        )
+        for index in selected_bim_indices
+    ]
+    signature_to_bim: dict[
+        tuple[str, int, frozenset[str] | None], int
+    ] = {}
+    for index, signature in zip(selected_bim_indices, selected_signatures):
+        if signature in signature_to_bim:
             raise FineMapSkip(
-                f"FvLMM regional genotype position is invalid at row {row_index}"
+                "selected BIM rows have indistinguishable coordinate/allele metadata"
             )
-        site_keys.append((chrom, int(pos_float)))
+        signature_to_bim[signature] = index
 
     filters = dict(record.genotype_filters)
     try:
@@ -2158,18 +2518,18 @@ def _postgwas_build_fvlmm_effective_ld(
     snps_only = bool(filters.get("snps_only", True))
 
     genotype_chunks: list[np.ndarray] = []
-    returned_keys: list[tuple[str, int]] = []
+    returned_sites: list[object] = []
     try:
         genotype_iter = load_genotype_chunks(
             str(requested_prefix),
-            chunk_size=max(1, min(20_000, len(site_keys))),
+            chunk_size=max(1, min(20_000, len(selected_bim_indices))),
             maf=maf,
             missing_rate=missing_rate,
             impute=True,
             model=model,
             het=het,
             snps_only=snps_only,
-            snp_sites=site_keys,
+            snp_indices=[int(index) for index in selected_bim_indices],
             sample_ids=[str(value) for value in context.sample_ids.tolist()],
         )
         for genotype_chunk, sites in genotype_iter:
@@ -2179,40 +2539,51 @@ def _postgwas_build_fvlmm_effective_ld(
                     "regional genotype chunk and site metadata have inconsistent shapes"
                 )
             genotype_chunks.append(np.ascontiguousarray(block, dtype=np.float32))
-            returned_keys.extend(
-                (
-                    _normalize_chr(getattr(site, "chrom")),
-                    int(getattr(site, "pos")),
-                )
-                for site in sites
-            )
-    except (OSError, ValueError, RuntimeError, TypeError) as exc:
+            returned_sites.extend(list(sites))
+    except (OSError, ValueError, TypeError) as exc:
         raise FineMapSkip(f"regional genotype could not be reconstructed: {exc}") from exc
     if len(genotype_chunks) == 0:
         raise FineMapSkip("regional genotype loader returned no variants")
+    if len(returned_sites) != len(selected_bim_indices):
+        raise FineMapSkip(
+            "regional genotype filters changed the requested variant set; exact "
+            "GWAS variant alignment cannot be proven"
+        )
 
     genotype_all = np.vstack(genotype_chunks).astype(np.float32, copy=False)
-    row_by_key: dict[tuple[str, int], int] = {}
-    for row_index, key in enumerate(returned_keys):
-        row_by_key.setdefault(key, row_index)
-    requested_normalized = [(_normalize_chr(chrom), pos) for chrom, pos in site_keys]
-    selected_rows: list[int] = []
-    selected_prepared: list[int] = []
-    for prepared_index, key in enumerate(requested_normalized):
-        returned_index = row_by_key.get(key)
-        if returned_index is None:
-            continue
-        selected_prepared.append(prepared_index)
-        selected_rows.append(returned_index)
-    if len(selected_rows) == 0:
+    row_by_bim_index: dict[int, int] = {}
+    for row_index, site in enumerate(returned_sites):
+        signature = _postgwas_site_identity_signature(site)
+        bim_index = signature_to_bim.get(signature)
+        if bim_index is None:
+            # A loader without allele metadata cannot distinguish duplicate
+            # coordinates.  Coordinate-only fallback is safe only when the
+            # selected BIM set has exactly one row at that coordinate.
+            coordinate_matches = [
+                index
+                for index in selected_bim_indices
+                if bim_rows[index][0] == signature[0]
+                and bim_rows[index][1] == signature[1]
+            ]
+            if signature[2] is None and len(coordinate_matches) == 1:
+                bim_index = coordinate_matches[0]
+            else:
+                raise FineMapSkip(
+                    "genotype site metadata cannot prove exact variant identity"
+                )
+        if bim_index in row_by_bim_index:
+            raise FineMapSkip("genotype loader returned duplicate variant identity")
+        row_by_bim_index[bim_index] = row_index
+    if set(row_by_bim_index) != set(selected_bim_indices):
         raise FineMapSkip(
-            "regional genotype rows did not match the prepared GWAS coordinates"
+            "genotype site metadata does not cover the requested BIM variants"
         )
+    selected_rows = [row_by_bim_index[index] for index in selected_bim_indices]
     genotypes = np.ascontiguousarray(
         np.asarray(genotype_all[np.asarray(selected_rows, dtype=np.int64)], dtype=np.float64),
         dtype=np.float64,
     )
-    aligned_input = prepared_source.iloc[selected_prepared].reset_index(drop=True)
+    aligned_input = prepared_source.reset_index(drop=True)
 
     try:
         from janusx.assoc.workflow import _gwas_eigh_from_grm
@@ -2225,7 +2596,7 @@ def _postgwas_build_fvlmm_effective_ld(
             require_rust=True,
             diag_ridge=_POSTGWAS_FVLMM_DIAG_RIDGE,
         )
-    except (RuntimeError, ValueError, TypeError) as exc:
+    except (ValueError, TypeError) as exc:
         raise FineMapSkip(f"FvLMM GRM eigendecomposition failed: {exc}") from exc
     eigvals = np.ascontiguousarray(np.asarray(eigvals, dtype=np.float64).reshape(-1))
     eigvecs = np.asarray(eigvecs, dtype=np.float64)
@@ -2265,6 +2636,32 @@ def _postgwas_build_fvlmm_effective_ld(
         ).reshape(-1)
     except (KeyError, TypeError, ValueError) as exc:
         raise FineMapSkip("FvLMM effective-LD kernel returned invalid arrays") from exc
+    try:
+        diagnostic_fixed_columns = kernel_result["fixed_effect_columns"]
+        diagnostic_rank = kernel_result["fixed_effect_rank"]
+        diagnostic_rank_tolerance = float(kernel_result["rank_tolerance"])
+        diagnostic_min_projected_diag = float(
+            kernel_result["min_projected_diag"]
+        )
+        if (
+            isinstance(diagnostic_fixed_columns, (bool, np.bool_))
+            or not isinstance(diagnostic_fixed_columns, (int, np.integer))
+            or int(diagnostic_fixed_columns) != len(record.fixed_effect_columns)
+            or isinstance(diagnostic_rank, (bool, np.bool_))
+            or not isinstance(diagnostic_rank, (int, np.integer))
+            or int(diagnostic_rank) < 1
+            or int(diagnostic_rank) > int(diagnostic_fixed_columns)
+            or int(diagnostic_rank) > int(context.sample_ids.size)
+            or not np.isfinite(diagnostic_rank_tolerance)
+            or diagnostic_rank_tolerance <= 0.0
+            or not np.isfinite(diagnostic_min_projected_diag)
+            or diagnostic_min_projected_diag <= 0.0
+        ):
+            raise ValueError("kernel diagnostics are non-finite or inconsistent")
+    except (KeyError, OverflowError, TypeError, ValueError) as exc:
+        raise FineMapSkip(
+            f"FvLMM effective-LD kernel diagnostics are invalid: {exc}"
+        ) from exc
     if (
         locus_r.ndim != 2
         or locus_r.shape[0] != locus_r.shape[1]
@@ -2274,8 +2671,18 @@ def _postgwas_build_fvlmm_effective_ld(
         or np.any(valid_indices >= genotypes.shape[0])
         or len(np.unique(valid_indices)) != valid_indices.size
         or not np.all(np.isfinite(locus_r))
-        or not np.allclose(locus_r, locus_r.T, atol=1e-12, rtol=1e-12)
-        or not np.allclose(np.diag(locus_r), 1.0, atol=1e-12, rtol=1e-12)
+        or not np.allclose(
+            locus_r,
+            locus_r.T,
+            atol=_POSTGWAS_FVLMM_LD_SYMMETRY_ATOL,
+            rtol=_POSTGWAS_FVLMM_LD_SYMMETRY_ATOL,
+        )
+        or not np.allclose(
+            np.diag(locus_r),
+            1.0,
+            atol=_POSTGWAS_FVLMM_LD_UNIT_DIAGONAL_ATOL,
+            rtol=_POSTGWAS_FVLMM_LD_UNIT_DIAGONAL_ATOL,
+        )
     ):
         raise FineMapSkip("FvLMM effective-LD kernel returned inconsistent results")
     aligned = aligned_input.iloc[valid_indices].reset_index(drop=True)
@@ -2283,17 +2690,27 @@ def _postgwas_build_fvlmm_effective_ld(
         raise FineMapSkip("FvLMM effective-LD and GWAS rows are misaligned")
 
     try:
-        ld_eigenvalues = np.linalg.eigvalsh(
-            0.5 * (locus_r + locus_r.T)
-        )
+        symmetric_ld = 0.5 * (locus_r + locus_r.T)
+        ld_eigenvalues = np.linalg.eigvalsh(symmetric_ld)
         min_ld_eigenvalue = float(np.min(ld_eigenvalues))
         max_ld_eigenvalue = float(np.max(ld_eigenvalues))
+        psd_tolerance = max(
+            _POSTGWAS_FVLMM_LD_PSD_ATOL,
+            _POSTGWAS_FVLMM_LD_PSD_RTOL
+            * max(1.0, float(np.max(np.abs(ld_eigenvalues)))),
+        )
+        if min_ld_eigenvalue < -psd_tolerance:
+            raise ValueError(
+                "effective LD is materially indefinite: "
+                f"min_eigenvalue={min_ld_eigenvalue:.6g}, "
+                f"tolerance={psd_tolerance:.6g}"
+            )
         condition_number = (
             float("inf")
-            if min_ld_eigenvalue <= 0.0
+            if min_ld_eigenvalue <= psd_tolerance
             else max_ld_eigenvalue / min_ld_eigenvalue
         )
-    except ( np.linalg.LinAlgError, ValueError) as exc:
+    except (np.linalg.LinAlgError, ValueError, TypeError) as exc:
         raise FineMapSkip(f"FvLMM LD diagnostics failed: {exc}") from exc
     logger.info(
         "FvLMM effective LD: samples=%d lambda=%.12g pve=%.12g "
@@ -2303,9 +2720,9 @@ def _postgwas_build_fvlmm_effective_ld(
         context.lambda_null,
         float(record.pve),
         tuple(record.fixed_effect_columns),
-        kernel_result.get("fixed_effect_rank", "NA"),
-        float(kernel_result.get("rank_tolerance", float("nan"))),
-        float(kernel_result.get("min_projected_diag", float("nan"))),
+        int(diagnostic_rank),
+        diagnostic_rank_tolerance,
+        diagnostic_min_projected_diag,
         min_ld_eigenvalue,
         condition_number,
     )

@@ -42,6 +42,7 @@ Citation
 """
 
 import os
+import hashlib
 import math
 import time
 import socket
@@ -392,6 +393,47 @@ def _sidecar_table_columns(path: str | Path) -> tuple[str, ...]:
     return ()
 
 
+def _persist_gwas_qmatrix_source(
+    *,
+    genotype_prefix: Path,
+    sample_ids: object,
+    qmatrix: object,
+) -> Path:
+    """Persist the exact in-memory Q matrix used by the GWAS design.
+
+    The NPZ contains only two fixed keys (``sample_ids`` and ``qmatrix``),
+    retains the matrix dtype/values without text rounding, and is named from a
+    content digest.  The sidecar fingerprints this file; the numerical values
+    are therefore reproducible while remaining outside the file-only log.
+    """
+
+    ids = np.asarray(sample_ids, dtype=str).reshape(-1)
+    values = np.asarray(qmatrix)
+    if values.ndim != 2 or values.shape[0] != ids.size or values.shape[1] <= 0:
+        raise ValueError("Q/PC matrix source has an invalid shape")
+    if ids.size == 0 or len(set(str(value) for value in ids.tolist())) != ids.size:
+        raise ValueError("Q/PC matrix source has invalid sample IDs")
+    if not np.issubdtype(values.dtype, np.number):
+        raise ValueError("Q/PC matrix source must be numeric")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Q/PC matrix source contains non-finite values")
+
+    values = np.ascontiguousarray(values)
+    digest = hashlib.sha256()
+    for sample_id in ids.tolist():
+        encoded = str(sample_id).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+        digest.update(encoded)
+    digest.update(str(values.dtype).encode("ascii"))
+    digest.update(str(tuple(int(value) for value in values.shape)).encode("ascii"))
+    digest.update(values.tobytes(order="C"))
+    source_path = Path(
+        f"{genotype_prefix}.gwas-qmatrix-{digest.hexdigest()[:24]}.npz"
+    )
+    np.savez(source_path, sample_ids=ids, qmatrix=values)
+    return source_path
+
+
 def _build_gwas_sidecar_context(
     *,
     genotype_prefix: str,
@@ -399,6 +441,7 @@ def _build_gwas_sidecar_context(
     cov_inputs: object,
     qmatrix: np.ndarray | None,
     cov_all: np.ndarray | None,
+    sample_ids: object | None = None,
     kinship_file: str | None,
     maf_threshold: float,
     max_missing_rate: float,
@@ -422,13 +465,13 @@ def _build_gwas_sidecar_context(
     q_count = 0
     try:
         q_count = int(np.asarray(qmatrix).shape[1])
-    except Exception:
+    except (AttributeError, IndexError, TypeError, ValueError):
         q_count = 0
     cov_count = 0
     if cov_all is not None:
         try:
             cov_count = int(np.asarray(cov_all).shape[1])
-        except Exception:
+        except (AttributeError, IndexError, TypeError, ValueError):
             cov_count = 0
     covariate_columns = [f"PC{index}" for index in range(1, q_count + 1)]
     if cov_file is not None:
@@ -445,6 +488,18 @@ def _build_gwas_sidecar_context(
         ]
     kinship_path = Path(kinship_text).expanduser()
     direct_kinship_id_path = Path(f"{kinship_path}.id")
+
+    qmatrix_file: Path | None = None
+    if q_count > 0:
+        if sample_ids is None:
+            raise ValueError(
+                "sample IDs are required to persist the GWAS Q/PC matrix source"
+            )
+        qmatrix_file = _persist_gwas_qmatrix_source(
+            genotype_prefix=Path(prefix),
+            sample_ids=sample_ids,
+            qmatrix=qmatrix,
+        )
 
     phenotype_columns = _sidecar_table_columns(phenotype_file)
     phenotype_id_column = phenotype_columns[0] if phenotype_columns else "sample"
@@ -463,6 +518,8 @@ def _build_gwas_sidecar_context(
             "snps_only": bool(snps_only),
             "genetic_model": str(genetic_model),
         },
+        qmatrix_file=qmatrix_file,
+        qmatrix_columns=tuple(f"PC{index}" for index in range(1, q_count + 1)),
     )
 
 
@@ -8087,6 +8144,7 @@ def _run_gwas_pipeline(
                         cov_inputs=args.cov,
                         qmatrix=qmatrix,
                         cov_all=cov_all,
+                        sample_ids=np.asarray(ids, dtype=str),
                         kinship_file=sidecar_grm_path[0],
                         maf_threshold=float(maf_threshold_scan),
                         max_missing_rate=float(max_missing_rate_scan),

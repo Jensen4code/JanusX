@@ -68,6 +68,12 @@ class GwasSidecarRunContext:
     kinship_id_file: Path
     genotype_filters: dict[str, object]
     fingerprint_cache: dict[Path, FileFingerprintV1] = field(default_factory=dict)
+    # When present, this is the exact numerical Q/PC matrix used by GWAS,
+    # persisted in the workflow's versioned NPZ source format.  The sidecar
+    # stores only its fingerprint and column identity; values remain external
+    # to the file-only log block.
+    qmatrix_file: Path | None = None
+    qmatrix_columns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,9 @@ class GwasNullModelSidecarV1:
     fixed_effect_columns: tuple[str, ...]
     genotype_filters: dict[str, object]
     allele_coding: str
+    qmatrix_file: FileFingerprintV1 | None = None
+    qmatrix_columns: tuple[str, ...] = ()
+    phenotype_trait_index: int | None = None
 
 
 __all__ = [
@@ -171,6 +180,7 @@ def build_fvlmm_sidecar(
     pve: float,
     grm_trace_mean: float,
     effective_snp_count: int,
+    phenotype_trait_index: int | None = None,
 ) -> GwasNullModelSidecarV1:
     """Build one FvLMM sidecar from the finalized result and fitted null."""
 
@@ -201,6 +211,7 @@ def build_fvlmm_sidecar(
         raise ValueError(f"kinship ID file is empty: {kinship_id_path}")
 
     covariate_columns = tuple(str(column) for column in context.covariate_columns)
+    qmatrix_columns = tuple(str(column) for column in context.qmatrix_columns)
     fixed_effect_columns = ("Intercept",) + covariate_columns
     result_fingerprint = fingerprint_file(result_path)
 
@@ -240,6 +251,17 @@ def build_fvlmm_sidecar(
         fixed_effect_columns=fixed_effect_columns,
         genotype_filters=dict(context.genotype_filters),
         allele_coding="A1_effect",
+        qmatrix_file=(
+            None
+            if context.qmatrix_file is None
+            else _cached_fingerprint(context, context.qmatrix_file)
+        ),
+        qmatrix_columns=qmatrix_columns,
+        phenotype_trait_index=(
+            None
+            if phenotype_trait_index is None
+            else int(phenotype_trait_index)
+        ),
     )
     _validate_record(record)
     return record
@@ -556,6 +578,18 @@ def validate_sidecar_dependencies(
         "GRM ID",
         allow_moved=True,
     )
+    if record.qmatrix_file is not None:
+        qmatrix_path = _resolve_dependency_path(
+            record.qmatrix_file,
+            dependency_roots,
+            "Q/PC matrix",
+        )
+        _validate_current_fingerprint(
+            record.qmatrix_file,
+            qmatrix_path,
+            "Q/PC matrix",
+            allow_moved=True,
+        )
 
 
 def _normalize_genotype_prefix(path: str | Path) -> Path:
@@ -708,6 +742,15 @@ def _parse_record(raw_payload: str) -> GwasNullModelSidecarV1:
             fixed_effect_columns=_string_tuple_field(payload, "fixed_effect_columns"),
             genotype_filters=_mapping_field(payload, "genotype_filters"),
             allele_coding=_string_field(payload, "allele_coding"),
+            qmatrix_file=_optional_fingerprint_field_if_present(
+                payload, "qmatrix_file"
+            ),
+            qmatrix_columns=_optional_string_tuple_field(
+                payload, "qmatrix_columns"
+            ),
+            phenotype_trait_index=_optional_nonnegative_int_field(
+                payload, "phenotype_trait_index"
+            ),
         )
     except SidecarFormatError:
         raise
@@ -760,6 +803,21 @@ def _string_tuple_field(
     return tuple(value)
 
 
+def _optional_string_tuple_field(
+    payload: Mapping[str, Any], name: str
+) -> tuple[str, ...]:
+    if name not in payload:
+        return ()
+    value = payload[name]
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise SidecarFormatError(f"sidecar field {name} must be an array")
+    if any(not isinstance(item, str) for item in value):
+        raise SidecarFormatError(f"sidecar field {name} must contain strings")
+    return tuple(value)
+
+
 def _fingerprint_field(
     payload: Mapping[str, Any], name: str
 ) -> FileFingerprintV1:
@@ -786,6 +844,14 @@ def _optional_fingerprint_field(
     if value is None:
         return None
     return _fingerprint_field(payload, name)
+
+
+def _optional_fingerprint_field_if_present(
+    payload: Mapping[str, Any], name: str
+) -> FileFingerprintV1 | None:
+    if name not in payload:
+        return None
+    return _optional_fingerprint_field(payload, name)
 
 
 def _fingerprint_tuple_field(
@@ -820,6 +886,14 @@ def _nonnegative_int_field(payload: Mapping[str, Any], name: str) -> int:
     if value < 0:
         raise SidecarFormatError(f"sidecar field {name} must not be negative")
     return value
+
+
+def _optional_nonnegative_int_field(
+    payload: Mapping[str, Any], name: str
+) -> int | None:
+    if name not in payload or payload[name] is None:
+        return None
+    return _nonnegative_int_field(payload, name)
 
 
 def _positive_shape_field(
@@ -923,6 +997,8 @@ def _validate_record(record: GwasNullModelSidecarV1) -> None:
     _validate_fingerprint(record.phenotype_file, "phenotype_file")
     _validate_fingerprint(record.kinship_file, "kinship_file")
     _validate_fingerprint(record.kinship_id_file, "kinship_id_file")
+    if record.qmatrix_file is not None:
+        _validate_fingerprint(record.qmatrix_file, "qmatrix_file")
     if record.covariate_file is not None:
         _validate_fingerprint(record.covariate_file, "covariate_file")
     if not isinstance(record.genotype_files, (tuple, list)) or not record.genotype_files:
@@ -933,13 +1009,28 @@ def _validate_record(record: GwasNullModelSidecarV1) -> None:
     _validate_string_sequence(record.z_columns, "z_columns", length=2)
     _validate_string_sequence(record.covariate_columns, "covariate_columns")
     _validate_string_sequence(record.fixed_effect_columns, "fixed_effect_columns")
+    _validate_string_sequence(record.qmatrix_columns, "qmatrix_columns")
     if record.phenotype_trait_column != record.trait:
         raise SidecarFormatError(
             "phenotype_trait_column must match trait"
         )
     if tuple(record.z_columns) != ("beta", "se"):
         raise SidecarFormatError("z columns must be exactly ('beta', 'se')")
-    if record.covariate_columns and record.covariate_file is None:
+    qmatrix_columns = tuple(record.qmatrix_columns)
+    if qmatrix_columns and record.qmatrix_file is None:
+        raise SidecarFormatError(
+            "nonempty qmatrix columns require a qmatrix dependency"
+        )
+    if record.qmatrix_file is not None and not qmatrix_columns:
+        raise SidecarFormatError(
+            "qmatrix dependency requires nonempty qmatrix columns"
+        )
+    if qmatrix_columns and tuple(record.covariate_columns[: len(qmatrix_columns)]) != qmatrix_columns:
+        raise SidecarFormatError(
+            "qmatrix columns must be the leading covariate columns"
+        )
+    external_covariate_columns = tuple(record.covariate_columns[len(qmatrix_columns) :])
+    if external_covariate_columns and record.covariate_file is None:
         raise SidecarFormatError(
             "nonempty covariate columns require a covariate dependency"
         )
@@ -960,6 +1051,15 @@ def _validate_record(record: GwasNullModelSidecarV1) -> None:
             _validate_finite_number(value, name)
     if not isinstance(record.genotype_filters, dict):
         raise SidecarFormatError("sidecar field genotype_filters must be an object")
+    if record.phenotype_trait_index is not None:
+        if (
+            isinstance(record.phenotype_trait_index, bool)
+            or not isinstance(record.phenotype_trait_index, int)
+            or record.phenotype_trait_index < 0
+        ):
+            raise SidecarFormatError(
+                "phenotype_trait_index must be a nonnegative integer or null"
+            )
 
 
 def _validate_string_sequence(
