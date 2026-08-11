@@ -136,8 +136,16 @@ D = \operatorname{diag}(Q).
 
 The implementation should use the GRM eigensystem or linear solves and must not
 materialize `P` as a dense matrix. Fixed effects are projected on the weighted
-scale. Monomorphic or numerically degenerate variants are removed before
-normalization, and the resulting matrix is symmetrized with a unit diagonal.
+scale. It must not explicitly invert `C^T V^-1 C`: user covariates can be exactly
+or nearly collinear after adding the intercept. The weighted fixed-effect system
+is solved with a rank-revealing SVD/pseudoinverse or an equivalently robust
+rank-revealing QR method using an explicit relative singular-value tolerance.
+PostGWAS records the detected fixed-effect rank and tolerance. Non-full rank is
+accepted when the projected result is finite and stable; an unusable rank-zero,
+non-finite, or numerically unresolved system warns and skips fine-mapping.
+
+Monomorphic or numerically degenerate variants are removed before normalization,
+and the resulting matrix is symmetrized with a unit diagonal.
 
 The existing `-mem` PostGWAS limit applies to genotype blocks, GRM/eigensystem
 workspace, effective-LD construction, and SuSiE. A memory preflight occurs before
@@ -163,6 +171,7 @@ PostGWAS records the following diagnostics in its log:
 - matched GWAS log and sidecar schema;
 - null-model type, lambda, PVE, and verified sample count;
 - effective-LD minimum eigenvalue and condition number;
+- fixed-effect column count, effective rank, and rank tolerance;
 - SuSiE convergence state, iteration count, and prior variances;
 - the reason for every warning-triggered skip.
 
@@ -208,11 +217,13 @@ Tests will cover:
 5. warning-and-skip behavior with no newly published PIP/CS files;
 6. FvLMM effective LD against a direct small-matrix reference implementation;
 7. equivalence of effective LD from eigensystem and solve formulations;
-8. a synthetic mixed-model locus where raw LD is unstable but effective LD
+8. exact and near rank-deficient covariates, compared with a direct
+   Moore-Penrose reference projection and checked for finite deterministic LD;
+9. a synthetic mixed-model locus where raw LD is unstable but effective LD
    converges without posterior-effect inflation;
-9. the Rice6048 FvLMM regression case, checking null-model reconstruction,
+10. the Rice6048 FvLMM regression case, checking null-model reconstruction,
    convergence, bounded prior variance, and agreement with susieR;
-10. unchanged LM fine-mapping and unrelated GWAS output behavior.
+11. unchanged LM fine-mapping and unrelated GWAS output behavior.
 
 Large generated datasets and experiment outputs remain local test artifacts and
 are not committed or pushed.
