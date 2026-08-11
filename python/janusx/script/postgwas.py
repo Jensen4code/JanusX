@@ -2254,6 +2254,15 @@ def _postgwas_scan_finemap_bim_rows(
     return selected_chrom, selected_bim_pos, ambiguous_sites
 
 
+def _postgwas_cleanup_finemap_paths(paths: tuple[str, ...]) -> None:
+    """Best-effort cleanup without replacing an active generation error."""
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+
+
 def _postgwas_run_susie_finemap_body(
     args: argparse.Namespace, logger: logging.Logger
 ) -> str:
@@ -2295,10 +2304,16 @@ def _postgwas_run_susie_finemap_body(
     cs_output_path = os.path.join(out_dir, f"{out_stem}.susie.cs.tsv")
     temporary_path = f"{output_path}.tmp"
     cs_temporary_path = f"{cs_output_path}.tmp"
+    backup_path = f"{output_path}.bak"
+    cs_backup_path = f"{cs_output_path}.bak"
+    unpublished_paths = (
+        temporary_path,
+        cs_temporary_path,
+        backup_path,
+        cs_backup_path,
+    )
     os.makedirs(out_dir, mode=0o755, exist_ok=True)
-    for stale_path in (temporary_path, cs_temporary_path):
-        if os.path.exists(stale_path):
-            os.remove(stale_path)
+    _postgwas_cleanup_finemap_paths(unpublished_paths)
 
     output_frames: list[pd.DataFrame] = []
     cs_output_frames: list[pd.DataFrame] = []
@@ -2618,6 +2633,12 @@ def _postgwas_run_susie_finemap_body(
 
     merged = pd.concat(output_frames, ignore_index=True)
     merged_cs = pd.concat(cs_output_frames, ignore_index=True)
+    final_paths = (output_path, cs_output_path)
+    temporary_paths = (temporary_path, cs_temporary_path)
+    backup_paths = (backup_path, cs_backup_path)
+    had_prior = [os.path.exists(path) for path in final_paths]
+    backed_up = [False, False]
+    published = [False, False]
     try:
         merged.to_csv(
             temporary_path,
@@ -2635,13 +2656,29 @@ def _postgwas_run_susie_finemap_body(
             float_format=_postgwas_format_finemap_float,
             lineterminator="\n",
         )
-        os.replace(temporary_path, output_path)
-        os.replace(cs_temporary_path, cs_output_path)
+        for index, final_path in enumerate(final_paths):
+            if had_prior[index]:
+                os.replace(final_path, backup_paths[index])
+                backed_up[index] = True
+        for index, temporary_output in enumerate(temporary_paths):
+            os.replace(temporary_output, final_paths[index])
+            published[index] = True
     except Exception:
-        for temporary_output in (temporary_path, cs_temporary_path):
-            if os.path.exists(temporary_output):
-                os.remove(temporary_output)
+        for index in range(len(final_paths) - 1, -1, -1):
+            if backed_up[index]:
+                try:
+                    os.replace(backup_paths[index], final_paths[index])
+                except OSError:
+                    continue
+                backed_up[index] = False
+            elif published[index] and not had_prior[index]:
+                _postgwas_cleanup_finemap_paths((final_paths[index],))
+        cleanup_backups = tuple(
+            path for index, path in enumerate(backup_paths) if not backed_up[index]
+        )
+        _postgwas_cleanup_finemap_paths(temporary_paths + cleanup_backups)
         raise
+    _postgwas_cleanup_finemap_paths(backup_paths)
     logger.info("SuSiE fine-mapping output: %s", format_path_for_display(output_path))
     logger.info("SuSiE credible-set output: %s", format_path_for_display(cs_output_path))
     return output_path
@@ -2657,9 +2694,7 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
     try:
         return _postgwas_run_susie_finemap_body(args, logger)
     except Exception:
-        for temporary_path in temporary_paths:
-            if os.path.exists(temporary_path):
-                os.remove(temporary_path)
+        _postgwas_cleanup_finemap_paths(temporary_paths)
         raise
 
 
