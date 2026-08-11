@@ -25,6 +25,7 @@ Citation
 import logging
 import os
 import gzip
+import tempfile
 from ._common.cli_args import (
     add_common_memory_arg,
     add_common_out_arg,
@@ -2263,6 +2264,23 @@ def _postgwas_cleanup_finemap_paths(paths: tuple[str, ...]) -> None:
             continue
 
 
+def _postgwas_create_finemap_backup_path(final_path: str) -> str:
+    """Create a unique, current-run backup path beside its final output."""
+    directory = os.path.dirname(final_path) or "."
+    prefix = f"{os.path.basename(final_path)}."
+    descriptor, backup_path = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=".bak",
+        dir=directory,
+    )
+    try:
+        os.close(descriptor)
+    except OSError:
+        _postgwas_cleanup_finemap_paths((backup_path,))
+        raise
+    return backup_path
+
+
 def _postgwas_run_susie_finemap_body(
     args: argparse.Namespace, logger: logging.Logger
 ) -> str:
@@ -2304,16 +2322,8 @@ def _postgwas_run_susie_finemap_body(
     cs_output_path = os.path.join(out_dir, f"{out_stem}.susie.cs.tsv")
     temporary_path = f"{output_path}.tmp"
     cs_temporary_path = f"{cs_output_path}.tmp"
-    backup_path = f"{output_path}.bak"
-    cs_backup_path = f"{cs_output_path}.bak"
-    unpublished_paths = (
-        temporary_path,
-        cs_temporary_path,
-        backup_path,
-        cs_backup_path,
-    )
     os.makedirs(out_dir, mode=0o755, exist_ok=True)
-    _postgwas_cleanup_finemap_paths(unpublished_paths)
+    _postgwas_cleanup_finemap_paths((temporary_path, cs_temporary_path))
 
     output_frames: list[pd.DataFrame] = []
     cs_output_frames: list[pd.DataFrame] = []
@@ -2635,7 +2645,7 @@ def _postgwas_run_susie_finemap_body(
     merged_cs = pd.concat(cs_output_frames, ignore_index=True)
     final_paths = (output_path, cs_output_path)
     temporary_paths = (temporary_path, cs_temporary_path)
-    backup_paths = (backup_path, cs_backup_path)
+    backup_paths: list[Optional[str]] = [None, None]
     had_prior = [os.path.exists(path) for path in final_paths]
     backed_up = [False, False]
     published = [False, False]
@@ -2658,7 +2668,9 @@ def _postgwas_run_susie_finemap_body(
         )
         for index, final_path in enumerate(final_paths):
             if had_prior[index]:
-                os.replace(final_path, backup_paths[index])
+                backup_path = _postgwas_create_finemap_backup_path(final_path)
+                backup_paths[index] = backup_path
+                os.replace(final_path, backup_path)
                 backed_up[index] = True
         for index, temporary_output in enumerate(temporary_paths):
             os.replace(temporary_output, final_paths[index])
@@ -2667,18 +2679,22 @@ def _postgwas_run_susie_finemap_body(
         for index in range(len(final_paths) - 1, -1, -1):
             if backed_up[index]:
                 try:
-                    os.replace(backup_paths[index], final_paths[index])
+                    os.replace(str(backup_paths[index]), final_paths[index])
                 except OSError:
                     continue
                 backed_up[index] = False
             elif published[index] and not had_prior[index]:
                 _postgwas_cleanup_finemap_paths((final_paths[index],))
         cleanup_backups = tuple(
-            path for index, path in enumerate(backup_paths) if not backed_up[index]
+            path
+            for index, path in enumerate(backup_paths)
+            if path is not None and not backed_up[index]
         )
         _postgwas_cleanup_finemap_paths(temporary_paths + cleanup_backups)
         raise
-    _postgwas_cleanup_finemap_paths(backup_paths)
+    _postgwas_cleanup_finemap_paths(
+        tuple(path for path in backup_paths if path is not None)
+    )
     logger.info("SuSiE fine-mapping output: %s", format_path_for_display(output_path))
     logger.info("SuSiE credible-set output: %s", format_path_for_display(cs_output_path))
     return output_path
