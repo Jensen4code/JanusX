@@ -1910,6 +1910,79 @@ _POSTGWAS_FINEMAP_OUTPUT_COLUMNS = [
     "posterior_mean",
 ]
 
+_POSTGWAS_FINEMAP_CS_COVERAGE = 0.95
+_POSTGWAS_FINEMAP_PRIOR_TOL = 1e-9
+
+
+def _postgwas_build_finemap_credible_sets(
+    alpha: object,
+    prior_variance: object,
+    *,
+    n_variants: int,
+    coverage: float = _POSTGWAS_FINEMAP_CS_COVERAGE,
+    prior_tol: float = _POSTGWAS_FINEMAP_PRIOR_TOL,
+) -> list[tuple[int, tuple[int, ...], float]]:
+    """Build deterministic credible sets from SuSiE alpha rows."""
+    alpha_array = np.asarray(alpha, dtype=np.float64)
+    if alpha_array.ndim != 2:
+        raise ValueError("Fine-mapping alpha must be a two-dimensional array.")
+
+    prior_array = np.asarray(prior_variance, dtype=np.float64)
+    if prior_array.ndim != 1:
+        raise ValueError("Fine-mapping prior variance must be a one-dimensional array.")
+
+    expected_variants = int(n_variants)
+    n_effects, observed_variants = alpha_array.shape
+    if observed_variants != expected_variants:
+        raise ValueError(
+            "Fine-mapping alpha shape does not match n_variants: "
+            f"got {observed_variants}, expected {expected_variants}."
+        )
+    if int(prior_array.shape[0]) != int(n_effects):
+        raise ValueError(
+            "Fine-mapping prior variance count does not match alpha effects: "
+            f"got {int(prior_array.shape[0])}, expected {int(n_effects)}."
+        )
+
+    coverage_value = float(coverage)
+    if not np.isfinite(coverage_value) or not 0.0 < coverage_value <= 1.0:
+        raise ValueError("Fine-mapping credible-set coverage must be in (0, 1].")
+    prior_tolerance = float(prior_tol)
+    if not np.isfinite(prior_tolerance) or prior_tolerance < 0.0:
+        raise ValueError("Fine-mapping prior tolerance must be finite and nonnegative.")
+
+    credible_sets: list[tuple[int, tuple[int, ...], float]] = []
+    selected_sets: set[frozenset[int]] = set()
+    for effect_index in range(int(n_effects)):
+        if prior_array[effect_index] <= prior_tolerance:
+            continue
+
+        row = alpha_array[effect_index]
+        if np.any(~np.isfinite(row)) or np.any(row < 0.0):
+            raise ValueError(
+                "Fine-mapping active alpha row contains non-finite or negative values."
+            )
+
+        rank = np.argsort(-row, kind="stable")
+        cumulative = np.cumsum(row[rank], dtype=np.float64)
+        threshold_positions = np.flatnonzero(cumulative >= coverage_value)
+        if threshold_positions.size == 0:
+            raise ValueError(
+                "Fine-mapping active alpha row does not reach requested coverage."
+            )
+        stop = int(threshold_positions[0])
+        representative_indices = tuple(int(index) for index in rank[: stop + 1])
+        selected_key = frozenset(representative_indices)
+        if selected_key in selected_sets:
+            continue
+        selected_sets.add(selected_key)
+        credible_sets.append(
+            (effect_index, representative_indices, float(cumulative[stop]))
+        )
+
+    return credible_sets
+
+
 _POSTGWAS_FINEMAP_INDEX_CHROM_COLUMN = "_janusx_finemap_chrom_norm"
 _POSTGWAS_FINEMAP_INDEX_POS_COLUMN = "_janusx_finemap_pos_num"
 
