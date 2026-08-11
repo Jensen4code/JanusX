@@ -17,7 +17,7 @@ use std::time::Instant;
 use crate::bedmath::{adaptive_grm_block_rows, is_identity_indices, packed_byte_lut};
 use crate::blas::{
     cblas_dgemm_dispatch, cblas_dsyrk_dispatch, cblas_sgemm_dispatch, cblas_ssyrk_dispatch,
-    CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS, CBLAS_UPPER,
+    BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::decode::{
     apply_prepared_grm_stream_row_copy_f32 as decode_apply_prepared_grm_stream_row_copy_f32,
@@ -276,7 +276,7 @@ where
     let eps = 1e-12_f32;
 
     // --- output buffers ---
-    let _blas_guard = OpenBlasThreadGuard::enter(blas_threads.max(1));
+    let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
     let mut grm = Vec::<f64>::with_capacity(n * n);
     let grm_ptr = grm.as_mut_ptr();
     let mut grm_tmp = vec![0.0_f32; n * n];
@@ -524,7 +524,7 @@ where
     };
     let (cblas_copy_rhs, cblas_force_tmp_accum) = grm_packed_cblas_flags();
 
-    let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
+    let _blas_guard = BlasThreadGuard::enter(threads.max(1));
     let mut grm = vec![0.0_f64; n * n];
     let mut block = vec![0.0_f64; row_step * n];
     let mut varsum_acc = varsum_full;
@@ -3201,7 +3201,7 @@ pub fn grm_packed_f32<'py>(
 
     let grm_vec = py
         .detach(move || -> Result<Vec<f32>, String> {
-            let _blas_guard = OpenBlasThreadGuard::enter(blas_threads.max(1));
+            let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
             let total_t0 = Instant::now();
             let mut decode_secs = 0.0_f64;
             let mut gemm_secs = 0.0_f64;
@@ -4116,7 +4116,7 @@ pub fn grm_stream_bed_f64<'py>(
 
     let grm_vec = py
         .detach(move || -> Result<(Vec<f64>, usize), String> {
-            let _blas_guard = OpenBlasThreadGuard::enter(blas_threads.max(1));
+            let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
             let total_t0 = Instant::now();
             let mut decode_secs = 0.0_f64;
             let mut gemm_secs = 0.0_f64;
@@ -4877,7 +4877,7 @@ pub fn grm_stream_bed_f32<'py>(
 
     let grm_vec = py
         .detach(move || -> Result<(Vec<f32>, usize), String> {
-            let _blas_guard = OpenBlasThreadGuard::enter(blas_threads.max(1));
+            let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
             let total_t0 = Instant::now();
             let mut decode_secs = 0.0_f64;
             let mut gemm_secs = 0.0_f64;
@@ -5882,11 +5882,11 @@ pub fn grm_sim_bench_f32(
                     match mode_parsed {
                         GrmSimMode::SerialSgemm => {
                             let blas_threads = if threads > 0 { threads } else { used_threads };
-                            let _blas_guard = OpenBlasThreadGuard::enter(blas_threads.max(1));
+                            let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
                             grm_sim_serial_sgemm_f32(&mut g, &x, m, n, batch);
                         }
                         GrmSimMode::ThreadsatReduce => {
-                            let _blas_guard = OpenBlasThreadGuard::enter(1);
+                            let _blas_guard = BlasThreadGuard::enter(1);
                             grm_sim_threadsat_tiled_sgemm_f32(
                                 &mut g,
                                 &x,

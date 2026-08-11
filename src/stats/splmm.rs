@@ -60,6 +60,11 @@ use crate::splmm_approx::{
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
 
 const SPLMM_TINY: f64 = 1e-30_f64;
+// Association denominators below the public scan `std_eps` default are
+// numerical residue, not usable marker information.  In particular, an
+// all-heterozygous marker has MAF=0.5 but zero genotype variance; subtracting
+// the fixed-effect projection can leave a tiny positive g'Pg (~1e-14).
+const SPLMM_ASSOC_DENOM_EPS: f64 = 1e-12_f64;
 const SPLMM_RESIDUAL_SSQ_REL_EPS: f64 = 1e-12_f64;
 const SPLMM_RESIDUAL_SSQ_ABS_EPS: f64 = 1e-10_f64;
 const SPLMM_DEFAULT_RHAT_MARKERS: usize = 30;
@@ -2517,7 +2522,7 @@ fn xt_mat_rhs_block(
 fn splmm_wald_from_score_denom(score: f64, denom: f64, sigma2: f64) -> Option<(f64, f64, f64)> {
     if !(score.is_finite()
         && denom.is_finite()
-        && denom > SPLMM_TINY
+        && denom > SPLMM_ASSOC_DENOM_EPS
         && sigma2.is_finite()
         && sigma2 > 0.0)
     {
@@ -6243,6 +6248,18 @@ mod tests {
         );
 
         assert_close(&core, &manual, 1e-5_f64);
+    }
+
+    #[test]
+    fn exact_scan_rejects_constant_heterozygous_marker() {
+        let score = 2.0e-3_f64;
+        let cancellation_denom = 8.9e-15_f64;
+        let sigma2 = 110.8_f64;
+
+        assert!(
+            splmm_wald_from_score_denom(score, cancellation_denom, sigma2).is_none(),
+            "a zero-variance marker's floating-point cancellation denominator must not be tested"
+        );
     }
 
     #[test]
