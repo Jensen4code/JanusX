@@ -108,6 +108,11 @@ from functools import lru_cache
 from typing import Any, Optional, Sequence, Tuple
 from urllib.parse import unquote
 from janusx import janusx as jxrs
+from janusx.assoc.null_model_sidecar import (
+    FineMapSkip,
+    discover_matching_sidecar,
+    validate_sidecar_dependencies,
+)
 from janusx.gtools.reader import GFFQuery, bedreader, readanno, _gff_prefetched_attr_colname
 import warnings
 from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
@@ -1588,6 +1593,13 @@ _POSTGWAS_FINEMAP_DEFAULT_MEMORY_GB = 8.0
 _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES = int(_POSTGWAS_FINEMAP_DEFAULT_MEMORY_GB * 1024**3)
 _POSTGWAS_FINEMAP_MEMORY_RESERVE_BYTES = 512 * 1024**2
 _POSTGWAS_FINEMAP_LDCLUMP_R2 = 0.99
+_POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES = (
+    (".fvlmm.tsv", "fvlmm"),
+    (".lmm.tsv", "lmm"),
+    (".lmm2.tsv", "lmm2"),
+    (".splmm.tsv", "splmm"),
+    (".splmm2.tsv", "splmm2"),
+)
 
 
 def _postgwas_estimate_finemap_memory_bytes(
@@ -1646,6 +1658,17 @@ def _postgwas_count_plink_samples(bfile: object) -> int:
             return sum(1 for line in handle if line.strip())
     except OSError as exc:
         raise ValueError(f"Unable to read PLINK sample file {fam_path}: {exc}") from exc
+
+
+def _postgwas_finemap_result_model(
+    result_path: str | os.PathLike[str],
+) -> Optional[str]:
+    """Classify maintained mixed-model result suffixes before LD allocation."""
+    name = os.path.basename(os.fspath(result_path)).lower()
+    for suffix, model in _POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES:
+        if name.endswith(suffix):
+            return model
+    return None
 
 
 def _postgwas_dev_help_requested(argv: Optional[list[str]] = None) -> bool:
@@ -2311,6 +2334,20 @@ def _postgwas_run_susie_finemap_body(
     gwas_files = [str(path) for path in list(getattr(args, "gwasfile", []) or [])]
     if len(gwas_files) != 1:
         raise ValueError("Fine-mapping requires exactly one GWAS input file.")
+    result_model = _postgwas_finemap_result_model(gwas_files[0])
+    if result_model is not None:
+        sidecar = discover_matching_sidecar(gwas_files[0])
+        validate_sidecar_dependencies(
+            sidecar,
+            gwas_files[0],
+            args.bfile,
+            expected_model=result_model,
+        )
+        if result_model != "fvlmm":
+            raise FineMapSkip(
+                f"{result_model} mixed-model fine-mapping is unsupported: "
+                "common-null score statistics are unavailable"
+            )
     finemap_loci = getattr(args, "finemap_bimrange_tuples", None)
     loci = list(
         finemap_loci
@@ -2758,8 +2795,10 @@ def _postgwas_run_susie_finemap_body(
     return output_path
 
 
-def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger) -> str:
-    """Run fine-mapping and remove both unpublished artifacts on any failure."""
+def _run_postgwas_susie_finemap(
+    args: argparse.Namespace, logger: logging.Logger
+) -> Optional[str]:
+    """Run fine-mapping, warning-and-skipping expected compatibility failures."""
     out_dir = str(getattr(args, "out", ".") or ".")
     out_stem = str(getattr(args, "prefix", "JanusX") or "JanusX").strip() or "JanusX"
     output_path = os.path.join(out_dir, f"{out_stem}.susie.pip.tsv")
@@ -2767,6 +2806,14 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
     temporary_paths = (f"{output_path}.tmp", f"{cs_output_path}.tmp")
     try:
         return _postgwas_run_susie_finemap_body(args, logger)
+    except FineMapSkip as exc:
+        _postgwas_cleanup_finemap_paths(temporary_paths)
+        logger.warning(
+            "fine-mapping skipped: %s; no new PIP/CS was generated; "
+            "pre-existing PIP/CS outputs may be stale.",
+            str(exc),
+        )
+        return None
     except Exception:
         _postgwas_cleanup_finemap_paths(temporary_paths)
         raise

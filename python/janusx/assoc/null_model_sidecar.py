@@ -45,6 +45,10 @@ class SidecarAmbiguous(SidecarError, LookupError):
     """Raised when more than one sidecar matches a result file."""
 
 
+class FineMapSkip(Exception):
+    """Expected sidecar compatibility failure that skips fine-mapping."""
+
+
 @dataclass(frozen=True)
 class FileFingerprintV1:
     canonical_path: str
@@ -106,17 +110,20 @@ __all__ = [
     "SIDECAR_BEGIN_V1",
     "SIDECAR_END_V1",
     "SIDECAR_SCHEMA_V1",
+    "FineMapSkip",
     "SidecarAmbiguous",
     "SidecarError",
     "SidecarFormatError",
     "SidecarNotFound",
     "build_fvlmm_sidecar",
+    "discover_matching_sidecar",
     "emit_sidecar_to_file_log",
     "find_matching_sidecar",
     "fingerprint_file",
     "hash_ordered_sample_ids",
     "parse_sidecar_blocks",
     "serialize_sidecar_block",
+    "validate_sidecar_dependencies",
 ]
 
 
@@ -411,6 +418,161 @@ def find_matching_sidecar(
     raise SidecarNotFound(
         f"no sidecar matches result {result_fingerprint.canonical_path}"
     )
+
+
+def discover_matching_sidecar(
+    result_path: str | Path,
+) -> GwasNullModelSidecarV1:
+    """Discover exactly one matching sidecar from sorted sibling GWAS logs."""
+
+    result = Path(result_path).expanduser()
+    try:
+        log_paths = sorted(
+            result.parent.glob("*.gwas.log"),
+            key=lambda path: str(path),
+        )
+    except OSError as exc:
+        raise FineMapSkip(
+            f"unable to scan for GWAS sidecar logs beside {result}: {exc}"
+        ) from exc
+
+    candidates: list[GwasNullModelSidecarV1] = []
+    for log_path in log_paths:
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            candidates.extend(parse_sidecar_blocks(log_text))
+        except SidecarFormatError as exc:
+            raise FineMapSkip(
+                f"sidecar log {log_path} is malformed: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise FineMapSkip(
+                f"sidecar log {log_path} is unavailable: {exc}"
+            ) from exc
+
+    try:
+        return find_matching_sidecar(result, candidates)
+    except SidecarAmbiguous as exc:
+        raise FineMapSkip(f"matching sidecar is ambiguous: {exc}") from exc
+    except SidecarNotFound as exc:
+        raise FineMapSkip(f"matching sidecar was not found: {exc}") from exc
+    except SidecarFormatError as exc:
+        raise FineMapSkip(f"matching sidecar is incompatible: {exc}") from exc
+
+
+def validate_sidecar_dependencies(
+    record: GwasNullModelSidecarV1,
+    result_path: str | Path,
+    bfile: str | Path,
+    *,
+    expected_model: str = "fvlmm",
+    expected_allele_coding: str = "A1_effect",
+) -> None:
+    """Validate sidecar metadata and all files needed by PostGWAS."""
+
+    try:
+        _validate_record(record)
+    except SidecarFormatError as exc:
+        raise FineMapSkip(f"sidecar metadata is incompatible: {exc}") from exc
+
+    if record.model != str(expected_model):
+        raise FineMapSkip(
+            f"sidecar model {record.model!r} does not match the supplied "
+            f"mixed-model result {expected_model!r}"
+        )
+    if record.allele_coding != str(expected_allele_coding):
+        raise FineMapSkip(
+            "sidecar allele convention "
+            f"{record.allele_coding!r} is incompatible with "
+            f"{expected_allele_coding!r}"
+        )
+
+    _validate_current_fingerprint(
+        record.result,
+        result_path,
+        "GWAS result",
+        allow_moved=True,
+    )
+
+    requested_prefix = _normalize_genotype_prefix(bfile)
+    recorded_prefix = _normalize_genotype_prefix(record.genotype_prefix)
+    if recorded_prefix != requested_prefix:
+        raise FineMapSkip(
+            "supplied -bfile does not match sidecar genotype prefix: "
+            f"{requested_prefix} != {recorded_prefix}"
+        )
+
+    genotype_suffixes = (".bed", ".bim", ".fam")
+    if len(record.genotype_files) != len(genotype_suffixes):
+        raise FineMapSkip(
+            "sidecar genotype fingerprint set must contain BED/BIM/FAM files"
+        )
+    for suffix, expected in zip(genotype_suffixes, record.genotype_files):
+        genotype_path = Path(f"{requested_prefix}{suffix}")
+        if Path(expected.canonical_path).expanduser().resolve() != genotype_path:
+            raise FineMapSkip(
+                f"sidecar {suffix[1:].upper()} fingerprint does not match "
+                "supplied -bfile"
+            )
+        _validate_current_fingerprint(
+            expected,
+            genotype_path,
+            f"genotype {suffix[1:].upper()}",
+        )
+
+    _validate_current_fingerprint(
+        record.phenotype_file,
+        record.phenotype_file.canonical_path,
+        "phenotype",
+    )
+    if record.covariate_file is not None:
+        _validate_current_fingerprint(
+            record.covariate_file,
+            record.covariate_file.canonical_path,
+            "covariate",
+        )
+    _validate_current_fingerprint(
+        record.kinship_file,
+        record.kinship_file.canonical_path,
+        "GRM",
+    )
+    _validate_current_fingerprint(
+        record.kinship_id_file,
+        record.kinship_id_file.canonical_path,
+        "GRM ID",
+    )
+
+
+def _normalize_genotype_prefix(path: str | Path) -> Path:
+    text = str(Path(path).expanduser())
+    lower = text.lower()
+    for suffix in (".bed", ".bim", ".fam"):
+        if lower.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    return Path(text).resolve()
+
+
+def _validate_current_fingerprint(
+    expected: FileFingerprintV1,
+    path: str | Path,
+    label: str,
+    *,
+    allow_moved: bool = False,
+) -> None:
+    try:
+        current = fingerprint_file(path)
+    except (OSError, ValueError) as exc:
+        raise FineMapSkip(f"{label} is unavailable: {path}") from exc
+
+    same_identity = (
+        current.basename == expected.basename
+        and current.size_bytes == expected.size_bytes
+        and current.sha256.lower() == expected.sha256.lower()
+        and (allow_moved or current.canonical_path == expected.canonical_path)
+    )
+    if not same_identity:
+        raise FineMapSkip(f"{label} fingerprint mismatch: {path}")
 
 
 def _one_match(
