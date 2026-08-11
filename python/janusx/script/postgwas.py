@@ -2122,10 +2122,9 @@ def _postgwas_match_prepared_variants_to_bim(
         ):
             # A named variant that cannot be found by ID is not proven by a
             # coordinate fallback when BIM contains real IDs.
-            if prepared_pair is None:
-                raise FineMapSkip(
-                    f"prepared SNP ID {prepared_snp!r} is not present in BIM"
-                )
+            raise FineMapSkip(
+                f"prepared SNP ID {prepared_snp!r} is not present in BIM"
+            )
         if prepared_pair is not None:
             if not (has_allele0 and has_allele1):
                 raise FineMapSkip(
@@ -3312,6 +3311,125 @@ def _postgwas_select_finemap_ld_route(
     return "raw"
 
 
+def _postgwas_read_finemap_fam_sample_ids(bfile: object) -> list[str]:
+    """Read unique PLINK IID values in their exact FAM order."""
+    prefix = _normalize_plink_prefix(bfile)
+    fam_path = Path(f"{prefix}.fam")
+    sample_ids: list[str] = []
+    try:
+        with fam_path.open("rt", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                fields = line.split()
+                if not fields:
+                    continue
+                if len(fields) < 2 or str(fields[1]).strip() == "":
+                    raise ValueError(f"malformed FAM row at {fam_path}:{line_number}")
+                sample_ids.append(str(fields[1]).strip())
+    except (OSError, ValueError) as exc:
+        raise FineMapSkip(f"PLINK FAM sample metadata is unavailable: {exc}") from exc
+    if not sample_ids:
+        raise FineMapSkip("PLINK FAM sample metadata is empty")
+    if len(set(sample_ids)) != len(sample_ids):
+        raise FineMapSkip("PLINK FAM sample metadata contains duplicate IIDs")
+    return sample_ids
+
+
+def _postgwas_resolve_finemap_sample_ids(
+    args: argparse.Namespace,
+    bfile: object,
+) -> tuple[list[str], np.ndarray]:
+    """Resolve and hash-check the exact sample order used by an ordinary GWAS.
+
+    Ordinary/legacy LM results do not carry the sidecar's reconstructable
+    phenotype context.  They are therefore safe only when the caller supplies
+    an explicit ordered sample list or indices together with its ordered-ID
+    hash.  In particular, FAM order is never silently treated as GWAS order.
+    """
+    fam_ids = _postgwas_read_finemap_fam_sample_ids(bfile)
+    supplied_ids = getattr(args, "finemap_sample_ids", None)
+    sample_id_file = getattr(args, "finemap_sample_id_file", None)
+    supplied_indices = getattr(args, "finemap_sample_indices", None)
+    if supplied_ids is None and sample_id_file is not None:
+        try:
+            supplied_ids = [
+                line.split()[0]
+                for line in Path(sample_id_file).read_text(encoding="utf-8").splitlines()
+                if line.split()
+            ]
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise FineMapSkip(
+                f"LM fine-mapping sample metadata could not be read: {exc}"
+            ) from exc
+    if supplied_ids is None and supplied_indices is None:
+        raise FineMapSkip(
+            "LM fine-mapping skipped: verified GWAS sample metadata is unavailable; "
+            "legacy LM cannot safely use the full FAM cohort"
+        )
+
+    sample_ids: list[str]
+    if supplied_ids is not None:
+        if isinstance(supplied_ids, (str, bytes)):
+            raise FineMapSkip("LM fine-mapping sample IDs must be an ordered sequence")
+        try:
+            sample_ids = [str(value).strip() for value in list(supplied_ids)]
+        except (TypeError, ValueError) as exc:
+            raise FineMapSkip("LM fine-mapping sample IDs are invalid") from exc
+        if not sample_ids or any(value == "" for value in sample_ids):
+            raise FineMapSkip("LM fine-mapping sample IDs are empty")
+        if len(set(sample_ids)) != len(sample_ids):
+            raise FineMapSkip("LM fine-mapping sample IDs contain duplicates")
+    else:
+        try:
+            raw_indices = list(supplied_indices)
+        except (TypeError, ValueError) as exc:
+            raise FineMapSkip("LM fine-mapping sample indices are invalid") from exc
+        indices: list[int] = []
+        for raw_index in raw_indices:
+            if isinstance(raw_index, (bool, np.bool_)):
+                raise FineMapSkip("LM fine-mapping sample indices must be integers")
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise FineMapSkip("LM fine-mapping sample indices must be integers") from exc
+            if index != raw_index or index < 0 or index >= len(fam_ids):
+                raise FineMapSkip("LM fine-mapping sample indices are out of range")
+            indices.append(index)
+        if not indices or len(set(indices)) != len(indices):
+            raise FineMapSkip("LM fine-mapping sample indices are empty or duplicated")
+        sample_ids = [fam_ids[index] for index in indices]
+
+    fam_index = {sample_id: index for index, sample_id in enumerate(fam_ids)}
+    try:
+        sample_indices = np.asarray(
+            [fam_index[sample_id] for sample_id in sample_ids], dtype=np.int64
+        )
+    except KeyError as exc:
+        raise FineMapSkip(
+            f"LM fine-mapping sample metadata contains IID absent from FAM: {exc.args[0]}"
+        ) from exc
+    if supplied_indices is not None and supplied_ids is not None:
+        try:
+            provided_indices = np.asarray(list(supplied_indices), dtype=np.int64)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise FineMapSkip("LM fine-mapping sample indices are invalid") from exc
+        if not np.array_equal(provided_indices, sample_indices):
+            raise FineMapSkip(
+                "LM fine-mapping sample IDs and sample indices disagree"
+            )
+
+    expected_hash = getattr(args, "finemap_sample_order_sha256", None)
+    if not isinstance(expected_hash, str) or expected_hash.strip() == "":
+        raise FineMapSkip(
+            "LM fine-mapping skipped: ordered GWAS sample hash is unavailable"
+        )
+    actual_hash = hash_ordered_sample_ids(sample_ids)
+    if actual_hash.lower() != expected_hash.strip().lower():
+        raise FineMapSkip(
+            "LM fine-mapping sample order hash does not match supplied metadata"
+        )
+    return sample_ids, np.ascontiguousarray(sample_indices, dtype=np.int64)
+
+
 def _postgwas_dev_help_requested(argv: Optional[list[str]] = None) -> bool:
     tokens = list(sys.argv[1:] if argv is None else argv)
     return "-dev" in tokens or "--dev" in tokens
@@ -3428,7 +3546,7 @@ def _postgwas_align_finemap_locus(
     gwas_chrom_col = "chrom_norm" if "chrom_norm" in gwas_df.columns else "chrom"
     for name, frame, columns in (
         ("GWAS", gwas_df, [gwas_chrom_col, "pos", "beta", "se", "z"]),
-        ("BED", bed_meta, ["chrom", "pos", "allele0", "allele1"]),
+        ("BED", bed_meta, ["chrom", "pos", "snp", "allele0", "allele1"]),
     ):
         missing = [column for column in columns if column not in frame.columns]
         if missing:
@@ -3460,6 +3578,7 @@ def _postgwas_align_finemap_locus(
         bed_by_site.setdefault((str(row["_chrom_norm"]), int(row["_pos_num"])), []).append(int(idx))
 
     pair_for_bed: dict[int, int] = {}
+    snp_conflicts = 0
     for site, bed_rows in bed_by_site.items():
         gwas_rows = gwas_by_site.get(site, [])
         if len(gwas_rows) == 1 and len(bed_rows) == 1:
@@ -3473,6 +3592,12 @@ def _postgwas_align_finemap_locus(
                 if "snp" in bed.columns
                 else None
             )
+            if bed_snp is None:
+                snp_conflicts += 1
+                continue
+            if gwas_snp is not None and gwas_snp != bed_snp:
+                snp_conflicts += 1
+                continue
             if (
                 site in prefilter_ambiguous_sites
                 and gwas_snp is not None
@@ -3484,13 +3609,14 @@ def _postgwas_align_finemap_locus(
             continue
         if len(gwas_rows) == 0:
             continue
-        if "snp" not in gwas.columns or "snp" not in bed.columns:
-            continue
-
         gwas_ids: dict[str, list[int]] = {}
         bed_ids: dict[str, list[int]] = {}
         for idx in gwas_rows:
-            snp = _postgwas_finemap_nonempty_text(gwas.at[idx, "snp"])
+            snp = (
+                _postgwas_finemap_nonempty_text(gwas.at[idx, "snp"])
+                if "snp" in gwas.columns
+                else None
+            )
             if snp is not None:
                 gwas_ids.setdefault(snp, []).append(idx)
         for idx in bed_rows:
@@ -3501,6 +3627,56 @@ def _postgwas_align_finemap_locus(
             matching_gwas_rows = gwas_ids.get(snp, [])
             if len(matching_bed_rows) == 1 and len(matching_gwas_rows) == 1:
                 pair_for_bed[matching_bed_rows[0]] = matching_gwas_rows[0]
+
+        # Duplicate coordinates are only safe when the remaining unnamed
+        # summary rows can be resolved by a unique allele pair.  Coordinate
+        # order is not a valid identity because BIM may contain alternate
+        # alleles at the same position.  Named summary rows are deliberately
+        # excluded from the allele fallback: a mismatched named SNP must not
+        # acquire a different canonical label merely because its alleles fit.
+        unmatched_gwas = {
+            int(idx)
+            for idx in gwas_rows
+            if int(idx) not in set(pair_for_bed.values())
+            and (
+                "snp" not in gwas.columns
+                or _postgwas_finemap_nonempty_text(gwas.at[idx, "snp"]) is None
+            )
+        }
+        unmatched_bed = {
+            int(idx) for idx in bed_rows if int(idx) not in pair_for_bed
+        }
+        gwas_by_alleles: dict[frozenset[str], list[int]] = {}
+        bed_by_alleles: dict[frozenset[str], list[int]] = {}
+        for idx in unmatched_gwas:
+            gwas_pair = _postgwas_variant_allele_pair(
+                _postgwas_variant_token(gwas.at[idx, "allele0"], allele=True)
+                if "allele0" in gwas.columns
+                else None,
+                _postgwas_variant_token(gwas.at[idx, "allele1"], allele=True)
+                if "allele1" in gwas.columns
+                else None,
+            )
+            if gwas_pair is not None:
+                gwas_by_alleles.setdefault(gwas_pair, []).append(idx)
+        for idx in unmatched_bed:
+            bed_pair = _postgwas_variant_allele_pair(
+                _postgwas_variant_token(bed.at[idx, "allele0"], allele=True),
+                _postgwas_variant_token(bed.at[idx, "allele1"], allele=True),
+            )
+            if bed_pair is not None:
+                bed_by_alleles.setdefault(bed_pair, []).append(idx)
+        for allele_pair, matching_bed_rows in bed_by_alleles.items():
+            matching_gwas_rows = gwas_by_alleles.get(allele_pair, [])
+            if len(matching_bed_rows) == 1 and len(matching_gwas_rows) == 1:
+                pair_for_bed[matching_bed_rows[0]] = matching_gwas_rows[0]
+
+        if len(gwas_rows) != len(bed_rows) or any(
+            bed_idx not in pair_for_bed for bed_idx in bed_rows
+        ) or any(
+            gwas_idx not in set(pair_for_bed.values()) for gwas_idx in gwas_rows
+        ):
+            snp_conflicts += 1
 
     gwas_has_alleles = {"allele0", "allele1"}.issubset(gwas.columns)
     records: list[pd.Series] = []
@@ -3533,6 +3709,7 @@ def _postgwas_align_finemap_locus(
                     flip = True
                 else:
                     counters["allele_conflicts"] += 1
+                    snp_conflicts += 1
                     continue
             else:
                 counters["assumed_direction"] += 1
@@ -3543,6 +3720,11 @@ def _postgwas_align_finemap_locus(
             gwas_row["beta"] = -float(gwas_row["beta"])
             gwas_row["z"] = -float(gwas_row["z"])
             counters["allele_flips"] += 1
+        canonical_snp = _postgwas_finemap_nonempty_text(bed_row["snp"])
+        if canonical_snp is None:
+            snp_conflicts += 1
+            continue
+        gwas_row["snp"] = canonical_snp
         gwas_row["allele0"] = bed_row["allele0"]
         gwas_row["allele1"] = bed_row["allele1"]
         gwas_row["chrom_norm"] = bed_row["_chrom_norm"]
@@ -3551,6 +3733,10 @@ def _postgwas_align_finemap_locus(
         retained_bed_indices.append(int(bed_idx))
 
     counters["unresolved_identities"] = int(len(gwas) - len(set(pair_for_bed.values())))
+    if snp_conflicts > 0:
+        raise FineMapSkip(
+            "GWAS/BIM SNP identity mismatch or missing canonical BIM SNP metadata"
+        )
     if len(records) == 0:
         aligned = gwas.drop(columns=["_chrom_norm", "_pos_num"], errors="ignore").iloc[0:0].copy()
         for allele_col in ("allele0", "allele1"):
@@ -3622,6 +3808,10 @@ def _postgwas_build_finemap_credible_sets(
             "Fine-mapping prior variance count does not match alpha effects: "
             f"got {int(prior_array.shape[0])}, expected {int(n_effects)}."
         )
+    if not np.all(np.isfinite(prior_array)):
+        raise ValueError("Fine-mapping prior variance contains non-finite values.")
+    if np.any(prior_array < 0.0):
+        raise ValueError("Fine-mapping prior variance contains negative values.")
 
     coverage_value = float(coverage)
     if not np.isfinite(coverage_value) or not 0.0 < coverage_value <= 1.0:
@@ -3947,6 +4137,7 @@ def _postgwas_build_sample_matched_raw_ld(
     args: argparse.Namespace,
     prepared: pd.DataFrame,
     locus: tuple[str, int, int],
+    sample_ids: Sequence[str],
     bed_indices: Optional[np.ndarray],
     selected_chrom: list[str],
     selected_bim_pos: list[int],
@@ -3955,104 +4146,197 @@ def _postgwas_build_sample_matched_raw_ld(
     existing_bytes: int,
     logger: logging.Logger,
 ) -> tuple[np.ndarray, pd.DataFrame]:
-    """Build ordinary sample-matched LD and return rows in matrix order.
-
-    This is deliberately a separate route adapter.  The caller must select it
-    only after deciding that the result is not an FvLMM result, so the raw
-    dense-LD allocation cannot occur on the mixed-model route.
-    """
+    """Build ordinary LD from the verified GWAS sample subset."""
     locus_label = _postgwas_finemap_locus_label(locus)
-    range_chrom = list(dict.fromkeys(selected_chrom)) or [locus[0]]
+    verified_sample_ids = [str(value) for value in sample_ids]
+    if not verified_sample_ids:
+        raise FineMapSkip(
+            "ordinary LD requires verified GWAS sample metadata; sample subset is empty"
+        )
     try:
         memory_limit_bytes = int(
             getattr(args, "finemap_memory_bytes", _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES)
         )
         estimated_memory = _postgwas_check_finemap_memory(
             n_variants=selected_bim_rows,
-            n_samples=_postgwas_count_plink_samples(args.bfile),
+            n_samples=len(verified_sample_ids),
             existing_bytes=existing_bytes,
             max_bytes=memory_limit_bytes,
         )
     except MemoryError as exc:
-        raise RuntimeError(f"SuSiE locus {locus_label} exceeds memory limit: {exc}") from exc
+        raise FineMapSkip(
+            f"SuSiE locus {locus_label} raw-LD memory preflight rejected the locus: {exc}"
+        ) from exc
     logger.info(
         "SuSiE locus %s memory preflight: variants=%d samples=%d estimated_peak=%.2f GiB limit=%.2f GiB.",
         locus_label,
         selected_bim_rows,
-        _postgwas_count_plink_samples(args.bfile),
+        len(verified_sample_ids),
         estimated_memory / float(1024**3),
         memory_limit_bytes / float(1024**3),
     )
-    try:
-        ld_result = jxrs.bed_ld_corr_rust(
-            str(args.bfile),
-            range_chrom,
-            [locus[1]] * len(range_chrom),
-            [locus[2]] * len(range_chrom),
-            selected_chrom=selected_chrom,
-            selected_pos=selected_bim_pos,
-            threads=int(args.thread),
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"SuSiE locus {locus_label} signed BED LD failed: {exc}"
-        ) from exc
-
-    if not isinstance(ld_result, tuple) or len(ld_result) != 6:
-        raise RuntimeError(
-            f"SuSiE locus {locus_label} signed BED LD returned an invalid result."
-        )
-    r_raw, bed_chrom, bed_pos, bed_snp, bed_allele0, bed_allele1 = ld_result
-    r = np.asarray(r_raw, dtype=np.float64)
-    metadata_lengths = {
-        len(bed_chrom),
-        len(bed_pos),
-        len(bed_snp),
-        len(bed_allele0),
-        len(bed_allele1),
-    }
-    if r.ndim != 2 or r.shape[0] != r.shape[1]:
-        raise RuntimeError(
-            f"SuSiE locus {locus_label} signed BED LD must be square; got {r.shape}."
-        )
-    if metadata_lengths != {int(r.shape[0])}:
-        raise RuntimeError(
-            f"SuSiE locus {locus_label} signed BED LD metadata is misaligned "
-            f"with matrix shape {r.shape}."
-        )
-    if not bool(np.all(np.isfinite(r))):
-        raise RuntimeError(
-            f"SuSiE locus {locus_label} signed BED LD contains non-finite values."
-        )
-    monomorphic_exclusions = max(0, selected_bim_rows - int(r.shape[0]))
-    if r.shape[0] == 0:
-        empty = prepared.iloc[0:0].copy()
-        empty.attrs["_janusx_finemap_alignment_counts"] = {
-            "bed_matches": 0,
-            "allele_flips": 0,
-            "allele_conflicts": 0,
-            "assumed_direction": 0,
-            "unresolved_identities": 0,
-        }
-        empty.attrs["_janusx_finemap_empty_reason"] = (
-            f"no polymorphic BED variants matched {len(prepared)} prepared "
-            f"GWAS rows (monomorphic={monomorphic_exclusions})"
-        )
-        empty.attrs["_janusx_finemap_bed_rows"] = int(r.shape[0])
-        return np.empty((0, 0), dtype=np.float64), empty
-
-    bed_meta = pd.DataFrame(
+    bim_rows = _postgwas_read_bim_identity_rows(args.bfile)
+    selected_bim_indices = _postgwas_match_prepared_variants_to_bim(
+        prepared.reset_index(drop=True),
+        bim_rows,
+    )
+    selected_bim_meta = pd.DataFrame(
         {
-            "chrom": list(bed_chrom),
-            "pos": list(bed_pos),
-            "snp": list(bed_snp),
-            "allele0": list(bed_allele0),
-            "allele1": list(bed_allele1),
+            "chrom": [bim_rows[index][0] for index in selected_bim_indices],
+            "pos": [bim_rows[index][1] for index in selected_bim_indices],
+            "snp": [bim_rows[index][2] for index in selected_bim_indices],
+            "allele0": [bim_rows[index][3] for index in selected_bim_indices],
+            "allele1": [bim_rows[index][4] for index in selected_bim_indices],
         }
     )
-    aligned, bed_indices, alignment_counts = _postgwas_align_finemap_locus(
+    genotype_chunks: list[np.ndarray] = []
+    returned_sites: list[object] = []
+    try:
+        loader_signature = inspect.signature(load_genotype_chunks)
+    except (TypeError, ValueError) as exc:
+        raise FineMapSkip(
+            "ordinary LD genotype loader signature is unavailable; exact sample/SNP selection cannot be proven"
+        ) from exc
+    loader_parameters = loader_signature.parameters
+    if "sample_ids" not in loader_parameters:
+        raise FineMapSkip(
+            "ordinary LD genotype loader does not support exact sample selection"
+        )
+    if (
+        "snp_indices" not in loader_parameters
+        and not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in loader_parameters.values()
+        )
+    ):
+        raise FineMapSkip(
+            "ordinary LD genotype loader does not support exact SNP selection"
+        )
+    try:
+        genotype_iter = load_genotype_chunks(
+            str(args.bfile),
+            chunk_size=max(1, min(20_000, len(selected_bim_indices))),
+            maf=0.0,
+            missing_rate=1.0,
+            impute=True,
+            model="add",
+            het=1.0,
+            snp_indices=[int(index) for index in selected_bim_indices],
+            sample_ids=verified_sample_ids,
+        )
+        for genotype_chunk, sites in genotype_iter:
+            block = np.asarray(genotype_chunk, dtype=np.float32)
+            if block.ndim != 2 or block.shape[0] != len(sites):
+                raise ValueError(
+                    "ordinary LD genotype chunk and site metadata have inconsistent shapes"
+                )
+            genotype_chunks.append(np.ascontiguousarray(block, dtype=np.float32))
+            returned_sites.extend(list(sites))
+    except FineMapSkip:
+        raise
+    except MemoryError as exc:
+        raise FineMapSkip(
+            f"SuSiE locus {locus_label} raw-LD memory allocation was unavailable: {exc}"
+        ) from exc
+    except _PostGWASExpectedCompatibilityError as exc:
+        _postgwas_skip_for_expected_source_error(exc, "ordinary LD genotype")
+        raise
+    except (OSError, EOFError, UnicodeError, pd.errors.ParserError) as exc:
+        _postgwas_skip_for_expected_source_error(exc, "ordinary LD genotype")
+        raise
+    except RuntimeError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "ordinary LD genotype",
+            runtime_markers=(
+                "snp selection",
+                "snp_indices",
+                "sample selection",
+                "sample_ids",
+                "does not support exact",
+                "selection unavailable",
+            ),
+        )
+        raise
+    except TypeError as exc:
+        message = str(exc).lower()
+        if any(
+            marker in message
+            for marker in ("snp_indices", "sample_ids", "unexpected keyword")
+        ):
+            raise FineMapSkip(
+                f"ordinary LD genotype loader does not support exact selection: {exc}"
+            ) from exc
+        raise
+    except ValueError as exc:
+        _postgwas_skip_for_expected_source_error(
+            exc,
+            "ordinary LD genotype",
+            value_markers=(
+                "snp_indices is empty",
+                "invalid snp_",
+                "genotype source",
+                "genotype chunk",
+                "site metadata",
+                "malformed",
+            ),
+        )
+        raise
+    if len(genotype_chunks) == 0:
+        raise FineMapSkip("ordinary LD genotype loader returned no variants")
+    if len(returned_sites) != len(selected_bim_indices):
+        raise FineMapSkip(
+            "ordinary LD genotype selection changed the requested variant set"
+        )
+
+    genotype_all = np.vstack(genotype_chunks).astype(np.float64, copy=False)
+    signature_to_bim: dict[
+        tuple[str, int, frozenset[str] | None], int
+    ] = {}
+    for bim_index in selected_bim_indices:
+        signature = (
+            bim_rows[bim_index][0],
+            bim_rows[bim_index][1],
+            _postgwas_variant_allele_pair(
+                bim_rows[bim_index][3], bim_rows[bim_index][4]
+            ),
+        )
+        if signature in signature_to_bim:
+            raise FineMapSkip(
+                "ordinary LD selected BIM rows have indistinguishable identity"
+            )
+        signature_to_bim[signature] = bim_index
+    row_by_bim_index: dict[int, int] = {}
+    for row_index, site in enumerate(returned_sites):
+        signature = _postgwas_site_identity_signature(site)
+        bim_index = signature_to_bim.get(signature)
+        if bim_index is None:
+            coordinate_matches = [
+                index
+                for index in selected_bim_indices
+                if bim_rows[index][0] == signature[0]
+                and bim_rows[index][1] == signature[1]
+            ]
+            if signature[2] is None and len(coordinate_matches) == 1:
+                bim_index = coordinate_matches[0]
+            else:
+                raise FineMapSkip(
+                    "ordinary LD genotype site metadata cannot prove exact variant identity"
+                )
+        if bim_index in row_by_bim_index:
+            raise FineMapSkip("ordinary LD genotype loader returned duplicate identity")
+        row_by_bim_index[bim_index] = row_index
+    if set(row_by_bim_index) != set(selected_bim_indices):
+        raise FineMapSkip(
+            "ordinary LD genotype site metadata does not cover selected BIM rows"
+        )
+    selected_rows = [row_by_bim_index[index] for index in selected_bim_indices]
+    genotypes = np.ascontiguousarray(
+        genotype_all[np.asarray(selected_rows, dtype=np.int64)], dtype=np.float64
+    )
+    aligned, aligned_bim_indices, alignment_counts = _postgwas_align_finemap_locus(
         prepared,
-        bed_meta,
+        selected_bim_meta,
         ambiguous_bim_sites=ambiguous_bim_sites,
     )
     if aligned.empty:
@@ -4061,27 +4345,56 @@ def _postgwas_build_sample_matched_raw_ld(
         empty.attrs["_janusx_finemap_empty_reason"] = (
             "no variants remained after BED identity and allele alignment"
         )
-        empty.attrs["_janusx_finemap_bed_rows"] = int(r.shape[0])
+        empty.attrs["_janusx_finemap_bed_rows"] = int(len(selected_bim_indices))
         return np.empty((0, 0), dtype=np.float64), empty
     if (
-        np.any(bed_indices < 0)
-        or np.any(bed_indices >= r.shape[0])
-        or len(np.unique(bed_indices)) != len(bed_indices)
+        np.any(aligned_bim_indices < 0)
+        or np.any(aligned_bim_indices >= genotypes.shape[0])
+        or len(np.unique(aligned_bim_indices)) != len(aligned_bim_indices)
     ):
-        raise RuntimeError(f"SuSiE locus {locus_label} returned invalid BED indices.")
-    if len(aligned) != len(bed_indices):
-        raise RuntimeError(
+        raise FineMapSkip(f"SuSiE locus {locus_label} returned invalid BED indices.")
+    if len(aligned) != len(aligned_bim_indices):
+        raise FineMapSkip(
             f"SuSiE locus {locus_label} alignment length mismatch: "
-            f"{len(aligned)} rows vs {len(bed_indices)} BED indices."
+            f"{len(aligned)} rows vs {len(aligned_bim_indices)} BED indices."
         )
-    if len(bed_indices) == r.shape[0] and np.array_equal(
-        bed_indices, np.arange(r.shape[0], dtype=np.int64)
-    ):
-        locus_r = r
-    else:
-        locus_r = np.ascontiguousarray(r[np.ix_(bed_indices, bed_indices)], dtype=np.float64)
+    genotypes = np.ascontiguousarray(genotypes[aligned_bim_indices], dtype=np.float64)
+    if genotypes.shape[0] == 0:
+        empty = prepared.iloc[0:0].copy()
+        empty.attrs["_janusx_finemap_alignment_counts"] = dict(alignment_counts)
+        empty.attrs["_janusx_finemap_empty_reason"] = (
+            f"no polymorphic BED variants matched {len(prepared)} prepared GWAS rows"
+        )
+        empty.attrs["_janusx_finemap_bed_rows"] = int(len(selected_bim_indices))
+        return np.empty((0, 0), dtype=np.float64), empty
+    if not np.all(np.isfinite(genotypes)):
+        raise FineMapSkip("ordinary LD genotypes contain non-finite values")
+    centered = genotypes - np.mean(genotypes, axis=1, keepdims=True)
+    norms = np.sqrt(np.einsum("ij,ij->i", centered, centered, dtype=np.float64))
+    valid = np.isfinite(norms) & (norms > 0.0)
+    monomorphic_exclusions = int(np.count_nonzero(~valid))
+    if not np.any(valid):
+        empty = prepared.iloc[0:0].copy()
+        empty.attrs["_janusx_finemap_alignment_counts"] = dict(alignment_counts)
+        empty.attrs["_janusx_finemap_empty_reason"] = (
+            f"no polymorphic BED variants matched {len(prepared)} prepared GWAS rows "
+            f"(monomorphic={monomorphic_exclusions})"
+        )
+        empty.attrs["_janusx_finemap_bed_rows"] = int(len(selected_bim_indices))
+        return np.empty((0, 0), dtype=np.float64), empty
+    if not np.all(valid):
+        valid_indices = np.flatnonzero(valid).astype(np.int64, copy=False)
+        aligned = aligned.iloc[valid_indices].reset_index(drop=True)
+        centered = centered[valid_indices]
+        norms = norms[valid_indices]
+    locus_r = np.asarray(
+        (centered @ centered.T) / (norms[:, None] * norms[None, :]),
+        dtype=np.float64,
+    )
+    locus_r = np.clip(0.5 * (locus_r + locus_r.T), -1.0, 1.0)
+    np.fill_diagonal(locus_r, 1.0)
     aligned.attrs["_janusx_finemap_alignment_counts"] = dict(alignment_counts)
-    aligned.attrs["_janusx_finemap_bed_rows"] = int(r.shape[0])
+    aligned.attrs["_janusx_finemap_bed_rows"] = int(len(selected_bim_indices))
     return locus_r, aligned
 
 
@@ -4133,6 +4446,10 @@ def _postgwas_run_susie_finemap_body(
                 f"{result_model} mixed-model fine-mapping is unsupported: "
                 "common-null score statistics are unavailable"
             )
+    route_model = sidecar.model if sidecar is not None else result_model
+    ld_route = _postgwas_select_finemap_ld_route(route_model, sidecar)
+    raw_sample_ids: Optional[list[str]] = None
+    raw_sample_indices: Optional[np.ndarray] = None
     finemap_loci = getattr(args, "finemap_bimrange_tuples", None)
     loci = list(
         finemap_loci
@@ -4145,8 +4462,26 @@ def _postgwas_run_susie_finemap_body(
     gwas, gwas_index = _postgwas_load_finemap_gwas(
         gwas_files[0], str(args.chr), str(args.pos)
     )
+    if ld_route == "raw":
+        raw_sample_ids, raw_sample_indices = _postgwas_resolve_finemap_sample_ids(
+            args,
+            args.bfile,
+        )
+        if raw_sample_indices.shape != (len(raw_sample_ids),):
+            raise FineMapSkip(
+                "LM fine-mapping sample ID/index mapping has inconsistent dimensions"
+            )
+        logger.info(
+            "LM fine-mapping verified sample subset: count=%d indices=%s order_sha256=%s.",
+            len(raw_sample_ids),
+            raw_sample_indices.tolist(),
+            hash_ordered_sample_ids(raw_sample_ids),
+        )
     gwas_memory_bytes = int(gwas.memory_usage(deep=True, index=True).sum())
     plink_sample_count = _postgwas_count_plink_samples(args.bfile)
+    clump_sample_count = (
+        len(raw_sample_ids) if raw_sample_ids is not None else plink_sample_count
+    )
     finemap_memory_limit_bytes = int(
         getattr(args, "finemap_memory_bytes", _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES)
     )
@@ -4158,7 +4493,7 @@ def _postgwas_run_susie_finemap_body(
     )
     clump_preload_max_rows = max(
         1,
-        clump_available_bytes // max(1, plink_sample_count * 4),
+        clump_available_bytes // max(1, clump_sample_count * 4),
     )
 
     out_dir = str(getattr(args, "out", ".") or ".")
@@ -4198,12 +4533,29 @@ def _postgwas_run_susie_finemap_body(
             continue
 
         prepared_source = prepared.reset_index(drop=True)
+        effective_locus_r: Optional[np.ndarray] = None
+        if ld_route == "fvlmm":
+            if sidecar is None:
+                raise FineMapSkip("FvLMM fine-mapping requires matched sidecar metadata")
+            # Build the effective matrix on every verified regional row before
+            # any clumping.  The same matrix is then used by both clumping and
+            # SuSiE; no raw genotype LD is touched on this route.
+            effective_locus_r, effective_source = _postgwas_build_fvlmm_effective_ld(
+                args=args,
+                record=sidecar,
+                prepared=prepared_source,
+                bed_indices=None,
+                logger=logger,
+            )
+            prepared_source = effective_source.reset_index(drop=True)
         prepared, clump_counts, fold_groups = _postgwas_finemap_ldclump(
             prepared_source,
             genofile=str(args.bfile),
             locus=locus_tuple,
             logger=logger,
             preload_max_rows=clump_preload_max_rows,
+            sample_ids=raw_sample_ids,
+            ld_matrix=effective_locus_r,
         )
         logger.info(
             "SuSiE locus %s LDclump: retained=%d/%d clumped=%d groups=%d "
@@ -4224,33 +4576,46 @@ def _postgwas_run_susie_finemap_body(
             continue
 
         selected_pos = prepared["pos"].astype(np.int64).tolist()
-        (
-            selected_chrom,
-            selected_bim_pos,
-            ambiguous_bim_sites,
-        ) = _postgwas_scan_finemap_bim_rows(args.bfile, locus_tuple, selected_pos)
-        selected_bim_rows = len(selected_bim_pos)
-        bed_indices: Optional[np.ndarray] = None
-        route_model = sidecar.model if sidecar is not None else result_model
-        ld_route = _postgwas_select_finemap_ld_route(route_model, sidecar)
+        selected_chrom: list[str] = []
+        selected_bim_pos: list[int] = []
+        ambiguous_bim_sites: set[tuple[str, int]] = set()
+        selected_bim_rows = 0
         if ld_route == "fvlmm":
-            if sidecar is None:
-                raise FineMapSkip("FvLMM fine-mapping requires matched sidecar metadata")
-            # No ordinary BED-LD matrix or raw-LD memory preflight exists on this
-            # branch. The effective-LD adapter owns its complete preflight.
-            locus_r, aligned = _postgwas_build_fvlmm_effective_ld(
-                args=args,
-                record=sidecar,
-                prepared=prepared,
-                bed_indices=bed_indices,
-                logger=logger,
+            if effective_locus_r is None:
+                raise FineMapSkip("FvLMM effective-LD matrix was not constructed")
+            matrix_indices = np.asarray(
+                getattr(prepared, "attrs", {}).get(
+                    "_janusx_finemap_matrix_indices", []
+                ),
+                dtype=np.int64,
             )
+            if matrix_indices.ndim != 1 or matrix_indices.size != len(prepared):
+                raise FineMapSkip(
+                    "FvLMM clumping did not return an explicit matrix index map"
+                )
+            if (
+                np.any(matrix_indices < 0)
+                or np.any(matrix_indices >= effective_locus_r.shape[0])
+                or np.unique(matrix_indices).size != matrix_indices.size
+            ):
+                raise FineMapSkip("FvLMM clumping returned an invalid matrix index map")
+            locus_r = np.ascontiguousarray(
+                effective_locus_r[np.ix_(matrix_indices, matrix_indices)],
+                dtype=np.float64,
+            )
+            aligned = prepared.copy()
         else:
+            (
+                selected_chrom,
+                selected_bim_pos,
+                ambiguous_bim_sites,
+            ) = _postgwas_scan_finemap_bim_rows(args.bfile, locus_tuple, selected_pos)
+            selected_bim_rows = len(selected_bim_pos)
             locus_r, aligned = _postgwas_build_sample_matched_raw_ld(
                 args=args,
                 prepared=prepared,
                 locus=locus_tuple,
-                bed_indices=bed_indices,
+                sample_ids=raw_sample_ids or [],
                 selected_chrom=selected_chrom,
                 selected_bim_pos=selected_bim_pos,
                 selected_bim_rows=selected_bim_rows,
@@ -4357,6 +4722,15 @@ def _postgwas_run_susie_finemap_body(
             raise RuntimeError(
                 f"SuSiE locus {locus_label} solver alpha/prior variance dimensions "
                 "do not agree with the fitted representatives."
+            )
+        logger.info(
+            "SuSiE locus %s prior_variances=%s.",
+            locus_label,
+            prior_variance.tolist(),
+        )
+        if not np.all(np.isfinite(prior_variance)) or np.any(prior_variance < 0.0):
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} solver returned invalid prior variance values."
             )
         if not bool(np.all(np.isfinite(pip))) or bool(np.any((pip < 0.0) | (pip > 1.0))):
             raise RuntimeError(
@@ -7603,6 +7977,7 @@ def _load_ldclump_genotype_rows(
     keys: Sequence[tuple[str, int]],
     *,
     chunk_size: int,
+    sample_ids: Optional[Sequence[str]] = None,
 ) -> np.ndarray:
     """Load requested LD-clump rows while consuming every returned chunk.
 
@@ -7616,6 +7991,18 @@ def _load_ldclump_genotype_rows(
     requested = [(str(chrom), int(pos)) for chrom, pos in keys]
     if len(requested) == 0:
         return np.zeros((0, 0), dtype=np.float32)
+    if sample_ids is not None:
+        try:
+            loader_parameters = inspect.signature(load_genotype_chunks).parameters
+        except (TypeError, ValueError) as exc:
+            raise FineMapSkip(
+                "LD-clump genotype loader signature is unavailable; exact sample "
+                "selection cannot be proven"
+            ) from exc
+        if "sample_ids" not in loader_parameters:
+            raise FineMapSkip(
+                "LD-clump genotype loader does not support exact sample selection"
+            )
 
     # The fine-mapping path uses normalized chromosome labels, whereas the
     # PLINK BIM can retain a ``chr`` prefix.  Query both spellings so the
@@ -7635,6 +8022,7 @@ def _load_ldclump_genotype_rows(
         missing_rate=1.0,
         impute=True,
         snp_sites=query_keys,
+        sample_ids=(list(sample_ids) if sample_ids is not None else None),
     ):
         genotype = np.asarray(chunk, dtype=np.float32)
         if genotype.ndim != 2 or genotype.shape[0] != len(sites):
@@ -7678,6 +8066,7 @@ def _ldclump_lead_r2_streaming(
     snps: Sequence[tuple[str, int]],
     *,
     chunk_rows: int,
+    sample_ids: Optional[Sequence[str]] = None,
 ) -> np.ndarray:
     """Compute one lead's r2 values without materializing its whole window."""
     requested = [(str(chrom), int(pos)) for chrom, pos in snps]
@@ -7688,6 +8077,7 @@ def _ldclump_lead_r2_streaming(
         genofile,
         [requested[0]],
         chunk_size=1,
+        sample_ids=sample_ids,
     )
     if lead.ndim != 2 or lead.shape[0] != 1:
         raise RuntimeError("LD-clump lead genotype row has an invalid shape")
@@ -7700,12 +8090,40 @@ def _ldclump_lead_r2_streaming(
             genofile,
             block_keys,
             chunk_size=len(block_keys),
+            sample_ids=sample_ids,
         )
         if block.ndim != 2 or block.shape[0] != len(block_keys):
             raise RuntimeError("LD-clump candidate genotype block has an invalid shape")
         block_with_lead = np.vstack((lead, block))
         r2[start : start + len(block_keys)] = _lead_vs_all_r2(block_with_lead)[1:]
     return r2
+
+
+def _postgwas_clump_compatibility_exception(exc: BaseException) -> bool:
+    """Recognize source/adapter failures that may safely keep only the lead."""
+    if isinstance(exc, _PostGWASExpectedCompatibilityError):
+        return True
+    if type(exc) in (OSError, EOFError, UnicodeError, pd.errors.ParserError):
+        return True
+    message = str(exc).lower()
+    markers = (
+        "no genotype rows",
+        "genotype rows missing",
+        "genotype chunk",
+        "site metadata",
+        "snp selection",
+        "sample selection",
+        "snp_sites",
+        "sample_ids",
+        "unsupported",
+        "unavailable",
+        "malformed",
+        "truncated",
+        "invalid shape",
+    )
+    if type(exc) in (ValueError, TypeError, RuntimeError):
+        return any(marker in message for marker in markers)
+    return False
 
 
 def _ldclump_significant_snps(
@@ -7720,6 +8138,7 @@ def _ldclump_significant_snps(
     logger: logging.Logger,
     show_progress: bool = True,
     preload_max_rows: Optional[int] = None,
+    sample_ids: Optional[Sequence[str]] = None,
 ) -> tuple[pd.DataFrame, dict[tuple[str, int], list[tuple[str, int]]]]:
     """
     LD-clump threshold-passing SNPs and keep lead SNPs only in annotation output.
@@ -7780,28 +8199,46 @@ def _ldclump_significant_snps(
         preload_max_rows is not None
         and len(all_keys) > max(1, int(preload_max_rows))
     )
-    try:
+    preload_error: Optional[BaseException] = None
+    if not preload_budget_limited:
         logger.info(
             f"Preloading genotype rows for LD clump: {len(all_keys)} SNPs..."
         )
-        if preload_budget_limited:
-            raise RuntimeError(
-                "preload row budget exceeded; using streaming LD-clump blocks"
+        try:
+            preloaded_geno = _load_ldclump_genotype_rows(
+                genofile,
+                all_keys,
+                chunk_size=max(1, min(20_000, len(all_keys))),
+                sample_ids=sample_ids,
             )
-        preloaded_geno = _load_ldclump_genotype_rows(
-            genofile,
-            all_keys,
-            chunk_size=max(1, min(20_000, len(all_keys))),
-        )
-        key_to_row = {k: i for i, k in enumerate(all_keys)}
-        # These row statistics are invariant across all lead/window calls.
-        # Reusing them avoids a full O(window * n_samples) reduction for every
-        # lead and leaves the hot loop to one matrix-vector product.
-        preloaded_row_sums = np.sum(preloaded_geno, axis=1, dtype=np.float64)
-        preloaded_row_sumsq = np.einsum(
-            "ij,ij->i", preloaded_geno, preloaded_geno, dtype=np.float64, optimize=True
-        )
-    except Exception as e:
+            key_to_row = {k: i for i, k in enumerate(all_keys)}
+            # These row statistics are invariant across all lead/window calls.
+            # Reusing them avoids a full O(window * n_samples) reduction for every
+            # lead and leaves the hot loop to one matrix-vector product.
+            preloaded_row_sums = np.sum(preloaded_geno, axis=1, dtype=np.float64)
+            preloaded_row_sumsq = np.einsum(
+                "ij,ij->i", preloaded_geno, preloaded_geno, dtype=np.float64, optimize=True
+            )
+        except FineMapSkip:
+            raise
+        except _PostGWASExpectedCompatibilityError as exc:
+            preload_error = exc
+        except (OSError, EOFError, UnicodeError, pd.errors.ParserError) as exc:
+            preload_error = exc
+        except ValueError as exc:
+            if not _postgwas_clump_compatibility_exception(exc):
+                raise
+            preload_error = exc
+        except TypeError as exc:
+            if not _postgwas_clump_compatibility_exception(exc):
+                raise
+            preload_error = exc
+        except RuntimeError as exc:
+            if not _postgwas_clump_compatibility_exception(exc):
+                raise
+            preload_error = exc
+
+    if preload_budget_limited or preload_error is not None:
         preloaded_geno = None
         preloaded_row_sums = None
         preloaded_row_sumsq = None
@@ -7817,8 +8254,8 @@ def _ldclump_significant_snps(
         else:
             logger.warning(
                 "Warning: Failed to preload all LD-clump genotypes; "
-                "falling back to per-lead genotype loading. "
-                f"Reason: {e}"
+                "falling back to per-lead genotype loading. Reason: %s",
+                preload_error,
             )
 
     if not key_to_row:
@@ -7841,15 +8278,11 @@ def _ldclump_significant_snps(
     clump_start_ts = time.monotonic()
     clump_success = False
     if use_rich_progress:
-        try:
-            progress = build_rich_progress(
-                show_remaining=True,
-                finished_text=" ",
-                transient=True,
-            )
-        except Exception:
-            progress = None
-            use_rich_progress = False
+        progress = build_rich_progress(
+            show_remaining=True,
+            finished_text=" ",
+            transient=True,
+        )
 
     with (progress if progress is not None else nullcontext()):
         if progress is not None:
@@ -7907,6 +8340,7 @@ def _ldclump_significant_snps(
                                     genofile,
                                     snps,
                                     chunk_rows=stream_chunk_rows,
+                                    sample_ids=sample_ids,
                                 )
                             if r2 is not None and r2.shape[0] == len(snps):
                                 clumped = [
@@ -7927,12 +8361,61 @@ def _ldclump_significant_snps(
                                         f"fallback to keep lead SNP only for {lead_chr}:{lead_pos}."
                                     )
                                 warn_count += 1
-                        except Exception as e:
+                        except FineMapSkip:
+                            raise
+                        except _PostGWASExpectedCompatibilityError as exc:
                             if warn_count < warn_limit:
                                 logger.warning(
                                     "Warning: LDclump genotype lookup failed for "
                                     f"{lead_chr}:{lead_pos}; fallback to keep lead SNP only. "
-                                    f"Reason: {e}"
+                                    "Reason: %s",
+                                    exc,
+                                )
+                            warn_count += 1
+                            clumped = [lead_key]
+                        except (OSError, EOFError, UnicodeError, pd.errors.ParserError) as exc:
+                            if warn_count < warn_limit:
+                                logger.warning(
+                                    "Warning: LDclump genotype lookup failed for "
+                                    f"{lead_chr}:{lead_pos}; fallback to keep lead SNP only. "
+                                    "Reason: %s",
+                                    exc,
+                                )
+                            warn_count += 1
+                            clumped = [lead_key]
+                        except ValueError as exc:
+                            if not _postgwas_clump_compatibility_exception(exc):
+                                raise
+                            if warn_count < warn_limit:
+                                logger.warning(
+                                    "Warning: LDclump genotype lookup failed for "
+                                    f"{lead_chr}:{lead_pos}; fallback to keep lead SNP only. "
+                                    "Reason: %s",
+                                    exc,
+                                )
+                            warn_count += 1
+                            clumped = [lead_key]
+                        except TypeError as exc:
+                            if not _postgwas_clump_compatibility_exception(exc):
+                                raise
+                            if warn_count < warn_limit:
+                                logger.warning(
+                                    "Warning: LDclump genotype lookup failed for "
+                                    f"{lead_chr}:{lead_pos}; fallback to keep lead SNP only. "
+                                    "Reason: %s",
+                                    exc,
+                                )
+                            warn_count += 1
+                            clumped = [lead_key]
+                        except RuntimeError as exc:
+                            if not _postgwas_clump_compatibility_exception(exc):
+                                raise
+                            if warn_count < warn_limit:
+                                logger.warning(
+                                    "Warning: LDclump genotype lookup failed for "
+                                    f"{lead_chr}:{lead_pos}; fallback to keep lead SNP only. "
+                                    "Reason: %s",
+                                    exc,
                                 )
                             warn_count += 1
                             clumped = [lead_key]
@@ -7990,41 +8473,29 @@ def _ldclump_significant_snps(
     return out_df, clump_dict
 
 
-def _postgwas_finemap_ldclump(
+def _postgwas_finalize_finemap_ldclump(
     prepared: pd.DataFrame,
-    *,
-    genofile: str,
-    locus: tuple[str, int, int],
-    logger: logging.Logger,
-    preload_max_rows: Optional[int] = None,
+    clump_df: pd.DataFrame,
+    clump_dict: dict[tuple[str, int], list[tuple[str, int]]],
 ) -> tuple[
     pd.DataFrame,
     dict[str, int],
     dict[tuple[str, int], tuple[int, ...]],
 ]:
-    """Keep |z|-priority lead SNPs before constructing dense SuSiE LD.
-
-    This deliberately reuses the postgwas LD-clump implementation so the
-    fine-mapping and annotation routes share the same greedy lead/window/r2
-    semantics.  Only exact and near-exact LD is removed here: ordinary LD
-    structure is retained for SuSiE.
-    """
+    """Restore fold groups and one matrix-order map after clumping."""
     input_rows = int(len(prepared))
     prepared_rows = prepared.reset_index(drop=True)
-    if input_rows <= 1:
-        fold_groups: dict[tuple[str, int], tuple[int, ...]] = {}
-        if input_rows == 1:
-            fold_key = (
-                _postgwas_finemap_normalize_chr(prepared_rows.iloc[0]["chrom_norm"]),
-                int(prepared_rows.iloc[0]["pos"]),
-            )
-            fold_groups[fold_key] = (0,)
-        return prepared.copy(), {
-            "input_rows": input_rows,
-            "retained_rows": input_rows,
+    if input_rows == 0:
+        empty = prepared_rows.copy()
+        empty.attrs["_janusx_finemap_matrix_indices"] = np.empty(
+            (0,), dtype=np.int64
+        )
+        return empty, {
+            "input_rows": 0,
+            "retained_rows": 0,
             "clumped_rows": 0,
-            "groups": input_rows,
-        }, fold_groups
+            "groups": 0,
+        }, {}
 
     priority = -np.abs(
         pd.to_numeric(prepared_rows["z"], errors="coerce").to_numpy(dtype=float)
@@ -8037,26 +8508,6 @@ def _postgwas_finemap_ldclump(
         pd.to_numeric(prepared_rows["pos"], errors="coerce")
         .astype(np.int64)
         .tolist()
-    )
-    work = pd.DataFrame(
-        {
-            "chrom_norm": prepared_chroms,
-            "pos": prepared_positions,
-            "_finemap_priority": priority,
-        }
-    )
-    window_bp = max(1, abs(int(locus[2]) - int(locus[1])))
-    clump_df, _clump_dict = _ldclump_significant_snps(
-        work,
-        chr_col="chrom_norm",
-        pos_col="pos",
-        p_col="_finemap_priority",
-        genofile=str(genofile),
-        window_bp=window_bp,
-        r2_thr=float(_POSTGWAS_FINEMAP_LDCLUMP_R2),
-        logger=logger,
-        show_progress=False,
-        preload_max_rows=preload_max_rows,
     )
     lead_keys = {
         (_postgwas_finemap_normalize_chr(chrom), int(pos))
@@ -8076,12 +8527,15 @@ def _postgwas_finemap_ldclump(
             representative_by_key[key] = int(row_idx)
 
     snp_identifiers = (
-        prepared_rows["snp"].map(lambda value: str(value)).tolist()
+        [
+            _postgwas_finemap_nonempty_text(value) or ""
+            for value in prepared_rows["snp"].tolist()
+        ]
         if "snp" in prepared_rows.columns
         else [""] * input_rows
     )
-    fold_groups = {}
-    for lead_key_raw, clump_keys in _clump_dict.items():
+    fold_groups: dict[tuple[str, int], tuple[int, ...]] = {}
+    for lead_key_raw, clump_keys in clump_dict.items():
         lead_key = (
             _postgwas_finemap_normalize_chr(lead_key_raw[0]),
             int(lead_key_raw[1]),
@@ -8134,7 +8588,11 @@ def _postgwas_finemap_ldclump(
         ],
         dtype=bool,
     )
-    retained = prepared.loc[keep].copy().reset_index(drop=True)
+    retained = prepared_rows.loc[keep].copy().reset_index(drop=True)
+    retained.attrs.update(getattr(prepared_rows, "attrs", {}))
+    retained.attrs["_janusx_finemap_matrix_indices"] = np.flatnonzero(keep).astype(
+        np.int64, copy=False
+    )
     retained_rows = int(len(retained))
     counters = {
         "input_rows": input_rows,
@@ -8143,6 +8601,253 @@ def _postgwas_finemap_ldclump(
         "groups": int(len(fold_groups)),
     }
     return retained, counters, fold_groups
+
+
+def _postgwas_finemap_ldclump_from_matrix(
+    prepared: pd.DataFrame,
+    *,
+    ld_matrix: object,
+    locus: tuple[str, int, int],
+    logger: logging.Logger,
+) -> tuple[
+    pd.DataFrame,
+    dict[str, int],
+    dict[tuple[str, int], tuple[int, ...]],
+]:
+    """Clump against an already-built LD matrix in the exact row order."""
+    prepared_rows = prepared.reset_index(drop=True)
+    input_rows = int(len(prepared_rows))
+    matrix = np.asarray(ld_matrix, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape != (input_rows, input_rows):
+        raise FineMapSkip(
+            "FvLMM effective-LD clumping matrix dimensions do not match GWAS rows"
+        )
+    if not np.all(np.isfinite(matrix)):
+        raise FineMapSkip("FvLMM effective-LD clumping matrix is non-finite")
+    if input_rows == 0:
+        return _postgwas_finalize_finemap_ldclump(
+            prepared_rows,
+            prepared_rows.iloc[0:0].set_index(["chrom_norm", "pos"]),
+            {},
+        )
+
+    required = {"chrom_norm", "pos", "z"}
+    missing = sorted(required.difference(prepared_rows.columns))
+    if missing:
+        raise FineMapSkip(
+            "FvLMM effective-LD clumping rows are missing: " + ", ".join(missing)
+        )
+    priority = -np.abs(
+        pd.to_numeric(prepared_rows["z"], errors="coerce").to_numpy(dtype=float)
+    )
+    if not np.all(np.isfinite(priority)):
+        raise FineMapSkip("FvLMM effective-LD clumping priorities are non-finite")
+    prepared_chroms = [
+        _postgwas_finemap_normalize_chr(value)
+        for value in prepared_rows["chrom_norm"].tolist()
+    ]
+    prepared_positions = pd.to_numeric(
+        prepared_rows["pos"], errors="coerce"
+    ).to_numpy(dtype=np.float64)
+    if not np.all(np.isfinite(prepared_positions)) or not np.all(
+        prepared_positions == np.floor(prepared_positions)
+    ):
+        raise FineMapSkip("FvLMM effective-LD clumping positions are invalid")
+    prepared_positions = prepared_positions.astype(np.int64).tolist()
+
+    work = pd.DataFrame(
+        {
+            "chrom_norm": prepared_chroms,
+            "pos": prepared_positions,
+            "_finemap_priority": priority,
+            "_matrix_index": np.arange(input_rows, dtype=np.int64),
+        }
+    )
+    work = (
+        work.sort_values("_finemap_priority", ascending=True, kind="mergesort")
+        .drop_duplicates(subset=["chrom_norm", "pos"], keep="first")
+        .reset_index(drop=True)
+    )
+    all_keys = [
+        (str(chrom), int(pos))
+        for chrom, pos in zip(work["chrom_norm"], work["pos"])
+    ]
+    chrom_arr = work["chrom_norm"].to_numpy(dtype=str)
+    pos_arr = work["pos"].to_numpy(dtype=np.int64)
+    matrix_indices = work["_matrix_index"].to_numpy(dtype=np.int64)
+    remaining = np.ones((len(work),), dtype=bool)
+    key_to_p = {
+        (str(chrom), int(pos)): float(value)
+        for chrom, pos, value in zip(
+            work["chrom_norm"], work["pos"], work["_finemap_priority"]
+        )
+    }
+    kept_rows: list[tuple[str, int, float, int, int, int, float, str]] = []
+    clump_dict: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    window_bp = max(1, abs(int(locus[2]) - int(locus[1])))
+    for work_idx, row in work.iterrows():
+        if not bool(remaining[int(work_idx)]):
+            continue
+        lead_chr = str(row["chrom_norm"])
+        lead_pos = int(row["pos"])
+        start = lead_pos - window_bp
+        end = lead_pos + window_bp
+        win_idx = np.flatnonzero(
+            remaining
+            & (chrom_arr == lead_chr)
+            & (pos_arr >= start)
+            & (pos_arr <= end)
+        )
+        lead_matrix_index = int(matrix_indices[int(work_idx)])
+        candidate_matrix_indices = matrix_indices[win_idx]
+        r2 = np.square(matrix[lead_matrix_index, candidate_matrix_indices])
+        if r2.shape != (len(win_idx),) or not np.all(np.isfinite(r2)):
+            raise FineMapSkip(
+                "FvLMM effective-LD clumping returned invalid lead correlations"
+            )
+        clumped_idx = win_idx[r2 >= float(_POSTGWAS_FINEMAP_LDCLUMP_R2)]
+        if int(work_idx) not in set(int(index) for index in clumped_idx.tolist()):
+            clumped_idx = np.concatenate(
+                (np.asarray([int(work_idx)], dtype=np.int64), clumped_idx)
+            )
+        clumped = [all_keys[int(index)] for index in clumped_idx.tolist()]
+        r2_map = {
+            all_keys[int(index)]: float(value)
+            for index, value in zip(win_idx.tolist(), r2.tolist())
+        }
+        mean_r2 = float(
+            np.mean([float(r2_map.get(key, 1.0)) for key in clumped])
+        )
+        clumped = sorted(
+            clumped,
+            key=lambda key: (float(key_to_p.get(key, np.inf)), int(key[1])),
+        )
+        clump_dict[(lead_chr, lead_pos)] = clumped
+        ld_start = int(min(int(key[1]) for key in clumped))
+        ld_end = int(max(int(key[1]) for key in clumped))
+        kept_rows.append(
+            (
+                lead_chr,
+                lead_pos,
+                float(row["_finemap_priority"]),
+                ld_start,
+                ld_end,
+                len(clumped),
+                mean_r2,
+                _format_clump_sites(clumped),
+            )
+        )
+        remaining[clumped_idx] = False
+
+    clump_df = pd.DataFrame(
+        kept_rows,
+        columns=[
+            "chrom_norm",
+            "pos",
+            "_finemap_priority",
+            "start",
+            "end",
+            "nsnps",
+            "MeanR2",
+            "LDclump",
+        ],
+    ).set_index(["chrom_norm", "pos"], drop=True)
+    logger.info(
+        "FvLMM effective-LD clumping used the already-built matrix: rows=%d retained=%d.",
+        input_rows,
+        len(kept_rows),
+    )
+    return _postgwas_finalize_finemap_ldclump(
+        prepared_rows,
+        clump_df,
+        clump_dict,
+    )
+
+
+def _postgwas_finemap_ldclump(
+    prepared: pd.DataFrame,
+    *,
+    genofile: str,
+    locus: tuple[str, int, int],
+    logger: logging.Logger,
+    preload_max_rows: Optional[int] = None,
+    sample_ids: Optional[Sequence[str]] = None,
+    ld_matrix: object = None,
+) -> tuple[
+    pd.DataFrame,
+    dict[str, int],
+    dict[tuple[str, int], tuple[int, ...]],
+]:
+    """Clump fine-mapping rows using the route-selected LD source."""
+    if ld_matrix is not None:
+        return _postgwas_finemap_ldclump_from_matrix(
+            prepared,
+            ld_matrix=ld_matrix,
+            locus=locus,
+            logger=logger,
+        )
+    if sample_ids is None or len(list(sample_ids)) == 0:
+        raise FineMapSkip(
+            "ordinary LD clumping requires verified GWAS sample metadata"
+        )
+    prepared_rows = prepared.reset_index(drop=True)
+    input_rows = int(len(prepared_rows))
+    if input_rows <= 1:
+        if input_rows == 0:
+            clump_df = prepared_rows.iloc[0:0].set_index(["chrom_norm", "pos"])
+            return _postgwas_finalize_finemap_ldclump(prepared_rows, clump_df, {})
+        key = (
+            _postgwas_finemap_normalize_chr(prepared_rows.iloc[0]["chrom_norm"]),
+            int(prepared_rows.iloc[0]["pos"]),
+        )
+        clump_df = pd.DataFrame(
+            {"_finemap_priority": [float(-abs(float(prepared_rows.iloc[0]["z"])))]},
+            index=pd.MultiIndex.from_tuples([key], names=["chrom_norm", "pos"]),
+        )
+        return _postgwas_finalize_finemap_ldclump(
+            prepared_rows,
+            clump_df,
+            {key: [key]},
+        )
+
+    priority = -np.abs(
+        pd.to_numeric(prepared_rows["z"], errors="coerce").to_numpy(dtype=float)
+    )
+    prepared_chroms = [
+        _postgwas_finemap_normalize_chr(value)
+        for value in prepared_rows["chrom_norm"].tolist()
+    ]
+    prepared_positions = (
+        pd.to_numeric(prepared_rows["pos"], errors="coerce")
+        .astype(np.int64)
+        .tolist()
+    )
+    work = pd.DataFrame(
+        {
+            "chrom_norm": prepared_chroms,
+            "pos": prepared_positions,
+            "_finemap_priority": priority,
+        }
+    )
+    window_bp = max(1, abs(int(locus[2]) - int(locus[1])))
+    clump_df, clump_dict = _ldclump_significant_snps(
+        work,
+        chr_col="chrom_norm",
+        pos_col="pos",
+        p_col="_finemap_priority",
+        genofile=str(genofile),
+        window_bp=window_bp,
+        r2_thr=float(_POSTGWAS_FINEMAP_LDCLUMP_R2),
+        logger=logger,
+        show_progress=False,
+        preload_max_rows=preload_max_rows,
+        sample_ids=sample_ids,
+    )
+    return _postgwas_finalize_finemap_ldclump(
+        prepared_rows,
+        clump_df,
+        clump_dict,
+    )
 
 
 def _draw_empty_ldblock(
