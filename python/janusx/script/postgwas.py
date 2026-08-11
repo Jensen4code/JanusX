@@ -1914,6 +1914,14 @@ _POSTGWAS_FINEMAP_INDEX_CHROM_COLUMN = "_janusx_finemap_chrom_norm"
 _POSTGWAS_FINEMAP_INDEX_POS_COLUMN = "_janusx_finemap_pos_num"
 
 
+def _postgwas_format_finemap_float(value: float) -> str:
+    """Format fine-mapping values without rounding tiny nonzero values to zero."""
+    numeric = float(value)
+    if numeric != 0.0 and abs(numeric) < 1e-4:
+        return f"{numeric:.4e}"
+    return f"{numeric:.4f}"
+
+
 def _postgwas_load_finemap_gwas(
     path: str,
     chr_col: str,
@@ -2335,7 +2343,7 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
             sep="\t",
             index=False,
             columns=_POSTGWAS_FINEMAP_OUTPUT_COLUMNS,
-            float_format="%.4f",
+            float_format=_postgwas_format_finemap_float,
             lineterminator="\n",
         )
         os.replace(temporary_path, output_path)
