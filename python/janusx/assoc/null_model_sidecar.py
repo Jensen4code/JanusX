@@ -159,26 +159,32 @@ def parse_sidecar_blocks(text: str) -> list[GwasNullModelSidecarV1]:
         raise SidecarFormatError("sidecar log must be text")
 
     records: list[GwasNullModelSidecarV1] = []
-    cursor = 0
-    while True:
-        begin = text.find(SIDECAR_BEGIN_V1, cursor)
-        end_before_begin = text.find(SIDECAR_END_V1, cursor)
-        if begin < 0:
-            if end_before_begin >= 0:
+    payload_lines: list[str] = []
+    in_block = False
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if not in_block:
+            if content == SIDECAR_BEGIN_V1:
+                in_block = True
+                payload_lines = []
+            elif content == SIDECAR_END_V1:
                 raise SidecarFormatError("sidecar end sentinel has no begin sentinel")
-            break
-        if end_before_begin >= 0 and end_before_begin < begin:
-            raise SidecarFormatError("sidecar sentinels are out of order")
+            continue
 
-        content_start = begin + len(SIDECAR_BEGIN_V1)
-        end = text.find(SIDECAR_END_V1, content_start)
-        if end < 0:
-            raise SidecarFormatError("sidecar begin sentinel has no end sentinel")
-        raw_payload = text[content_start:end].strip()
-        if not raw_payload:
-            raise SidecarFormatError("sidecar block is empty")
-        records.append(_parse_record(raw_payload))
-        cursor = end + len(SIDECAR_END_V1)
+        if content == SIDECAR_BEGIN_V1:
+            raise SidecarFormatError("sidecar begin sentinel appears before its end")
+        if content == SIDECAR_END_V1:
+            raw_payload = "".join(payload_lines).strip()
+            if not raw_payload:
+                raise SidecarFormatError("sidecar block is empty")
+            records.append(_parse_record(raw_payload))
+            payload_lines = []
+            in_block = False
+            continue
+        payload_lines.append(line)
+
+    if in_block:
+        raise SidecarFormatError("sidecar begin sentinel has no end sentinel")
     return records
 
 
@@ -200,7 +206,12 @@ def find_matching_sidecar(
     exact = [
         record
         for record in records
-        if record.result.canonical_path == result_fingerprint.canonical_path
+        if (
+            record.result.canonical_path == result_fingerprint.canonical_path
+            and record.result.basename == result_fingerprint.basename
+            and record.result.size_bytes == result_fingerprint.size_bytes
+            and record.result.sha256.lower() == result_fingerprint.sha256.lower()
+        )
     ]
     if exact:
         return _one_match(exact, "canonical result path")
