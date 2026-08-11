@@ -1586,7 +1586,7 @@ def _postgwas_finemap_locus_label(item: tuple[str, int, int]) -> str:
 _POSTGWAS_FINEMAP_DEFAULT_MEMORY_GB = 8.0
 _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES = int(_POSTGWAS_FINEMAP_DEFAULT_MEMORY_GB * 1024**3)
 _POSTGWAS_FINEMAP_MEMORY_RESERVE_BYTES = 512 * 1024**2
-_POSTGWAS_FINEMAP_LDCLUMP_R2 = 0.999999
+_POSTGWAS_FINEMAP_LDCLUMP_R2 = 0.99
 
 
 def _postgwas_estimate_finemap_memory_bytes(
@@ -2087,7 +2087,7 @@ def _run_postgwas_susie_finemap(args: argparse.Namespace, logger: logging.Logger
             )
             continue
 
-        prepared, clump_counts = _postgwas_finemap_ldclump(
+        prepared, clump_counts, _clump_groups = _postgwas_finemap_ldclump(
             prepared,
             genofile=str(args.bfile),
             locus=locus_tuple,
@@ -5787,7 +5787,11 @@ def _postgwas_finemap_ldclump(
     locus: tuple[str, int, int],
     logger: logging.Logger,
     preload_max_rows: Optional[int] = None,
-) -> tuple[pd.DataFrame, dict[str, int]]:
+) -> tuple[
+    pd.DataFrame,
+    dict[str, int],
+    dict[tuple[str, int], tuple[int, ...]],
+]:
     """Keep |z|-priority lead SNPs before constructing dense SuSiE LD.
 
     This deliberately reuses the postgwas LD-clump implementation so the
@@ -5796,19 +5800,38 @@ def _postgwas_finemap_ldclump(
     structure is retained for SuSiE.
     """
     input_rows = int(len(prepared))
+    prepared_rows = prepared.reset_index(drop=True)
     if input_rows <= 1:
+        fold_groups: dict[tuple[str, int], tuple[int, ...]] = {}
+        if input_rows == 1:
+            fold_key = (
+                _postgwas_finemap_normalize_chr(prepared_rows.iloc[0]["chrom_norm"]),
+                int(prepared_rows.iloc[0]["pos"]),
+            )
+            fold_groups[fold_key] = (0,)
         return prepared.copy(), {
             "input_rows": input_rows,
             "retained_rows": input_rows,
             "clumped_rows": 0,
             "groups": input_rows,
-        }
+        }, fold_groups
 
-    priority = -np.abs(pd.to_numeric(prepared["z"], errors="coerce").to_numpy(dtype=float))
+    priority = -np.abs(
+        pd.to_numeric(prepared_rows["z"], errors="coerce").to_numpy(dtype=float)
+    )
+    prepared_chroms = [
+        _postgwas_finemap_normalize_chr(value)
+        for value in prepared_rows["chrom_norm"].tolist()
+    ]
+    prepared_positions = (
+        pd.to_numeric(prepared_rows["pos"], errors="coerce")
+        .astype(np.int64)
+        .tolist()
+    )
     work = pd.DataFrame(
         {
-            "chrom_norm": prepared["chrom_norm"].astype(str).to_numpy(dtype=object),
-            "pos": pd.to_numeric(prepared["pos"], errors="coerce").to_numpy(dtype=float),
+            "chrom_norm": prepared_chroms,
+            "pos": prepared_positions,
             "_finemap_priority": priority,
         }
     )
@@ -5826,7 +5849,7 @@ def _postgwas_finemap_ldclump(
         preload_max_rows=preload_max_rows,
     )
     lead_keys = {
-        (str(chrom), int(pos))
+        (_postgwas_finemap_normalize_chr(chrom), int(pos))
         for chrom, pos in clump_df.index.tolist()
     }
     # A coordinate can occur more than once in a summary table.  LDclump is
@@ -5834,22 +5857,63 @@ def _postgwas_finemap_ldclump(
     # for each retained coordinate; otherwise a duplicate BIM site could
     # re-enter the dense SuSiE matrix after the clump step.
     representative_by_key: dict[tuple[str, int], int] = {}
-    for row_idx, (chrom, pos) in enumerate(
-        zip(
-            prepared["chrom_norm"].astype(str).tolist(),
-            pd.to_numeric(prepared["pos"], errors="coerce").astype(np.int64).tolist(),
-        )
-    ):
-        key = (str(chrom), int(pos))
+    rows_by_key: dict[tuple[str, int], list[int]] = {}
+    for row_idx, (chrom, pos) in enumerate(zip(prepared_chroms, prepared_positions)):
+        key = (chrom, int(pos))
+        rows_by_key.setdefault(key, []).append(int(row_idx))
         old_idx = representative_by_key.get(key)
         if old_idx is None or priority[row_idx] < priority[old_idx]:
             representative_by_key[key] = int(row_idx)
-    # The preparation stage already guarantees integral finite positions; keep
-    # this explicit key construction deterministic for direct unit callers.
-    prepared_chroms = prepared["chrom_norm"].astype(str).tolist()
-    prepared_positions = (
-        pd.to_numeric(prepared["pos"], errors="coerce").astype(np.int64).tolist()
+
+    snp_identifiers = (
+        prepared_rows["snp"].map(lambda value: str(value)).tolist()
+        if "snp" in prepared_rows.columns
+        else [""] * input_rows
     )
+    fold_groups = {}
+    for lead_key_raw, clump_keys in _clump_dict.items():
+        lead_key = (
+            _postgwas_finemap_normalize_chr(lead_key_raw[0]),
+            int(lead_key_raw[1]),
+        )
+        normalized_clump_keys = {
+            (_postgwas_finemap_normalize_chr(chrom), int(pos))
+            for chrom, pos in clump_keys
+        }
+        if lead_key not in normalized_clump_keys:
+            raise ValueError(
+                "Fine-mapping LD-clump group does not contain its representative "
+                f"coordinate {lead_key[0]}:{lead_key[1]}"
+            )
+        representative_idx = representative_by_key.get(lead_key)
+        if representative_idx is None:
+            raise ValueError(
+                "Fine-mapping LD-clump representative coordinate is absent from "
+                f"prepared rows: {lead_key[0]}:{lead_key[1]}"
+            )
+        member_indices = sorted(
+            {
+                row_idx
+                for key in normalized_clump_keys
+                for row_idx in rows_by_key.get(key, [])
+            },
+            key=lambda row_idx: (
+                prepared_chroms[row_idx],
+                int(prepared_positions[row_idx]),
+                snp_identifiers[row_idx],
+                int(row_idx),
+            ),
+        )
+        if representative_idx not in member_indices:
+            raise ValueError(
+                "Fine-mapping LD-clump group does not resolve its representative "
+                f"row for {lead_key[0]}:{lead_key[1]}"
+            )
+        fold_groups[lead_key] = tuple(
+            [representative_idx]
+            + [row_idx for row_idx in member_indices if row_idx != representative_idx]
+        )
+
     keep = np.asarray(
         [
             (str(chrom), int(pos)) in lead_keys
@@ -5866,9 +5930,9 @@ def _postgwas_finemap_ldclump(
         "input_rows": input_rows,
         "retained_rows": retained_rows,
         "clumped_rows": max(0, input_rows - retained_rows),
-        "groups": int(len(clump_df)),
+        "groups": int(len(fold_groups)),
     }
-    return retained, counters
+    return retained, counters, fold_groups
 
 
 def _draw_empty_ldblock(
