@@ -2862,6 +2862,44 @@ def _postgwas_build_fvlmm_effective_ld(
             )
         signature_to_bim[signature] = index
 
+    # The effective-LD kernel consumes genotype rows in selected-BIM order.
+    # Align the summary rows to that same order before filtering projected
+    # diagonals, retaining one explicit map for every later row subset.
+    alignment_input = prepared_source.copy()
+    for column in ("beta", "se", "z"):
+        if column not in alignment_input.columns:
+            alignment_input[column] = 0.0
+    selected_bim_meta = pd.DataFrame(
+        {
+            "chrom": [bim_rows[index][0] for index in selected_bim_indices],
+            "pos": [bim_rows[index][1] for index in selected_bim_indices],
+            "snp": [bim_rows[index][2] for index in selected_bim_indices],
+            "allele0": [bim_rows[index][3] for index in selected_bim_indices],
+            "allele1": [bim_rows[index][4] for index in selected_bim_indices],
+        }
+    )
+    selected_site_counts: dict[tuple[str, int], int] = {}
+    for chrom, pos in zip(selected_bim_meta["chrom"], selected_bim_meta["pos"]):
+        key = (_postgwas_finemap_normalize_chr(chrom), int(pos))
+        selected_site_counts[key] = selected_site_counts.get(key, 0) + 1
+    selected_ambiguous_sites = {
+        key for key, count in selected_site_counts.items() if count > 1
+    }
+    aligned_input, effective_bed_indices, alignment_counts = _postgwas_align_finemap_locus(
+        alignment_input,
+        selected_bim_meta,
+        ambiguous_bim_sites=selected_ambiguous_sites,
+    )
+    if aligned_input.empty:
+        raise FineMapSkip(
+            "FvLMM fine-mapping has no variants after BED identity and allele alignment"
+        )
+    effective_bed_indices = np.asarray(effective_bed_indices, dtype=np.int64)
+    if effective_bed_indices.size != len(aligned_input):
+        raise FineMapSkip(
+            "FvLMM summary/BED alignment map has inconsistent dimensions"
+        )
+
     filters = dict(record.genotype_filters)
     try:
         maf = float(filters.get("maf", 0.0))
@@ -2997,7 +3035,13 @@ def _postgwas_build_fvlmm_effective_ld(
         np.asarray(genotype_all[np.asarray(selected_rows, dtype=np.int64)], dtype=np.float64),
         dtype=np.float64,
     )
-    aligned_input = prepared_source.reset_index(drop=True)
+    if (
+        np.any(effective_bed_indices < 0)
+        or np.any(effective_bed_indices >= genotypes.shape[0])
+        or len(np.unique(effective_bed_indices)) != len(effective_bed_indices)
+    ):
+        raise FineMapSkip("FvLMM summary/BED alignment map contains invalid indices")
+    genotypes = np.ascontiguousarray(genotypes[effective_bed_indices], dtype=np.float64)
 
     from janusx.assoc import workflow as workflow_module
     if not hasattr(workflow_module.jxrs, "rust_eigh_from_array_f64"):
@@ -3135,6 +3179,7 @@ def _postgwas_build_fvlmm_effective_ld(
     ):
         raise FineMapSkip("FvLMM effective-LD kernel returned inconsistent results")
     aligned = aligned_input.iloc[valid_indices].reset_index(drop=True)
+    aligned.attrs["_janusx_finemap_alignment_counts"] = dict(alignment_counts)
     if aligned.shape[0] != locus_r.shape[0]:
         raise FineMapSkip("FvLMM effective-LD and GWAS rows are misaligned")
 
@@ -3245,6 +3290,26 @@ def _postgwas_finemap_result_model(
         if name.endswith(suffix):
             return model
     return None
+
+
+def _postgwas_select_finemap_ld_route(
+    model: Optional[str],
+    record: Optional[GwasNullModelSidecarV1] = None,
+) -> str:
+    """Select the LD implementation before any ordinary dense-LD allocation."""
+    route_model = str(model or "").strip().lower()
+    if record is not None:
+        record_model = str(getattr(record, "model", "")).strip().lower()
+        if record_model != "":
+            route_model = record_model
+    if route_model == "fvlmm":
+        return "fvlmm"
+    if route_model in {"lmm", "lmm2", "splmm", "splmm2"}:
+        raise FineMapSkip(
+            f"{route_model} mixed-model fine-mapping is unsupported: "
+            "common-null score statistics are unavailable"
+        )
+    return "raw"
 
 
 def _postgwas_dev_help_requested(argv: Optional[list[str]] = None) -> bool:
@@ -3877,6 +3942,149 @@ def _postgwas_scan_finemap_bim_rows(
     return selected_chrom, selected_bim_pos, ambiguous_sites
 
 
+def _postgwas_build_sample_matched_raw_ld(
+    *,
+    args: argparse.Namespace,
+    prepared: pd.DataFrame,
+    locus: tuple[str, int, int],
+    bed_indices: Optional[np.ndarray],
+    selected_chrom: list[str],
+    selected_bim_pos: list[int],
+    selected_bim_rows: int,
+    ambiguous_bim_sites: set[tuple[str, int]],
+    existing_bytes: int,
+    logger: logging.Logger,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Build ordinary sample-matched LD and return rows in matrix order.
+
+    This is deliberately a separate route adapter.  The caller must select it
+    only after deciding that the result is not an FvLMM result, so the raw
+    dense-LD allocation cannot occur on the mixed-model route.
+    """
+    locus_label = _postgwas_finemap_locus_label(locus)
+    range_chrom = list(dict.fromkeys(selected_chrom)) or [locus[0]]
+    try:
+        memory_limit_bytes = int(
+            getattr(args, "finemap_memory_bytes", _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES)
+        )
+        estimated_memory = _postgwas_check_finemap_memory(
+            n_variants=selected_bim_rows,
+            n_samples=_postgwas_count_plink_samples(args.bfile),
+            existing_bytes=existing_bytes,
+            max_bytes=memory_limit_bytes,
+        )
+    except MemoryError as exc:
+        raise RuntimeError(f"SuSiE locus {locus_label} exceeds memory limit: {exc}") from exc
+    logger.info(
+        "SuSiE locus %s memory preflight: variants=%d samples=%d estimated_peak=%.2f GiB limit=%.2f GiB.",
+        locus_label,
+        selected_bim_rows,
+        _postgwas_count_plink_samples(args.bfile),
+        estimated_memory / float(1024**3),
+        memory_limit_bytes / float(1024**3),
+    )
+    try:
+        ld_result = jxrs.bed_ld_corr_rust(
+            str(args.bfile),
+            range_chrom,
+            [locus[1]] * len(range_chrom),
+            [locus[2]] * len(range_chrom),
+            selected_chrom=selected_chrom,
+            selected_pos=selected_bim_pos,
+            threads=int(args.thread),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"SuSiE locus {locus_label} signed BED LD failed: {exc}"
+        ) from exc
+
+    if not isinstance(ld_result, tuple) or len(ld_result) != 6:
+        raise RuntimeError(
+            f"SuSiE locus {locus_label} signed BED LD returned an invalid result."
+        )
+    r_raw, bed_chrom, bed_pos, bed_snp, bed_allele0, bed_allele1 = ld_result
+    r = np.asarray(r_raw, dtype=np.float64)
+    metadata_lengths = {
+        len(bed_chrom),
+        len(bed_pos),
+        len(bed_snp),
+        len(bed_allele0),
+        len(bed_allele1),
+    }
+    if r.ndim != 2 or r.shape[0] != r.shape[1]:
+        raise RuntimeError(
+            f"SuSiE locus {locus_label} signed BED LD must be square; got {r.shape}."
+        )
+    if metadata_lengths != {int(r.shape[0])}:
+        raise RuntimeError(
+            f"SuSiE locus {locus_label} signed BED LD metadata is misaligned "
+            f"with matrix shape {r.shape}."
+        )
+    if not bool(np.all(np.isfinite(r))):
+        raise RuntimeError(
+            f"SuSiE locus {locus_label} signed BED LD contains non-finite values."
+        )
+    monomorphic_exclusions = max(0, selected_bim_rows - int(r.shape[0]))
+    if r.shape[0] == 0:
+        empty = prepared.iloc[0:0].copy()
+        empty.attrs["_janusx_finemap_alignment_counts"] = {
+            "bed_matches": 0,
+            "allele_flips": 0,
+            "allele_conflicts": 0,
+            "assumed_direction": 0,
+            "unresolved_identities": 0,
+        }
+        empty.attrs["_janusx_finemap_empty_reason"] = (
+            f"no polymorphic BED variants matched {len(prepared)} prepared "
+            f"GWAS rows (monomorphic={monomorphic_exclusions})"
+        )
+        empty.attrs["_janusx_finemap_bed_rows"] = int(r.shape[0])
+        return np.empty((0, 0), dtype=np.float64), empty
+
+    bed_meta = pd.DataFrame(
+        {
+            "chrom": list(bed_chrom),
+            "pos": list(bed_pos),
+            "snp": list(bed_snp),
+            "allele0": list(bed_allele0),
+            "allele1": list(bed_allele1),
+        }
+    )
+    aligned, bed_indices, alignment_counts = _postgwas_align_finemap_locus(
+        prepared,
+        bed_meta,
+        ambiguous_bim_sites=ambiguous_bim_sites,
+    )
+    if aligned.empty:
+        empty = prepared.iloc[0:0].copy()
+        empty.attrs["_janusx_finemap_alignment_counts"] = dict(alignment_counts)
+        empty.attrs["_janusx_finemap_empty_reason"] = (
+            "no variants remained after BED identity and allele alignment"
+        )
+        empty.attrs["_janusx_finemap_bed_rows"] = int(r.shape[0])
+        return np.empty((0, 0), dtype=np.float64), empty
+    if (
+        np.any(bed_indices < 0)
+        or np.any(bed_indices >= r.shape[0])
+        or len(np.unique(bed_indices)) != len(bed_indices)
+    ):
+        raise RuntimeError(f"SuSiE locus {locus_label} returned invalid BED indices.")
+    if len(aligned) != len(bed_indices):
+        raise RuntimeError(
+            f"SuSiE locus {locus_label} alignment length mismatch: "
+            f"{len(aligned)} rows vs {len(bed_indices)} BED indices."
+        )
+    if len(bed_indices) == r.shape[0] and np.array_equal(
+        bed_indices, np.arange(r.shape[0], dtype=np.int64)
+    ):
+        locus_r = r
+    else:
+        locus_r = np.ascontiguousarray(r[np.ix_(bed_indices, bed_indices)], dtype=np.float64)
+    aligned.attrs["_janusx_finemap_alignment_counts"] = dict(alignment_counts)
+    aligned.attrs["_janusx_finemap_bed_rows"] = int(r.shape[0])
+    return locus_r, aligned
+
+
 def _postgwas_cleanup_finemap_paths(paths: tuple[str, ...]) -> None:
     """Best-effort cleanup without replacing an active generation error."""
     for path in paths:
@@ -3911,6 +4119,7 @@ def _postgwas_run_susie_finemap_body(
     if len(gwas_files) != 1:
         raise ValueError("Fine-mapping requires exactly one GWAS input file.")
     result_model = _postgwas_finemap_result_model(gwas_files[0])
+    sidecar: Optional[GwasNullModelSidecarV1] = None
     if result_model is not None:
         sidecar = discover_matching_sidecar(gwas_files[0])
         validate_sidecar_dependencies(
@@ -4020,94 +4229,54 @@ def _postgwas_run_susie_finemap_body(
             selected_bim_pos,
             ambiguous_bim_sites,
         ) = _postgwas_scan_finemap_bim_rows(args.bfile, locus_tuple, selected_pos)
-        range_chrom = list(dict.fromkeys(selected_chrom)) or [locus_tuple[0]]
         selected_bim_rows = len(selected_bim_pos)
-        try:
-            memory_limit_bytes = int(
-                getattr(args, "finemap_memory_bytes", _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES)
+        bed_indices: Optional[np.ndarray] = None
+        route_model = sidecar.model if sidecar is not None else result_model
+        ld_route = _postgwas_select_finemap_ld_route(route_model, sidecar)
+        if ld_route == "fvlmm":
+            if sidecar is None:
+                raise FineMapSkip("FvLMM fine-mapping requires matched sidecar metadata")
+            # No ordinary BED-LD matrix or raw-LD memory preflight exists on this
+            # branch. The effective-LD adapter owns its complete preflight.
+            locus_r, aligned = _postgwas_build_fvlmm_effective_ld(
+                args=args,
+                record=sidecar,
+                prepared=prepared,
+                bed_indices=bed_indices,
+                logger=logger,
             )
-            estimated_memory = _postgwas_check_finemap_memory(
-                n_variants=selected_bim_rows,
-                n_samples=plink_sample_count,
-                existing_bytes=gwas_memory_bytes,
-                max_bytes=memory_limit_bytes,
-            )
-        except MemoryError as exc:
-            raise RuntimeError(f"SuSiE locus {locus_label} exceeds memory limit: {exc}") from exc
-        logger.info(
-            "SuSiE locus %s memory preflight: variants=%d samples=%d estimated_peak=%.2f GiB limit=%.2f GiB.",
-            locus_label,
-            selected_bim_rows,
-            plink_sample_count,
-            estimated_memory / float(1024**3),
-            memory_limit_bytes / float(1024**3),
-        )
-        try:
-            ld_result = jxrs.bed_ld_corr_rust(
-                str(args.bfile),
-                range_chrom,
-                [locus_tuple[1]] * len(range_chrom),
-                [locus_tuple[2]] * len(range_chrom),
+        else:
+            locus_r, aligned = _postgwas_build_sample_matched_raw_ld(
+                args=args,
+                prepared=prepared,
+                locus=locus_tuple,
+                bed_indices=bed_indices,
                 selected_chrom=selected_chrom,
-                selected_pos=selected_bim_pos,
-                threads=int(args.thread),
+                selected_bim_pos=selected_bim_pos,
+                selected_bim_rows=selected_bim_rows,
+                ambiguous_bim_sites=ambiguous_bim_sites,
+                existing_bytes=gwas_memory_bytes,
+                logger=logger,
             )
-        except Exception as exc:
-            raise RuntimeError(
-                f"SuSiE locus {locus_label} signed BED LD failed: {exc}"
-            ) from exc
 
-        if not isinstance(ld_result, tuple) or len(ld_result) != 6:
-            raise RuntimeError(
-                f"SuSiE locus {locus_label} signed BED LD returned an invalid result."
-            )
-        r_raw, bed_chrom, bed_pos, bed_snp, bed_allele0, bed_allele1 = ld_result
-        del ld_result
-        r = np.asarray(r_raw, dtype=np.float64)
-        metadata_lengths = {
-            len(bed_chrom),
-            len(bed_pos),
-            len(bed_snp),
-            len(bed_allele0),
-            len(bed_allele1),
+        alignment_counts = {
+            "bed_matches": len(aligned),
+            "allele_flips": 0,
+            "allele_conflicts": 0,
+            "assumed_direction": 0,
+            "unresolved_identities": 0,
         }
-        if r.ndim != 2 or r.shape[0] != r.shape[1]:
-            raise RuntimeError(
-                f"SuSiE locus {locus_label} signed BED LD must be square; got {r.shape}."
-            )
-        if metadata_lengths != {int(r.shape[0])}:
-            raise RuntimeError(
-                f"SuSiE locus {locus_label} signed BED LD metadata is misaligned "
-                f"with matrix shape {r.shape}."
-            )
-        if not bool(np.all(np.isfinite(r))):
-            raise RuntimeError(
-                f"SuSiE locus {locus_label} signed BED LD contains non-finite values."
-            )
-        monomorphic_exclusions = max(0, selected_bim_rows - int(r.shape[0]))
-        if r.shape[0] == 0:
-            logger.warning(
-                "SuSiE locus %s skipped: no polymorphic BED variants matched %d prepared "
-                "GWAS rows (monomorphic=%d).",
-                locus_label,
-                len(prepared),
-                monomorphic_exclusions,
-            )
-            del r_raw, r
-            continue
-
-        bed_meta = pd.DataFrame(
-            {
-                "chrom": list(bed_chrom),
-                "pos": list(bed_pos),
-                "snp": list(bed_snp),
-                "allele0": list(bed_allele0),
-                "allele1": list(bed_allele1),
-            }
+        raw_alignment_counts = getattr(aligned, "attrs", {}).get(
+            "_janusx_finemap_alignment_counts", {}
         )
-        aligned, bed_indices, alignment_counts = _postgwas_align_finemap_locus(
-            prepared, bed_meta, ambiguous_bim_sites=ambiguous_bim_sites
-        )
+        if isinstance(raw_alignment_counts, dict):
+            alignment_counts.update(
+                {
+                    key: int(value)
+                    for key, value in raw_alignment_counts.items()
+                    if key in alignment_counts
+                }
+            )
         if alignment_counts["assumed_direction"] > 0 and not warned_assumed_direction:
             if gwas_has_allele_columns:
                 warning_detail = "some GWAS allele values are missing"
@@ -4118,37 +4287,34 @@ def _postgwas_run_susie_finemap_body(
                 warning_detail,
             )
             warned_assumed_direction = True
-        if aligned.empty:
-            logger.warning(
-                "SuSiE locus %s skipped: no variants remained after BED identity and allele alignment.",
-                locus_label,
-            )
-            del r_raw, r, bed_meta, aligned
-            continue
-
-        if len(aligned) != len(bed_indices):
-            raise RuntimeError(
-                f"SuSiE locus {locus_label} alignment length mismatch: "
-                f"{len(aligned)} rows vs {len(bed_indices)} BED indices."
-            )
-        if (
-            np.any(bed_indices < 0)
-            or np.any(bed_indices >= r.shape[0])
-            or len(np.unique(bed_indices)) != len(bed_indices)
-        ):
-            raise RuntimeError(f"SuSiE locus {locus_label} returned invalid BED indices.")
-
-        identity_indices = (
-            len(bed_indices) == r.shape[0]
-            and bool(np.array_equal(bed_indices, np.arange(r.shape[0], dtype=np.int64)))
+        monomorphic_exclusions = max(0, selected_bim_rows - len(aligned))
+        empty_reason = getattr(aligned, "attrs", {}).get(
+            "_janusx_finemap_empty_reason"
         )
-        if identity_indices:
-            locus_r = r
-        else:
-            locus_r = np.ascontiguousarray(
-                r[np.ix_(bed_indices, bed_indices)], dtype=np.float64
+        bed_rows = int(
+            getattr(aligned, "attrs", {}).get(
+                "_janusx_finemap_bed_rows", len(aligned)
             )
-        del r_raw, r
+        )
+        if len(aligned) == 0 or locus_r.shape[0] == 0:
+            logger.warning(
+                "SuSiE locus %s skipped: %s.",
+                locus_label,
+                empty_reason
+                or (
+                    f"no polymorphic BED variants matched {len(prepared)} prepared "
+                    f"GWAS rows (monomorphic={monomorphic_exclusions})"
+                ),
+            )
+            continue
+        if not isinstance(aligned, pd.DataFrame):
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} LD route returned invalid aligned rows."
+            )
+        if locus_r.ndim != 2 or locus_r.shape != (len(aligned), len(aligned)):
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} aligned z/LD dimensions do not agree."
+            )
         z = np.ascontiguousarray(aligned["z"], dtype=np.float64)
         if locus_r.shape != (len(aligned), len(aligned)) or z.shape != (len(aligned),):
             raise RuntimeError(
@@ -4212,7 +4378,19 @@ def _postgwas_run_susie_finemap_body(
                 f"SuSiE locus {locus_label} credible-set construction failed: {exc}"
             ) from exc
 
-        retained_meta = bed_meta.iloc[bed_indices].reset_index(drop=True)
+        metadata_columns = ("chrom", "pos", "snp", "allele0", "allele1")
+        missing_metadata = [
+            column for column in metadata_columns if column not in aligned.columns
+        ]
+        if missing_metadata:
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} LD route omitted metadata: "
+                + ", ".join(missing_metadata)
+            )
+        # Both routes return aligned rows in the exact matrix order.  Keeping
+        # this single table as the metadata source prevents projected-diagonal
+        # filtering from drifting away from Z, PIP, or folded CS members.
+        retained_meta = aligned.loc[:, metadata_columns].reset_index(drop=True)
         try:
             cs_locus_output = _postgwas_expand_finemap_credible_sets(
                 retained_meta,
@@ -4260,7 +4438,7 @@ def _postgwas_run_susie_finemap_body(
             locus_label,
             summary_counts["locus_rows"],
             summary_counts["invalid_summary"],
-            len(bed_meta),
+            bed_rows,
             monomorphic_exclusions,
             alignment_counts["bed_matches"],
             alignment_counts["allele_flips"],
@@ -4280,15 +4458,7 @@ def _postgwas_run_susie_finemap_body(
             selected_chrom,
             selected_bim_pos,
             ambiguous_bim_sites,
-            range_chrom,
-            bed_chrom,
-            bed_pos,
-            bed_snp,
-            bed_allele0,
-            bed_allele1,
-            bed_meta,
             aligned,
-            bed_indices,
             locus_r,
             z,
             fit,
