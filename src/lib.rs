@@ -59,6 +59,8 @@ mod lm_trait;
 mod lmm;
 #[path = "stats/logreg.rs"]
 mod logreg;
+#[path = "stats/mixed_ld.rs"]
+mod mixed_ld;
 #[path = "stats/packed.rs"]
 mod packed;
 #[path = "stats/plot.rs"]
@@ -277,6 +279,7 @@ use lmm::{
     lmm_reml_lmm2_chunk_from_snp_f32,
 };
 use logreg::fit_best_and_not_py;
+use mixed_ld::fvlmm_effective_ld_spectral_f64;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
 use packed::{
     bed_decode_rows_f32_from_meta, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
@@ -922,6 +925,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_reml_lmm2_chunk_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_from_snp_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fvlmm_effective_ld_spectral_f64, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_with_cache_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_from_snp_f32, m)?)?;
