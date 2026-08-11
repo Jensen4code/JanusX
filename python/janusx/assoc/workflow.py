@@ -445,14 +445,6 @@ def _build_gwas_sidecar_context(
         ]
     kinship_path = Path(kinship_text).expanduser()
     direct_kinship_id_path = Path(f"{kinship_path}.id")
-    stem_kinship_id_path = kinship_path.with_suffix(".id")
-    kinship_id_path = (
-        direct_kinship_id_path
-        if direct_kinship_id_path.is_file()
-        else stem_kinship_id_path
-        if kinship_path.suffix.lower() in {".txt", ".tsv", ".csv", ".npy"}
-        else direct_kinship_id_path
-    )
 
     phenotype_columns = _sidecar_table_columns(phenotype_file)
     phenotype_id_column = phenotype_columns[0] if phenotype_columns else "sample"
@@ -463,7 +455,7 @@ def _build_gwas_sidecar_context(
         covariate_file=cov_file,
         covariate_columns=tuple(covariate_columns),
         kinship_file=kinship_path,
-        kinship_id_file=kinship_id_path,
+        kinship_id_file=direct_kinship_id_path,
         genotype_filters={
             "maf": float(maf_threshold),
             "max_missing_rate": float(max_missing_rate),

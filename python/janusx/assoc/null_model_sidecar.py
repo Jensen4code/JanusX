@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -180,10 +181,11 @@ def build_fvlmm_sidecar(
         raise ValueError("FvLMM sidecar sample IDs must not be empty")
 
     genotype_prefix = Path(context.genotype_prefix).expanduser()
-    if genotype_prefix.suffix.lower() == ".bed":
-        genotype_prefix = genotype_prefix.with_suffix("")
+    genotype_prefix_text = str(genotype_prefix)
+    if genotype_prefix_text.lower().endswith(".bed"):
+        genotype_prefix = Path(genotype_prefix_text[:-4])
     genotype_paths = tuple(
-        genotype_prefix.with_suffix(suffix) for suffix in (".bed", ".bim", ".fam")
+        Path(f"{genotype_prefix}{suffix}") for suffix in (".bed", ".bim", ".fam")
     )
 
     kinship_id_path = Path(context.kinship_id_file).expanduser()
@@ -239,10 +241,45 @@ def build_fvlmm_sidecar(
 def emit_sidecar_to_file_log(
     logger: Any, record: GwasNullModelSidecarV1
 ) -> None:
-    """Write one serialized sidecar block through the supplied report logger."""
+    """Write one serialized sidecar block through file handlers only."""
 
     block = serialize_sidecar_block(record)
-    logger.info(block.rstrip("\n"))
+    if not isinstance(logger, logging.Logger):
+        raise TypeError("logger must be a logging.Logger")
+    if not logger.isEnabledFor(logging.INFO):
+        return
+
+    handlers: list[logging.FileHandler] = []
+    seen_handlers: set[int] = set()
+    current: logging.Logger | None = logger
+    while current is not None:
+        for handler in current.handlers:
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            handler_id = id(handler)
+            if handler_id in seen_handlers:
+                continue
+            seen_handlers.add(handler_id)
+            if handler.level <= logging.INFO:
+                handlers.append(handler)
+        if not current.propagate:
+            break
+        current = current.parent
+
+    if not handlers:
+        raise RuntimeError("no INFO-level file handler available for sidecar log")
+
+    log_record = logger.makeRecord(
+        logger.name,
+        logging.INFO,
+        __file__,
+        0,
+        block.rstrip("\n"),
+        (),
+        None,
+    )
+    for handler in handlers:
+        handler.handle(log_record)
 
 
 def _cached_fingerprint(
