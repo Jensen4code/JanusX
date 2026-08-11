@@ -44,6 +44,7 @@ from .workflow import (
     _gwas_evd_stage_ctx,
     _gwas_fvlmm_scan_stage_ctx,
     _gwas_scan_stage_ctx,
+    _gwas_report_logger,
     _log_file_only,
     _log_model_line,
     _resolve_stream_scan_chunk_size,
@@ -59,6 +60,11 @@ from .workflow import (
     rich_progress_available,
     run_lm_stream_bed_single_entry,
     should_animate_status,
+)
+from .null_model_sidecar import (
+    GwasSidecarRunContext,
+    build_fvlmm_sidecar,
+    emit_sidecar_to_file_log,
 )
 
 _WARNED_BED_MMAP_LIMIT_LEGACY = False
@@ -79,6 +85,48 @@ def _finite_optional_float(value: object) -> Optional[float]:
     except Exception:
         return None
     return out if np.isfinite(out) else None
+
+
+def _emit_fvlmm_sidecar_after_publication(
+    *,
+    context: Optional[GwasSidecarRunContext],
+    result_file: str,
+    trait: str,
+    sample_ids: object,
+    mod: object,
+    effective_snp_count: int,
+    logger: logging.Logger,
+) -> None:
+    if context is None:
+        return
+    try:
+        record = build_fvlmm_sidecar(
+            context=context,
+            result_file=result_file,
+            trait=trait,
+            sample_ids=sample_ids,
+            lambda_null=float(getattr(mod, "lbd_null")),
+            sigma_g2=(
+                None
+                if getattr(mod, "sigma_g2_null", None) is None
+                else float(getattr(mod, "sigma_g2_null"))
+            ),
+            sigma_e2=(
+                None
+                if getattr(mod, "sigma_e2_null", None) is None
+                else float(getattr(mod, "sigma_e2_null"))
+            ),
+            pve=float(getattr(mod, "pve")),
+            grm_trace_mean=float(getattr(mod, "trace_mean")),
+            effective_snp_count=int(effective_snp_count),
+        )
+        emit_sidecar_to_file_log(_gwas_report_logger(logger), record)
+    except Exception as exc:
+        _log_file_only(
+            logger,
+            logging.WARNING,
+            f"FvLMM null-model sidecar unavailable for trait {trait}: {exc}",
+        )
 
 
 def _resolve_trait_prepared_meta_for_current_filters(
@@ -494,6 +542,7 @@ def run_chunked_gwas_lmm_lm(
     force_model: bool = False,
     lm2_covariate_indices: Union[np.ndarray, None] = None,
     trait_prepared_meta: Optional[dict[str, object]] = None,
+    null_sidecar_context: Optional[GwasSidecarRunContext] = None,
 ) -> None:
     """
     Run LM/LMM/LMM2/FvLMM GWAS through the maintained windowed BED path.
@@ -781,6 +830,7 @@ def run_chunked_gwas_lmm_lm(
                 force_model=bool(force_model),
                 emit_trait_header=bool(emit_trait_header),
                 trait_prepared_meta=trait_prepared_meta,
+                null_sidecar_context=null_sidecar_context,
             )
             if multi_trait_mode and trait_idx < len(trait_iter) - 1:
                 logger.info("")
@@ -1814,6 +1864,16 @@ def run_chunked_gwas_lmm_lm(
             use_spinner=False,
             emit_done_line=False,
         )
+        if str(effective_model_key).lower() == "fvlmm":
+            _emit_fvlmm_sidecar_after_publication(
+                context=null_sidecar_context,
+                result_file=out_tsv,
+                trait=str(pname),
+                sample_ids=trait_ids,
+                mod=mod,
+                effective_snp_count=int(done_snps),
+                logger=logger,
+            )
         saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
@@ -1895,6 +1955,7 @@ def run_chunked_gwas_streaming_shared(
     force_model: bool = False,
     emit_trait_header: bool = True,
     trait_prepared_meta: Optional[dict[str, object]] = None,
+    null_sidecar_context: Optional[GwasSidecarRunContext] = None,
 ) -> None:
     """
     Shared-chunk streaming GWAS for multiple models on one trait.
@@ -2788,6 +2849,16 @@ def run_chunked_gwas_streaming_shared(
                 use_spinner=False,
                 emit_done_line=False,
             )
+            if str(ctx.get("model_key", "")).lower() == "fvlmm":
+                _emit_fvlmm_sidecar_after_publication(
+                    context=null_sidecar_context,
+                    result_file=out_tsv,
+                    trait=str(pname),
+                    sample_ids=trait_ids,
+                    mod=ctx.get("mod"),
+                    effective_snp_count=int(done_snps),
+                    logger=logger,
+                )
             saved_paths.append(str(out_tsv))
             _log_model_line(
                 logger,

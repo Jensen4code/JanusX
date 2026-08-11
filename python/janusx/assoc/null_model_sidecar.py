@@ -7,13 +7,15 @@ future readers can ignore ordinary log text and older logs can remain valid.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
+from importlib import metadata as importlib_metadata
 import json
 import math
 from pathlib import Path
 import re
 import struct
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 
@@ -48,6 +50,19 @@ class FileFingerprintV1:
     basename: str
     size_bytes: int
     sha256: str
+
+
+@dataclass
+class GwasSidecarRunContext:
+    genotype_prefix: Path
+    phenotype_file: Path
+    phenotype_id_column: str
+    covariate_file: Path | None
+    covariate_columns: tuple[str, ...]
+    kinship_file: Path
+    kinship_id_file: Path
+    genotype_filters: dict[str, object]
+    fingerprint_cache: dict[Path, FileFingerprintV1] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -85,6 +100,7 @@ class GwasNullModelSidecarV1:
 
 __all__ = [
     "FileFingerprintV1",
+    "GwasSidecarRunContext",
     "GwasNullModelSidecarV1",
     "SIDECAR_BEGIN_V1",
     "SIDECAR_END_V1",
@@ -93,6 +109,8 @@ __all__ = [
     "SidecarError",
     "SidecarFormatError",
     "SidecarNotFound",
+    "build_fvlmm_sidecar",
+    "emit_sidecar_to_file_log",
     "find_matching_sidecar",
     "fingerprint_file",
     "hash_ordered_sample_ids",
@@ -132,6 +150,132 @@ def hash_ordered_sample_ids(sample_ids: Iterable[str]) -> str:
         digest.update(_HASH_LENGTH.pack(len(encoded)))
         digest.update(encoded)
     return digest.hexdigest()
+
+
+def build_fvlmm_sidecar(
+    context: GwasSidecarRunContext,
+    result_file: str | Path,
+    trait: str,
+    sample_ids: Iterable[str],
+    lambda_null: float,
+    sigma_g2: float | None,
+    sigma_e2: float | None,
+    pve: float,
+    grm_trace_mean: float,
+    effective_snp_count: int,
+) -> GwasNullModelSidecarV1:
+    """Build one FvLMM sidecar from the finalized result and fitted null."""
+
+    if not isinstance(context, GwasSidecarRunContext):
+        raise TypeError("context must be GwasSidecarRunContext")
+
+    result_path = Path(result_file).expanduser()
+    if not result_path.is_file():
+        raise FileNotFoundError(f"FvLMM result file not found: {result_path}")
+    if result_path.stat().st_size <= 0:
+        raise ValueError(f"FvLMM result file is empty: {result_path}")
+
+    ordered_sample_ids = list(sample_ids)
+    if len(ordered_sample_ids) == 0:
+        raise ValueError("FvLMM sidecar sample IDs must not be empty")
+
+    genotype_prefix = Path(context.genotype_prefix).expanduser()
+    if genotype_prefix.suffix.lower() == ".bed":
+        genotype_prefix = genotype_prefix.with_suffix("")
+    genotype_paths = tuple(
+        genotype_prefix.with_suffix(suffix) for suffix in (".bed", ".bim", ".fam")
+    )
+
+    kinship_id_path = Path(context.kinship_id_file).expanduser()
+    kinship_shape_n = _count_nonempty_lines(kinship_id_path)
+    if kinship_shape_n <= 0:
+        raise ValueError(f"kinship ID file is empty: {kinship_id_path}")
+
+    covariate_columns = tuple(str(column) for column in context.covariate_columns)
+    fixed_effect_columns = ("Intercept",) + covariate_columns
+    result_fingerprint = fingerprint_file(result_path)
+
+    record = GwasNullModelSidecarV1(
+        schema=SIDECAR_SCHEMA_V1,
+        created_at=_sidecar_created_at(),
+        janusx_version=_janusx_version(),
+        result=result_fingerprint,
+        model="fvlmm",
+        trait=str(trait),
+        z_columns=("beta", "se"),
+        effective_snp_count=int(effective_snp_count),
+        genotype_prefix=str(genotype_prefix.resolve()),
+        genotype_files=tuple(
+            _cached_fingerprint(context, path) for path in genotype_paths
+        ),
+        phenotype_file=_cached_fingerprint(context, context.phenotype_file),
+        phenotype_id_column=str(context.phenotype_id_column),
+        phenotype_trait_column=str(trait),
+        covariate_file=(
+            None
+            if context.covariate_file is None
+            else _cached_fingerprint(context, context.covariate_file)
+        ),
+        covariate_columns=covariate_columns,
+        kinship_file=_cached_fingerprint(context, context.kinship_file),
+        kinship_id_file=_cached_fingerprint(context, kinship_id_path),
+        kinship_format="dense",
+        kinship_shape=(kinship_shape_n, kinship_shape_n),
+        sample_count=len(ordered_sample_ids),
+        sample_order_sha256=hash_ordered_sample_ids(ordered_sample_ids),
+        lambda_null=float(lambda_null),
+        sigma_g2=(None if sigma_g2 is None else float(sigma_g2)),
+        sigma_e2=(None if sigma_e2 is None else float(sigma_e2)),
+        pve=float(pve),
+        grm_trace_mean=float(grm_trace_mean),
+        fixed_effect_columns=fixed_effect_columns,
+        genotype_filters=dict(context.genotype_filters),
+        allele_coding="A1_effect",
+    )
+    _validate_record(record)
+    return record
+
+
+def emit_sidecar_to_file_log(
+    logger: Any, record: GwasNullModelSidecarV1
+) -> None:
+    """Write one serialized sidecar block through the supplied report logger."""
+
+    block = serialize_sidecar_block(record)
+    logger.info(block.rstrip("\n"))
+
+
+def _cached_fingerprint(
+    context: GwasSidecarRunContext, path: str | Path
+) -> FileFingerprintV1:
+    canonical = Path(path).expanduser().resolve()
+    cached = context.fingerprint_cache.get(canonical)
+    if cached is None:
+        cached = fingerprint_file(canonical)
+        context.fingerprint_cache[canonical] = cached
+    return cached
+
+
+def _count_nonempty_lines(path: str | Path) -> int:
+    count = 0
+    with Path(path).expanduser().open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.strip() != "":
+                count += 1
+    return count
+
+
+def _sidecar_created_at() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _janusx_version() -> str:
+    for distribution_name in ("janusx", "JanusX"):
+        try:
+            return str(importlib_metadata.version(distribution_name))
+        except importlib_metadata.PackageNotFoundError:
+            continue
+    return "unknown"
 
 
 def serialize_sidecar_block(record: GwasNullModelSidecarV1) -> str:

@@ -58,6 +58,7 @@ import textwrap
 from dataclasses import dataclass
 from shutil import get_terminal_size
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterator, Union, Optional, Callable
 import uuid
 from contextlib import contextmanager
@@ -179,6 +180,7 @@ from janusx.script._common.grmio import (
     grm_text_materialized_message,
     load_or_materialize_square_grm_cache,
 )
+from janusx.assoc.null_model_sidecar import GwasSidecarRunContext
 
 
 def _resolve_pyblup_assoc_symbol(name: str):
@@ -360,6 +362,116 @@ def _gwas_report_logger(logger: logging.Logger) -> logging.Logger:
     except Exception:
         pass
     return logger
+
+
+def _sidecar_table_columns(path: str | Path) -> tuple[str, ...]:
+    try:
+        with Path(path).expanduser().open(
+            "r", encoding="utf-8", errors="replace"
+        ) as handle:
+            first_line = next(
+                (line.strip() for line in handle if line.strip() != ""), ""
+            )
+    except Exception:
+        return ()
+    if first_line == "":
+        return ()
+    if "\t" in first_line:
+        columns = first_line.split("\t")
+    elif "," in first_line:
+        columns = first_line.split(",")
+    else:
+        columns = first_line.split()
+    columns = tuple(str(column).strip() for column in columns)
+    if len(columns) < 2:
+        return ()
+    try:
+        float(columns[1])
+    except (TypeError, ValueError):
+        return columns
+    return ()
+
+
+def _build_gwas_sidecar_context(
+    *,
+    genotype_prefix: str,
+    phenotype_file: str,
+    cov_inputs: object,
+    qmatrix: np.ndarray | None,
+    cov_all: np.ndarray | None,
+    kinship_file: str | None,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    genetic_model: str,
+) -> GwasSidecarRunContext | None:
+    prefix = _as_plink_prefix(str(genotype_prefix))
+    kinship_text = str(kinship_file or "").strip()
+    if prefix is None or kinship_text == "":
+        return None
+
+    cov_files, cov_sites = _split_cov_sources(_normalize_cov_inputs(cov_inputs))
+    cov_file: Path | None = None
+    for candidate in cov_files:
+        candidate_path = Path(candidate).expanduser()
+        if candidate_path.is_file():
+            cov_file = candidate_path
+            break
+
+    q_count = 0
+    try:
+        q_count = int(np.asarray(qmatrix).shape[1])
+    except Exception:
+        q_count = 0
+    cov_count = 0
+    if cov_all is not None:
+        try:
+            cov_count = int(np.asarray(cov_all).shape[1])
+        except Exception:
+            cov_count = 0
+    covariate_columns = [f"PC{index}" for index in range(1, q_count + 1)]
+    if cov_file is not None:
+        file_columns = _sidecar_table_columns(cov_file)
+        if len(file_columns) > 1:
+            covariate_columns.extend(file_columns[1:])
+    while len(covariate_columns) < q_count + cov_count:
+        index = len(covariate_columns) - q_count + 1
+        covariate_columns.append(f"Covariate{index}")
+    if len(cov_sites) > 0 and cov_count > 0 and cov_file is None:
+        covariate_columns = [
+            *covariate_columns[:q_count],
+            *[f"Covariate{index}" for index in range(1, cov_count + 1)],
+        ]
+    kinship_path = Path(kinship_text).expanduser()
+    direct_kinship_id_path = Path(f"{kinship_path}.id")
+    stem_kinship_id_path = kinship_path.with_suffix(".id")
+    kinship_id_path = (
+        direct_kinship_id_path
+        if direct_kinship_id_path.is_file()
+        else stem_kinship_id_path
+        if kinship_path.suffix.lower() in {".txt", ".tsv", ".csv", ".npy"}
+        else direct_kinship_id_path
+    )
+
+    phenotype_columns = _sidecar_table_columns(phenotype_file)
+    phenotype_id_column = phenotype_columns[0] if phenotype_columns else "sample"
+    return GwasSidecarRunContext(
+        genotype_prefix=Path(prefix),
+        phenotype_file=Path(phenotype_file).expanduser(),
+        phenotype_id_column=phenotype_id_column,
+        covariate_file=cov_file,
+        covariate_columns=tuple(covariate_columns),
+        kinship_file=kinship_path,
+        kinship_id_file=kinship_id_path,
+        genotype_filters={
+            "maf": float(maf_threshold),
+            "max_missing_rate": float(max_missing_rate),
+            "het_threshold": float(het_threshold),
+            "snps_only": bool(snps_only),
+            "genetic_model": str(genetic_model),
+        },
+    )
 
 
 def _gwas_stream_logger(logger: logging.Logger) -> Optional[logging.Logger]:
@@ -7882,6 +7994,8 @@ def _run_gwas_pipeline(
 
                     splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
             post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = splmm_post_grm_hook
+            null_sidecar_context: Optional[GwasSidecarRunContext] = None
+            sidecar_grm_path: list[Optional[str]] = [None]
             qtn_post_grm_requested = bool(qtn_input_requested and (args.farmcpu or args.algwas))
             if qtn_post_grm_requested:
                 base_post_grm_hook = post_grm_hook
@@ -7909,6 +8023,26 @@ def _run_gwas_pipeline(
                         _prepare_qtn_after_grm(stream_genofile_ready, loaded_dense_grm_path)
 
                     post_grm_hook = _prepare_splmm_then_qtn_after_grm
+            if bool(args.fvlmm):
+                sidecar_post_grm_hook = post_grm_hook
+
+                def _capture_sidecar_grm_path(
+                    stream_genofile_ready: str,
+                    loaded_dense_grm_path: Optional[str],
+                ) -> None:
+                    loaded_text = str(loaded_dense_grm_path or "").strip()
+                    if loaded_text != "":
+                        sidecar_grm_path[0] = loaded_text
+                    else:
+                        requested_grm = str(getattr(args, "grm", "")).strip()
+                        if requested_grm not in {"", "1", "2"}:
+                            sidecar_grm_path[0] = requested_grm
+                    if sidecar_post_grm_hook is not None:
+                        sidecar_post_grm_hook(
+                            stream_genofile_ready, loaded_dense_grm_path
+                        )
+
+                post_grm_hook = _capture_sidecar_grm_path
             if shared_context_needed:
                 if terminal_rich:
                     _section(terminal_logger, "GWAS task")
@@ -7954,6 +8088,20 @@ def _run_gwas_pipeline(
                     ),
                     scanmeta_outprefix=str(outprefix),
                 )
+                if bool(args.fvlmm):
+                    null_sidecar_context = _build_gwas_sidecar_context(
+                        genotype_prefix=str(genofile_stream),
+                        phenotype_file=str(args.pheno),
+                        cov_inputs=args.cov,
+                        qmatrix=qmatrix,
+                        cov_all=cov_all,
+                        kinship_file=sidecar_grm_path[0],
+                        maf_threshold=float(maf_threshold_scan),
+                        max_missing_rate=float(max_missing_rate_scan),
+                        het_threshold=float(het_threshold_scan),
+                        snps_only=bool(args.snps_only),
+                        genetic_model=str(args.model),
+                    )
                 packed_route_status_resolved = _format_gwas_packed_route_resolution(
                     original_genofile=str(gfile),
                     stream_genofile=str(genofile_stream),
@@ -8399,6 +8547,7 @@ def _run_gwas_pipeline(
                             ),
                             force_model=bool(args.force_model),
                             trait_prepared_meta=trait_prepared_meta,
+                            null_sidecar_context=null_sidecar_context,
                         )
 
                     def _run_route_lm_stream(
@@ -9487,6 +9636,7 @@ def _run_gwas_pipeline(
                                     force_model=bool(args.force_model),
                                     emit_trait_header=bool(emit_trait_header_model),
                                     trait_prepared_meta=trait_meta_shared,
+                                    null_sidecar_context=null_sidecar_context,
                                 )
                                 next_idx = group_end
                                 trait_done = (
