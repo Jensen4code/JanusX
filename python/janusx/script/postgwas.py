@@ -26,6 +26,8 @@ import logging
 import os
 import gzip
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from ._common.cli_args import (
     add_common_memory_arg,
     add_common_out_arg,
@@ -110,7 +112,12 @@ from urllib.parse import unquote
 from janusx import janusx as jxrs
 from janusx.assoc.null_model_sidecar import (
     FineMapSkip,
+    GwasNullModelSidecarV1,
+    _dependency_search_roots,
+    _resolve_dependency_path,
     discover_matching_sidecar,
+    hash_ordered_sample_ids,
+    serialize_sidecar_block,
     validate_sidecar_dependencies,
 )
 from janusx.gtools.reader import GFFQuery, bedreader, readanno, _gff_prefetched_attr_colname
@@ -1592,6 +1599,7 @@ def _postgwas_finemap_locus_label(item: tuple[str, int, int]) -> str:
 _POSTGWAS_FINEMAP_DEFAULT_MEMORY_GB = 8.0
 _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES = int(_POSTGWAS_FINEMAP_DEFAULT_MEMORY_GB * 1024**3)
 _POSTGWAS_FINEMAP_MEMORY_RESERVE_BYTES = 512 * 1024**2
+_POSTGWAS_FVLMM_DIAG_RIDGE = 1e-6
 _POSTGWAS_FINEMAP_LDCLUMP_R2 = 0.99
 _POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES = (
     (".fvlmm.tsv", "fvlmm"),
@@ -1600,6 +1608,708 @@ _POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES = (
     (".splmm.tsv", "splmm"),
     (".splmm2.tsv", "splmm2"),
 )
+
+
+@dataclass
+class FvLMMFineMapContext:
+    """Verified sample, fixed-effect, and null-model state for FvLMM LD."""
+
+    sample_ids: np.ndarray
+    sample_indices_in_bfile: np.ndarray
+    fixed_effects: np.ndarray
+    kinship: np.ndarray
+    lambda_null: float
+    sidecar: GwasNullModelSidecarV1
+
+
+def _postgwas_validate_fvlmm_sidecar(
+    record: GwasNullModelSidecarV1,
+) -> None:
+    """Validate metadata needed by the Task 5 reconstruction before I/O."""
+    if not isinstance(record, GwasNullModelSidecarV1):
+        raise FineMapSkip("FvLMM sidecar metadata has an invalid record type")
+    try:
+        # Reuse the schema's complete semantic validation, including the
+        # fixed-effect/covariate relationship established by Task 3.
+        serialize_sidecar_block(record)
+    except Exception as exc:
+        raise FineMapSkip(f"sidecar metadata is incompatible: {exc}") from exc
+
+    if record.model != "fvlmm":
+        raise FineMapSkip(
+            f"sidecar model {record.model!r} is not compatible with FvLMM reconstruction"
+        )
+    fixed_columns = tuple(str(column) for column in record.fixed_effect_columns)
+    covariate_columns = tuple(str(column) for column in record.covariate_columns)
+    if fixed_columns != ("Intercept",) + covariate_columns:
+        raise FineMapSkip(
+            "sidecar fixed-effect metadata disagrees with its covariate columns"
+        )
+    try:
+        lambda_null = float(record.lambda_null)
+    except (TypeError, ValueError) as exc:
+        raise FineMapSkip("FvLMM sidecar lambda is invalid") from exc
+    if not np.isfinite(lambda_null) or lambda_null <= 0.0:
+        raise FineMapSkip("FvLMM sidecar lambda must be finite and positive")
+    if str(record.kinship_format).strip().lower() != "dense":
+        raise FineMapSkip(
+            f"FvLMM sidecar GRM format {record.kinship_format!r} is unsupported"
+        )
+    try:
+        kinship_shape = tuple(int(value) for value in record.kinship_shape)
+    except (TypeError, ValueError) as exc:
+        raise FineMapSkip("FvLMM sidecar GRM shape is invalid") from exc
+    if (
+        len(kinship_shape) != 2
+        or kinship_shape[0] <= 0
+        or kinship_shape[1] <= 0
+        or kinship_shape[0] != kinship_shape[1]
+    ):
+        raise FineMapSkip(
+            f"FvLMM sidecar GRM shape must be non-empty square, got {record.kinship_shape!r}"
+        )
+    if int(record.sample_count) <= 0:
+        raise FineMapSkip("FvLMM sidecar sample count must be positive")
+
+
+def _postgwas_resolve_fvlmm_dependency(
+    fingerprint: object,
+    label: str,
+    dependency_roots: Optional[Sequence[Path]],
+) -> Path:
+    """Resolve a validated sidecar dependency, including moved bundles."""
+    try:
+        if dependency_roots is not None:
+            return Path(
+                _resolve_dependency_path(
+                    fingerprint,
+                    dependency_roots,
+                    label,
+                )
+            )
+        path = Path(str(getattr(fingerprint, "canonical_path"))).expanduser()
+        if not path.is_file():
+            raise FineMapSkip(f"{label} file not found: {path}")
+        return path
+    except FineMapSkip:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise FineMapSkip(f"{label} dependency is unavailable: {exc}") from exc
+
+
+def _postgwas_fvlmm_genotype_fam_path(
+    record: GwasNullModelSidecarV1,
+    genotype_prefix: Optional[str | os.PathLike[str]],
+) -> Path:
+    if genotype_prefix is not None and str(genotype_prefix).strip() != "":
+        prefix = _normalize_plink_prefix(genotype_prefix)
+        return Path(f"{prefix}.fam")
+    for fingerprint in record.genotype_files:
+        if str(getattr(fingerprint, "basename", "")).lower().endswith(".fam"):
+            return Path(str(fingerprint.canonical_path)).expanduser()
+    prefix = _normalize_plink_prefix(record.genotype_prefix)
+    return Path(f"{prefix}.fam")
+
+
+def _postgwas_reconstruct_fvlmm_context(
+    record: GwasNullModelSidecarV1,
+    *,
+    genotype_prefix: Optional[str | os.PathLike[str]] = None,
+    dependency_roots: Optional[Sequence[Path]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> FvLMMFineMapContext:
+    """Reconstruct the GWAS FvLMM sample order and fixed-effect design.
+
+    The source loaders used here are the same workflow loaders used by GWAS:
+    phenotype parsing/duplicate-ID averaging, covariate parsing, FAM IID
+    extraction, and GRM ID-based alignment.  The full GRM is intentionally
+    loaded only after the final ordered sample hash has been checked.
+    """
+    _postgwas_validate_fvlmm_sidecar(record)
+    log = logger if isinstance(logger, logging.Logger) else logging.getLogger(__name__)
+
+    from janusx.assoc.workflow import (
+        _align_pheno_to_sample_order,
+        _read_cov_file_flexible,
+        _trait_values_and_mask,
+        load_phenotype,
+    )
+    from janusx.script._common.genoio import read_id_file as _read_geno_id_file
+    from janusx.script._common.grmio import (
+        load_and_align_grm,
+        read_id_file as _read_grm_id_file,
+    )
+
+    roots = None
+    if dependency_roots is not None:
+        roots = tuple(Path(root).expanduser().resolve() for root in dependency_roots)
+
+    fam_path = _postgwas_fvlmm_genotype_fam_path(record, genotype_prefix)
+    if not fam_path.is_file():
+        raise FineMapSkip(f"PLINK FAM file not found: {fam_path}")
+    try:
+        fam_ids_raw = _read_geno_id_file(
+            str(fam_path),
+            log,
+            "PLINK FAM",
+            show_status=False,
+        )
+    except (OSError, ValueError) as exc:
+        raise FineMapSkip(f"PLINK FAM IDs could not be read: {exc}") from exc
+    if fam_ids_raw is None:
+        raise FineMapSkip("PLINK FAM IDs are missing")
+    fam_ids = np.asarray(fam_ids_raw, dtype=str).reshape(-1)
+    if fam_ids.size == 0:
+        raise FineMapSkip("PLINK FAM IDs are empty")
+    fam_id_list = [str(value) for value in fam_ids.tolist()]
+    if len(set(fam_id_list)) != len(fam_id_list):
+        raise FineMapSkip("PLINK FAM contains duplicate sample IDs")
+
+    phenotype_path = _postgwas_resolve_fvlmm_dependency(
+        record.phenotype_file,
+        "phenotype",
+        roots,
+    )
+    try:
+        phenotype = load_phenotype(
+            str(phenotype_path),
+            None,
+            log,
+            id_col=0,
+            use_spinner=False,
+        )
+    except Exception as exc:
+        raise FineMapSkip(f"phenotype could not be reconstructed: {exc}") from exc
+
+    covariate_ids: Optional[np.ndarray] = None
+    covariate_values: Optional[np.ndarray] = None
+    if record.covariate_file is not None:
+        covariate_path = _postgwas_resolve_fvlmm_dependency(
+            record.covariate_file,
+            "covariate",
+            roots,
+        )
+        try:
+            covariate_ids_raw, covariate_values_raw = _read_cov_file_flexible(
+                str(covariate_path),
+                fam_ids,
+                log,
+                label="Covariate",
+            )
+        except Exception as exc:
+            raise FineMapSkip(f"covariates could not be reconstructed: {exc}") from exc
+        covariate_ids = np.asarray(covariate_ids_raw, dtype=str).reshape(-1)
+        covariate_values = np.asarray(covariate_values_raw, dtype=np.float32)
+        if covariate_values.ndim == 1:
+            covariate_values = covariate_values.reshape(-1, 1)
+        if covariate_values.ndim != 2 or covariate_values.shape[0] != covariate_ids.size:
+            raise FineMapSkip(
+                "covariate ID and value shapes disagree"
+            )
+        if len(set(str(value) for value in covariate_ids.tolist())) != covariate_ids.size:
+            raise FineMapSkip("covariate file contains duplicate sample IDs")
+        if covariate_values.shape[1] != len(record.covariate_columns):
+            raise FineMapSkip(
+                "covariate column count disagrees with the FvLMM sidecar metadata"
+            )
+    elif len(record.covariate_columns) != 0:
+        raise FineMapSkip(
+            "FvLMM sidecar declares covariates but has no covariate file"
+        )
+
+    grm_id_path = _postgwas_resolve_fvlmm_dependency(
+        record.kinship_id_file,
+        "GRM ID",
+        roots,
+    )
+    try:
+        grm_ids_raw = _read_grm_id_file(str(grm_id_path))
+    except (OSError, ValueError) as exc:
+        raise FineMapSkip(f"GRM ID file could not be read: {exc}") from exc
+    grm_ids = np.asarray(grm_ids_raw, dtype=str).reshape(-1)
+    if grm_ids.size == 0:
+        raise FineMapSkip("GRM ID file is empty")
+    grm_id_list = [str(value) for value in grm_ids.tolist()]
+    if len(set(grm_id_list)) != len(grm_id_list):
+        raise FineMapSkip("GRM ID file contains duplicate sample IDs")
+    expected_grm_n = int(record.kinship_shape[0])
+    if grm_ids.size != expected_grm_n:
+        raise FineMapSkip(
+            "GRM ID count mismatch: "
+            f"sidecar shape={record.kinship_shape}, IDs={grm_ids.size}"
+        )
+
+    # This mirrors prepare_streaming_context: intersect sources in FAM order,
+    # then apply the exact single-trait ~isnan phenotype mask.
+    source_sets = [set(fam_id_list), set(str(value) for value in phenotype.index)]
+    source_sets.append(set(grm_id_list))
+    if covariate_ids is not None:
+        source_sets.append(set(str(value) for value in covariate_ids.tolist()))
+    common = set.intersection(*source_sets)
+    common_ids = [sample_id for sample_id in fam_id_list if sample_id in common]
+    if len(common_ids) == 0:
+        # The GWAS loader retries with PLINK IID (phenotype column 2) only when
+        # the first phenotype ID column has no overlap.
+        try:
+            phenotype_alt = load_phenotype(
+                str(phenotype_path),
+                None,
+                log,
+                id_col=1,
+                use_spinner=False,
+            )
+        except Exception:
+            phenotype_alt = None
+        if phenotype_alt is not None:
+            alt_sets = [set(fam_id_list), set(str(value) for value in phenotype_alt.index)]
+            alt_sets.append(set(grm_id_list))
+            if covariate_ids is not None:
+                alt_sets.append(set(str(value) for value in covariate_ids.tolist()))
+            alt_common = set.intersection(*alt_sets)
+            alt_ids = [sample_id for sample_id in fam_id_list if sample_id in alt_common]
+            if len(alt_ids) > 0:
+                phenotype = phenotype_alt
+                common = alt_common
+                common_ids = alt_ids
+    if len(common_ids) == 0:
+        raise FineMapSkip(
+            "no overlapping samples across FAM, phenotype, GRM, and covariates"
+        )
+
+    aligned_pheno, ordered_common = _align_pheno_to_sample_order(
+        phenotype,
+        np.asarray(common_ids, dtype=str),
+    )
+    try:
+        _trait_values, phenotype_keep = _trait_values_and_mask(
+            aligned_pheno,
+            record.phenotype_trait_column,
+        )
+    except Exception as exc:
+        raise FineMapSkip(
+            "phenotype trait metadata disagrees with the FvLMM sidecar"
+        ) from exc
+    keep_idx = np.flatnonzero(np.asarray(phenotype_keep, dtype=bool)).astype(
+        np.int64,
+        copy=False,
+    )
+    sample_ids = np.ascontiguousarray(ordered_common[keep_idx], dtype=str)
+    if sample_ids.size == 0:
+        raise FineMapSkip("phenotype missingness leaves no FvLMM samples")
+    if sample_ids.size != int(record.sample_count):
+        raise FineMapSkip(
+            "sample order/count disagrees with the FvLMM sidecar: "
+            f"reconstructed={sample_ids.size}, sidecar={record.sample_count}"
+        )
+    actual_hash = hash_ordered_sample_ids([str(value) for value in sample_ids.tolist()])
+    if actual_hash.lower() != str(record.sample_order_sha256).lower():
+        raise FineMapSkip(
+            "sample order hash mismatch between reconstructed GWAS samples and sidecar"
+        )
+
+    fam_index = {sample_id: index for index, sample_id in enumerate(fam_id_list)}
+    sample_indices = np.ascontiguousarray(
+        np.asarray([fam_index[str(value)] for value in sample_ids.tolist()], dtype=np.int64),
+        dtype=np.int64,
+    )
+
+    if covariate_values is None:
+        fixed_effects = np.ones((sample_ids.size, 1), dtype=np.float64)
+    else:
+        covariate_index = {
+            str(sample_id): index
+            for index, sample_id in enumerate(covariate_ids.tolist())
+        }
+        cov_take = np.asarray(
+            [covariate_index[str(value)] for value in sample_ids.tolist()],
+            dtype=np.int64,
+        )
+        cov_subset = np.ascontiguousarray(
+            covariate_values[cov_take],
+            dtype=np.float64,
+        )
+        fixed_effects = np.ascontiguousarray(
+            np.column_stack(
+                [np.ones((sample_ids.size,), dtype=np.float64), cov_subset]
+            ),
+            dtype=np.float64,
+        )
+    if fixed_effects.shape != (sample_ids.size, len(record.fixed_effect_columns)):
+        raise FineMapSkip(
+            "reconstructed fixed-effect shape disagrees with the FvLMM sidecar"
+        )
+    if not np.all(np.isfinite(fixed_effects)):
+        raise FineMapSkip("reconstructed fixed effects contain non-finite values")
+
+    kinship_path = _postgwas_resolve_fvlmm_dependency(
+        record.kinship_file,
+        "GRM",
+        roots,
+    )
+    try:
+        kinship_raw, _resolved_grm_id_path = load_and_align_grm(
+            str(kinship_path),
+            [str(value) for value in sample_ids.tolist()],
+            grm_id_path=str(grm_id_path),
+            label="GRM",
+        )
+    except FineMapSkip:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise FineMapSkip(f"GRM could not be aligned by its ID file: {exc}") from exc
+    kinship = np.ascontiguousarray(np.asarray(kinship_raw, dtype=np.float64), dtype=np.float64)
+    if kinship.shape != (sample_ids.size, sample_ids.size):
+        raise FineMapSkip(
+            "aligned GRM shape disagrees with reconstructed FvLMM samples: "
+            f"{kinship.shape} vs {(sample_ids.size, sample_ids.size)}"
+        )
+    if not np.all(np.isfinite(kinship)):
+        raise FineMapSkip("aligned GRM contains non-finite values")
+
+    return FvLMMFineMapContext(
+        sample_ids=sample_ids,
+        sample_indices_in_bfile=sample_indices,
+        fixed_effects=fixed_effects,
+        kinship=kinship,
+        lambda_null=float(record.lambda_null),
+        sidecar=record,
+    )
+
+
+def _postgwas_fvlmm_memory_components(
+    *,
+    n_variants: int,
+    n_samples: int,
+    fixed_effect_columns: int | Sequence[object],
+    bfile_samples: Optional[int] = None,
+    grm_samples: Optional[int] = None,
+    susie_l: int = 5,
+    existing_bytes: int = 0,
+) -> dict[str, int]:
+    """Return a conservative complete peak working-set accounting."""
+    m = max(0, int(n_variants))
+    n = max(0, int(n_samples))
+    n_bfile = max(n, int(bfile_samples or 0))
+    n_grm = max(n, int(grm_samples or 0))
+    if isinstance(fixed_effect_columns, (int, np.integer)):
+        q = max(0, int(fixed_effect_columns))
+    else:
+        q = max(0, len(fixed_effect_columns))
+    l = max(1, min(max(1, int(susie_l)), max(1, m)))
+    f64 = 8
+    f32 = 4
+    components = {
+        "existing_gwas_frame": max(0, int(existing_bytes)),
+        "grm_source_full": n_grm * n_grm * f64,
+        "grm_subset": n * n * f64,
+        "eigh_input_copy": n * n * f64,
+        "eigensystem": n * n * f64 + n * f64,
+        "regional_genotype_f32": m * n * f32,
+        "regional_genotype_f64": m * n * f64,
+        "regional_bed_packed": m * ((n_bfile + 3) // 4),
+        "rotated_genotype": m * n * f64,
+        "residual_genotype": m * n * f64,
+        "fixed_effects_f64": n * q * f64,
+        "whitened_fixed_effects": n * q * f64,
+        "projected_coefficients": m * q * f64,
+        "projected_gram_ld": m * m * f64,
+        # PyO3's NumPy argument conversion may retain/copy each f64 input and
+        # the returned LD matrix; count those copies independently.
+        "pyo3_genotype_copy": m * n * f64,
+        "pyo3_eigvals_copy": n * f64,
+        "pyo3_u_t_copy": n * n * f64,
+        "pyo3_fixed_effect_copy": n * q * f64,
+        "pyo3_ld_output_copy": m * m * f64,
+        "susie_ld_copy": m * m * f64,
+        "susie_vectors": (l + 4) * m * f64 + l * f64,
+        "reserve": _POSTGWAS_FINEMAP_MEMORY_RESERVE_BYTES,
+    }
+    return components
+
+
+def _postgwas_estimate_fvlmm_memory_bytes(
+    n_variants: int,
+    n_samples: int,
+    fixed_effect_columns: int | Sequence[object] = 1,
+    *,
+    bfile_samples: Optional[int] = None,
+    grm_samples: Optional[int] = None,
+    susie_l: int = 5,
+    existing_bytes: int = 0,
+) -> int:
+    """Estimate the complete FvLMM effective-LD/SuSiE peak in bytes."""
+    return int(
+        sum(
+            _postgwas_fvlmm_memory_components(
+                n_variants=n_variants,
+                n_samples=n_samples,
+                fixed_effect_columns=fixed_effect_columns,
+                bfile_samples=bfile_samples,
+                grm_samples=grm_samples,
+                susie_l=susie_l,
+                existing_bytes=existing_bytes,
+            ).values()
+        )
+    )
+
+
+def _postgwas_build_fvlmm_effective_ld(
+    *,
+    args: argparse.Namespace,
+    record: GwasNullModelSidecarV1,
+    prepared: pd.DataFrame,
+    bed_indices: Optional[np.ndarray],
+    logger: logging.Logger,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Build exact FvLMM effective LD and retain kernel valid-row indices."""
+    _postgwas_validate_fvlmm_sidecar(record)
+    if not isinstance(prepared, pd.DataFrame):
+        raise FineMapSkip("FvLMM fine-mapping input rows are not a DataFrame")
+    if prepared.empty:
+        raise FineMapSkip("FvLMM fine-mapping has no regional GWAS rows")
+    required_columns = {"chrom", "pos"}
+    missing_columns = sorted(required_columns.difference(prepared.columns))
+    if missing_columns:
+        raise FineMapSkip(
+            "FvLMM fine-mapping rows are missing required columns: "
+            + ", ".join(missing_columns)
+        )
+
+    requested_prefix = getattr(args, "bfile", None)
+    if requested_prefix is None or str(requested_prefix).strip() == "":
+        requested_prefix = record.genotype_prefix
+    try:
+        bfile_samples = _postgwas_count_plink_samples(requested_prefix)
+    except (OSError, ValueError) as exc:
+        raise FineMapSkip(f"FvLMM memory preflight could not inspect FAM: {exc}") from exc
+    existing_bytes = int(
+        prepared.memory_usage(deep=True, index=True).sum()
+    )
+    susie_l = int(getattr(args, "finemap_l", 5))
+    estimated_bytes = _postgwas_estimate_fvlmm_memory_bytes(
+        n_variants=len(prepared),
+        n_samples=int(record.sample_count),
+        fixed_effect_columns=record.fixed_effect_columns,
+        bfile_samples=bfile_samples,
+        grm_samples=int(record.kinship_shape[0]),
+        susie_l=susie_l,
+        existing_bytes=existing_bytes,
+    )
+    memory_limit_bytes = int(
+        getattr(args, "finemap_memory_bytes", _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES)
+    )
+    if estimated_bytes > max(0, memory_limit_bytes):
+        raise FineMapSkip(
+            "FvLMM memory preflight rejected the locus before loading the full "
+            "GRM/genotype: "
+            f"estimated_peak={estimated_bytes / float(1024**3):.2f} GiB, "
+            f"limit={max(0, memory_limit_bytes) / float(1024**3):.2f} GiB"
+        )
+    logger.info(
+        "FvLMM memory preflight: variants=%d samples=%d fixed_effect_columns=%d "
+        "estimated_peak=%.2f GiB limit=%.2f GiB.",
+        len(prepared),
+        int(record.sample_count),
+        len(record.fixed_effect_columns),
+        estimated_bytes / float(1024**3),
+        max(0, memory_limit_bytes) / float(1024**3),
+    )
+    prepared_source = prepared.reset_index(drop=True)
+
+    dependency_roots = _dependency_search_roots(
+        record.result.canonical_path,
+        requested_prefix,
+    )
+    context = _postgwas_reconstruct_fvlmm_context(
+        record,
+        genotype_prefix=requested_prefix,
+        dependency_roots=dependency_roots,
+        logger=logger,
+    )
+
+    site_keys: list[tuple[str, int]] = []
+    for row_index, row in prepared_source.iterrows():
+        chrom = str(row["chrom"])
+        pos_value = pd.to_numeric(row["pos"], errors="coerce")
+        try:
+            pos_float = float(pos_value)
+        except (TypeError, ValueError):
+            pos_float = float("nan")
+        if not np.isfinite(pos_float) or pos_float != np.floor(pos_float):
+            raise FineMapSkip(
+                f"FvLMM regional genotype position is invalid at row {row_index}"
+            )
+        site_keys.append((chrom, int(pos_float)))
+
+    filters = dict(record.genotype_filters)
+    try:
+        maf = float(filters.get("maf", 0.0))
+        missing_rate = float(
+            filters.get("max_missing_rate", filters.get("missing_rate", 1.0))
+        )
+        het = float(filters.get("het_threshold", filters.get("het", 1.0)))
+    except (TypeError, ValueError) as exc:
+        raise FineMapSkip("FvLMM sidecar genotype filters are invalid") from exc
+    if not all(np.isfinite(value) for value in (maf, missing_rate, het)):
+        raise FineMapSkip("FvLMM sidecar genotype filters must be finite")
+    if maf < 0.0 or missing_rate < 0.0 or het < 0.0:
+        raise FineMapSkip("FvLMM sidecar genotype filters must be non-negative")
+    model = str(filters.get("genetic_model", "add"))
+    snps_only = bool(filters.get("snps_only", True))
+
+    genotype_chunks: list[np.ndarray] = []
+    returned_keys: list[tuple[str, int]] = []
+    try:
+        genotype_iter = load_genotype_chunks(
+            str(requested_prefix),
+            chunk_size=max(1, min(20_000, len(site_keys))),
+            maf=maf,
+            missing_rate=missing_rate,
+            impute=True,
+            model=model,
+            het=het,
+            snps_only=snps_only,
+            snp_sites=site_keys,
+            sample_ids=[str(value) for value in context.sample_ids.tolist()],
+        )
+        for genotype_chunk, sites in genotype_iter:
+            block = np.asarray(genotype_chunk, dtype=np.float32)
+            if block.ndim != 2 or block.shape[0] != len(sites):
+                raise ValueError(
+                    "regional genotype chunk and site metadata have inconsistent shapes"
+                )
+            genotype_chunks.append(np.ascontiguousarray(block, dtype=np.float32))
+            returned_keys.extend(
+                (
+                    _normalize_chr(getattr(site, "chrom")),
+                    int(getattr(site, "pos")),
+                )
+                for site in sites
+            )
+    except (OSError, ValueError, RuntimeError, TypeError) as exc:
+        raise FineMapSkip(f"regional genotype could not be reconstructed: {exc}") from exc
+    if len(genotype_chunks) == 0:
+        raise FineMapSkip("regional genotype loader returned no variants")
+
+    genotype_all = np.vstack(genotype_chunks).astype(np.float32, copy=False)
+    row_by_key: dict[tuple[str, int], int] = {}
+    for row_index, key in enumerate(returned_keys):
+        row_by_key.setdefault(key, row_index)
+    requested_normalized = [(_normalize_chr(chrom), pos) for chrom, pos in site_keys]
+    selected_rows: list[int] = []
+    selected_prepared: list[int] = []
+    for prepared_index, key in enumerate(requested_normalized):
+        returned_index = row_by_key.get(key)
+        if returned_index is None:
+            continue
+        selected_prepared.append(prepared_index)
+        selected_rows.append(returned_index)
+    if len(selected_rows) == 0:
+        raise FineMapSkip(
+            "regional genotype rows did not match the prepared GWAS coordinates"
+        )
+    genotypes = np.ascontiguousarray(
+        np.asarray(genotype_all[np.asarray(selected_rows, dtype=np.int64)], dtype=np.float64),
+        dtype=np.float64,
+    )
+    aligned_input = prepared_source.iloc[selected_prepared].reset_index(drop=True)
+
+    try:
+        from janusx.assoc.workflow import _gwas_eigh_from_grm
+
+        eigvals, eigvecs, _eigh_backend, _eigh_elapsed = _gwas_eigh_from_grm(
+            context.kinship,
+            threads=max(1, int(getattr(args, "thread", 1))),
+            logger=logger,
+            stage_label="PostGWAS FvLMM",
+            require_rust=True,
+            diag_ridge=_POSTGWAS_FVLMM_DIAG_RIDGE,
+        )
+    except (RuntimeError, ValueError, TypeError) as exc:
+        raise FineMapSkip(f"FvLMM GRM eigendecomposition failed: {exc}") from exc
+    eigvals = np.ascontiguousarray(np.asarray(eigvals, dtype=np.float64).reshape(-1))
+    eigvecs = np.asarray(eigvecs, dtype=np.float64)
+    if (
+        eigvecs.ndim != 2
+        or eigvecs.shape != (context.sample_ids.size, context.sample_ids.size)
+        or eigvals.shape != (context.sample_ids.size,)
+        or not np.all(np.isfinite(eigvals))
+        or not np.all(np.isfinite(eigvecs))
+    ):
+        raise FineMapSkip("FvLMM GRM eigendecomposition returned invalid arrays")
+    u_t = np.ascontiguousarray(eigvecs.T, dtype=np.float64)
+
+    try:
+        kernel_result = jxrs.fvlmm_effective_ld_spectral_f64(
+            genotypes,
+            eigvals,
+            u_t,
+            context.fixed_effects,
+            context.lambda_null,
+            threads=max(1, int(getattr(args, "thread", 1))),
+        )
+    except (ValueError, TypeError) as exc:
+        raise FineMapSkip(
+            f"FvLMM effective-LD kernel rejected the reconstructed context: {exc}"
+        ) from exc
+    if not isinstance(kernel_result, dict):
+        raise FineMapSkip("FvLMM effective-LD kernel returned a non-mapping result")
+    try:
+        locus_r = np.ascontiguousarray(
+            np.asarray(kernel_result["r"], dtype=np.float64),
+            dtype=np.float64,
+        )
+        valid_indices = np.asarray(
+            kernel_result["valid_indices"],
+            dtype=np.int64,
+        ).reshape(-1)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FineMapSkip("FvLMM effective-LD kernel returned invalid arrays") from exc
+    if (
+        locus_r.ndim != 2
+        or locus_r.shape[0] != locus_r.shape[1]
+        or locus_r.shape[0] != valid_indices.size
+        or valid_indices.size == 0
+        or np.any(valid_indices < 0)
+        or np.any(valid_indices >= genotypes.shape[0])
+        or len(np.unique(valid_indices)) != valid_indices.size
+        or not np.all(np.isfinite(locus_r))
+        or not np.allclose(locus_r, locus_r.T, atol=1e-12, rtol=1e-12)
+        or not np.allclose(np.diag(locus_r), 1.0, atol=1e-12, rtol=1e-12)
+    ):
+        raise FineMapSkip("FvLMM effective-LD kernel returned inconsistent results")
+    aligned = aligned_input.iloc[valid_indices].reset_index(drop=True)
+    if aligned.shape[0] != locus_r.shape[0]:
+        raise FineMapSkip("FvLMM effective-LD and GWAS rows are misaligned")
+
+    try:
+        ld_eigenvalues = np.linalg.eigvalsh(
+            0.5 * (locus_r + locus_r.T)
+        )
+        min_ld_eigenvalue = float(np.min(ld_eigenvalues))
+        max_ld_eigenvalue = float(np.max(ld_eigenvalues))
+        condition_number = (
+            float("inf")
+            if min_ld_eigenvalue <= 0.0
+            else max_ld_eigenvalue / min_ld_eigenvalue
+        )
+    except ( np.linalg.LinAlgError, ValueError) as exc:
+        raise FineMapSkip(f"FvLMM LD diagnostics failed: {exc}") from exc
+    logger.info(
+        "FvLMM effective LD: samples=%d lambda=%.12g pve=%.12g "
+        "fixed_effect_columns=%s fixed_effect_rank=%s rank_tolerance=%.6g "
+        "min_projected_diag=%.6g min_ld_eigenvalue=%.6g condition_number=%.6g.",
+        context.sample_ids.size,
+        context.lambda_null,
+        float(record.pve),
+        tuple(record.fixed_effect_columns),
+        kernel_result.get("fixed_effect_rank", "NA"),
+        float(kernel_result.get("rank_tolerance", float("nan"))),
+        float(kernel_result.get("min_projected_diag", float("nan"))),
+        min_ld_eigenvalue,
+        condition_number,
+    )
+    return locus_r, aligned
 
 
 def _postgwas_estimate_finemap_memory_bytes(
