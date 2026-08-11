@@ -12,7 +12,7 @@ implementation during development and benchmarking.
 Reference project:
 
 - Name: ADAMIXTURE
-- Repository: <https://github.com/medical-genomics-group/admixture>
+- Repository: <https://github.com/AI-sandbox/ADAMIXTURE>
 - License: BSD 3-Clause License
 
 BSD 3-Clause License text:
