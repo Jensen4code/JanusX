@@ -2788,6 +2788,27 @@ def _postgwas_estimate_fvlmm_memory_bytes(
     )
 
 
+def _postgwas_log_fvlmm_stage(
+    logger: logging.Logger,
+    stage: str,
+    started: float,
+    *,
+    requested_threads: int,
+    using_threads: int,
+    backend: Optional[str] = None,
+) -> None:
+    elapsed = max(0.0, time.perf_counter() - started)
+    logger.info(
+        "FvLMM fine-map stage: stage=%s seconds=%.6f requested_threads=%d "
+        "using_threads=%d%s",
+        stage,
+        elapsed,
+        requested_threads,
+        using_threads,
+        "" if backend is None else f" backend={backend}",
+    )
+
+
 def _postgwas_build_fvlmm_effective_ld(
     *,
     args: argparse.Namespace,
@@ -2797,6 +2818,7 @@ def _postgwas_build_fvlmm_effective_ld(
     logger: logging.Logger,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """Build exact FvLMM effective LD and retain kernel valid-row indices."""
+    requested_threads = max(1, int(getattr(args, "thread", 1)))
     _postgwas_validate_fvlmm_sidecar(record)
     if not isinstance(prepared, pd.DataFrame):
         raise FineMapSkip("FvLMM fine-mapping input rows are not a DataFrame")
@@ -2915,17 +2937,34 @@ def _postgwas_build_fvlmm_effective_ld(
     )
     prepared_source = prepared.reset_index(drop=True)
 
+    context_started = time.perf_counter()
     context = _postgwas_reconstruct_fvlmm_context(
         record,
         genotype_prefix=requested_prefix,
         dependency_roots=dependency_roots,
         logger=logger,
     )
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "context",
+        context_started,
+        requested_threads=requested_threads,
+        using_threads=1,
+    )
 
+    bim_scan_started = time.perf_counter()
     selected_bim_indices, selected_bim_metadata = _postgwas_resolve_prepared_bim_rows(
         requested_prefix,
         prepared_source,
     )
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "bim_scan",
+        bim_scan_started,
+        requested_threads=requested_threads,
+        using_threads=1,
+    )
+    genotype_decode_started = time.perf_counter()
     selected_signatures = [
         (
             metadata[0],
@@ -3123,17 +3162,25 @@ def _postgwas_build_fvlmm_effective_ld(
     ):
         raise FineMapSkip("FvLMM summary/BED alignment map contains invalid indices")
     genotypes = np.ascontiguousarray(genotypes[effective_bed_indices], dtype=np.float64)
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "genotype_decode",
+        genotype_decode_started,
+        requested_threads=requested_threads,
+        using_threads=1,
+    )
 
     from janusx.assoc import workflow as workflow_module
     if not hasattr(workflow_module.jxrs, "rust_eigh_from_array_f64"):
         raise FineMapSkip(
             "FvLMM Rust EVD symbol rust_eigh_from_array_f64 is unavailable"
         )
+    grm_evd_started = time.perf_counter()
     try:
         _gwas_eigh_from_grm = workflow_module._gwas_eigh_from_grm
         eigvals, eigvecs, _eigh_backend, _eigh_elapsed = _gwas_eigh_from_grm(
             context.kinship,
-            threads=max(1, int(getattr(args, "thread", 1))),
+            threads=requested_threads,
             logger=logger,
             stage_label="PostGWAS FvLMM",
             require_rust=True,
@@ -3176,7 +3223,16 @@ def _postgwas_build_fvlmm_effective_ld(
     ):
         raise FineMapSkip("FvLMM GRM eigendecomposition returned invalid arrays")
     u_t = np.ascontiguousarray(eigvecs.T, dtype=np.float64)
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "grm_evd",
+        grm_evd_started,
+        requested_threads=requested_threads,
+        using_threads=requested_threads,
+        backend=str(_eigh_backend),
+    )
 
+    effective_ld_started = time.perf_counter()
     try:
         kernel_result = jxrs.fvlmm_effective_ld_spectral_f64(
             genotypes,
@@ -3184,7 +3240,7 @@ def _postgwas_build_fvlmm_effective_ld(
             u_t,
             context.fixed_effects,
             context.lambda_null,
-            threads=max(1, int(getattr(args, "thread", 1))),
+            threads=requested_threads,
         )
     except _PostGWASExpectedCompatibilityError as exc:
         _postgwas_skip_for_expected_source_error(exc, "FvLMM effective-LD kernel")
@@ -3217,6 +3273,19 @@ def _postgwas_build_fvlmm_effective_ld(
         diagnostic_min_projected_diag = float(
             kernel_result["min_projected_diag"]
         )
+        diagnostic_backend = str(kernel_result["backend"])
+        diagnostic_requested_threads = kernel_result["requested_threads"]
+        diagnostic_using_threads = kernel_result["using_threads"]
+        diagnostic_timings = [
+            float(kernel_result[key])
+            for key in (
+                "rotation_seconds",
+                "svd_seconds",
+                "residual_seconds",
+                "gram_seconds",
+                "total_seconds",
+            )
+        ]
         if (
             isinstance(diagnostic_fixed_columns, (bool, np.bool_))
             or not isinstance(diagnostic_fixed_columns, (int, np.integer))
@@ -3230,6 +3299,17 @@ def _postgwas_build_fvlmm_effective_ld(
             or diagnostic_rank_tolerance <= 0.0
             or not np.isfinite(diagnostic_min_projected_diag)
             or diagnostic_min_projected_diag <= 0.0
+            or diagnostic_backend not in {"accelerate", "openblas", "blas", "rust"}
+            or isinstance(diagnostic_requested_threads, (bool, np.bool_))
+            or not isinstance(diagnostic_requested_threads, (int, np.integer))
+            or int(diagnostic_requested_threads) != requested_threads
+            or isinstance(diagnostic_using_threads, (bool, np.bool_))
+            or not isinstance(diagnostic_using_threads, (int, np.integer))
+            or int(diagnostic_using_threads) != requested_threads
+            or not all(
+                np.isfinite(value) and value >= 0.0
+                for value in diagnostic_timings
+            )
         ):
             raise ValueError("kernel diagnostics are non-finite or inconsistent")
     except (KeyError, OverflowError, TypeError, ValueError) as exc:
@@ -3287,6 +3367,14 @@ def _postgwas_build_fvlmm_effective_ld(
         )
     except (np.linalg.LinAlgError, ValueError, TypeError) as exc:
         raise FineMapSkip(f"FvLMM LD diagnostics failed: {exc}") from exc
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "effective_ld",
+        effective_ld_started,
+        requested_threads=int(diagnostic_requested_threads),
+        using_threads=int(diagnostic_using_threads),
+        backend=diagnostic_backend,
+    )
     logger.info(
         "FvLMM effective LD: samples=%d lambda=%.12g pve=%.12g "
         "fixed_effect_columns=%s fixed_effect_rank=%s rank_tolerance=%.6g "
@@ -4659,6 +4747,7 @@ def _postgwas_run_susie_finemap_body(
                 logger=logger,
             )
             prepared_source = effective_source.reset_index(drop=True)
+        effective_clump_started = time.perf_counter()
         prepared, clump_counts, fold_groups = _postgwas_finemap_ldclump(
             prepared_source,
             genofile=str(args.bfile),
@@ -4668,6 +4757,15 @@ def _postgwas_run_susie_finemap_body(
             sample_ids=raw_sample_ids,
             ld_matrix=effective_locus_r,
         )
+        if ld_route == "fvlmm":
+            fvlmm_threads = max(1, int(getattr(args, "thread", 1)))
+            _postgwas_log_fvlmm_stage(
+                logger,
+                "effective_clump",
+                effective_clump_started,
+                requested_threads=fvlmm_threads,
+                using_threads=1,
+            )
         logger.info(
             "SuSiE locus %s LDclump: retained=%d/%d clumped=%d groups=%d "
             "(r2>=%.6f, window=%d bp).",
@@ -4795,6 +4893,7 @@ def _postgwas_run_susie_finemap_body(
             raise RuntimeError(
                 f"SuSiE locus {locus_label} aligned z/LD dimensions do not agree."
             )
+        susie_started = time.perf_counter()
         try:
             fit = jxrs.susie_rss_f64(
                 z,
@@ -4806,6 +4905,15 @@ def _postgwas_run_susie_finemap_body(
             )
         except Exception as exc:
             raise RuntimeError(f"SuSiE locus {locus_label} solver failed: {exc}") from exc
+        if ld_route == "fvlmm":
+            fvlmm_threads = max(1, int(getattr(args, "thread", 1)))
+            _postgwas_log_fvlmm_stage(
+                logger,
+                "susie",
+                susie_started,
+                requested_threads=fvlmm_threads,
+                using_threads=fvlmm_threads,
+            )
 
         try:
             pip = np.asarray(fit["pip"], dtype=np.float64).reshape(-1)

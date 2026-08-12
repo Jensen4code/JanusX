@@ -5,8 +5,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::BoundObject;
+use std::time::Instant;
 
-use crate::blas::BlasThreadGuard;
+use crate::blas::{rust_sgemm_backend_tag, BlasThreadGuard};
 
 const PROJECTED_DIAG_REL_TOL: f64 = 64.0 * f64::EPSILON;
 
@@ -18,6 +19,11 @@ struct EffectiveLdResult {
     fixed_effect_rank: usize,
     rank_tolerance: f64,
     min_projected_diag: f64,
+    rotation_seconds: f64,
+    svd_seconds: f64,
+    residual_seconds: f64,
+    gram_seconds: f64,
+    total_seconds: f64,
 }
 
 fn validate_finite_matrix(matrix: &DMatrix<f64>, name: &str) -> Result<(), String> {
@@ -50,6 +56,7 @@ fn fvlmm_effective_ld_spectral_core(
     lambda_null: f64,
     rcond: Option<f64>,
 ) -> Result<EffectiveLdResult, String> {
+    let total_started = Instant::now();
     let snp_count = genotypes.nrows();
     let sample_count = genotypes.ncols();
     let fixed_effect_columns = fixed_effects.ncols();
@@ -93,6 +100,7 @@ fn fvlmm_effective_ld_spectral_core(
         None => (sample_count.max(fixed_effect_columns) as f64) * f64::EPSILON,
     };
 
+    let rotation_started = Instant::now();
     let mut whitening = Vec::with_capacity(sample_count);
     for (index, &eigval) in eigvals.iter().enumerate() {
         let variance = eigval + lambda_null;
@@ -125,7 +133,9 @@ fn fvlmm_effective_ld_spectral_core(
             cw[(sample, column)] *= scale;
         }
     }
+    let rotation_seconds = rotation_started.elapsed().as_secs_f64();
 
+    let svd_started = Instant::now();
     let svd = SVD::try_new(cw, true, false, 5.0 * f64::EPSILON, 0)
         .ok_or_else(|| "rank-revealing SVD did not converge".to_string())?;
     let singular_values = svd.singular_values;
@@ -154,7 +164,9 @@ fn fvlmm_effective_ld_spectral_core(
     let u_covariates = svd
         .u
         .ok_or_else(|| "rank-revealing SVD did not produce left singular vectors".to_string())?;
+    let svd_seconds = svd_started.elapsed().as_secs_f64();
 
+    let residual_started = Instant::now();
     // Keep only Gw projected into the retained fixed-effect column space.  The
     // full n x n P matrix is never formed.
     let mut projected = DMatrix::<f64>::from_element(snp_count, fixed_effect_rank, f64::NAN);
@@ -221,6 +233,9 @@ fn fvlmm_effective_ld_spectral_core(
         .iter()
         .map(|&index| projected_diag[index])
         .fold(f64::INFINITY, f64::min);
+    let residual_seconds = residual_started.elapsed().as_secs_f64();
+
+    let gram_started = Instant::now();
     let valid_count = valid_indices.len();
     let mut r = DMatrix::<f64>::zeros(valid_count, valid_count);
     for (left, &left_index) in valid_indices.iter().enumerate() {
@@ -252,6 +267,8 @@ fn fvlmm_effective_ld_spectral_core(
             r[(right, left)] = value;
         }
     }
+    let gram_seconds = gram_started.elapsed().as_secs_f64();
+    let total_seconds = total_started.elapsed().as_secs_f64();
 
     Ok(EffectiveLdResult {
         r,
@@ -260,6 +277,11 @@ fn fvlmm_effective_ld_spectral_core(
         fixed_effect_rank,
         rank_tolerance,
         min_projected_diag,
+        rotation_seconds,
+        svd_seconds,
+        residual_seconds,
+        gram_seconds,
+        total_seconds,
     })
 }
 
@@ -312,6 +334,8 @@ pub fn fvlmm_effective_ld_spectral_f64<'py>(
     );
 
     let _blas_guard = BlasThreadGuard::enter(threads.max(1));
+    let requested_threads = threads.max(1);
+    let using_threads = requested_threads;
     let result = py
         .detach(|| {
             fvlmm_effective_ld_spectral_core(
@@ -351,6 +375,14 @@ pub fn fvlmm_effective_ld_spectral_f64<'py>(
     out.set_item("fixed_effect_rank", result.fixed_effect_rank)?;
     out.set_item("rank_tolerance", result.rank_tolerance)?;
     out.set_item("min_projected_diag", result.min_projected_diag)?;
+    out.set_item("backend", rust_sgemm_backend_tag())?;
+    out.set_item("requested_threads", requested_threads)?;
+    out.set_item("using_threads", using_threads)?;
+    out.set_item("rotation_seconds", result.rotation_seconds)?;
+    out.set_item("svd_seconds", result.svd_seconds)?;
+    out.set_item("residual_seconds", result.residual_seconds)?;
+    out.set_item("gram_seconds", result.gram_seconds)?;
+    out.set_item("total_seconds", result.total_seconds)?;
     Ok(out)
 }
 
