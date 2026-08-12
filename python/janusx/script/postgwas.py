@@ -109,7 +109,7 @@ import multiprocessing as mp
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext, redirect_stdout, redirect_stderr
 from functools import lru_cache
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Iterable, Optional, Sequence, Tuple
 from urllib.parse import unquote
 from janusx import janusx as jxrs
 from janusx.assoc.null_model_sidecar import (
@@ -2016,45 +2016,6 @@ def _postgwas_variant_token(value: object, *, allele: bool = False) -> str | Non
     return text.upper() if allele else text
 
 
-def _postgwas_read_bim_identity_rows(
-    genotype_prefix: object,
-) -> list[tuple[str, int, str | None, str | None, str | None]]:
-    """Read BIM rows in source order without collapsing duplicate coordinates."""
-
-    prefix = _normalize_plink_prefix(genotype_prefix)
-    bim_path = Path(f"{prefix}.bim")
-    rows: list[tuple[str, int, str | None, str | None, str | None]] = []
-    try:
-        with bim_path.open("rt", encoding="utf-8", errors="replace") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                tokens = line.split()
-                if not tokens:
-                    continue
-                if len(tokens) < 6:
-                    raise ValueError(f"Malformed BIM row at {bim_path}:{line_number}")
-                chrom = _normalize_chr(tokens[0])
-                try:
-                    pos = int(float(tokens[3]))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"Invalid BIM position at {bim_path}:{line_number}"
-                    ) from exc
-                rows.append(
-                    (
-                        chrom,
-                        pos,
-                        _postgwas_variant_token(tokens[1]),
-                        _postgwas_variant_token(tokens[4], allele=True),
-                        _postgwas_variant_token(tokens[5], allele=True),
-                    )
-                )
-    except (OSError, ValueError) as exc:
-        raise FineMapSkip(f"BIM variant identity could not be read: {exc}") from exc
-    if not rows:
-        raise FineMapSkip("BIM variant identity is empty")
-    return rows
-
-
 def _postgwas_variant_allele_pair(
     allele0: str | None,
     allele1: str | None,
@@ -2064,13 +2025,115 @@ def _postgwas_variant_allele_pair(
     return frozenset((allele0, allele1))
 
 
-def _postgwas_match_prepared_variants_to_bim(
-    prepared: pd.DataFrame,
-    bim_rows: Sequence[tuple[str, int, str | None, str | None, str | None]],
-) -> list[int]:
-    """Return one unambiguous BIM row per prepared row, preserving order."""
+def _postgwas_scan_bim_candidates(
+    handle: Iterable[str],
+    target_sites: set[tuple[str, int]],
+) -> tuple[
+    dict[
+        tuple[str, int],
+        list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+    ],
+    int,
+]:
+    """Scan BIM once and retain identity metadata only for target coordinates."""
 
-    prepared_indices: list[int] = []
+    candidates = {site: [] for site in target_sites}
+    source_index = 0
+    for line_number, line in enumerate(handle, start=1):
+        tokens = line.split()
+        if not tokens:
+            continue
+        if len(tokens) < 6:
+            raise ValueError(f"Malformed BIM row at line {line_number}")
+        chrom = _normalize_chr(tokens[0])
+        try:
+            pos = int(float(tokens[3]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid BIM position at line {line_number}") from exc
+        metadata = (
+            chrom,
+            pos,
+            _postgwas_variant_token(tokens[1]),
+            _postgwas_variant_token(tokens[4], allele=True),
+            _postgwas_variant_token(tokens[5], allele=True),
+        )
+        site = (chrom, pos)
+        if site in candidates:
+            candidates[site].append((source_index, metadata))
+        source_index += 1
+    return candidates, source_index
+
+
+def _postgwas_index_bim_candidates(
+    candidates_by_site: dict[
+        tuple[str, int],
+        list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+    ],
+) -> dict[
+    tuple[str, int],
+    tuple[
+        list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        dict[str, list[tuple[int, tuple[str, int, str | None, str | None, str | None]]]],
+        dict[
+            frozenset[str],
+            list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        ],
+        dict[
+            tuple[str, frozenset[str]],
+            list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        ],
+        bool,
+    ],
+]:
+    """Index retained BIM candidates once per target coordinate."""
+
+    indexed = {}
+    for site, candidates in candidates_by_site.items():
+        by_id: dict[
+            str, list[tuple[int, tuple[str, int, str | None, str | None, str | None]]]
+        ] = {}
+        by_allele_pair: dict[
+            frozenset[str],
+            list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        ] = {}
+        by_id_and_allele_pair: dict[
+            tuple[str, frozenset[str]],
+            list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        ] = {}
+        has_named_id = False
+        for candidate in candidates:
+            metadata = candidate[1]
+            if metadata[2] is not None:
+                has_named_id = True
+                by_id.setdefault(metadata[2], []).append(candidate)
+            allele_pair = _postgwas_variant_allele_pair(metadata[3], metadata[4])
+            if allele_pair is not None:
+                by_allele_pair.setdefault(allele_pair, []).append(candidate)
+                if metadata[2] is not None:
+                    by_id_and_allele_pair.setdefault(
+                        (metadata[2], allele_pair), []
+                    ).append(candidate)
+        indexed[site] = (
+            candidates,
+            by_id,
+            by_allele_pair,
+            by_id_and_allele_pair,
+            has_named_id,
+        )
+    return indexed
+
+
+def _postgwas_resolve_prepared_bim_rows(
+    genotype_prefix: object,
+    prepared: pd.DataFrame,
+) -> tuple[
+    list[int],
+    list[tuple[str, int, str | None, str | None, str | None]],
+]:
+    """Resolve prepared variants from one BIM scan without materializing BIM."""
+
+    prepared_identity: list[tuple[str, int, str | None, str | None, str | None]] = []
+    target_sites: set[tuple[str, int]] = set()
     used: set[int] = set()
     has_snp = "snp" in prepared.columns
     has_allele0 = "allele0" in prepared.columns
@@ -2086,16 +2149,6 @@ def _postgwas_match_prepared_variants_to_bim(
                 f"FvLMM variant identity has an invalid position at row {row_number}"
             )
         pos = int(pos_float)
-        candidates = [
-            index
-            for index, bim_row in enumerate(bim_rows)
-            if bim_row[0] == chrom and bim_row[1] == pos
-        ]
-        if not candidates:
-            raise FineMapSkip(
-                f"no BIM variant matches prepared row {row_number} at {chrom}:{pos}"
-            )
-
         prepared_snp = (
             _postgwas_variant_token(row["snp"]) if has_snp else None
         )
@@ -2109,17 +2162,46 @@ def _postgwas_match_prepared_variants_to_bim(
             if has_allele1
             else None
         )
-        prepared_pair = _postgwas_variant_allele_pair(prepared_a0, prepared_a1)
-        id_matches = (
-            [index for index in candidates if bim_rows[index][2] == prepared_snp]
-            if prepared_snp is not None
-            else []
+        prepared_identity.append(
+            (chrom, pos, prepared_snp, prepared_a0, prepared_a1)
         )
+        target_sites.add((chrom, pos))
+
+    prefix = _normalize_plink_prefix(genotype_prefix)
+    bim_path = Path(f"{prefix}.bim")
+    try:
+        with bim_path.open("rt", encoding="utf-8", errors="replace") as handle:
+            candidates_by_site, source_rows = _postgwas_scan_bim_candidates(
+                handle, target_sites
+            )
+    except (OSError, ValueError) as exc:
+        raise FineMapSkip(f"BIM variant identity could not be read: {exc}") from exc
+    if source_rows == 0:
+        raise FineMapSkip("BIM variant identity is empty")
+    indexed_candidates_by_site = _postgwas_index_bim_candidates(candidates_by_site)
+
+    selected_indices: list[int] = []
+    selected_metadata: list[tuple[str, int, str | None, str | None, str | None]] = []
+    for row_number, (chrom, pos, prepared_snp, prepared_a0, prepared_a1) in enumerate(
+        prepared_identity
+    ):
+        (
+            all_candidates,
+            candidates_by_id,
+            candidates_by_allele_pair,
+            candidates_by_id_and_allele_pair,
+            has_named_id,
+        ) = indexed_candidates_by_site[(chrom, pos)]
+        candidates = all_candidates
+        if not candidates:
+            raise FineMapSkip(
+                f"no BIM variant matches prepared row {row_number} at {chrom}:{pos}"
+            )
+        prepared_pair = _postgwas_variant_allele_pair(prepared_a0, prepared_a1)
+        id_matches = candidates_by_id.get(prepared_snp, []) if prepared_snp is not None else []
         if id_matches:
             candidates = id_matches
-        elif prepared_snp is not None and any(
-            bim_rows[index][2] is not None for index in candidates
-        ):
+        elif prepared_snp is not None and has_named_id:
             # A named variant that cannot be found by ID is not proven by a
             # coordinate fallback when BIM contains real IDs.
             raise FineMapSkip(
@@ -2131,25 +2213,26 @@ def _postgwas_match_prepared_variants_to_bim(
                 raise FineMapSkip(
                     f"prepared variant row {row_number} has incomplete allele identity"
                 )
-            candidates = [
-                index
-                for index in candidates
-                if _postgwas_variant_allele_pair(
-                    bim_rows[index][3], bim_rows[index][4]
+            allele_matches = candidates_by_allele_pair.get(prepared_pair, [])
+            candidates = (
+                allele_matches
+                if candidates is all_candidates
+                else candidates_by_id_and_allele_pair.get(
+                    (prepared_snp, prepared_pair), []
                 )
-                == prepared_pair
-            ]
+            )
         if len(candidates) != 1:
             raise FineMapSkip(
                 "variant identity is ambiguous; exact BIM alignment cannot be proven "
                 f"for prepared row {row_number} at {chrom}:{pos}"
             )
-        bim_index = candidates[0]
+        bim_index, bim_metadata = candidates[0]
         if bim_index in used:
             raise FineMapSkip("prepared variants resolve to the same BIM row")
         used.add(bim_index)
-        prepared_indices.append(bim_index)
-    return prepared_indices
+        selected_indices.append(bim_index)
+        selected_metadata.append(bim_metadata)
+    return selected_indices, selected_metadata
 
 
 def _postgwas_site_identity_signature(site: object) -> tuple[str, int, frozenset[str] | None]:
@@ -2602,6 +2685,7 @@ def _postgwas_fvlmm_memory_components(
     qmatrix_rows: Optional[int] = None,
     susie_l: int = 5,
     existing_bytes: int = 0,
+    live_gwas_bytes: int = 0,
 ) -> dict[str, int]:
     """Return a conservative complete peak working-set accounting."""
     m = _postgwas_memory_count(n_variants)
@@ -2627,6 +2711,7 @@ def _postgwas_fvlmm_memory_components(
     mq = _postgwas_memory_product(m, q)
     components = {
         "existing_gwas_frame": _postgwas_memory_count(existing_bytes),
+        "live_gwas_frame": _postgwas_memory_count(live_gwas_bytes),
         "grm_source_full": _postgwas_memory_product(n_grm, n_grm, f64),
         "grm_subset": _postgwas_memory_product(nn, f64),
         "eigh_input_copy": _postgwas_memory_product(nn, f64),
@@ -2689,6 +2774,7 @@ def _postgwas_estimate_fvlmm_memory_bytes(
     qmatrix_rows: Optional[int] = None,
     susie_l: int = 5,
     existing_bytes: int = 0,
+    live_gwas_bytes: int = 0,
 ) -> int:
     """Estimate the complete FvLMM effective-LD/SuSiE peak in bytes."""
     return _postgwas_memory_sum(
@@ -2701,7 +2787,29 @@ def _postgwas_estimate_fvlmm_memory_bytes(
             qmatrix_rows=qmatrix_rows,
             susie_l=susie_l,
             existing_bytes=existing_bytes,
+            live_gwas_bytes=live_gwas_bytes,
         ).values()
+    )
+
+
+def _postgwas_log_fvlmm_stage(
+    logger: logging.Logger,
+    stage: str,
+    started: float,
+    *,
+    requested_threads: int,
+    using_threads: int,
+    backend: Optional[str] = None,
+) -> None:
+    elapsed = max(0.0, time.perf_counter() - started)
+    logger.info(
+        "FvLMM fine-map stage: stage=%s seconds=%.6f requested_threads=%d "
+        "using_threads=%d%s",
+        stage,
+        elapsed,
+        requested_threads,
+        using_threads,
+        "" if backend is None else f" backend={backend}",
     )
 
 
@@ -2712,8 +2820,10 @@ def _postgwas_build_fvlmm_effective_ld(
     prepared: pd.DataFrame,
     bed_indices: Optional[np.ndarray],
     logger: logging.Logger,
+    live_gwas_bytes: int = 0,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """Build exact FvLMM effective LD and retain kernel valid-row indices."""
+    requested_threads = max(1, int(getattr(args, "thread", 1)))
     _postgwas_validate_fvlmm_sidecar(record)
     if not isinstance(prepared, pd.DataFrame):
         raise FineMapSkip("FvLMM fine-mapping input rows are not a DataFrame")
@@ -2798,6 +2908,7 @@ def _postgwas_build_fvlmm_effective_ld(
             qmatrix_rows=qmatrix_rows,
             susie_l=susie_l,
             existing_bytes=existing_bytes,
+            live_gwas_bytes=live_gwas_bytes,
         )
         memory_limit_bytes = min(
             _POSTGWAS_MEMORY_INT_MAX,
@@ -2823,34 +2934,53 @@ def _postgwas_build_fvlmm_effective_ld(
         )
     logger.info(
         "FvLMM memory preflight: variants=%d samples=%d fixed_effect_columns=%d "
-        "estimated_peak=%.2f GiB limit=%.2f GiB.",
+        "locus_frame=%.2f GiB live_gwas=%.2f GiB estimated_peak=%.2f GiB "
+        "limit=%.2f GiB.",
         len(prepared),
         int(record.sample_count),
         len(record.fixed_effect_columns),
+        existing_bytes / float(1024**3),
+        max(0, int(live_gwas_bytes)) / float(1024**3),
         estimated_bytes / float(1024**3),
         max(0, memory_limit_bytes) / float(1024**3),
     )
     prepared_source = prepared.reset_index(drop=True)
 
+    context_started = time.perf_counter()
     context = _postgwas_reconstruct_fvlmm_context(
         record,
         genotype_prefix=requested_prefix,
         dependency_roots=dependency_roots,
         logger=logger,
     )
-
-    bim_rows = _postgwas_read_bim_identity_rows(requested_prefix)
-    selected_bim_indices = _postgwas_match_prepared_variants_to_bim(
-        prepared_source,
-        bim_rows,
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "context",
+        context_started,
+        requested_threads=requested_threads,
+        using_threads=1,
     )
+
+    bim_scan_started = time.perf_counter()
+    selected_bim_indices, selected_bim_metadata = _postgwas_resolve_prepared_bim_rows(
+        requested_prefix,
+        prepared_source,
+    )
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "bim_scan",
+        bim_scan_started,
+        requested_threads=requested_threads,
+        using_threads=1,
+    )
+    genotype_decode_started = time.perf_counter()
     selected_signatures = [
         (
-            bim_rows[index][0],
-            bim_rows[index][1],
-            _postgwas_variant_allele_pair(bim_rows[index][3], bim_rows[index][4]),
+            metadata[0],
+            metadata[1],
+            _postgwas_variant_allele_pair(metadata[3], metadata[4]),
         )
-        for index in selected_bim_indices
+        for metadata in selected_bim_metadata
     ]
     signature_to_bim: dict[
         tuple[str, int, frozenset[str] | None], int
@@ -2871,11 +3001,11 @@ def _postgwas_build_fvlmm_effective_ld(
             alignment_input[column] = 0.0
     selected_bim_meta = pd.DataFrame(
         {
-            "chrom": [bim_rows[index][0] for index in selected_bim_indices],
-            "pos": [bim_rows[index][1] for index in selected_bim_indices],
-            "snp": [bim_rows[index][2] for index in selected_bim_indices],
-            "allele0": [bim_rows[index][3] for index in selected_bim_indices],
-            "allele1": [bim_rows[index][4] for index in selected_bim_indices],
+            "chrom": [metadata[0] for metadata in selected_bim_metadata],
+            "pos": [metadata[1] for metadata in selected_bim_metadata],
+            "snp": [metadata[2] for metadata in selected_bim_metadata],
+            "allele0": [metadata[3] for metadata in selected_bim_metadata],
+            "allele1": [metadata[4] for metadata in selected_bim_metadata],
         }
     )
     selected_site_counts: dict[tuple[str, int], int] = {}
@@ -3013,9 +3143,8 @@ def _postgwas_build_fvlmm_effective_ld(
             # selected BIM set has exactly one row at that coordinate.
             coordinate_matches = [
                 index
-                for index in selected_bim_indices
-                if bim_rows[index][0] == signature[0]
-                and bim_rows[index][1] == signature[1]
+                for index, metadata in zip(selected_bim_indices, selected_bim_metadata)
+                if metadata[0] == signature[0] and metadata[1] == signature[1]
             ]
             if signature[2] is None and len(coordinate_matches) == 1:
                 bim_index = coordinate_matches[0]
@@ -3042,17 +3171,25 @@ def _postgwas_build_fvlmm_effective_ld(
     ):
         raise FineMapSkip("FvLMM summary/BED alignment map contains invalid indices")
     genotypes = np.ascontiguousarray(genotypes[effective_bed_indices], dtype=np.float64)
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "genotype_decode",
+        genotype_decode_started,
+        requested_threads=requested_threads,
+        using_threads=1,
+    )
 
     from janusx.assoc import workflow as workflow_module
     if not hasattr(workflow_module.jxrs, "rust_eigh_from_array_f64"):
         raise FineMapSkip(
             "FvLMM Rust EVD symbol rust_eigh_from_array_f64 is unavailable"
         )
+    grm_evd_started = time.perf_counter()
     try:
         _gwas_eigh_from_grm = workflow_module._gwas_eigh_from_grm
         eigvals, eigvecs, _eigh_backend, _eigh_elapsed = _gwas_eigh_from_grm(
             context.kinship,
-            threads=max(1, int(getattr(args, "thread", 1))),
+            threads=requested_threads,
             logger=logger,
             stage_label="PostGWAS FvLMM",
             require_rust=True,
@@ -3095,7 +3232,16 @@ def _postgwas_build_fvlmm_effective_ld(
     ):
         raise FineMapSkip("FvLMM GRM eigendecomposition returned invalid arrays")
     u_t = np.ascontiguousarray(eigvecs.T, dtype=np.float64)
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "grm_evd",
+        grm_evd_started,
+        requested_threads=requested_threads,
+        using_threads=requested_threads,
+        backend=str(_eigh_backend),
+    )
 
+    effective_ld_started = time.perf_counter()
     try:
         kernel_result = jxrs.fvlmm_effective_ld_spectral_f64(
             genotypes,
@@ -3103,7 +3249,7 @@ def _postgwas_build_fvlmm_effective_ld(
             u_t,
             context.fixed_effects,
             context.lambda_null,
-            threads=max(1, int(getattr(args, "thread", 1))),
+            threads=requested_threads,
         )
     except _PostGWASExpectedCompatibilityError as exc:
         _postgwas_skip_for_expected_source_error(exc, "FvLMM effective-LD kernel")
@@ -3136,6 +3282,19 @@ def _postgwas_build_fvlmm_effective_ld(
         diagnostic_min_projected_diag = float(
             kernel_result["min_projected_diag"]
         )
+        diagnostic_backend = str(kernel_result["backend"])
+        diagnostic_requested_threads = kernel_result["requested_threads"]
+        diagnostic_using_threads = kernel_result["using_threads"]
+        diagnostic_timings = [
+            float(kernel_result[key])
+            for key in (
+                "rotation_seconds",
+                "svd_seconds",
+                "residual_seconds",
+                "gram_seconds",
+                "total_seconds",
+            )
+        ]
         if (
             isinstance(diagnostic_fixed_columns, (bool, np.bool_))
             or not isinstance(diagnostic_fixed_columns, (int, np.integer))
@@ -3149,6 +3308,17 @@ def _postgwas_build_fvlmm_effective_ld(
             or diagnostic_rank_tolerance <= 0.0
             or not np.isfinite(diagnostic_min_projected_diag)
             or diagnostic_min_projected_diag <= 0.0
+            or diagnostic_backend not in {"accelerate", "openblas", "blas", "rust"}
+            or isinstance(diagnostic_requested_threads, (bool, np.bool_))
+            or not isinstance(diagnostic_requested_threads, (int, np.integer))
+            or int(diagnostic_requested_threads) != requested_threads
+            or isinstance(diagnostic_using_threads, (bool, np.bool_))
+            or not isinstance(diagnostic_using_threads, (int, np.integer))
+            or int(diagnostic_using_threads) != requested_threads
+            or not all(
+                np.isfinite(value) and value >= 0.0
+                for value in diagnostic_timings
+            )
         ):
             raise ValueError("kernel diagnostics are non-finite or inconsistent")
     except (KeyError, OverflowError, TypeError, ValueError) as exc:
@@ -3206,6 +3376,14 @@ def _postgwas_build_fvlmm_effective_ld(
         )
     except (np.linalg.LinAlgError, ValueError, TypeError) as exc:
         raise FineMapSkip(f"FvLMM LD diagnostics failed: {exc}") from exc
+    _postgwas_log_fvlmm_stage(
+        logger,
+        "effective_ld",
+        effective_ld_started,
+        requested_threads=int(diagnostic_requested_threads),
+        using_threads=int(diagnostic_using_threads),
+        backend=diagnostic_backend,
+    )
     logger.info(
         "FvLMM effective LD: samples=%d lambda=%.12g pve=%.12g "
         "fixed_effect_columns=%s fixed_effect_rank=%s rank_tolerance=%.6g "
@@ -3760,24 +3938,21 @@ def _postgwas_canonicalize_raw_finemap_rows(
     matrix is allocated merely to establish variant identity.
     """
     prepared_source = prepared.reset_index(drop=True)
-    bim_rows = _postgwas_read_bim_identity_rows(bfile)
-    selected_bim_indices = _postgwas_match_prepared_variants_to_bim(
+    selected_bim_indices, selected_bim_metadata = _postgwas_resolve_prepared_bim_rows(
+        bfile,
         prepared_source,
-        bim_rows,
     )
     selected_bim_meta = pd.DataFrame(
         {
-            "chrom": [bim_rows[index][0] for index in selected_bim_indices],
-            "pos": [bim_rows[index][1] for index in selected_bim_indices],
-            "snp": [bim_rows[index][2] for index in selected_bim_indices],
-            "allele0": [bim_rows[index][3] for index in selected_bim_indices],
-            "allele1": [bim_rows[index][4] for index in selected_bim_indices],
+            "chrom": [metadata[0] for metadata in selected_bim_metadata],
+            "pos": [metadata[1] for metadata in selected_bim_metadata],
+            "snp": [metadata[2] for metadata in selected_bim_metadata],
+            "allele0": [metadata[3] for metadata in selected_bim_metadata],
+            "allele1": [metadata[4] for metadata in selected_bim_metadata],
         }
     )
     selected_site_counts: dict[tuple[str, int], int] = {}
-    for chrom, pos, _snp, _allele0, _allele1 in (
-        bim_rows[index] for index in selected_bim_indices
-    ):
+    for chrom, pos, _snp, _allele0, _allele1 in selected_bim_metadata:
         site = (_postgwas_finemap_normalize_chr(chrom), int(pos))
         selected_site_counts[site] = selected_site_counts.get(site, 0) + 1
     ambiguous_sites = {
@@ -3798,6 +3973,8 @@ def _postgwas_canonicalize_raw_finemap_rows(
     aligned = aligned.reset_index(drop=True)
     aligned.attrs["_janusx_finemap_alignment_counts"] = dict(alignment_counts)
     aligned.attrs["_janusx_finemap_bed_rows"] = int(len(selected_bim_indices))
+    aligned.attrs["_janusx_finemap_bim_indices"] = list(selected_bim_indices)
+    aligned.attrs["_janusx_finemap_bim_metadata"] = list(selected_bim_metadata)
     return aligned
 
 
@@ -4149,43 +4326,6 @@ def _postgwas_select_finemap_gwas_locus(
     return gwas.iloc[row_indices[left:right]]
 
 
-def _postgwas_scan_finemap_bim_rows(
-    bfile: object,
-    locus: tuple[str, int, int],
-    selected_pos: list[int],
-) -> tuple[list[str], list[int], set[tuple[str, int]]]:
-    """Return selected BIM rows and duplicate-site context before monomorphic filtering."""
-    prefix = _normalize_plink_prefix(bfile)
-    bim_path = f"{prefix}.bim"
-    target_chrom = _postgwas_finemap_normalize_chr(locus[0])
-    selected_positions = {int(pos) for pos in selected_pos}
-    selected_chrom: list[str] = []
-    selected_bim_pos: list[int] = []
-    site_counts: dict[tuple[str, int], int] = {}
-    with open(bim_path, "rt", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            fields = line.split()
-            if len(fields) < 4:
-                raise ValueError(f"Malformed BIM row at {bim_path}:{line_number}.")
-            try:
-                pos = int(fields[3])
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid BIM position at {bim_path}:{line_number}: {fields[3]!r}."
-                ) from exc
-            if (
-                _postgwas_finemap_normalize_chr(fields[0]) == target_chrom
-                and int(locus[1]) <= pos <= int(locus[2])
-                and pos in selected_positions
-            ):
-                selected_chrom.append(fields[0])
-                selected_bim_pos.append(pos)
-                site = (_postgwas_finemap_normalize_chr(fields[0]), pos)
-                site_counts[site] = site_counts.get(site, 0) + 1
-    ambiguous_sites = {site for site, count in site_counts.items() if count > 1}
-    return selected_chrom, selected_bim_pos, ambiguous_sites
-
-
 def _postgwas_build_sample_matched_raw_ld(
     *,
     args: argparse.Namespace,
@@ -4193,10 +4333,10 @@ def _postgwas_build_sample_matched_raw_ld(
     locus: tuple[str, int, int],
     sample_ids: Sequence[str],
     bed_indices: Optional[np.ndarray],
-    selected_chrom: list[str],
-    selected_bim_pos: list[int],
-    selected_bim_rows: int,
-    ambiguous_bim_sites: set[tuple[str, int]],
+    selected_bim_indices: list[int],
+    selected_bim_metadata: list[
+        tuple[str, int, str | None, str | None, str | None]
+    ],
     existing_bytes: int,
     logger: logging.Logger,
 ) -> tuple[np.ndarray, pd.DataFrame]:
@@ -4207,6 +4347,11 @@ def _postgwas_build_sample_matched_raw_ld(
         raise FineMapSkip(
             "ordinary LD requires verified GWAS sample metadata; sample subset is empty"
         )
+    if len(selected_bim_indices) != len(prepared) or len(selected_bim_metadata) != len(
+        prepared
+    ):
+        raise FineMapSkip("raw-route BIM identity metadata does not match prepared rows")
+    selected_bim_rows = len(selected_bim_indices)
     try:
         memory_limit_bytes = int(
             getattr(args, "finemap_memory_bytes", _POSTGWAS_FINEMAP_MAX_MEMORY_BYTES)
@@ -4229,20 +4374,22 @@ def _postgwas_build_sample_matched_raw_ld(
         estimated_memory / float(1024**3),
         memory_limit_bytes / float(1024**3),
     )
-    bim_rows = _postgwas_read_bim_identity_rows(args.bfile)
-    selected_bim_indices = _postgwas_match_prepared_variants_to_bim(
-        prepared.reset_index(drop=True),
-        bim_rows,
-    )
     selected_bim_meta = pd.DataFrame(
         {
-            "chrom": [bim_rows[index][0] for index in selected_bim_indices],
-            "pos": [bim_rows[index][1] for index in selected_bim_indices],
-            "snp": [bim_rows[index][2] for index in selected_bim_indices],
-            "allele0": [bim_rows[index][3] for index in selected_bim_indices],
-            "allele1": [bim_rows[index][4] for index in selected_bim_indices],
+            "chrom": [metadata[0] for metadata in selected_bim_metadata],
+            "pos": [metadata[1] for metadata in selected_bim_metadata],
+            "snp": [metadata[2] for metadata in selected_bim_metadata],
+            "allele0": [metadata[3] for metadata in selected_bim_metadata],
+            "allele1": [metadata[4] for metadata in selected_bim_metadata],
         }
     )
+    selected_site_counts: dict[tuple[str, int], int] = {}
+    for chrom, pos, _snp, _allele0, _allele1 in selected_bim_metadata:
+        site = (_postgwas_finemap_normalize_chr(chrom), int(pos))
+        selected_site_counts[site] = selected_site_counts.get(site, 0) + 1
+    ambiguous_bim_sites = {
+        site for site, count in selected_site_counts.items() if count > 1
+    }
     genotype_chunks: list[np.ndarray] = []
     returned_sites: list[object] = []
     try:
@@ -4347,12 +4494,12 @@ def _postgwas_build_sample_matched_raw_ld(
     signature_to_bim: dict[
         tuple[str, int, frozenset[str] | None], int
     ] = {}
-    for bim_index in selected_bim_indices:
+    for bim_index, bim_metadata in zip(selected_bim_indices, selected_bim_metadata):
         signature = (
-            bim_rows[bim_index][0],
-            bim_rows[bim_index][1],
+            bim_metadata[0],
+            bim_metadata[1],
             _postgwas_variant_allele_pair(
-                bim_rows[bim_index][3], bim_rows[bim_index][4]
+                bim_metadata[3], bim_metadata[4]
             ),
         )
         if signature in signature_to_bim:
@@ -4367,9 +4514,8 @@ def _postgwas_build_sample_matched_raw_ld(
         if bim_index is None:
             coordinate_matches = [
                 index
-                for index in selected_bim_indices
-                if bim_rows[index][0] == signature[0]
-                and bim_rows[index][1] == signature[1]
+                for index, metadata in zip(selected_bim_indices, selected_bim_metadata)
+                if metadata[0] == signature[0] and metadata[1] == signature[1]
             ]
             if signature[2] is None and len(coordinate_matches) == 1:
                 bim_index = coordinate_matches[0]
@@ -4608,8 +4754,10 @@ def _postgwas_run_susie_finemap_body(
                 prepared=prepared_source,
                 bed_indices=None,
                 logger=logger,
+                live_gwas_bytes=gwas_memory_bytes,
             )
             prepared_source = effective_source.reset_index(drop=True)
+        effective_clump_started = time.perf_counter()
         prepared, clump_counts, fold_groups = _postgwas_finemap_ldclump(
             prepared_source,
             genofile=str(args.bfile),
@@ -4619,6 +4767,15 @@ def _postgwas_run_susie_finemap_body(
             sample_ids=raw_sample_ids,
             ld_matrix=effective_locus_r,
         )
+        if ld_route == "fvlmm":
+            fvlmm_threads = max(1, int(getattr(args, "thread", 1)))
+            _postgwas_log_fvlmm_stage(
+                logger,
+                "effective_clump",
+                effective_clump_started,
+                requested_threads=fvlmm_threads,
+                using_threads=1,
+            )
         logger.info(
             "SuSiE locus %s LDclump: retained=%d/%d clumped=%d groups=%d "
             "(r2>=%.6f, window=%d bp).",
@@ -4637,10 +4794,6 @@ def _postgwas_run_susie_finemap_body(
             )
             continue
 
-        selected_pos = prepared["pos"].astype(np.int64).tolist()
-        selected_chrom: list[str] = []
-        selected_bim_pos: list[int] = []
-        ambiguous_bim_sites: set[tuple[str, int]] = set()
         selected_bim_rows = 0
         if ld_route == "fvlmm":
             if effective_locus_r is None:
@@ -4667,23 +4820,26 @@ def _postgwas_run_susie_finemap_body(
             )
             aligned = prepared.copy()
         else:
-            (
-                selected_chrom,
-                selected_bim_pos,
-                ambiguous_bim_sites,
-            ) = _postgwas_scan_finemap_bim_rows(args.bfile, locus_tuple, selected_pos)
-            selected_bim_rows = len(selected_bim_pos)
+            selected_bim_indices = getattr(prepared, "attrs", {}).get(
+                "_janusx_finemap_bim_indices"
+            )
+            selected_bim_metadata = getattr(prepared, "attrs", {}).get(
+                "_janusx_finemap_bim_metadata"
+            )
             locus_r, aligned = _postgwas_build_sample_matched_raw_ld(
                 args=args,
                 prepared=prepared,
                 locus=locus_tuple,
                 sample_ids=raw_sample_ids or [],
-                selected_chrom=selected_chrom,
-                selected_bim_pos=selected_bim_pos,
-                selected_bim_rows=selected_bim_rows,
-                ambiguous_bim_sites=ambiguous_bim_sites,
+                selected_bim_indices=selected_bim_indices,
+                selected_bim_metadata=selected_bim_metadata,
                 existing_bytes=gwas_memory_bytes,
                 logger=logger,
+            )
+            selected_bim_rows = int(
+                getattr(aligned, "attrs", {}).get(
+                    "_janusx_finemap_bed_rows", len(aligned)
+                )
             )
 
         alignment_counts = {
@@ -4747,6 +4903,7 @@ def _postgwas_run_susie_finemap_body(
             raise RuntimeError(
                 f"SuSiE locus {locus_label} aligned z/LD dimensions do not agree."
             )
+        susie_started = time.perf_counter()
         try:
             fit = jxrs.susie_rss_f64(
                 z,
@@ -4758,6 +4915,15 @@ def _postgwas_run_susie_finemap_body(
             )
         except Exception as exc:
             raise RuntimeError(f"SuSiE locus {locus_label} solver failed: {exc}") from exc
+        if ld_route == "fvlmm":
+            fvlmm_threads = max(1, int(getattr(args, "thread", 1)))
+            _postgwas_log_fvlmm_stage(
+                logger,
+                "susie",
+                susie_started,
+                requested_threads=fvlmm_threads,
+                using_threads=fvlmm_threads,
+            )
 
         try:
             pip = np.asarray(fit["pip"], dtype=np.float64).reshape(-1)
@@ -4890,10 +5056,6 @@ def _postgwas_run_susie_finemap_body(
             prepared_source,
             prepared,
             fold_groups,
-            selected_pos,
-            selected_chrom,
-            selected_bim_pos,
-            ambiguous_bim_sites,
             aligned,
             locus_r,
             z,
@@ -8662,9 +8824,26 @@ def _postgwas_finalize_finemap_ldclump(
     )
     retained = prepared_rows.loc[keep].copy().reset_index(drop=True)
     retained.attrs.update(getattr(prepared_rows, "attrs", {}))
-    retained.attrs["_janusx_finemap_matrix_indices"] = np.flatnonzero(keep).astype(
+    matrix_indices = np.flatnonzero(keep).astype(
         np.int64, copy=False
     )
+    retained.attrs["_janusx_finemap_matrix_indices"] = matrix_indices
+    bim_indices = prepared_rows.attrs.get("_janusx_finemap_bim_indices")
+    bim_metadata = prepared_rows.attrs.get("_janusx_finemap_bim_metadata")
+    if bim_indices is not None or bim_metadata is not None:
+        if (
+            not isinstance(bim_indices, list)
+            or not isinstance(bim_metadata, list)
+            or len(bim_indices) != input_rows
+            or len(bim_metadata) != input_rows
+        ):
+            raise FineMapSkip("raw-route BIM identity metadata does not match prepared rows")
+        retained.attrs["_janusx_finemap_bim_indices"] = [
+            int(bim_indices[index]) for index in matrix_indices.tolist()
+        ]
+        retained.attrs["_janusx_finemap_bim_metadata"] = [
+            bim_metadata[index] for index in matrix_indices.tolist()
+        ]
     retained_rows = int(len(retained))
     counters = {
         "input_rows": input_rows,

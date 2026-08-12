@@ -1300,6 +1300,40 @@ pub(crate) unsafe fn cblas_sgemm_dispatch(
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[inline]
 #[allow(dead_code)]
+fn checked_dgemm_matrix_span(
+    order: CblasInt,
+    rows: usize,
+    columns: usize,
+    leading_dimension: usize,
+) -> Option<usize> {
+    if rows == 0 || columns == 0 {
+        return Some(0);
+    }
+    let minimum_leading_dimension = if order == CBLAS_ROW_MAJOR {
+        columns
+    } else if order == CBLAS_COL_MAJOR {
+        rows
+    } else {
+        return None;
+    };
+    if leading_dimension < minimum_leading_dimension {
+        return None;
+    }
+    let span = if order == CBLAS_ROW_MAJOR {
+        (rows - 1)
+            .checked_mul(leading_dimension)
+            .and_then(|offset| offset.checked_add(columns))
+    } else {
+        (columns - 1)
+            .checked_mul(leading_dimension)
+            .and_then(|offset| offset.checked_add(rows))
+    };
+    span
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+#[allow(dead_code)]
 unsafe fn cblas_dgemm_rust(
     order: CblasInt,
     transa: CblasInt,
@@ -1316,19 +1350,102 @@ unsafe fn cblas_dgemm_rust(
     c: *mut f64,
     ldc: CblasInt,
 ) {
-    assert_eq!(
-        order, CBLAS_COL_MAJOR,
-        "Rust DGEMM fallback expects column-major order"
+    assert!(
+        m >= 0 && n >= 0 && k >= 0,
+        "Rust DGEMM dimensions must be nonnegative"
     );
+    assert!(
+        lda >= 0 && ldb >= 0 && ldc >= 0,
+        "Rust DGEMM leading dimensions must be nonnegative"
+    );
+    assert!(
+        order == CBLAS_ROW_MAJOR || order == CBLAS_COL_MAJOR,
+        "Rust DGEMM received an unsupported matrix order"
+    );
+
+    // CBLAS treats a zero-sized output as a no-op. Return before creating any
+    // slices so null A/B/C pointers are harmless for this supported contract.
+    if m == 0 || n == 0 {
+        return;
+    }
+
     let (m, n, k) = (m as usize, n as usize, k as usize);
     let (lda, ldb, ldc) = (lda as usize, ldb as usize, ldc as usize);
 
-    let a_cols = if transa == CBLAS_NO_TRANS { k } else { m };
-    let b_cols = if transb == CBLAS_NO_TRANS { n } else { k };
-    let a_slice = std::slice::from_raw_parts(a, lda.saturating_mul(a_cols));
-    let b_slice = std::slice::from_raw_parts(b, ldb.saturating_mul(b_cols));
-    let c_slice = std::slice::from_raw_parts_mut(c, ldc.saturating_mul(n));
+    let c_span =
+        checked_dgemm_matrix_span(order, m, n, ldc).expect("Rust DGEMM C matrix span overflow");
+    let c_slice = std::slice::from_raw_parts_mut(c, c_span);
 
+    // BLAS specifies that A and B are not referenced when alpha is zero or K
+    // is zero. In particular, beta=0 must also avoid reading C so NaN inputs
+    // do not leak into the result.
+    if alpha == 0.0 || k == 0 {
+        for col in 0..n {
+            for row in 0..m {
+                let idx = if order == CBLAS_ROW_MAJOR {
+                    row * ldc + col
+                } else {
+                    row + col * ldc
+                };
+                c_slice[idx] = if beta == 0.0 {
+                    0.0
+                } else {
+                    beta * c_slice[idx]
+                };
+            }
+        }
+        return;
+    }
+
+    let (a_rows, a_columns) = if transa == CBLAS_NO_TRANS {
+        (m, k)
+    } else {
+        (k, m)
+    };
+    let (b_rows, b_columns) = if transb == CBLAS_NO_TRANS {
+        (k, n)
+    } else {
+        (n, k)
+    };
+    let a_span = checked_dgemm_matrix_span(order, a_rows, a_columns, lda)
+        .expect("Rust DGEMM A matrix span overflow");
+    let b_span = checked_dgemm_matrix_span(order, b_rows, b_columns, ldb)
+        .expect("Rust DGEMM B matrix span overflow");
+    let a_slice = std::slice::from_raw_parts(a, a_span);
+    let b_slice = std::slice::from_raw_parts(b, b_span);
+
+    if order == CBLAS_ROW_MAJOR {
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0_f64;
+                for p in 0..k {
+                    let av = if transa == CBLAS_NO_TRANS {
+                        a_slice[row * lda + p]
+                    } else {
+                        a_slice[p * lda + row]
+                    };
+                    let bv = if transb == CBLAS_NO_TRANS {
+                        b_slice[p * ldb + col]
+                    } else {
+                        b_slice[col * ldb + p]
+                    };
+                    acc += av * bv;
+                }
+                let idx = row * ldc + col;
+                c_slice[idx] = if beta == 0.0 {
+                    alpha * acc
+                } else {
+                    alpha * acc + beta * c_slice[idx]
+                };
+            }
+        }
+        return;
+    }
+
+    assert_eq!(
+        order, CBLAS_COL_MAJOR,
+        "Rust DGEMM fallback expects row- or column-major order"
+    );
     for col in 0..n {
         for row in 0..m {
             let mut acc = 0.0_f64;
@@ -1346,7 +1463,11 @@ unsafe fn cblas_dgemm_rust(
                 acc += av * bv;
             }
             let idx = row + col * ldc;
-            c_slice[idx] = alpha * acc + beta * c_slice[idx];
+            c_slice[idx] = if beta == 0.0 {
+                alpha * acc
+            } else {
+                alpha * acc + beta * c_slice[idx]
+            };
         }
     }
 }
@@ -3303,5 +3424,435 @@ pub fn rust_blas_get_num_threads() -> isize {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         -1
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod tests {
+    use super::*;
+
+    fn matrix_storage(matrix: &[Vec<f64>], order: CblasInt) -> Vec<f64> {
+        let rows = matrix.len();
+        let columns = matrix[0].len();
+        if order == CBLAS_ROW_MAJOR {
+            matrix.iter().flat_map(|row| row.iter().copied()).collect()
+        } else {
+            (0..columns)
+                .flat_map(|column| (0..rows).map(move |row| matrix[row][column]))
+                .collect()
+        }
+    }
+
+    fn padded_matrix_storage(
+        matrix: &[Vec<f64>],
+        order: CblasInt,
+        leading_dimension: usize,
+    ) -> Vec<f64> {
+        let rows = matrix.len();
+        let columns = matrix[0].len();
+        let span = checked_dgemm_matrix_span(order, rows, columns, leading_dimension).unwrap();
+        let mut storage = vec![f64::NAN; span];
+        for row in 0..rows {
+            for column in 0..columns {
+                let index = if order == CBLAS_ROW_MAJOR {
+                    row * leading_dimension + column
+                } else {
+                    row + column * leading_dimension
+                };
+                storage[index] = matrix[row][column];
+            }
+        }
+        storage
+    }
+
+    #[test]
+    fn checked_dgemm_matrix_span_stops_at_final_accessed_element() {
+        assert_eq!(checked_dgemm_matrix_span(CBLAS_ROW_MAJOR, 2, 3, 5), Some(8));
+        assert_eq!(
+            checked_dgemm_matrix_span(CBLAS_COL_MAJOR, 2, 3, 5),
+            Some(12)
+        );
+        assert_eq!(checked_dgemm_matrix_span(CBLAS_ROW_MAJOR, 2, 3, 2), None);
+        assert_eq!(checked_dgemm_matrix_span(CBLAS_COL_MAJOR, 2, 3, 1), None);
+        assert_eq!(checked_dgemm_matrix_span(999, 2, 3, 5), None);
+        assert_eq!(checked_dgemm_matrix_span(CBLAS_ROW_MAJOR, 0, 3, 5), Some(0));
+        assert_eq!(checked_dgemm_matrix_span(CBLAS_COL_MAJOR, 2, 0, 5), Some(0));
+    }
+
+    #[test]
+    fn rust_dgemm_fallback_supports_padded_leading_dimensions() {
+        let m = 2;
+        let n = 3;
+        let k = 2;
+        let logical_a = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let logical_b = vec![vec![5.0, 6.0, 7.0], vec![8.0, 9.0, 10.0]];
+        let initial_c = vec![vec![0.5, 1.0, 1.5], vec![2.0, 2.5, 3.0]];
+
+        for &order in &[CBLAS_ROW_MAJOR, CBLAS_COL_MAJOR] {
+            for &transa in &[CBLAS_NO_TRANS, CBLAS_TRANS] {
+                for &transb in &[CBLAS_NO_TRANS, CBLAS_TRANS] {
+                    let physical_a = if transa == CBLAS_NO_TRANS {
+                        logical_a.clone()
+                    } else {
+                        (0..k)
+                            .map(|row| (0..m).map(|column| logical_a[column][row]).collect())
+                            .collect()
+                    };
+                    let physical_b = if transb == CBLAS_NO_TRANS {
+                        logical_b.clone()
+                    } else {
+                        (0..n)
+                            .map(|row| (0..k).map(|column| logical_b[column][row]).collect())
+                            .collect()
+                    };
+                    let lda = 5;
+                    let ldb = 6;
+                    let ldc = 7;
+                    // The backing allocations intentionally end at the last element
+                    // addressed by DGEMM, not at ld * physical_rows/columns.
+                    let a = padded_matrix_storage(&physical_a, order, lda);
+                    let b = padded_matrix_storage(&physical_b, order, ldb);
+                    let mut c = padded_matrix_storage(&initial_c, order, ldc);
+
+                    unsafe {
+                        cblas_dgemm_rust(
+                            order,
+                            transa,
+                            transb,
+                            m as CblasInt,
+                            n as CblasInt,
+                            k as CblasInt,
+                            1.5,
+                            a.as_ptr(),
+                            lda as CblasInt,
+                            b.as_ptr(),
+                            ldb as CblasInt,
+                            -0.25,
+                            c.as_mut_ptr(),
+                            ldc as CblasInt,
+                        );
+                    }
+
+                    for row in 0..m {
+                        for column in 0..n {
+                            let product = (0..k)
+                                .map(|p| logical_a[row][p] * logical_b[p][column])
+                                .sum::<f64>();
+                            let index = if order == CBLAS_ROW_MAJOR {
+                                row * ldc + column
+                            } else {
+                                row + column * ldc
+                            };
+                            let expected = 1.5 * product - 0.25 * initial_c[row][column];
+                            assert_eq!(c[index], expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_dgemm_fallback_alpha_zero_skips_nan_operands_and_honors_beta() {
+        let m = 2;
+        let n = 2;
+        let k = 3;
+        let initial_c = vec![vec![1.5, f64::NAN], vec![-2.0, 4.25]];
+
+        for &order in &[CBLAS_ROW_MAJOR, CBLAS_COL_MAJOR] {
+            for &transa in &[CBLAS_NO_TRANS, CBLAS_TRANS] {
+                for &transb in &[CBLAS_NO_TRANS, CBLAS_TRANS] {
+                    let physical_a = if transa == CBLAS_NO_TRANS {
+                        vec![vec![f64::NAN; k]; m]
+                    } else {
+                        vec![vec![f64::NAN; m]; k]
+                    };
+                    let physical_b = if transb == CBLAS_NO_TRANS {
+                        vec![vec![f64::NAN; n]; k]
+                    } else {
+                        vec![vec![f64::NAN; k]; n]
+                    };
+                    let lda = 5;
+                    let ldb = 6;
+                    let ldc = 7;
+                    let a = padded_matrix_storage(&physical_a, order, lda);
+                    let b = padded_matrix_storage(&physical_b, order, ldb);
+                    let mut c = padded_matrix_storage(&initial_c, order, ldc);
+
+                    unsafe {
+                        cblas_dgemm_rust(
+                            order,
+                            transa,
+                            transb,
+                            m as CblasInt,
+                            n as CblasInt,
+                            k as CblasInt,
+                            0.0,
+                            a.as_ptr(),
+                            lda as CblasInt,
+                            b.as_ptr(),
+                            ldb as CblasInt,
+                            2.0,
+                            c.as_mut_ptr(),
+                            ldc as CblasInt,
+                        );
+                    }
+
+                    let expected = [[3.0, f64::NAN], [-4.0, 8.5]];
+                    for row in 0..m {
+                        for column in 0..n {
+                            let index = if order == CBLAS_ROW_MAJOR {
+                                row * ldc + column
+                            } else {
+                                row + column * ldc
+                            };
+                            if expected[row][column].is_nan() {
+                                assert!(c[index].is_nan());
+                            } else {
+                                assert_eq!(c[index], expected[row][column]);
+                            }
+                        }
+                    }
+
+                    let mut c =
+                        vec![f64::NAN; checked_dgemm_matrix_span(order, m, n, ldc).unwrap()];
+                    unsafe {
+                        cblas_dgemm_rust(
+                            order,
+                            transa,
+                            transb,
+                            m as CblasInt,
+                            n as CblasInt,
+                            k as CblasInt,
+                            0.0,
+                            std::ptr::null(),
+                            lda as CblasInt,
+                            std::ptr::null(),
+                            ldb as CblasInt,
+                            0.0,
+                            c.as_mut_ptr(),
+                            ldc as CblasInt,
+                        );
+                    }
+                    for row in 0..m {
+                        for column in 0..n {
+                            let index = if order == CBLAS_ROW_MAJOR {
+                                row * ldc + column
+                            } else {
+                                row + column * ldc
+                            };
+                            assert_eq!(c[index], 0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_dgemm_fallback_k_zero_skips_operands_and_scales_c() {
+        let m = 2;
+        let n = 3;
+        let ldc = 7;
+        let initial_c = vec![vec![1.5, f64::NAN, -2.0], vec![4.25, 0.0, 3.0]];
+
+        for &order in &[CBLAS_ROW_MAJOR, CBLAS_COL_MAJOR] {
+            let mut c = padded_matrix_storage(&initial_c, order, ldc);
+            unsafe {
+                cblas_dgemm_rust(
+                    order,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    m as CblasInt,
+                    n as CblasInt,
+                    0,
+                    f64::NAN,
+                    std::ptr::null(),
+                    1,
+                    std::ptr::null(),
+                    1,
+                    -0.5,
+                    c.as_mut_ptr(),
+                    ldc as CblasInt,
+                );
+            }
+
+            let expected = [[-0.75, f64::NAN, 1.0], [-2.125, -0.0, -1.5]];
+            for row in 0..m {
+                for column in 0..n {
+                    let index = if order == CBLAS_ROW_MAJOR {
+                        row * ldc + column
+                    } else {
+                        row + column * ldc
+                    };
+                    if expected[row][column].is_nan() {
+                        assert!(c[index].is_nan());
+                    } else {
+                        assert_eq!(c[index], expected[row][column]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_dgemm_fallback_zero_dimensions_do_not_dereference_inputs() {
+        unsafe {
+            cblas_dgemm_rust(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                0,
+                2,
+                3,
+                1.0,
+                std::ptr::null(),
+                3,
+                std::ptr::null(),
+                2,
+                1.0,
+                std::ptr::null_mut(),
+                2,
+            );
+            cblas_dgemm_rust(
+                CBLAS_COL_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_TRANS,
+                2,
+                0,
+                3,
+                f64::NAN,
+                std::ptr::null(),
+                3,
+                std::ptr::null(),
+                2,
+                f64::NAN,
+                std::ptr::null_mut(),
+                2,
+            );
+        }
+    }
+
+    #[test]
+    fn rust_dgemm_fallback_supports_cblas_layouts_transposes_and_scalars() {
+        let m = 2;
+        let n = 3;
+        let k = 2;
+        let logical_a = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let logical_b = vec![vec![5.0, 6.0, 7.0], vec![8.0, 9.0, 10.0]];
+        let initial_c = vec![vec![0.5, 1.0, 1.5], vec![2.0, 2.5, 3.0]];
+        let expected = vec![vec![41.75, 47.5, 53.25], vec![93.0, 106.75, 120.5]];
+
+        for &order in &[CBLAS_ROW_MAJOR, CBLAS_COL_MAJOR] {
+            for &transa in &[CBLAS_NO_TRANS, CBLAS_TRANS] {
+                for &transb in &[CBLAS_NO_TRANS, CBLAS_TRANS] {
+                    let physical_a = if transa == CBLAS_NO_TRANS {
+                        logical_a.clone()
+                    } else {
+                        (0..k)
+                            .map(|row| (0..m).map(|column| logical_a[column][row]).collect())
+                            .collect()
+                    };
+                    let physical_b = if transb == CBLAS_NO_TRANS {
+                        logical_b.clone()
+                    } else {
+                        (0..n)
+                            .map(|row| (0..k).map(|column| logical_b[column][row]).collect())
+                            .collect()
+                    };
+                    let a = matrix_storage(&physical_a, order);
+                    let b = matrix_storage(&physical_b, order);
+                    let mut c = matrix_storage(&initial_c, order);
+                    let lda = if order == CBLAS_ROW_MAJOR {
+                        physical_a[0].len()
+                    } else {
+                        physical_a.len()
+                    } as CblasInt;
+                    let ldb = if order == CBLAS_ROW_MAJOR {
+                        physical_b[0].len()
+                    } else {
+                        physical_b.len()
+                    } as CblasInt;
+                    let ldc = if order == CBLAS_ROW_MAJOR { n } else { m } as CblasInt;
+
+                    unsafe {
+                        cblas_dgemm_rust(
+                            order,
+                            transa,
+                            transb,
+                            m as CblasInt,
+                            n as CblasInt,
+                            k as CblasInt,
+                            2.0,
+                            a.as_ptr(),
+                            lda,
+                            b.as_ptr(),
+                            ldb,
+                            -0.5,
+                            c.as_mut_ptr(),
+                            ldc,
+                        );
+                    }
+
+                    for row in 0..m {
+                        for column in 0..n {
+                            let actual = if order == CBLAS_ROW_MAJOR {
+                                c[row * ldc as usize + column]
+                            } else {
+                                c[row + column * ldc as usize]
+                            };
+                            assert!(
+                                (actual - expected[row][column]).abs() < 1.0e-12,
+                                "order={order}, transa={transa}, transb={transb}, ({row}, {column}): actual={actual:.16e}, expected={:.16e}",
+                                expected[row][column]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let expected_product = vec![vec![21.0, 24.0, 27.0], vec![47.0, 54.0, 61.0]];
+        for &order in &[CBLAS_ROW_MAJOR, CBLAS_COL_MAJOR] {
+            let a = matrix_storage(&logical_a, order);
+            let b = matrix_storage(&logical_b, order);
+            let mut c = vec![f64::NAN; m * n];
+            let lda = if order == CBLAS_ROW_MAJOR { k } else { m } as CblasInt;
+            let ldb = if order == CBLAS_ROW_MAJOR { n } else { k } as CblasInt;
+            let ldc = if order == CBLAS_ROW_MAJOR { n } else { m } as CblasInt;
+
+            unsafe {
+                cblas_dgemm_rust(
+                    order,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    m as CblasInt,
+                    n as CblasInt,
+                    k as CblasInt,
+                    1.0,
+                    a.as_ptr(),
+                    lda,
+                    b.as_ptr(),
+                    ldb,
+                    0.0,
+                    c.as_mut_ptr(),
+                    ldc,
+                );
+            }
+
+            for row in 0..m {
+                for column in 0..n {
+                    let actual = if order == CBLAS_ROW_MAJOR {
+                        c[row * ldc as usize + column]
+                    } else {
+                        c[row + column * ldc as usize]
+                    };
+                    assert_eq!(actual, expected_product[row][column]);
+                }
+            }
+        }
     }
 }
