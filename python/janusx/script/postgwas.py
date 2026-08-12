@@ -2685,6 +2685,7 @@ def _postgwas_fvlmm_memory_components(
     qmatrix_rows: Optional[int] = None,
     susie_l: int = 5,
     existing_bytes: int = 0,
+    live_gwas_bytes: int = 0,
 ) -> dict[str, int]:
     """Return a conservative complete peak working-set accounting."""
     m = _postgwas_memory_count(n_variants)
@@ -2710,6 +2711,7 @@ def _postgwas_fvlmm_memory_components(
     mq = _postgwas_memory_product(m, q)
     components = {
         "existing_gwas_frame": _postgwas_memory_count(existing_bytes),
+        "live_gwas_frame": _postgwas_memory_count(live_gwas_bytes),
         "grm_source_full": _postgwas_memory_product(n_grm, n_grm, f64),
         "grm_subset": _postgwas_memory_product(nn, f64),
         "eigh_input_copy": _postgwas_memory_product(nn, f64),
@@ -2772,6 +2774,7 @@ def _postgwas_estimate_fvlmm_memory_bytes(
     qmatrix_rows: Optional[int] = None,
     susie_l: int = 5,
     existing_bytes: int = 0,
+    live_gwas_bytes: int = 0,
 ) -> int:
     """Estimate the complete FvLMM effective-LD/SuSiE peak in bytes."""
     return _postgwas_memory_sum(
@@ -2784,6 +2787,7 @@ def _postgwas_estimate_fvlmm_memory_bytes(
             qmatrix_rows=qmatrix_rows,
             susie_l=susie_l,
             existing_bytes=existing_bytes,
+            live_gwas_bytes=live_gwas_bytes,
         ).values()
     )
 
@@ -2816,6 +2820,7 @@ def _postgwas_build_fvlmm_effective_ld(
     prepared: pd.DataFrame,
     bed_indices: Optional[np.ndarray],
     logger: logging.Logger,
+    live_gwas_bytes: int = 0,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """Build exact FvLMM effective LD and retain kernel valid-row indices."""
     requested_threads = max(1, int(getattr(args, "thread", 1)))
@@ -2903,6 +2908,7 @@ def _postgwas_build_fvlmm_effective_ld(
             qmatrix_rows=qmatrix_rows,
             susie_l=susie_l,
             existing_bytes=existing_bytes,
+            live_gwas_bytes=live_gwas_bytes,
         )
         memory_limit_bytes = min(
             _POSTGWAS_MEMORY_INT_MAX,
@@ -2928,10 +2934,13 @@ def _postgwas_build_fvlmm_effective_ld(
         )
     logger.info(
         "FvLMM memory preflight: variants=%d samples=%d fixed_effect_columns=%d "
-        "estimated_peak=%.2f GiB limit=%.2f GiB.",
+        "locus_frame=%.2f GiB live_gwas=%.2f GiB estimated_peak=%.2f GiB "
+        "limit=%.2f GiB.",
         len(prepared),
         int(record.sample_count),
         len(record.fixed_effect_columns),
+        existing_bytes / float(1024**3),
+        max(0, int(live_gwas_bytes)) / float(1024**3),
         estimated_bytes / float(1024**3),
         max(0, memory_limit_bytes) / float(1024**3),
     )
@@ -4745,6 +4754,7 @@ def _postgwas_run_susie_finemap_body(
                 prepared=prepared_source,
                 bed_indices=None,
                 logger=logger,
+                live_gwas_bytes=gwas_memory_bytes,
             )
             prepared_source = effective_source.reset_index(drop=True)
         effective_clump_started = time.perf_counter()
