@@ -5,14 +5,23 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::BoundObject;
+use rayon::prelude::*;
+#[cfg(test)]
+use std::cell::Cell;
 use std::time::Instant;
 
 use crate::blas::{
     cblas_dgemm_dispatch, rust_sgemm_backend_tag, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS,
     CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
+use crate::stats_common::get_cached_pool;
 
 const PROJECTED_DIAG_REL_TOL: f64 = 64.0 * f64::EPSILON;
+
+#[cfg(test)]
+thread_local! {
+    static CHECKED_DGEMM_CALLS: Cell<usize> = Cell::new(0);
+}
 
 #[derive(Debug)]
 struct EffectiveLdResult {
@@ -27,6 +36,85 @@ struct EffectiveLdResult {
     residual_seconds: f64,
     gram_seconds: f64,
     total_seconds: f64,
+    using_threads: usize,
+}
+
+#[derive(Debug)]
+struct RowResidual {
+    original_index: usize,
+    diagonal: f64,
+    normalized_row: Option<Vec<f64>>,
+}
+
+impl RowResidual {
+    #[inline]
+    fn normalize(mut self, diagonal_tolerance: f64) -> Self {
+        if self.diagonal.is_finite() && self.diagonal > diagonal_tolerance {
+            let scale = self.diagonal.sqrt();
+            if scale.is_finite() && scale > 0.0 {
+                if let Some(mut row) = self.normalized_row.take() {
+                    let mut finite = true;
+                    for value in &mut row {
+                        *value /= scale;
+                        if !value.is_finite() {
+                            finite = false;
+                            break;
+                        }
+                    }
+                    if finite {
+                        self.normalized_row = Some(row);
+                    }
+                }
+            } else {
+                self.normalized_row = None;
+            }
+        } else {
+            self.normalized_row = None;
+        }
+        self
+    }
+}
+
+#[inline]
+fn residualize_one_row(
+    original_index: usize,
+    sample_count: usize,
+    fixed_effect_rank: usize,
+    gw_row_major: &[f64],
+    projected_row_major: &[f64],
+    u_covariates_row_major: &[f64],
+) -> RowResidual {
+    let mut row = Vec::with_capacity(sample_count);
+    let mut diagonal = 0.0_f64;
+    for sample in 0..sample_count {
+        let mut value = gw_row_major[original_index * sample_count + sample];
+        for rank_column in 0..fixed_effect_rank {
+            value -= projected_row_major[original_index * fixed_effect_rank + rank_column]
+                * u_covariates_row_major[sample * fixed_effect_rank + rank_column];
+        }
+        let squared = value * value;
+        if !value.is_finite() || !squared.is_finite() {
+            return RowResidual {
+                original_index,
+                diagonal: f64::NAN,
+                normalized_row: None,
+            };
+        }
+        diagonal += squared;
+        if !diagonal.is_finite() {
+            return RowResidual {
+                original_index,
+                diagonal: f64::NAN,
+                normalized_row: None,
+            };
+        }
+        row.push(value);
+    }
+    RowResidual {
+        original_index,
+        diagonal,
+        normalized_row: Some(row),
+    }
 }
 
 fn validate_finite_matrix(matrix: &DMatrix<f64>, name: &str) -> Result<(), String> {
@@ -76,6 +164,9 @@ fn checked_dgemm(
     out: &mut [f64],
     threads: usize,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    CHECKED_DGEMM_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     if m == 0 || n == 0 || k == 0 {
         return Err(format!(
             "checked_dgemm dimensions must be positive: m={m}, n={n}, k={k}"
@@ -201,6 +292,7 @@ fn fvlmm_effective_ld_spectral_core(
     threads: usize,
 ) -> Result<EffectiveLdResult, String> {
     let total_started = Instant::now();
+    let using_threads = threads.max(1);
     let snp_count = genotypes.nrows();
     let sample_count = genotypes.ncols();
     let fixed_effect_columns = fixed_effects.ncols();
@@ -281,7 +373,7 @@ fn fvlmm_effective_ld_spectral_core(
         &genotypes_row_major,
         &u_t_row_major,
         &mut gw_row_major,
-        threads,
+        using_threads,
     )?;
     checked_dgemm(
         CBLAS_NO_TRANS,
@@ -292,7 +384,7 @@ fn fvlmm_effective_ld_spectral_core(
         &u_t_row_major,
         &fixed_effects_row_major,
         &mut cw_row_major,
-        threads,
+        using_threads,
     )?;
     for sample in 0..sample_count {
         let scale = whitening[sample];
@@ -353,52 +445,49 @@ fn fvlmm_effective_ld_spectral_core(
         &gw_row_major,
         &u_covariates_row_major,
         &mut projected_row_major,
-        threads,
+        using_threads,
     )?;
 
     // Form residualized genotype rows explicitly, rather than recovering
     // their squared norms by subtracting two nearly equal quadratic forms.
     // The latter loses a small but resolvable projected signal to cancellation.
-    let mut residuals = DMatrix::<f64>::zeros(snp_count, sample_count);
-    let mut projected_diag = vec![f64::NAN; snp_count];
-    let mut max_projected_diag = 0.0_f64;
-    for snp in 0..snp_count {
-        let mut diagonal = 0.0_f64;
-        let mut row_finite = true;
-        for sample in 0..sample_count {
-            let mut value = gw_row_major[snp * sample_count + sample];
-            for rank_column in 0..fixed_effect_rank {
-                value -= projected_row_major[snp * fixed_effect_rank + rank_column]
-                    * u_covariates_row_major[sample * fixed_effect_rank + rank_column];
-            }
-            let squared = value * value;
-            if !value.is_finite() || !squared.is_finite() {
-                row_finite = false;
-                break;
-            }
-            diagonal += squared;
-            if !diagonal.is_finite() {
-                row_finite = false;
-                break;
-            }
-            residuals[(snp, sample)] = value;
-        }
-        if row_finite && diagonal.is_finite() {
-            projected_diag[snp] = diagonal;
-            max_projected_diag = max_projected_diag.max(diagonal);
-        }
-    }
+    let pool = get_cached_pool(using_threads)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "failed to create the FvLMM residual Rayon pool".to_string())?;
+    let _rayon_blas_guard = BlasThreadGuard::enter(1);
+    let rows = pool.install(|| {
+        (0..snp_count)
+            .into_par_iter()
+            .map(|snp| {
+                residualize_one_row(
+                    snp,
+                    sample_count,
+                    fixed_effect_rank,
+                    &gw_row_major,
+                    &projected_row_major,
+                    &u_covariates_row_major,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let max_projected_diag = rows
+        .iter()
+        .filter_map(|row| row.diagonal.is_finite().then_some(row.diagonal))
+        .fold(0.0_f64, f64::max);
     if !max_projected_diag.is_finite() || max_projected_diag <= 0.0 {
         return Err("projected genotype diagonals are all non-finite or zero".to_string());
     }
 
     let diagonal_tolerance = PROJECTED_DIAG_REL_TOL * max_projected_diag;
-    let valid_indices: Vec<usize> = projected_diag
+    let rows = pool.install(|| {
+        rows.into_par_iter()
+            .map(|row| row.normalize(diagonal_tolerance))
+            .collect::<Vec<_>>()
+    });
+    drop(_rayon_blas_guard);
+    let valid_indices: Vec<usize> = rows
         .iter()
-        .enumerate()
-        .filter_map(|(index, &diagonal)| {
-            (diagonal.is_finite() && diagonal > diagonal_tolerance).then_some(index)
-        })
+        .filter_map(|row| row.normalized_row.is_some().then_some(row.original_index))
         .collect();
     if valid_indices.is_empty() {
         return Err("no SNP rows have a finite, non-negligible projected diagonal".to_string());
@@ -406,42 +495,65 @@ fn fvlmm_effective_ld_spectral_core(
 
     let min_projected_diag = valid_indices
         .iter()
-        .map(|&index| projected_diag[index])
+        .map(|&index| rows[index].diagonal)
         .fold(f64::INFINITY, f64::min);
     let residual_seconds = residual_started.elapsed().as_secs_f64();
 
     let gram_started = Instant::now();
     let valid_count = valid_indices.len();
-    let mut r = DMatrix::<f64>::zeros(valid_count, valid_count);
-    for (left, &left_index) in valid_indices.iter().enumerate() {
-        let left_scale = projected_diag[left_index].sqrt();
-        for (right, &right_index) in valid_indices.iter().enumerate().skip(left) {
-            let value = if left == right {
-                1.0_f64
-            } else {
-                let right_scale = projected_diag[right_index].sqrt();
-                let mut total = 0.0_f64;
-                for sample in 0..sample_count {
-                    let left_value = residuals[(left_index, sample)] / left_scale;
-                    let right_value = residuals[(right_index, sample)] / right_scale;
-                    let product = left_value * right_value;
-                    if !product.is_finite() {
-                        return Err(format!("effective LD is non-finite at ({left}, {right})"));
-                    }
-                    total += product;
-                    if !total.is_finite() {
-                        return Err(format!("effective LD is non-finite at ({left}, {right})"));
-                    }
-                }
-                total
-            };
+    let normalized_len =
+        checked_dgemm_matrix_len(valid_count, sample_count, "normalized residuals")?;
+    let mut normalized_row_major = Vec::with_capacity(normalized_len);
+    for row in &rows {
+        if let Some(normalized_row) = &row.normalized_row {
+            normalized_row_major.extend_from_slice(normalized_row);
+        }
+    }
+    if normalized_row_major.len() != normalized_len {
+        return Err(format!(
+            "normalized residual length mismatch: expected {normalized_len}, got {}",
+            normalized_row_major.len()
+        ));
+    }
+    // The packed matrix is the only representation needed by the BLAS Gram
+    // product. Release the per-row containers before allocating its output so
+    // the optimized path does not retain two copies of every valid row.
+    drop(rows);
+
+    let gram_len = checked_dgemm_matrix_len(valid_count, valid_count, "effective LD")?;
+    let mut gram_row_major = vec![0.0_f64; gram_len];
+    checked_dgemm(
+        CBLAS_NO_TRANS,
+        CBLAS_TRANS,
+        valid_count,
+        valid_count,
+        sample_count,
+        &normalized_row_major,
+        &normalized_row_major,
+        &mut gram_row_major,
+        using_threads,
+    )?;
+    for left in 0..valid_count {
+        let diagonal = gram_row_major[left * valid_count + left];
+        if !diagonal.is_finite() {
+            return Err(format!("effective LD is non-finite at ({left}, {left})"));
+        }
+        gram_row_major[left * valid_count + left] = 1.0;
+        for right in (left + 1)..valid_count {
+            let left_value = gram_row_major[left * valid_count + right];
+            let right_value = gram_row_major[right * valid_count + left];
+            if !left_value.is_finite() || !right_value.is_finite() {
+                return Err(format!("effective LD is non-finite at ({left}, {right})"));
+            }
+            let value = 0.5_f64 * (left_value + right_value);
             if !value.is_finite() {
                 return Err(format!("effective LD is non-finite at ({left}, {right})"));
             }
-            r[(left, right)] = value;
-            r[(right, left)] = value;
+            gram_row_major[left * valid_count + right] = value;
+            gram_row_major[right * valid_count + left] = value;
         }
     }
+    let r = DMatrix::from_row_slice(valid_count, valid_count, &gram_row_major);
     let gram_seconds = gram_started.elapsed().as_secs_f64();
     let total_seconds = total_started.elapsed().as_secs_f64();
 
@@ -457,6 +569,7 @@ fn fvlmm_effective_ld_spectral_core(
         residual_seconds,
         gram_seconds,
         total_seconds,
+        using_threads,
     })
 }
 
@@ -509,7 +622,6 @@ pub fn fvlmm_effective_ld_spectral_f64<'py>(
     );
 
     let requested_threads = threads.max(1);
-    let using_threads = requested_threads;
     let result = py
         .detach(|| {
             fvlmm_effective_ld_spectral_core(
@@ -552,7 +664,7 @@ pub fn fvlmm_effective_ld_spectral_f64<'py>(
     out.set_item("min_projected_diag", result.min_projected_diag)?;
     out.set_item("backend", rust_sgemm_backend_tag())?;
     out.set_item("requested_threads", requested_threads)?;
-    out.set_item("using_threads", using_threads)?;
+    out.set_item("using_threads", result.using_threads)?;
     out.set_item("rotation_seconds", result.rotation_seconds)?;
     out.set_item("svd_seconds", result.svd_seconds)?;
     out.set_item("residual_seconds", result.residual_seconds)?;
@@ -564,6 +676,7 @@ pub fn fvlmm_effective_ld_spectral_f64<'py>(
 #[cfg(test)]
 mod tests {
     use nalgebra::{DMatrix, DVector, SVD};
+    use std::cell::Cell;
 
     use super::{
         checked_dgemm, dmatrix_to_row_major, fvlmm_effective_ld_spectral_core,
@@ -784,6 +897,7 @@ mod tests {
             residual_seconds: 0.0,
             gram_seconds: 0.0,
             total_seconds: 0.0,
+            using_threads: 1,
         })
     }
 
@@ -1022,6 +1136,101 @@ mod tests {
             0.4,
             Some(1.0e-12),
         );
+    }
+
+    #[test]
+    fn effective_ld_filters_rows_in_source_order_and_uses_checked_gram_across_threads() {
+        let n = 6;
+        let genotypes = DMatrix::from_row_slice(
+            6,
+            n,
+            &[
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                1.0,
+                1.0 + 1.0e-8,
+                1.0,
+                1.0 + 1.0e-8,
+                1.0,
+                1.0 + 1.0e-8,
+                0.0,
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                5.0,
+                5.0,
+                1.0,
+                4.0,
+                2.0,
+                3.0,
+                0.0,
+                1.0e308,
+                -1.0e308,
+                1.0e308,
+                -1.0e308,
+                1.0e308,
+                -1.0e308,
+                0.5,
+                2.0,
+                -1.0,
+                3.0,
+                1.5,
+                -0.25,
+            ],
+        );
+        let eigvals = [0.0; 6];
+        let u_t = DMatrix::<f64>::identity(n, n);
+        let fixed_effects = DMatrix::from_column_slice(n, 1, &[1.0; 6]);
+
+        let expected = fvlmm_effective_ld_scalar_reference(
+            &genotypes,
+            &eigvals,
+            &u_t,
+            &fixed_effects,
+            1.0,
+            None,
+        )
+        .expect("scalar effective-LD reference");
+        assert_eq!(expected.valid_indices, vec![2, 3, 5]);
+
+        let mut previous = None;
+        for threads in [1, 2, 4, 8] {
+            super::CHECKED_DGEMM_CALLS.with(|calls| calls.set(0));
+            let actual = fvlmm_effective_ld_spectral_core(
+                &genotypes,
+                &eigvals,
+                &u_t,
+                &fixed_effects,
+                1.0,
+                None,
+                threads,
+            )
+            .unwrap_or_else(|error| panic!("thread count {threads}: {error}"));
+
+            assert_eq!(actual.valid_indices, vec![2, 3, 5]);
+            assert_eq!(
+                super::CHECKED_DGEMM_CALLS.with(Cell::get),
+                4,
+                "the final normalized Gram must use checked dGEMM (threads={threads})"
+            );
+            assert!(actual.r.iter().all(|value| value.is_finite()));
+            assert_matrix_close(&actual.r, &expected.r, 1.0e-10);
+            for row in 0..actual.r.nrows() {
+                assert_eq!(actual.r[(row, row)], 1.0);
+                for column in 0..actual.r.ncols() {
+                    assert_eq!(actual.r[(row, column)], actual.r[(column, row)]);
+                }
+            }
+            if let Some(previous) = &previous {
+                assert_matrix_close(&actual.r, previous, 1.0e-10);
+            }
+            previous = Some(actual.r);
+        }
     }
 
     #[test]
