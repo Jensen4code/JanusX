@@ -2064,6 +2064,65 @@ def _postgwas_scan_bim_candidates(
     return candidates, source_index
 
 
+def _postgwas_index_bim_candidates(
+    candidates_by_site: dict[
+        tuple[str, int],
+        list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+    ],
+) -> dict[
+    tuple[str, int],
+    tuple[
+        list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        dict[str, list[tuple[int, tuple[str, int, str | None, str | None, str | None]]]],
+        dict[
+            frozenset[str],
+            list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        ],
+        dict[
+            tuple[str, frozenset[str]],
+            list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        ],
+        bool,
+    ],
+]:
+    """Index retained BIM candidates once per target coordinate."""
+
+    indexed = {}
+    for site, candidates in candidates_by_site.items():
+        by_id: dict[
+            str, list[tuple[int, tuple[str, int, str | None, str | None, str | None]]]
+        ] = {}
+        by_allele_pair: dict[
+            frozenset[str],
+            list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        ] = {}
+        by_id_and_allele_pair: dict[
+            tuple[str, frozenset[str]],
+            list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+        ] = {}
+        has_named_id = False
+        for candidate in candidates:
+            metadata = candidate[1]
+            if metadata[2] is not None:
+                has_named_id = True
+                by_id.setdefault(metadata[2], []).append(candidate)
+            allele_pair = _postgwas_variant_allele_pair(metadata[3], metadata[4])
+            if allele_pair is not None:
+                by_allele_pair.setdefault(allele_pair, []).append(candidate)
+                if metadata[2] is not None:
+                    by_id_and_allele_pair.setdefault(
+                        (metadata[2], allele_pair), []
+                    ).append(candidate)
+        indexed[site] = (
+            candidates,
+            by_id,
+            by_allele_pair,
+            by_id_and_allele_pair,
+            has_named_id,
+        )
+    return indexed
+
+
 def _postgwas_resolve_prepared_bim_rows(
     genotype_prefix: object,
     prepared: pd.DataFrame,
@@ -2119,28 +2178,30 @@ def _postgwas_resolve_prepared_bim_rows(
         raise FineMapSkip(f"BIM variant identity could not be read: {exc}") from exc
     if source_rows == 0:
         raise FineMapSkip("BIM variant identity is empty")
+    indexed_candidates_by_site = _postgwas_index_bim_candidates(candidates_by_site)
 
     selected_indices: list[int] = []
     selected_metadata: list[tuple[str, int, str | None, str | None, str | None]] = []
     for row_number, (chrom, pos, prepared_snp, prepared_a0, prepared_a1) in enumerate(
         prepared_identity
     ):
-        candidates = list(candidates_by_site[(chrom, pos)])
+        (
+            all_candidates,
+            candidates_by_id,
+            candidates_by_allele_pair,
+            candidates_by_id_and_allele_pair,
+            has_named_id,
+        ) = indexed_candidates_by_site[(chrom, pos)]
+        candidates = all_candidates
         if not candidates:
             raise FineMapSkip(
                 f"no BIM variant matches prepared row {row_number} at {chrom}:{pos}"
             )
         prepared_pair = _postgwas_variant_allele_pair(prepared_a0, prepared_a1)
-        id_matches = (
-            [candidate for candidate in candidates if candidate[1][2] == prepared_snp]
-            if prepared_snp is not None
-            else []
-        )
+        id_matches = candidates_by_id.get(prepared_snp, []) if prepared_snp is not None else []
         if id_matches:
             candidates = id_matches
-        elif prepared_snp is not None and any(
-            metadata[2] is not None for _index, metadata in candidates
-        ):
+        elif prepared_snp is not None and has_named_id:
             # A named variant that cannot be found by ID is not proven by a
             # coordinate fallback when BIM contains real IDs.
             raise FineMapSkip(
@@ -2152,14 +2213,14 @@ def _postgwas_resolve_prepared_bim_rows(
                 raise FineMapSkip(
                     f"prepared variant row {row_number} has incomplete allele identity"
                 )
-            candidates = [
-                candidate
-                for candidate in candidates
-                if _postgwas_variant_allele_pair(
-                    candidate[1][3], candidate[1][4]
+            allele_matches = candidates_by_allele_pair.get(prepared_pair, [])
+            candidates = (
+                allele_matches
+                if candidates is all_candidates
+                else candidates_by_id_and_allele_pair.get(
+                    (prepared_snp, prepared_pair), []
                 )
-                == prepared_pair
-            ]
+            )
         if len(candidates) != 1:
             raise FineMapSkip(
                 "variant identity is ambiguous; exact BIM alignment cannot be proven "
