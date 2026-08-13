@@ -3978,6 +3978,19 @@ def _postgwas_canonicalize_raw_finemap_rows(
     return aligned
 
 
+_POSTGWAS_FINEMAP_BASE_OUTPUT_COLUMNS = [
+    "locus",
+    "chrom",
+    "pos",
+    "snp",
+    "allele0",
+    "allele1",
+    "beta",
+    "se",
+    "posterior_mean",
+    "pip",
+]
+
 _POSTGWAS_FINEMAP_OUTPUT_COLUMNS = [
     "locus",
     "chrom",
@@ -3987,9 +4000,23 @@ _POSTGWAS_FINEMAP_OUTPUT_COLUMNS = [
     "allele1",
     "beta",
     "se",
-    "z",
-    "pip",
+    "cs_set",
+    "tag",
+    "rsqr",
     "posterior_mean",
+    "pip",
+    "coverage",
+]
+
+_POSTGWAS_FINEMAP_CS_SUMMARY_COLUMNS = [
+    "cs",
+    "coverage",
+    "representative_snp",
+    "representative_pip",
+    "n_snps",
+    "start",
+    "end",
+    "min_r2",
 ]
 
 _POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS = [
@@ -4006,8 +4033,127 @@ _POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS = [
     "is_representative",
 ]
 
+_POSTGWAS_FINEMAP_CS_MEMBER_COLUMNS = [
+    "locus",
+    "cs",
+    "coverage",
+    "chrom",
+    "pos",
+    "snp",
+    "allele0",
+    "allele1",
+    "beta",
+    "se",
+    "pip",
+    "posterior_mean",
+    "tag",
+    "rsqr",
+]
+
 _POSTGWAS_FINEMAP_CS_COVERAGE = 0.95
 _POSTGWAS_FINEMAP_PRIOR_TOL = 1e-9
+
+
+def _postgwas_finemap_row_key(row: pd.Series) -> tuple[str, int]:
+    """Return the coordinate identity used by fine-mapping row joins."""
+    chrom_column = "chrom" if "chrom" in row.index else "chrom_norm"
+    return (
+        _postgwas_finemap_normalize_chr(row[chrom_column]),
+        int(row["pos"]),
+    )
+
+
+def _postgwas_sort_finemap_output_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Place all CS rows first and keep each locus/CS block contiguous."""
+    if frame.empty:
+        return frame.reset_index(drop=True)
+    ordered = frame.copy()
+    ordered["_finemap_non_cs_order"] = ordered["cs_set"].isna().astype(np.int8)
+    ordered["_finemap_cs_order"] = pd.to_numeric(
+        ordered["cs_set"].astype(str).str.extract(r"(\d+)$", expand=False),
+        errors="coerce",
+    ).fillna(np.iinfo(np.int64).max)
+    ordered["_finemap_original_order"] = np.arange(len(ordered), dtype=np.int64)
+    ordered = ordered.sort_values(
+        [
+            "_finemap_non_cs_order",
+            "locus",
+            "_finemap_cs_order",
+            "chrom",
+            "pos",
+            "snp",
+            "_finemap_original_order",
+        ],
+        kind="mergesort",
+    )
+    return ordered.drop(
+        columns=[
+            "_finemap_non_cs_order",
+            "_finemap_cs_order",
+            "_finemap_original_order",
+        ]
+    ).reset_index(drop=True)
+
+
+def _postgwas_build_finemap_base_output(
+    prepared_rows: pd.DataFrame,
+    fitted_rows: pd.DataFrame,
+    pip: object,
+    posterior_mean: object,
+    *,
+    locus: str,
+) -> pd.DataFrame:
+    """Build one base row for every prepared SNP before CS annotation."""
+    prepared = prepared_rows.reset_index(drop=True)
+    fitted = fitted_rows.reset_index(drop=True)
+    required = {"chrom", "pos", "snp", "allele0", "allele1", "beta", "se"}
+    missing = sorted(required.difference(prepared.columns))
+    if missing:
+        raise ValueError(
+            "Fine-mapping prepared rows are missing column(s): " + ", ".join(missing)
+        )
+    missing = sorted(required.difference(fitted.columns))
+    if missing:
+        raise ValueError(
+            "Fine-mapping fitted rows are missing column(s): " + ", ".join(missing)
+        )
+    pip_array = np.asarray(pip, dtype=np.float64).reshape(-1)
+    posterior_array = np.asarray(posterior_mean, dtype=np.float64).reshape(-1)
+    if pip_array.shape != (len(fitted),) or posterior_array.shape != (len(fitted),):
+        raise ValueError("Fine-mapping fitted arrays do not match fitted rows.")
+
+    fitted_by_key: dict[tuple[str, int], int] = {}
+    for index, row in fitted.iterrows():
+        key = _postgwas_finemap_row_key(row)
+        if key not in fitted_by_key:
+            fitted_by_key[key] = int(index)
+
+    rows: list[dict[str, object]] = []
+    for _, row in prepared.iterrows():
+        fitted_index = fitted_by_key.get(_postgwas_finemap_row_key(row))
+        rows.append(
+            {
+                "locus": locus,
+                "chrom": row["chrom"],
+                "pos": int(row["pos"]),
+                "snp": row["snp"],
+                "allele0": row["allele0"],
+                "allele1": row["allele1"],
+                "beta": float(row["beta"]),
+                "se": float(row["se"]),
+                "posterior_mean": (
+                    float(posterior_array[fitted_index])
+                    if fitted_index is not None
+                    else np.nan
+                ),
+                "pip": (
+                    float(pip_array[fitted_index])
+                    if fitted_index is not None
+                    else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(rows, columns=_POSTGWAS_FINEMAP_BASE_OUTPUT_COLUMNS)
 
 
 def _postgwas_build_finemap_credible_sets(
@@ -4148,7 +4294,10 @@ def _postgwas_expand_finemap_credible_sets(
             "snp": _snp_value(row),
             "allele0": row["allele0"] if "allele0" in row.index else "",
             "allele1": row["allele1"] if "allele1" in row.index else "",
-            "pip": float(representative_pip),
+            # The restored proxy is not a fitted SuSiE variable.  Keep the
+            # tag's PIP only on the representative row; duplicating it on
+            # every proxy would inflate posterior mass in the CS table.
+            "pip": float(representative_pip) if representative else np.nan,
             "coverage": float(coverage),
             "representative_snp": representative_snp,
             "is_representative": bool(representative),
@@ -4251,6 +4400,389 @@ def _postgwas_expand_finemap_credible_sets(
         next_cs_number += 1
 
     return pd.DataFrame(rows, columns=_POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS)
+
+
+def _postgwas_build_finemap_cs_summary(cs_rows: pd.DataFrame) -> pd.DataFrame:
+    """Build one compact summary row for every expanded credible set.
+
+    The standalone CS table contains one row per member, including restored
+    clumped/folded SNPs.  The PIP table needs one row per CS, so this helper
+    chooses the highest-PIP representative and summarizes the expanded member
+    coordinates without changing the standalone CS output contract.
+    """
+    summary_columns = ["locus", *_POSTGWAS_FINEMAP_CS_SUMMARY_COLUMNS]
+    if cs_rows.empty:
+        return pd.DataFrame(columns=summary_columns)
+    required = {
+        "locus",
+        "cs",
+        "coverage",
+        "chrom",
+        "pos",
+        "snp",
+        "pip",
+        "representative_snp",
+        "is_representative",
+    }
+    missing = sorted(required.difference(cs_rows.columns))
+    if missing:
+        raise ValueError(
+            "Fine-mapping CS summary is missing column(s): " + ", ".join(missing)
+        )
+
+    rows: list[dict[str, object]] = []
+    grouped = cs_rows.groupby(
+        ["locus", "cs"], sort=False, dropna=False, as_index=False
+    )
+    for (locus, cs_name), group in grouped:
+        members = group.reset_index(drop=True)
+        representatives = members.loc[
+            members["is_representative"].astype(bool)
+        ].copy()
+        if representatives.empty:
+            representatives = members.copy()
+        representatives["_pip_numeric"] = pd.to_numeric(
+            representatives["pip"], errors="coerce"
+        )
+        representatives = representatives.sort_values(
+            ["_pip_numeric", "pos", "snp"],
+            ascending=[False, True, True],
+            kind="mergesort",
+        )
+        representative = representatives.iloc[0]
+        representative_snp = str(representative["representative_snp"])
+        representative_pip = float(representative["pip"])
+        positions = pd.to_numeric(members["pos"], errors="coerce")
+        if positions.isna().any():
+            raise ValueError(
+                f"Fine-mapping CS {locus}/{cs_name} contains a non-numeric position."
+            )
+        group_sizes = (
+            members.groupby("representative_snp", sort=False, dropna=False)
+            .size()
+            .astype(int)
+        )
+        min_r2 = ">0.99" if bool((group_sizes > 1).any()) else "1"
+        rows.append(
+            {
+                "locus": locus,
+                "cs": cs_name,
+                "coverage": float(members["coverage"].iloc[0]),
+                "representative_snp": representative_snp,
+                "representative_pip": representative_pip,
+                "n_snps": int(len(members)),
+                "start": int(positions.min()),
+                "end": int(positions.max()),
+                "min_r2": min_r2,
+            }
+        )
+    return pd.DataFrame(rows, columns=summary_columns)
+
+
+def _postgwas_merge_finemap_cs_summary(
+    pip_rows: pd.DataFrame, cs_summary: pd.DataFrame
+) -> pd.DataFrame:
+    """Annotate representative SNP rows in the per-SNP PIP table with CS data."""
+    output = pip_rows.copy()
+    for column in _POSTGWAS_FINEMAP_CS_SUMMARY_COLUMNS:
+        if column not in output.columns:
+            output[column] = pd.NA
+    if cs_summary.empty:
+        return output
+    required = {"locus", "representative_snp", *_POSTGWAS_FINEMAP_CS_SUMMARY_COLUMNS}
+    missing = sorted(required.difference(cs_summary.columns))
+    if missing:
+        raise ValueError(
+            "Fine-mapping CS summary is missing column(s): " + ", ".join(missing)
+        )
+    summary = cs_summary.loc[:, ["locus", *_POSTGWAS_FINEMAP_CS_SUMMARY_COLUMNS]].copy()
+    if summary.duplicated(["locus", "representative_snp"]).any():
+        raise ValueError("Fine-mapping CS summary has duplicate representatives.")
+    if "snp" not in output.columns:
+        raise ValueError("Fine-mapping PIP output is missing the SNP identifier column.")
+    summary = summary.rename(columns={"representative_snp": "_cs_representative_snp"})
+    merged = output.merge(
+        summary,
+        how="left",
+        left_on=["locus", "snp"],
+        right_on=["locus", "_cs_representative_snp"],
+        sort=False,
+        suffixes=("", "_summary"),
+        validate="many_to_one",
+    )
+    representative_key = "_cs_representative_snp"
+    merged["representative_snp"] = merged[representative_key].where(
+        merged[representative_key].notna(), merged["representative_snp"]
+    )
+    for column in _POSTGWAS_FINEMAP_CS_SUMMARY_COLUMNS:
+        summary_column = f"{column}_summary"
+        if summary_column in merged.columns:
+            merged[column] = merged[summary_column]
+            merged = merged.drop(columns=[summary_column])
+    merged = merged.drop(columns=[representative_key])
+    for column in ("n_snps", "start", "end"):
+        numeric = pd.to_numeric(merged[column], errors="coerce")
+        if bool((numeric.dropna() != np.floor(numeric.dropna())).any()):
+            raise ValueError(
+                f"Fine-mapping CS summary column {column} contains non-integer values."
+            )
+        merged[column] = numeric.astype("Int64")
+    return merged
+
+
+def _postgwas_build_finemap_cs_member_annotations(
+    cs_rows: pd.DataFrame,
+    *,
+    locus_r: object,
+    fitted_rows: pd.DataFrame,
+    prepared_rows: pd.DataFrame,
+    pip: object,
+    posterior_mean: object,
+    fold_r2: Optional[
+        dict[tuple[str, int], dict[tuple[str, int], float]]
+    ] = None,
+) -> pd.DataFrame:
+    """Build per-SNP CS annotations, including restored clump members.
+
+    ``cs_rows`` contains the expanded CS membership.  Fitted representatives
+    receive their fitted PIP/posterior mean, while restored members retain a
+    missing PIP and posterior mean because they were not separate SuSiE
+    variables.  Their ``tag`` and ``rsqr`` identify the fitted variable whose
+    posterior mass applies to the entire LD clump.  ``rsqr`` is computed
+    against the tag in the same LD matrix used by the fit.
+    """
+    if cs_rows.empty:
+        return pd.DataFrame(columns=_POSTGWAS_FINEMAP_CS_MEMBER_COLUMNS)
+    matrix = np.asarray(locus_r, dtype=np.float64)
+    fitted = fitted_rows.reset_index(drop=True)
+    prepared = prepared_rows.reset_index(drop=True)
+    pip_array = np.asarray(pip, dtype=np.float64).reshape(-1)
+    posterior_array = np.asarray(posterior_mean, dtype=np.float64).reshape(-1)
+    fold_r2 = fold_r2 or {}
+    if matrix.ndim != 2 or matrix.shape != (len(fitted), len(fitted)):
+        raise ValueError("Fine-mapping CS annotation LD matrix has invalid dimensions.")
+    if pip_array.shape != (len(fitted),) or posterior_array.shape != (len(fitted),):
+        raise ValueError("Fine-mapping CS annotation fit arrays have invalid dimensions.")
+
+    fitted_by_key: dict[tuple[str, int], int] = {}
+    for index, row in fitted.iterrows():
+        key = _postgwas_finemap_row_key(row)
+        if key in fitted_by_key:
+            raise ValueError(
+                "Fine-mapping fitted rows contain duplicate coordinate identity: "
+                f"{key[0]}:{key[1]}"
+            )
+        fitted_by_key[key] = int(index)
+    prepared_by_key: dict[tuple[str, int], pd.Series] = {}
+    for _, row in prepared.iterrows():
+        key = _postgwas_finemap_row_key(row)
+        if key not in prepared_by_key:
+            prepared_by_key[key] = row
+    rows: list[dict[str, object]] = []
+    for (locus, cs_name, representative_snp), group in cs_rows.groupby(
+        ["locus", "cs", "representative_snp"], sort=False, dropna=False
+    ):
+        group = group.reset_index(drop=True)
+        representatives = group.loc[group["is_representative"].astype(bool)]
+        if representatives.empty:
+            representatives = group.iloc[[0]]
+        tag_row = representatives.iloc[0]
+        tag_snp = str(representative_snp)
+        tag_key = _postgwas_finemap_row_key(tag_row)
+        tag_index = fitted_by_key.get(tag_key)
+        if tag_index is None:
+            raise ValueError(
+                f"Fine-mapping CS {locus}/{cs_name} tag is absent from fitted rows: {tag_snp}"
+            )
+        for _, member in group.iterrows():
+            member_snp = str(member["snp"])
+            member_key = _postgwas_finemap_row_key(member)
+            fitted_index = fitted_by_key.get(member_key)
+            if fitted_index is None:
+                source_row = prepared_by_key.get(member_key)
+                if source_row is None:
+                    raise ValueError(
+                        f"Fine-mapping CS member is absent from fitted and prepared rows: {member_snp}"
+                    )
+                member_beta = source_row.get("beta", np.nan)
+                member_se = source_row.get("se", np.nan)
+            else:
+                source_row = fitted.iloc[int(fitted_index)]
+                member_beta = source_row.get("beta", np.nan)
+                member_se = source_row.get("se", np.nan)
+            if fitted_index is None:
+                # A clumped proxy is not a separate SuSiE variable.  Copying
+                # the tag PIP to every proxy duplicates posterior mass and
+                # makes the per-SNP PIP column cease to be a probability.
+                member_pip = np.nan
+                member_posterior = np.nan
+                rsqr_value = fold_r2.get(tag_key, {}).get(member_key)
+                if rsqr_value is None:
+                    raise ValueError(
+                        "Fine-mapping CS folded member is missing its tag LD r2: "
+                        f"{tag_snp}->{member_snp}"
+                    )
+                rsqr = float(rsqr_value)
+            else:
+                member_pip = float(pip_array[int(fitted_index)])
+                member_posterior = float(posterior_array[int(fitted_index)])
+                rsqr = float(matrix[int(tag_index), int(fitted_index)] ** 2)
+            if member_key == tag_key:
+                member_pip = float(pip_array[tag_index])
+                member_posterior = float(posterior_array[tag_index])
+                rsqr = 1.0
+            rows.append(
+                {
+                    "locus": locus,
+                    "cs": cs_name,
+                    "coverage": float(member["coverage"]),
+                    "chrom": member["chrom"],
+                    "pos": int(member["pos"]),
+                    "snp": member_snp,
+                    "allele0": member.get("allele0", ""),
+                    "allele1": member.get("allele1", ""),
+                    "beta": float(member_beta),
+                    "se": float(member_se),
+                    "pip": member_pip,
+                    "posterior_mean": member_posterior,
+                    "tag": tag_snp,
+                    "rsqr": rsqr,
+                }
+            )
+    return pd.DataFrame(rows, columns=_POSTGWAS_FINEMAP_CS_MEMBER_COLUMNS)
+
+
+def _postgwas_merge_finemap_cs_members(
+    pip_rows: pd.DataFrame,
+    cs_rows: pd.DataFrame,
+    prepared_rows: pd.DataFrame,
+    *,
+    locus_r: object = None,
+    fitted_rows: Optional[pd.DataFrame] = None,
+    pip: object = None,
+    posterior_mean: object = None,
+    fold_r2: Optional[
+        dict[tuple[str, int], dict[tuple[str, int], float]]
+    ] = None,
+    rsqr_by_member: Optional[dict[tuple[str, str], float]] = None,
+) -> pd.DataFrame:
+    """Merge CS members into the requested ordered per-SNP output table."""
+    if rsqr_by_member is not None:
+        # Small deterministic unit-test adapter; production uses locus_r.
+        member_rows = cs_rows.copy()
+        member_rows["tag"] = member_rows["representative_snp"].astype(str)
+        member_rows["rsqr"] = [
+            float(rsqr_by_member[(str(row["locus"]), str(row["snp"]))])
+            for _, row in member_rows.iterrows()
+        ]
+        prepared_by_key = {
+            _postgwas_finemap_row_key(row): row
+            for _, row in prepared_rows.iterrows()
+        }
+        member_rows["beta"] = [
+            prepared_by_key[_postgwas_finemap_row_key(row)]["beta"]
+            for _, row in member_rows.iterrows()
+        ]
+        member_rows["se"] = [
+            prepared_by_key[_postgwas_finemap_row_key(row)]["se"]
+            for _, row in member_rows.iterrows()
+        ]
+        member_rows["posterior_mean"] = np.nan
+        member_rows["pip"] = member_rows["pip"].astype(float)
+        member_rows.loc[
+            ~member_rows["is_representative"].astype(bool), "pip"
+        ] = np.nan
+    else:
+        if fitted_rows is None or pip is None or posterior_mean is None or locus_r is None:
+            raise ValueError("Fine-mapping CS member merge requires fitted LD inputs.")
+        member_rows = _postgwas_build_finemap_cs_member_annotations(
+            cs_rows,
+            locus_r=locus_r,
+            fitted_rows=fitted_rows,
+            prepared_rows=prepared_rows,
+            pip=pip,
+            posterior_mean=posterior_mean,
+            fold_r2=fold_r2,
+        )
+    base = pip_rows.copy()
+    if "locus" not in base.columns or "snp" not in base.columns:
+        raise ValueError("Fine-mapping PIP output is missing locus or SNP identifiers.")
+    member_rows = member_rows.copy()
+    member_rows["_cs_order"] = pd.to_numeric(
+        member_rows["cs"].astype(str).str.extract(r"(\d+)$", expand=False),
+        errors="coerce",
+    )
+    member_rows = member_rows.sort_values(
+        ["locus", "_cs_order", "pos", "snp"],
+        kind="mergesort",
+    )
+    member_rows["_merge_chrom"] = member_rows["chrom"].map(
+        _postgwas_finemap_normalize_chr
+    )
+    member_rows["_merge_pos"] = pd.to_numeric(
+        member_rows["pos"], errors="raise"
+    ).astype(np.int64)
+    member_rows = member_rows.drop_duplicates(
+        ["locus", "_merge_chrom", "_merge_pos"], keep="first"
+    )
+    cs_keys = {
+        (str(row["locus"]), str(row["_merge_chrom"]), int(row["_merge_pos"]))
+        for _, row in member_rows.iterrows()
+    }
+    output_rows: list[dict[str, object]] = []
+    for _, member in member_rows.iterrows():
+        output_rows.append(
+            {
+                "locus": member["locus"],
+                "chrom": member["chrom"],
+                "pos": int(member["pos"]),
+                "snp": member["snp"],
+                "allele0": member["allele0"],
+                "allele1": member["allele1"],
+                "beta": member["beta"],
+                "se": member["se"],
+                "cs_set": member["cs"],
+                "tag": member["tag"],
+                "rsqr": member["rsqr"],
+                "posterior_mean": member["posterior_mean"],
+                "pip": member["pip"],
+                "coverage": member["coverage"],
+            }
+        )
+    for _, source in base.iterrows():
+        key = (
+            str(source["locus"]),
+            _postgwas_finemap_normalize_chr(source["chrom"]),
+            int(source["pos"]),
+        )
+        if key in cs_keys:
+            continue
+        output_rows.append(
+            {
+                "locus": source["locus"],
+                "chrom": source["chrom"],
+                "pos": int(source["pos"]),
+                "snp": source["snp"],
+                "allele0": source["allele0"],
+                "allele1": source["allele1"],
+                "beta": source["beta"],
+                "se": source["se"],
+                "cs_set": pd.NA,
+                "tag": pd.NA,
+                "rsqr": pd.NA,
+                "posterior_mean": source["posterior_mean"],
+                "pip": source["pip"],
+                "coverage": pd.NA,
+            }
+        )
+    result = pd.DataFrame(output_rows, columns=_POSTGWAS_FINEMAP_OUTPUT_COLUMNS)
+    # The CS/non-CS merge introduces ``pd.NA`` in annotation columns.  Without
+    # an explicit numeric conversion pandas can retain an object dtype, in
+    # which case ``DataFrame.to_csv(float_format=...)`` does not format the
+    # values consistently (notably rsqr and coverage).
+    for column in ("beta", "se", "rsqr", "posterior_mean", "pip", "coverage"):
+        result[column] = pd.to_numeric(result[column], errors="coerce")
+    return _postgwas_sort_finemap_output_rows(result)
 
 
 _POSTGWAS_FINEMAP_INDEX_CHROM_COLUMN = "_janusx_finemap_chrom_norm"
@@ -5006,31 +5538,33 @@ def _postgwas_run_susie_finemap_body(
             raise RuntimeError(
                 f"SuSiE locus {locus_label} credible-set expansion failed: {exc}"
             ) from exc
-        locus_output = pd.DataFrame(
-            {
-                "locus": [locus_label] * len(aligned),
-                "chrom": retained_meta["chrom"].to_numpy(dtype=object),
-                "pos": retained_meta["pos"].to_numpy(dtype=np.int64),
-                "snp": retained_meta["snp"].to_numpy(dtype=object),
-                "allele0": retained_meta["allele0"].to_numpy(dtype=object),
-                "allele1": retained_meta["allele1"].to_numpy(dtype=object),
-                "beta": aligned["beta"].to_numpy(dtype=np.float64),
-                "se": aligned["se"].to_numpy(dtype=np.float64),
-                "z": z,
-                "pip": pip,
-                "posterior_mean": posterior_mean,
-            },
-            columns=_POSTGWAS_FINEMAP_OUTPUT_COLUMNS,
+        fitted_output_rows = retained_meta.assign(
+            beta=aligned["beta"].to_numpy(dtype=np.float64),
+            se=aligned["se"].to_numpy(dtype=np.float64),
         )
-        output_order = sorted(
-            range(len(locus_output)),
-            key=lambda index: (
-                _chrom_sort_key(locus_output.at[index, "chrom"]),
-                int(locus_output.at[index, "pos"]),
-                str(locus_output.at[index, "snp"]),
+        # Start from every prepared GWAS row.  Clumping only determines the
+        # variables fitted by SuSiE; it must not silently remove non-CS folded
+        # variants from the final per-SNP table.
+        locus_base_output = _postgwas_build_finemap_base_output(
+            prepared_source,
+            fitted_output_rows,
+            pip,
+            posterior_mean,
+            locus=locus_label,
+        )
+        locus_output = _postgwas_merge_finemap_cs_members(
+            locus_base_output,
+            cs_locus_output,
+            prepared_source,
+            locus_r=locus_r,
+            fitted_rows=fitted_output_rows,
+            pip=pip,
+            posterior_mean=posterior_mean,
+            fold_r2=getattr(prepared, "attrs", {}).get(
+                "_janusx_finemap_fold_r2", {}
             ),
         )
-        locus_output = locus_output.iloc[output_order].reset_index(drop=True)
+        locus_output = locus_output.reset_index(drop=True)
         output_frames.append(locus_output)
         cs_output_frames.append(cs_locus_output)
         logger.info(
@@ -5066,13 +5600,16 @@ def _postgwas_run_susie_finemap_body(
             prior_variance,
             retained_meta,
             cs_locus_output,
+            locus_base_output,
             locus_output,
         )
 
     if len(output_frames) == 0:
         raise RuntimeError("SuSiE fine-mapping produced no successful locus.")
 
-    merged = pd.concat(output_frames, ignore_index=True)
+    merged = _postgwas_sort_finemap_output_rows(
+        pd.concat(output_frames, ignore_index=True)
+    )
     merged_cs = pd.concat(cs_output_frames, ignore_index=True)
     final_paths = (output_path, cs_output_path)
     temporary_paths = (temporary_path, cs_temporary_path)
@@ -5087,6 +5624,7 @@ def _postgwas_run_susie_finemap_body(
             index=False,
             columns=_POSTGWAS_FINEMAP_OUTPUT_COLUMNS,
             float_format=_postgwas_format_finemap_float,
+            na_rep="",
             lineterminator="\n",
         )
         merged_cs.to_csv(
@@ -5095,6 +5633,7 @@ def _postgwas_run_susie_finemap_body(
             index=False,
             columns=_POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS,
             float_format=_postgwas_format_finemap_float,
+            na_rep="",
             lineterminator="\n",
         )
         for index, final_path in enumerate(final_paths):
@@ -8363,6 +8902,9 @@ def _ldclump_significant_snps(
     show_progress: bool = True,
     preload_max_rows: Optional[int] = None,
     sample_ids: Optional[Sequence[str]] = None,
+    fold_r2: Optional[
+        dict[tuple[str, int], dict[tuple[str, int], float]]
+    ] = None,
 ) -> tuple[pd.DataFrame, dict[tuple[str, int], list[tuple[str, int]]]]:
     """
     LD-clump threshold-passing SNPs and keep lead SNPs only in annotation output.
@@ -8552,6 +9094,7 @@ def _ldclump_significant_snps(
                     snps = [all_keys[int(i)] for i in candidate_idx]
 
                     clumped = [lead_key]
+                    r2_map: dict[tuple[str, int], float] = {lead_key: 1.0}
                     mean_r2 = 1.0
                     if len(snps) > 1:
                         try:
@@ -8661,6 +9204,10 @@ def _ldclump_significant_snps(
                         clumped,
                         key=lambda k: (float(key_to_p.get(k, np.inf)), int(k[1])),
                     )
+                    if fold_r2 is not None:
+                        fold_r2[lead_key] = {
+                            key: float(r2_map.get(key, 1.0)) for key in clumped
+                        }
                     clump_dict[lead_key] = clumped
                     ld_start = int(min([int(x[1]) for x in clumped])) if len(clumped) > 0 else int(lead_pos)
                     ld_end = int(max([int(x[1]) for x in clumped])) if len(clumped) > 0 else int(lead_pos)
@@ -8711,6 +9258,10 @@ def _postgwas_finalize_finemap_ldclump(
     prepared: pd.DataFrame,
     clump_df: pd.DataFrame,
     clump_dict: dict[tuple[str, int], list[tuple[str, int]]],
+    *,
+    fold_r2: Optional[
+        dict[tuple[str, int], dict[tuple[str, int], float]]
+    ] = None,
 ) -> tuple[
     pd.DataFrame,
     dict[str, int],
@@ -8828,6 +9379,23 @@ def _postgwas_finalize_finemap_ldclump(
         np.int64, copy=False
     )
     retained.attrs["_janusx_finemap_matrix_indices"] = matrix_indices
+    if fold_r2 is not None:
+        normalized_fold_r2: dict[
+            tuple[str, int], dict[tuple[str, int], float]
+        ] = {}
+        for lead_key_raw, member_map in fold_r2.items():
+            lead_key = (
+                _postgwas_finemap_normalize_chr(lead_key_raw[0]),
+                int(lead_key_raw[1]),
+            )
+            normalized_fold_r2[lead_key] = {
+                (
+                    _postgwas_finemap_normalize_chr(member_key[0]),
+                    int(member_key[1]),
+                ): float(value)
+                for member_key, value in member_map.items()
+            }
+        retained.attrs["_janusx_finemap_fold_r2"] = normalized_fold_r2
     bim_indices = prepared_rows.attrs.get("_janusx_finemap_bim_indices")
     bim_metadata = prepared_rows.attrs.get("_janusx_finemap_bim_metadata")
     if bim_indices is not None or bim_metadata is not None:
@@ -8935,6 +9503,7 @@ def _postgwas_finemap_ldclump_from_matrix(
     }
     kept_rows: list[tuple[str, int, float, int, int, int, float, str]] = []
     clump_dict: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    fold_r2: dict[tuple[str, int], dict[tuple[str, int], float]] = {}
     window_bp = max(1, abs(int(locus[2]) - int(locus[1])))
     for work_idx, row in work.iterrows():
         if not bool(remaining[int(work_idx)]):
@@ -8965,6 +9534,9 @@ def _postgwas_finemap_ldclump_from_matrix(
         r2_map = {
             all_keys[int(index)]: float(value)
             for index, value in zip(win_idx.tolist(), r2.tolist())
+        }
+        fold_r2[(lead_chr, lead_pos)] = {
+            key: float(r2_map.get(key, 1.0)) for key in clumped
         }
         mean_r2 = float(
             np.mean([float(r2_map.get(key, 1.0)) for key in clumped])
@@ -9012,6 +9584,7 @@ def _postgwas_finemap_ldclump_from_matrix(
         prepared_rows,
         clump_df,
         clump_dict,
+        fold_r2=fold_r2,
     )
 
 
@@ -9059,6 +9632,7 @@ def _postgwas_finemap_ldclump(
             prepared_rows,
             clump_df,
             {key: [key]},
+            fold_r2={key: {key: 1.0}},
         )
 
     priority = -np.abs(
@@ -9081,6 +9655,7 @@ def _postgwas_finemap_ldclump(
         }
     )
     window_bp = max(1, abs(int(locus[2]) - int(locus[1])))
+    fold_r2: dict[tuple[str, int], dict[tuple[str, int], float]] = {}
     clump_df, clump_dict = _ldclump_significant_snps(
         work,
         chr_col="chrom_norm",
@@ -9093,11 +9668,13 @@ def _postgwas_finemap_ldclump(
         show_progress=False,
         preload_max_rows=preload_max_rows,
         sample_ids=sample_ids,
+        fold_r2=fold_r2,
     )
     return _postgwas_finalize_finemap_ldclump(
         prepared_rows,
         clump_df,
         clump_dict,
+        fold_r2=fold_r2,
     )
 
 
