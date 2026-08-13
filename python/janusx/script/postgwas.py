@@ -6329,10 +6329,8 @@ def _apply_bimrange_manhattan_axis(
     ax.set_xlim(left, right)
     ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / 1_000_000:g}Mb"))
-    ax.set_xlabel(None)
-    c = str(chrom_label)
-    ax._janusx_loc_left_label = f"{c}:{left / 1_000_000:g}Mb"   # type: ignore[attr-defined]
-    ax._janusx_loc_right_label = f"{c}:{right / 1_000_000:g}Mb"  # type: ignore[attr-defined]
+    c = _sanitize_plot_text(chrom_label)
+    ax.set_xlabel(f"Chromosome {c}")
 
 
 def _apply_multi_bimrange_manhattan_axis(
@@ -6349,63 +6347,17 @@ def _apply_multi_bimrange_manhattan_axis(
         return
     ax.set_xlim(left, right)
     centers = [0.5 * (float(seg["x_start"]) + float(seg["x_end"])) for seg in layout]
-    labels = [_sanitize_plot_text(seg["label"]) for seg in layout]
+    labels = [_sanitize_plot_text(seg["chrom"]) for seg in layout]
     ax.set_xticks(centers)
     ax.set_xticklabels(labels)
-    loc_fontsize = 5.0 if label_fontsize is None else float(label_fontsize)
+    ax.set_xlabel("Chromosome")
+    if label_fontsize is not None:
+        ax.tick_params(axis="x", labelsize=float(label_fontsize))
     for i in range(len(layout) - 1):
         x_end = float(layout[i]["x_end"])
         x_next = float(layout[i + 1]["x_start"])
         xb = 0.5 * (x_end + x_next)
         ax.axvline(x=xb, color="black", linestyle=":", linewidth=0.7, alpha=0.9)
-        prev_end_lab = _sanitize_plot_text(
-            f"{layout[i]['chrom']}:{int(layout[i]['end']) / 1_000_000:g}Mb"
-        )
-        next_start_lab = (
-            f"{layout[i + 1]['chrom']}:{int(layout[i + 1]['start']) / 1_000_000:g}Mb"
-        )
-        next_start_lab = _sanitize_plot_text(next_start_lab)
-        x_shift = 0.006 * (right - left)
-        trans = ax.get_xaxis_transform()
-        ax.text(
-            xb - x_shift,
-            -0.06,
-            prev_end_lab,
-            transform=trans,
-            ha="right",
-            va="top",
-            fontsize=loc_fontsize,
-            clip_on=False,
-            zorder=40,
-            bbox={
-                "facecolor": "white",
-                "edgecolor": "none",
-                "alpha": 0.55,
-                "pad": 0.2,
-            },
-        )
-        ax.text(
-            xb + x_shift,
-            -0.06,
-            next_start_lab,
-            transform=trans,
-            ha="left",
-            va="top",
-            fontsize=loc_fontsize,
-            clip_on=False,
-            zorder=40,
-            bbox={
-                "facecolor": "white",
-                "edgecolor": "none",
-                "alpha": 0.55,
-                "pad": 0.2,
-            },
-        )
-    first = layout[0]
-    last = layout[-1]
-    ax._janusx_loc_left_label = f"{first['chrom']}:{int(first['start']) / 1_000_000:g}Mb"   # type: ignore[attr-defined]
-    ax._janusx_loc_right_label = f"{last['chrom']}:{int(last['end']) / 1_000_000:g}Mb"      # type: ignore[attr-defined]
-    ax.set_xlabel(None)
 
 
 def _show_end_locs_without_xticks(
@@ -6435,7 +6387,6 @@ def _show_end_locs_without_xticks(
     left_lab = _sanitize_plot_text(left_lab)
     right_lab = _sanitize_plot_text(right_lab)
 
-    ax.set_xlabel(None)
     ax.set_xticks([])
     ax.tick_params(axis="x", which="both", length=0, labelbottom=False)
     trans = ax.transAxes
@@ -10313,7 +10264,6 @@ def _postgwas_plot_susie_locus_records(
         pip_y_max = _POSTGWAS_SUSIE_PIP_Y_MAX_WITH_HEADROOM
     ax_pip.set_ylim(pip_y_min, pip_y_max)
     ax_pip.grid(axis="y", color="#D9D9D2", linewidth=0.6, alpha=0.7)
-    ax_pip.set_title("SuSiE PIP", loc="left", pad=5.0)
     if legend_handles:
         ax_pip.legend(
             list(legend_handles.values()),
@@ -11659,10 +11609,6 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     else:
                         bchrom, bstart, bend = args.bimrange_tuples[0]
                         _apply_bimrange_manhattan_axis(ax, bchrom, bstart, bend)
-                    _show_end_locs_without_xticks(
-                        ax,
-                        label_fontsize=manh_loc_fontsize,
-                    )
             if args.ylim_min is not None or args.ylim_max is not None:
                 _y0, _y1 = ax.get_ylim()
                 lo = float(args.ylim_min) if args.ylim_min is not None else 0.0
@@ -12265,7 +12211,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         line_color="grey",
                         sig_line_color="red",
                     )
-                if not (args.bimrange_tuples is not None and len(args.bimrange_tuples) == 1):
+                if args.bimrange_tuples is None:
                     _show_end_locs_without_xticks(
                         ax_manhld_top,
                         label_fontsize=float(_tmp_fontsize),
@@ -12855,7 +12801,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 draw_xmins.append(float(np.nanmin(x_keep)))
                 draw_xmaxs.append(float(np.nanmax(x_keep)))
 
-        ax.set_xlabel("chrom")
+        ax.set_xlabel("Chromosome")
         ax.set_ylabel("-log10(p)")
         if (
             x_axis_left is not None
@@ -13523,7 +13469,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 line_color="grey",
                 sig_line_color="red",
             )
-        if not (args.bimrange_tuples is not None and len(args.bimrange_tuples) == 1):
+        if args.bimrange_tuples is None:
             _show_end_locs_without_xticks(
                 ax_manhld_top,
                 label_fontsize=float(manhld_fontsize),
