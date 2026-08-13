@@ -10251,11 +10251,6 @@ def _postgwas_plot_susie_locus_records(
         panel_width_in=float(_PANEL_WIDTH_IN),
         reserve_right_in=1.25,
     )
-    manh_canvas_width = (
-        float(_PANEL_LEFT_IN) + float(_PANEL_WIDTH_IN) + float(_PANEL_RIGHT_IN)
-    )
-    pip_canvas_width = manh_canvas_width + 1.25
-    pip_scatter_size_scale = (pip_canvas_width / manh_canvas_width) ** 2
     all_cs_names = [
         str(cs_name)
         for record in records
@@ -10286,10 +10281,7 @@ def _postgwas_plot_susie_locus_records(
             ax_pip.scatter(
                 np.asarray(points["x"], dtype=float)[indices],
                 np.asarray(points["pip"], dtype=float)[indices],
-                s=(
-                    np.asarray(points["size"], dtype=float)[indices]
-                    * pip_scatter_size_scale
-                ),
+                s=np.asarray(points["size"], dtype=float)[indices],
                 c=colors,
                 marker=marker,
                 alpha=0.92 if role != "non_cs" else 0.75,
@@ -10347,14 +10339,6 @@ def _postgwas_plot_susie_locus_records(
         )
     axis_limits = _postgwas_susie_locus_axis_limits(ranges, layout)
     ax_pip.set_xlim(axis_limits)
-    fig.suptitle(
-        "; ".join(str(record["locus"]) for record in records),
-        x=0.08,
-        y=0.995,
-        ha="left",
-        va="top",
-        fontsize=float(getattr(args, "_postgwas_base_fontsize", 8.0)),
-    )
     os.makedirs(os.path.dirname(path) or ".", mode=0o755, exist_ok=True)
     _save_figure_and_close(fig, path)
     logger.info("SuSiE locus figure: %s", format_path_for_display(path))
