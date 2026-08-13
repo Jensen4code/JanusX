@@ -1615,6 +1615,8 @@ _POSTGWAS_FINEMAP_PURITY_R2_DEFAULT = 0.25
 _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR = "#9A9A91"
 _POSTGWAS_SUSIE_PIP_HEADROOM_THRESHOLD = 0.98
 _POSTGWAS_SUSIE_PIP_Y_MAX_WITH_HEADROOM = 1.05
+_POSTGWAS_SUSIE_PIP_FLOOR_THRESHOLD = 0.02
+_POSTGWAS_SUSIE_PIP_Y_MIN_WITH_HEADROOM = -0.05
 _POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES = (
     (".fvlmm.tsv", "fvlmm"),
     (".lmm.tsv", "lmm"),
@@ -10249,6 +10251,11 @@ def _postgwas_plot_susie_locus_records(
         panel_width_in=float(_PANEL_WIDTH_IN),
         reserve_right_in=1.25,
     )
+    manh_canvas_width = (
+        float(_PANEL_LEFT_IN) + float(_PANEL_WIDTH_IN) + float(_PANEL_RIGHT_IN)
+    )
+    pip_canvas_width = manh_canvas_width + 1.25
+    pip_scatter_size_scale = (pip_canvas_width / manh_canvas_width) ** 2
     all_cs_names = [
         str(cs_name)
         for record in records
@@ -10279,7 +10286,10 @@ def _postgwas_plot_susie_locus_records(
             ax_pip.scatter(
                 np.asarray(points["x"], dtype=float)[indices],
                 np.asarray(points["pip"], dtype=float)[indices],
-                s=np.asarray(points["size"], dtype=float)[indices],
+                s=(
+                    np.asarray(points["size"], dtype=float)[indices]
+                    * pip_scatter_size_scale
+                ),
                 c=colors,
                 marker=marker,
                 alpha=0.92 if role != "non_cs" else 0.75,
@@ -10303,10 +10313,13 @@ def _postgwas_plot_susie_locus_records(
         ]
     )
     finite_pip = pip_values[np.isfinite(pip_values)]
+    pip_y_min = 0.0
+    if finite_pip.size > 0 and float(np.min(finite_pip)) <= _POSTGWAS_SUSIE_PIP_FLOOR_THRESHOLD:
+        pip_y_min = _POSTGWAS_SUSIE_PIP_Y_MIN_WITH_HEADROOM
     pip_y_max = 1.0
     if finite_pip.size > 0 and float(np.max(finite_pip)) >= _POSTGWAS_SUSIE_PIP_HEADROOM_THRESHOLD:
         pip_y_max = _POSTGWAS_SUSIE_PIP_Y_MAX_WITH_HEADROOM
-    ax_pip.set_ylim(0.0, pip_y_max)
+    ax_pip.set_ylim(pip_y_min, pip_y_max)
     ax_pip.grid(axis="y", color="#D9D9D2", linewidth=0.6, alpha=0.7)
     ax_pip.set_title("SuSiE PIP", loc="left", pad=5.0)
     if legend_handles:
