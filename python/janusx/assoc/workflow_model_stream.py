@@ -72,6 +72,34 @@ _WARNED_BED_MMAP_LIMIT_LEGACY = False
 _WARNED_BED_PREPARED_SNPS_ONLY_LEGACY = False
 
 
+def _format_kfile_assoc_text(
+    *,
+    maf: object,
+    results: object,
+    include_header: bool = True,
+) -> str:
+    """Format the k-file contract output without site metadata or filtering."""
+    maf_arr = np.asarray(maf, dtype=np.float64).reshape(-1)
+    result_arr = np.asarray(results, dtype=np.float64)
+    if result_arr.ndim != 2 or int(result_arr.shape[1]) < 3:
+        raise ValueError("k-file association results must have at least 3 columns.")
+    if int(result_arr.shape[0]) != int(maf_arr.shape[0]):
+        raise ValueError("k-file MAF and association result row counts differ.")
+    out = np.column_stack(
+        [
+            np.char.mod("%.8g", maf_arr),
+            np.char.mod("%.8g", result_arr[:, 0]),
+            np.char.mod("%.8g", result_arr[:, 1]),
+            np.char.mod("%.6e", result_arr[:, 2]),
+        ]
+    )
+    buf = io.StringIO()
+    if bool(include_header):
+        buf.write("maf\tbeta\tse\tpwald\n")
+    np.savetxt(buf, out, fmt="%s", delimiter="\t")
+    return buf.getvalue()
+
+
 def _current_bed_memory_mb() -> float:
     try:
         mb = float(os.environ.get("JX_BED_BLOCK_TARGET_MB", "512"))
@@ -517,6 +545,213 @@ def _filter_snps_only_chunk_python_fallback(
     raise RuntimeError(
         "Rust-only GWAS mode disables Python snps_only chunk fallback."
     )
+
+
+def run_chunked_gwas_kfile(
+    *,
+    model_names: list[str],
+    kfile: str,
+    kfile_ids: np.ndarray,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    n_kmers: int,
+    outprefix: str,
+    chunk_size: int,
+    grm: Union[np.ndarray, str, None],
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    threads: int,
+    logger: logging.Logger,
+    sparse_grm: Optional[str] = None,
+    summary_rows: Optional[list[dict[str, object]]] = None,
+    saved_paths: Optional[list[str]] = None,
+    use_spinner: bool = False,
+) -> None:
+    """Run the four-column streaming GWAS contract directly on a k-file."""
+    requested = []
+    for raw in model_names:
+        key = str(raw).strip().lower()
+        if key in {"lm", "lmm", "fvlmm", "splmm"} and key not in requested:
+            requested.append(key)
+    if not requested:
+        return
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+    source_ids = np.asarray(kfile_ids, dtype=str).reshape(-1)
+    target_ids = np.asarray(ids, dtype=str).reshape(-1)
+    source_pos = {sid: i for i, sid in enumerate(source_ids.tolist())}
+    missing = [sid for sid in target_ids.tolist() if sid not in source_pos]
+    if missing:
+        raise ValueError(f"k-file sample alignment failed: {missing[:5]}")
+
+    for trait_name in list(pheno.columns):
+        y_full, sameidx = _trait_values_and_mask(pheno, trait_name)
+        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        if int(keep_idx.shape[0]) == 0:
+            logger.warning(f"{trait_name}: no overlapping samples, skipped.")
+            continue
+        trait_ids = np.asarray(target_ids[keep_idx], dtype=str)
+        sample_indices = np.asarray(
+            [source_pos[sid] for sid in trait_ids.tolist()],
+            dtype=np.int64,
+        )
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+        x_cov = np.asarray(qmatrix[keep_idx], dtype=np.float64)
+        if cov_all is not None:
+            x_cov = np.concatenate(
+                [x_cov, np.asarray(cov_all[keep_idx], dtype=np.float64)],
+                axis=1,
+            )
+        grm_trait = None
+        if grm is not None and not isinstance(grm, str):
+            grm_arr = np.asarray(grm)
+            if grm_arr.ndim != 2 or grm_arr.shape[0] != grm_arr.shape[1]:
+                raise ValueError("k-file GRM must be a square matrix.")
+            if grm_arr.shape[0] == target_ids.shape[0]:
+                grm_trait = np.ascontiguousarray(
+                    grm_arr[np.ix_(keep_idx, keep_idx)]
+                )
+            elif grm_arr.shape[0] == keep_idx.shape[0]:
+                grm_trait = np.ascontiguousarray(grm_arr)
+            else:
+                raise ValueError("k-file GRM sample dimension does not match phenotype IDs.")
+
+        models: list[tuple[str, object]] = []
+        shared_lmm = None
+        for model_key in requested:
+            if model_key == "lm":
+                models.append((model_key, LM(y=y_vec, X=x_cov)))
+            elif model_key == "lmm":
+                if grm_trait is None:
+                    raise ValueError("k-file LMM requires a GRM.")
+                shared_lmm = LMM(y=y_vec, X=x_cov, kinship=grm_trait)
+                models.append((model_key, shared_lmm))
+            elif model_key == "fvlmm":
+                if grm_trait is None:
+                    raise ValueError("k-file FvLMM requires a GRM.")
+                if shared_lmm is not None and hasattr(FvLMM, "from_lmm"):
+                    models.append((model_key, FvLMM.from_lmm(shared_lmm)))
+                else:
+                    models.append(
+                        (model_key, FvLMM(y=y_vec, X=x_cov, kinship=grm_trait))
+                    )
+            elif model_key == "splmm":
+                from .api import ASSOC
+
+                sparse_kinship = sparse_grm if sparse_grm is not None else grm_trait
+                if sparse_kinship is None:
+                    raise ValueError("k-file SparseLMM requires a GRM.")
+                sparse_model = ASSOC(
+                    model="splmm",
+                    model_args={
+                        "threads": max(1, int(threads)),
+                        "chunk_size": max(1, int(chunk_size)),
+                    },
+                )
+                if isinstance(sparse_kinship, str):
+                    # Preserve sample IDs so ASSOC can use a sparse GRM's .id
+                    # sidecar to reorder the k-file-aligned trait subset.
+                    sparse_model.fit(
+                        pd.Series(y_vec, index=pd.Index(trait_ids, dtype=str)),
+                        X=x_cov,
+                        k=sparse_kinship,
+                    )
+                else:
+                    sparse_model.fit(y_vec, X=x_cov, k=sparse_kinship)
+                models.append((model_key, sparse_model))
+
+        out_handles: dict[str, tuple[object, str, str, int]] = {}
+        try:
+            for model_key, _model in models:
+                safe_trait = _safe_trait_file_label(trait_name)
+                out_tsv = f"{outprefix}.{safe_trait}.{model_key}.tsv"
+                tmp_tsv = _gwas_result_tmp_path(out_tsv)
+                out_handles[model_key] = (
+                    open(tmp_tsv, "w", encoding="utf-8", newline=""),
+                    tmp_tsv,
+                    out_tsv,
+                    0,
+                )
+
+            reader = jxrs.KfileChunkReader(
+                str(kfile),
+                sample_indices=sample_indices.tolist(),
+            )
+            while True:
+                item = reader.next_chunk(max(1, int(chunk_size)))
+                if item is None:
+                    break
+                dosage_raw, maf_raw, _row_idx = item
+                dosage = np.ascontiguousarray(np.asarray(dosage_raw, dtype=np.float32))
+                maf = np.asarray(maf_raw, dtype=np.float32).reshape(-1)
+                if dosage.ndim != 2 or dosage.shape[1] != int(y_vec.shape[0]):
+                    raise RuntimeError("k-file dosage chunk is not aligned to the trait samples.")
+                if int(dosage.shape[0]) != int(maf.shape[0]):
+                    raise RuntimeError("k-file dosage/MAF chunk row counts differ.")
+                for model_key, model in models:
+                    if model_key == "splmm":
+                        results = model._assoc_backend_splmm(
+                            dosage,
+                            threads=max(1, int(threads)),
+                            chunk_size=max(1, int(chunk_size)),
+                        )
+                    else:
+                        results = model.gwas(dosage, threads=max(1, int(threads)))
+                    text = _format_kfile_assoc_text(
+                        maf=maf,
+                        results=results,
+                        include_header=(
+                            int(out_handles[model_key][3]) == 0
+                        ),
+                    )
+                    handle, tmp_tsv, out_tsv, count = out_handles[model_key]
+                    handle.write(text)
+                    out_handles[model_key] = (handle, tmp_tsv, out_tsv, count + int(maf.shape[0]))
+
+            for model_key, _model in models:
+                handle, tmp_tsv, out_tsv, count = out_handles[model_key]
+                handle.flush()
+                handle.close()
+                if count <= 0:
+                    _cleanup_gwas_result_tmp(tmp_tsv)
+                    continue
+                _finalize_gwas_result_tsv(tmp_tsv, out_tsv, kfile, logger=logger)
+                saved_paths.append(str(out_tsv))
+                summary_rows.append(
+                    {
+                        "phenotype": str(trait_name),
+                        "model": str(model_key).upper() if model_key != "fvlmm" else "FvLMM",
+                        "nidv": int(keep_idx.shape[0]),
+                        "eff_snp": int(count),
+                        "pve": (
+                            float(getattr(_model, "pve"))
+                            if model_key in {"lmm", "fvlmm"}
+                            and np.isfinite(float(getattr(_model, "pve", np.nan)))
+                            else None
+                        ),
+                        "avg_cpu": 0.0,
+                        "peak_rss_gb": 0.0,
+                        "gwas_time_s": 0.0,
+                        "viz_time_s": 0.0,
+                        "result_file": str(out_tsv),
+                    }
+                )
+                _log_model_line(
+                    logger,
+                    "FvLMM" if model_key == "fvlmm" else model_key.upper(),
+                    f"Results saved to {_display_path(str(out_tsv))}",
+                    use_spinner=bool(use_spinner),
+                )
+        except Exception:
+            for handle, tmp_tsv, _out_tsv, _count in out_handles.values():
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                _cleanup_gwas_result_tmp(tmp_tsv)
+            raise
 
 
 def run_chunked_gwas_lmm_lm(

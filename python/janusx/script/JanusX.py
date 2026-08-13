@@ -138,6 +138,7 @@ _CLI_MODULE_SECTIONS = [
             ("kmer", "K-mer counting workflow via KMC"),
             ("kmerge", "Merge multi-sample KMC databases into genotype matrix"),
             ("kstats", "Compute pairwise KMC k-mer statistics"),
+            ("kformat", "Filter and convert JanusX kfile bitmatrices"),
         ],
     ),
     (
@@ -158,7 +159,7 @@ _MODULE_NAMES = [
     "gwas", "fvlmm2", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
     "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "garfieldbench", "fastpop", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
-    "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "view", "treeplot", "refcheck",
+    "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "kformat", "view", "treeplot", "refcheck",
 ]
 _SCRIPT_MODULE_ALIASES = {
     # Keep CLI surface stable (`jx gwas` / `jx gs`) while routing heavy

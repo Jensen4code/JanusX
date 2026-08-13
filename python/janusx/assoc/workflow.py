@@ -180,6 +180,9 @@ from janusx.script._common.grmio import (
     grm_load_status_open,
     grm_text_materialized_message,
     load_or_materialize_square_grm_cache,
+    load_grm_matrix,
+    read_id_file as _read_grm_id_file,
+    resolve_grm_id_path,
 )
 from janusx.assoc.null_model_sidecar import GwasSidecarRunContext
 
@@ -4042,6 +4045,40 @@ def prepare_streaming_context(
       - GRM + Q (cached)
       - covariates (optional)
     """
+    if _is_kfile_prefix(genofile):
+        k_chunk = max(
+            1,
+            min(
+                10_000,
+                int(preinspected_n_snps)
+                if preinspected_n_snps is not None
+                else 10_000,
+            ),
+        )
+        pheno_k, ids_k, n_k, grm_k, q_k, cov_k, eff_k = _prepare_kfile_stream_context(
+            prefix=_resolve_kfile_prefix(genofile),
+            phenofile=phenofile,
+            pheno_cols=pheno_cols,
+            cov_inputs=cov_inputs,
+            chunk_size=k_chunk,
+            grm_option=str(mgrm),
+            qcov=str(pcdim),
+            threads=int(threads),
+            logger=logger,
+            use_spinner=bool(use_spinner),
+            require_grm=bool(require_kinship),
+        )
+        return (
+            pheno_k,
+            ids_k,
+            n_k,
+            grm_k,
+            q_k,
+            cov_k,
+            eff_k,
+            str(_resolve_kfile_prefix(genofile)),
+            None,
+        )
     delay_pheno_complete = bool(prewarm_global_scanmeta)
     pheno_src = _basename_only(phenofile)
     pheno_t0 = time.monotonic() if delay_pheno_complete else None
@@ -4518,6 +4555,231 @@ def _as_plink_prefix(path_or_prefix: str) -> Union[str, None]:
     if all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam")):
         return p
     return None
+
+
+def _is_kfile_prefix(path_or_prefix: object) -> bool:
+    raw = str(path_or_prefix or "").strip()
+    if raw == "":
+        return False
+    meta = raw if raw.lower().endswith(".meta.json") else f"{raw}.meta.json"
+    return os.path.isfile(meta)
+
+
+def _resolve_kfile_prefix(path_or_prefix: object) -> str:
+    raw = str(path_or_prefix or "").strip()
+    if raw.lower().endswith(".meta.json"):
+        return raw[: -len(".meta.json")]
+    return raw
+
+
+def _inspect_kfile_source(prefix: str) -> tuple[np.ndarray, int, dict[str, object]]:
+    if not hasattr(jxrs, "kfile_inspect"):
+        raise RuntimeError(
+            "Rust extension missing kfile_inspect; rebuild/reinstall JanusX."
+        )
+    info = dict(jxrs.kfile_inspect(str(prefix)))
+    ids = np.asarray(info.get("sample_ids", []), dtype=str).reshape(-1)
+    n_samples = int(info.get("n_samples", ids.shape[0]))
+    n_kmers = int(info.get("n_kmers", 0))
+    if ids.shape[0] != n_samples:
+        raise ValueError(
+            f"k-file .idv sample count mismatch: ids={ids.shape[0]}, metadata={n_samples}"
+        )
+    if n_samples == 0 or n_kmers == 0:
+        raise ValueError("k-file metadata contains no samples or k-mers.")
+    if len(set(ids.tolist())) != int(ids.shape[0]):
+        raise ValueError("k-file .idv contains duplicate sample IDs.")
+    return ids, n_kmers, info
+
+
+def _new_kfile_reader(
+    prefix: str,
+    *,
+    sample_indices: Optional[np.ndarray] = None,
+) -> object:
+    if not hasattr(jxrs, "KfileChunkReader"):
+        raise RuntimeError(
+            "Rust extension missing KfileChunkReader; rebuild/reinstall JanusX."
+        )
+    idx = None
+    if sample_indices is not None:
+        idx = np.asarray(sample_indices, dtype=np.int64).reshape(-1).tolist()
+    return jxrs.KfileChunkReader(str(prefix), sample_indices=idx)
+
+
+def _build_kfile_grm_streaming(
+    prefix: str,
+    *,
+    sample_indices: np.ndarray,
+    n_kmers: int,
+    chunk_size: int,
+    method: int,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[np.ndarray, int]:
+    """Build a bounded-memory centered/standardized GRM from kfile dosage chunks."""
+    if int(method) not in {1, 2}:
+        raise ValueError("k-file GRM method must be 1 (centered) or 2 (standardized).")
+    idx = np.asarray(sample_indices, dtype=np.int64).reshape(-1)
+    n = int(idx.shape[0])
+    if n == 0:
+        raise ValueError("k-file GRM sample selection is empty.")
+    reader = _new_kfile_reader(prefix, sample_indices=idx)
+    grm = np.zeros((n, n), dtype=np.float64)
+    denom = 0.0
+    eff_m = 0
+    while True:
+        item = reader.next_chunk(max(1, int(chunk_size)))
+        if item is None:
+            break
+        dosage, _maf_chunk, _row_idx = item
+        block = np.ascontiguousarray(np.asarray(dosage, dtype=np.float64))
+        if block.ndim != 2 or block.shape[1] != n:
+            raise ValueError("k-file GRM chunk sample dimension mismatch.")
+        # This is the same centered/standardized convention as the BED GRM
+        # path, but the whole chunk is accumulated with one BLAS-friendly
+        # matrix product.  The reader's MAF is deliberately not used here:
+        # centering needs the presence frequency p, not min(p, 1-p).
+        p = np.mean(block, axis=1) * 0.5
+        variance = np.maximum(2.0 * p * (1.0 - p), 0.0)
+        centered = block - (2.0 * p)[:, None]
+        if int(method) == 2:
+            keep = variance > 1e-12
+            if np.any(keep):
+                standardized = centered[keep] / np.sqrt(variance[keep])[:, None]
+                grm += standardized.T @ standardized
+                denom += float(np.count_nonzero(keep))
+            eff_m += int(np.count_nonzero(keep))
+        else:
+            grm += centered.T @ centered
+            denom += float(np.sum(variance, dtype=np.float64))
+            eff_m += int(block.shape[0])
+    if eff_m == 0 or denom <= 0.0:
+        return np.zeros((n, n), dtype=np.float32), 0
+    out = np.asarray(grm / denom, dtype=np.float32)
+    out = np.asarray((out + out.T) * 0.5, dtype=np.float32)
+    if logger is not None and bool(getattr(logger, "_janusx_gwas_verbose", False)):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"k-file GRM stream: retained {int(eff_m)} of {int(n_kmers)} rows.",
+        )
+    return out, int(eff_m)
+
+
+def _load_kfile_external_grm(
+    grm_path: str,
+    *,
+    ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    path = str(grm_path)
+    matrix = np.asarray(load_grm_matrix(path), dtype=np.float64)
+    id_path = resolve_grm_id_path(path, None)
+    if id_path is None:
+        if matrix.shape[0] != int(ids.shape[0]):
+            raise ValueError(
+                "External GRM has no .id sidecar and its size does not match k-file samples."
+            )
+        return matrix, np.asarray(ids, dtype=str)
+    grm_ids = np.asarray(_read_grm_id_file(id_path), dtype=str)
+    if matrix.shape[0] != int(grm_ids.shape[0]):
+        raise ValueError("External GRM matrix and .id sidecar have different sample counts.")
+    pos = {sid: i for i, sid in enumerate(grm_ids.tolist())}
+    missing = [sid for sid in np.asarray(ids, dtype=str).tolist() if sid not in pos]
+    if missing:
+        raise ValueError(f"External GRM is missing k-file samples: {missing[:5]}")
+    order = np.asarray([pos[sid] for sid in np.asarray(ids, dtype=str)], dtype=np.int64)
+    return np.ascontiguousarray(matrix[np.ix_(order, order)]), np.asarray(ids, dtype=str)
+
+
+def _prepare_kfile_stream_context(
+    *,
+    prefix: str,
+    phenofile: str,
+    pheno_cols: Union[list[int], None],
+    cov_inputs: Union[str, list[str], None],
+    chunk_size: int,
+    grm_option: str,
+    qcov: str,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    require_grm: bool = False,
+) -> tuple[pd.DataFrame, np.ndarray, int, Optional[np.ndarray], np.ndarray, Optional[np.ndarray], int]:
+    k_ids, n_kmers, _info = _inspect_kfile_source(prefix)
+    pheno = _load_phenotype_with_status(
+        phenofile,
+        pheno_cols,
+        logger,
+        id_col=0,
+        use_spinner=use_spinner,
+    )
+    pheno, ids = _align_pheno_to_sample_order(pheno, k_ids)
+    any_finite = False
+    for col in pheno.columns:
+        values = pd.to_numeric(pheno[col], errors="coerce").to_numpy(dtype=np.float64)
+        any_finite |= bool(np.any(np.isfinite(values)))
+    if not any_finite:
+        raise ValueError("No finite phenotype samples overlap k-file .idv IDs.")
+    id_pos = {sid: i for i, sid in enumerate(k_ids.tolist())}
+    sample_indices = np.asarray([id_pos[sid] for sid in ids], dtype=np.int64)
+    cov_all, cov_ids = _load_covariate_for_streaming(
+        cov_inputs,
+        prefix,
+        ids,
+        max(1, int(chunk_size)),
+        logger,
+        use_spinner=use_spinner,
+        snps_only=False,
+    )
+    if cov_ids is not None:
+        cov_pos = {sid: i for i, sid in enumerate(np.asarray(cov_ids, dtype=str))}
+        keep_cov = np.asarray([sid in cov_pos for sid in ids], dtype=np.bool_)
+        if not np.all(keep_cov):
+            ids = np.asarray(ids[keep_cov], dtype=str)
+            pheno = pheno.loc[ids]
+            sample_indices = np.asarray([id_pos[sid] for sid in ids], dtype=np.int64)
+        cov_all = np.asarray(
+            cov_all[[cov_pos[sid] for sid in ids]],
+            dtype=np.float32,
+        )
+    qdim = _parse_qcov_dim(qcov)
+    grm = None
+    eff_m = int(n_kmers)
+    if (
+        (bool(require_grm) or qdim > 0)
+        and str(grm_option).strip() not in {"", "1", "2"}
+    ):
+        grm, _grm_ids = _load_kfile_external_grm(grm_option, ids=ids)
+    elif str(grm_option).strip() in {"1", "2"} and (bool(require_grm) or qdim > 0):
+        grm, eff_m = _build_kfile_grm_streaming(
+            prefix,
+            sample_indices=sample_indices,
+            n_kmers=n_kmers,
+            chunk_size=max(1, int(chunk_size)),
+            method=int(str(grm_option).strip()),
+            logger=logger,
+        )
+    qmatrix = np.zeros((len(ids), 0), dtype=np.float32)
+    if qdim > 0:
+        if grm is None:
+            raise ValueError("k-file Q/PC preparation requires a GRM.")
+        _eval, eigvec, _backend, _elapsed = _gwas_eigh_from_grm(
+            grm,
+            threads=max(1, int(threads)),
+            logger=logger,
+            stage_label="k-file GWAS-Q",
+            require_rust=True,
+        )
+        qmatrix = np.asarray(eigvec[:, -int(qdim):], dtype=np.float32)
+    return (
+        pheno,
+        np.asarray(ids, dtype=str),
+        int(n_kmers),
+        grm,
+        qmatrix,
+        (None if cov_all is None else np.asarray(cov_all, dtype=np.float32)),
+        int(eff_m),
+    )
 
 
 def _is_full_identity_index(idx: object, size: int) -> bool:
@@ -6126,6 +6388,11 @@ def run_chunked_gwas_streaming_shared(*args, **kwargs):
     from janusx.assoc.workflow_model_stream import run_chunked_gwas_streaming_shared as _impl
     return _impl(*args, **kwargs)
 
+
+def run_chunked_gwas_kfile(*args, **kwargs):
+    from janusx.assoc.workflow_model_stream import run_chunked_gwas_kfile as _impl
+    return _impl(*args, **kwargs)
+
 def prepare_qk_and_filter(*args, **kwargs):
     from janusx.assoc.workflow_model_farmcpu import prepare_qk_and_filter as _impl
     return _impl(*args, **kwargs)
@@ -6825,6 +7092,15 @@ def parse_args(argv: Optional[list[str]] = None):
     genotype_group = parser.add_argument_group("Genotype Arguments (Required: Select exactly one)")
     geno_group = genotype_group.add_mutually_exclusive_group(required=False)
     add_common_genotype_source_args(geno_group, include_file=True)
+    geno_group.add_argument(
+        "-kfile",
+        "--kfile",
+        type=str,
+        help=(
+            "JanusX k-mer bitmatrix prefix. Reads only <prefix>.bsite and <prefix>.idv "
+            "through the streaming k-file GWAS route; <prefix>.bkmer is not required."
+        ),
+    )
 
     phenotype_group = parser.add_argument_group("Phenotype Arguments (Required)")
     add_common_pheno_arg(
@@ -7127,12 +7403,12 @@ def parse_args(argv: Optional[list[str]] = None):
     args, extras = parser.parse_known_args(argv)
     args._out_was_explicit = bool(_option_present(raw_argv, "-o", "--out"))
     args._prefix_was_explicit = bool(_option_present(raw_argv, "-prefix", "--prefix"))
-    has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile)
+    has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile or args.kfile)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
         parser.error(
             "the following arguments are required: -p/--pheno & "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -kfile KFILE)"
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
@@ -7144,7 +7420,7 @@ def parse_args(argv: Optional[list[str]] = None):
     if not has_genotype:
         parser.error(
             "the following arguments are required: "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -kfile KFILE)"
         )
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
@@ -7364,7 +7640,7 @@ def _run_gwas_pipeline(
         args = parse_args(argv)
     # Plotting is enabled by default for GWAS CLI, but benchmarks can disable
     # it to keep visualization out of end-to-end runtime comparisons.
-    args.plot = _gwas_plot_enabled()
+    args.plot = False if getattr(args, "kfile", None) else _gwas_plot_enabled()
     args.cov = _normalize_cov_inputs(args.cov)
     args._lm2_cov_idx = None
     args._lm2_fallback_to_lm = False
@@ -7387,6 +7663,17 @@ def _run_gwas_pipeline(
         gfile, prefix = determine_genotype_source(args)
     finally:
         setattr(args, "prefix", legacy_prefix)
+
+    kfile_mode = bool(getattr(args, "kfile", None))
+    if kfile_mode:
+        gfile = _resolve_kfile_prefix(args.kfile)
+        prefix = os.path.basename(gfile.rstrip("/\\"))
+        # The k-file contract deliberately scans every bsite row.  Keep the
+        # regular GWAS filter options from leaking into GRM/scan helpers if a
+        # future route is added below, and make the effective policy explicit.
+        args.maf = 0.0
+        args.geno = 1.0
+        args.het = 1.0
 
     out_dir, outprefix = _resolve_gwas_output_prefix(
         getattr(args, "out", None),
@@ -7508,6 +7795,8 @@ def _run_gwas_pipeline(
     advanced_config_rows: list[tuple[str, object]] = []
     _, _file_matrix_path_cli = _resolve_file_input_matrix(gfile)
     input_is_file_matrix = bool(_file_matrix_path_cli is not None)
+    if kfile_mode:
+        input_is_file_matrix = False
     qtn_input_requested = _qtn_source_from_args(args) is not None
     requested_stream_models: list[str] = []
     scan_bimranges = list(getattr(args, "bimrange_ranges", []) or [])
@@ -7530,6 +7819,22 @@ def _run_gwas_pipeline(
     requested_memory_models = list(requested_stream_models)
     if bool(args.farmcpu):
         requested_memory_models.append("farmcpu")
+    if kfile_mode:
+        unsupported_kfile_models = [
+            str(model)
+            for model in requested_stream_models
+            if str(model).strip().lower() not in {"lm", "lmm", "fvlmm", "splmm"}
+        ]
+        if len(unsupported_kfile_models) > 0 or bool(args.farmcpu) or bool(args.algwas):
+            unsupported_kfile_models.extend(
+                model
+                for model, enabled in (("farmcpu", args.farmcpu), ("algwas", args.algwas))
+                if bool(enabled) and model not in unsupported_kfile_models
+            )
+            raise ValueError(
+                "-kfile currently supports only -lm, -lmm, -fvlmm and -splmm; "
+                f"unsupported model(s): {', '.join(unsupported_kfile_models)}"
+            )
     qcov_requested = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     qcov_needs_grm = False
     standard_stream_models_requested = bool(
@@ -7577,55 +7882,93 @@ def _run_gwas_pipeline(
         )
         raise SystemExit(1)
     if args.memory is None:
-        inspect_force_kind = determine_genotype_source_force_kind_from_args(args)
-        preinspect_src = _basename_only(gfile)
-        preinspect_t0 = time.monotonic()
-        with CliStatus(genotype_load_status_open(preinspect_src), enabled=False, use_process=True) as task:
+        if kfile_mode:
+            preinspect_t0 = time.monotonic()
             try:
-                preinspect_ids_raw, preinspect_n_snps, preinspect_warn_msgs = _inspect_genotype_file_with_warnings(
-                    gfile,
-                    snps_only=bool(args.snps_only),
-                    maf_threshold=float(args.maf),
-                    max_missing_rate=float(args.geno),
-                    het_threshold=float(args.het),
-                    force_kind=inspect_force_kind,
-                )
-            except ValueError as ex:
-                task.fail(genotype_load_status_fail(preinspect_src))
+                preinspect_ids, preinspect_n_snps, _kfile_info = _inspect_kfile_source(gfile)
+            except Exception as ex:
                 _abort_cli_input_error(logger, ex)
-            except Exception:
-                task.fail(genotype_load_status_fail(preinspect_src))
-                raise
-        preinspect_ids = np.asarray(preinspect_ids_raw, dtype=str)
-        preinspect_n_snps = int(preinspect_n_snps)
-        preinspect_warnings.extend(preinspect_warn_msgs)
-        preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
-        preinspect_src_for_merge = str(preinspect_src)
-        qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
-        if not bool(defer_genotype_success_until_scanmeta):
+            preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
+            preinspect_src_for_merge = _basename_only(gfile)
+            qcov_needs_grm = _gwas_qcov_prefers_grm_route(
+                args.qcov,
+                int(len(preinspect_ids)),
+            )
             _queue_preconfig_success(
-                f"{genotype_load_status_done(preinspect_src, n_samples=len(preinspect_ids), n_snps=int(preinspect_n_snps))} "
+                f"k-file metadata loaded ({len(preinspect_ids)} samples, {int(preinspect_n_snps)} k-mers) "
                 f"[{format_elapsed(preinspect_elapsed_secs)}]"
             )
-        auto_memory_gb, auto_memory_reason = _resolve_gwas_auto_decode_memory_gb(
-            n_samples_total=int(len(preinspect_ids)),
-            n_markers_total=int(preinspect_n_snps),
-            requested_models=list(requested_memory_models),
-            qcov_needs_grm=bool(qcov_needs_grm),
-        )
-        args.memory = float(auto_memory_gb)
-        args._memory_mb = _bed_memory_gb_to_mb(args.memory)
-        args._memory_auto_reason = str(auto_memory_reason)
-        auto_memory_msg = (
-            "GWAS decode memory auto: "
-            f"{float(args.memory):.2f} GB "
-            f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
-            "Override with -mem/--memory to keep a fixed working-memory budget."
-        )
-        if _gwas_logger_verbose(logger):
-            logger.info(auto_memory_msg)
+            auto_memory_gb, auto_memory_reason = _resolve_gwas_auto_decode_memory_gb(
+                n_samples_total=int(len(preinspect_ids)),
+                n_markers_total=int(preinspect_n_snps),
+                requested_models=list(requested_memory_models),
+                qcov_needs_grm=bool(qcov_needs_grm),
+            )
+            args.memory = float(auto_memory_gb)
+            args._memory_mb = _bed_memory_gb_to_mb(args.memory)
+            args._memory_auto_reason = str(auto_memory_reason)
         else:
-            _log_file_only(logger, logging.INFO, auto_memory_msg)
+            inspect_force_kind = determine_genotype_source_force_kind_from_args(args)
+            preinspect_src = _basename_only(gfile)
+            preinspect_t0 = time.monotonic()
+            with CliStatus(genotype_load_status_open(preinspect_src), enabled=False, use_process=True) as task:
+                try:
+                    preinspect_ids_raw, preinspect_n_snps, preinspect_warn_msgs = _inspect_genotype_file_with_warnings(
+                        gfile,
+                        snps_only=bool(args.snps_only),
+                        maf_threshold=float(args.maf),
+                        max_missing_rate=float(args.geno),
+                        het_threshold=float(args.het),
+                        force_kind=inspect_force_kind,
+                    )
+                except ValueError as ex:
+                    task.fail(genotype_load_status_fail(preinspect_src))
+                    _abort_cli_input_error(logger, ex)
+                except Exception:
+                    task.fail(genotype_load_status_fail(preinspect_src))
+                    raise
+            preinspect_ids = np.asarray(preinspect_ids_raw, dtype=str)
+            preinspect_n_snps = int(preinspect_n_snps)
+            preinspect_warnings.extend(preinspect_warn_msgs)
+            preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
+            preinspect_src_for_merge = str(preinspect_src)
+            qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
+            if not bool(defer_genotype_success_until_scanmeta):
+                _queue_preconfig_success(
+                    f"{genotype_load_status_done(preinspect_src, n_samples=len(preinspect_ids), n_snps=int(preinspect_n_snps))} "
+                    f"[{format_elapsed(preinspect_elapsed_secs)}]"
+                )
+            auto_memory_gb, auto_memory_reason = _resolve_gwas_auto_decode_memory_gb(
+                n_samples_total=int(len(preinspect_ids)),
+                n_markers_total=int(preinspect_n_snps),
+                requested_models=list(requested_memory_models),
+                qcov_needs_grm=bool(qcov_needs_grm),
+            )
+            args.memory = float(auto_memory_gb)
+            args._memory_mb = _bed_memory_gb_to_mb(args.memory)
+            args._memory_auto_reason = str(auto_memory_reason)
+            auto_memory_msg = (
+                "GWAS decode memory auto: "
+                f"{float(args.memory):.2f} GB "
+                f"(reason: {str(auto_memory_reason).strip() or 'route-aware default'}). "
+                "Override with -mem/--memory to keep a fixed working-memory budget."
+            )
+            if _gwas_logger_verbose(logger):
+                logger.info(auto_memory_msg)
+            else:
+                _log_file_only(logger, logging.INFO, auto_memory_msg)
+    elif kfile_mode:
+        preinspect_t0 = time.monotonic()
+        try:
+            preinspect_ids, preinspect_n_snps, _kfile_info = _inspect_kfile_source(gfile)
+        except Exception as ex:
+            _abort_cli_input_error(logger, ex)
+        preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
+        preinspect_src_for_merge = _basename_only(gfile)
+        qcov_needs_grm = _gwas_qcov_prefers_grm_route(
+            args.qcov,
+            int(len(preinspect_ids)),
+        )
     elif preinspect_ids is not None:
         qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
 
@@ -7800,7 +8143,15 @@ def _run_gwas_pipeline(
         _flush_preconfig_successes()
 
     checks: list[bool] = []
-    if args.bfile:
+    if args.kfile:
+        checks.append(
+            ensure_file_exists(
+                logger,
+                f"{gfile}.meta.json",
+                "Genotype k-file metadata",
+            )
+        )
+    elif args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
@@ -8122,7 +8473,91 @@ def _run_gwas_pipeline(
                         )
 
                 post_grm_hook = _capture_sidecar_grm_path
-            if shared_context_needed:
+            if kfile_mode:
+                if terminal_rich:
+                    _section(terminal_logger, "k-file GWAS")
+                if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
+                    _flush_preconfig_successes()
+                kfile_sparse_grm = None
+                for cfg in splmm_prepared_run_cfgs.values():
+                    raw_sparse_path = cfg.get("sparse_jxgrm_path", None)
+                    if raw_sparse_path is None:
+                        continue
+                    sparse_path_text = str(raw_sparse_path).strip()
+                    if sparse_path_text != "":
+                        kfile_sparse_grm = sparse_path_text
+                        break
+                kfile_chunk_size = max(1, int(args.chunksize))
+                if preinspect_ids is not None and preinspect_n_snps is not None:
+                    kfile_chunk_size = _resolve_bed_block_rows_from_memory(
+                        float(args._memory_mb),
+                        int(len(preinspect_ids)),
+                        int(preinspect_n_snps),
+                        streaming=True,
+                        working_buffers=_gwas_requested_working_buffers(
+                            requested_models=list(requested_memory_models),
+                            qcov_needs_grm=bool(qcov_needs_grm),
+                        ),
+                    )
+                args.chunksize = int(kfile_chunk_size)
+                pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m = _prepare_kfile_stream_context(
+                    prefix=str(genofile_stream),
+                    phenofile=str(args.pheno),
+                    pheno_cols=args.ncol,
+                    cov_inputs=args.cov,
+                    chunk_size=int(kfile_chunk_size),
+                    grm_option=str(args.grm),
+                    qcov=str(args.qcov),
+                    threads=max(1, int(args.thread)),
+                    logger=logger,
+                    use_spinner=bool(use_spinner),
+                    require_grm=bool(
+                        args.lmm
+                        or getattr(args, "lmm2", False)
+                        or args.fvlmm
+                        or (
+                            _gwas_splmm_requested(args)
+                            and kfile_sparse_grm is None
+                        )
+                    ),
+                )
+                run_chunked_gwas_kfile(
+                    model_names=list(stream_models),
+                    kfile=str(genofile_stream),
+                    kfile_ids=np.asarray(preinspect_ids, dtype=str),
+                    pheno=pheno,
+                    ids=np.asarray(ids, dtype=str),
+                    n_kmers=int(n_snps),
+                    outprefix=str(outprefix),
+                    chunk_size=int(kfile_chunk_size),
+                    grm=grm,
+                    sparse_grm=kfile_sparse_grm,
+                    qmatrix=np.asarray(qmatrix, dtype=np.float32),
+                    cov_all=(None if cov_all is None else np.asarray(cov_all, dtype=np.float32)),
+                    threads=max(1, int(args.thread)),
+                    logger=logger,
+                    summary_rows=gwas_summary_rows,
+                    saved_paths=saved_result_paths,
+                    use_spinner=bool(use_spinner),
+                )
+                preloaded_packed = None
+                genofile_stream = str(_resolve_kfile_prefix(genofile_stream))
+                stream_models = []
+                has_farmcpu = False
+                farmcpu_handled_in_trait_loop = True
+                setattr(
+                    logger,
+                    "_janusx_gwas_task_context_rows",
+                    [
+                        ("Data Loaded", f"{int(len(ids))} Samples | {int(n_snps)} k-mers"),
+                        ("Genotype Cache", _display_path(str(genofile_stream))),
+                        ("GRM Status", _format_gwas_grm_status(grm, args.grm)),
+                        ("Q Matrix", _format_gwas_q_status(qmatrix)),
+                        ("Covariates", _format_gwas_cov_status(cov_all)),
+                        ("Output", "maf/beta/se/pwald; plot disabled"),
+                    ],
+                )
+            elif shared_context_needed:
                 if terminal_rich:
                     _section(terminal_logger, "GWAS task")
                 if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
@@ -8141,7 +8576,12 @@ def _run_gwas_pipeline(
                     pcdim=args.qcov,
                     cov_inputs=args.cov,
                     threads=args.thread,
-                    require_kinship=(args.lmm or getattr(args, "lmm2", False) or args.fvlmm),
+                    require_kinship=(
+                        args.lmm
+                        or getattr(args, "lmm2", False)
+                        or args.fvlmm
+                        or _gwas_splmm_requested(args)
+                    ),
                     logger=logger,
                     use_spinner=use_spinner,
                     snps_only=bool(args.snps_only),

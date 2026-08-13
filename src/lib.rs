@@ -265,7 +265,10 @@ use heritability::{
     prepare_heritability_broad_sparse_cache, prepare_heritability_trait_workflow,
     prepare_sparse_onehot_blup_cache, SparseOneHotBlupCache,
 };
-use kmer::{kmer_count_run_py, kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py};
+use kmer::{
+    kfile_inspect_py, kformat_run_py, kmer_count_run_py, kmer_resolve_inputs_py, kmerge_run_py,
+    kstats_run_py, KfileChunkReader,
+};
 use ld::{
     bed_ld_corr_rust, bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority,
     bed_prune_mask_to_plink_rust, bed_prune_selected_to_plink_rust, bed_prune_to_plink_rust,
@@ -722,6 +725,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
     m.add_class::<Bin01StreamWriter>()?;
+    m.add_class::<KfileChunkReader>()?;
     m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(and_popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(bitand_assign_py, m)?)?;
@@ -745,6 +749,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kmerge_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(kmer_resolve_inputs_py, m)?)?;
     m.add_function(wrap_pyfunction!(kstats_run_py, m)?)?;
+    m.add_function(wrap_pyfunction!(kfile_inspect_py, m)?)?;
+    m.add_function(wrap_pyfunction!(kformat_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(fastq2count_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(fastq2vcf_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(merge_genotypes, m)?)?;
