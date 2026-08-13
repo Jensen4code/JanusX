@@ -5410,6 +5410,10 @@ def _postgwas_run_susie_finemap_body(
             continue
 
         prepared_source = prepared.reset_index(drop=True)
+        plot_source = prepared_source.loc[
+            :, ["chrom", "pos", "snp", "z"]
+        ].reset_index(drop=True)
+        effective_source: Optional[pd.DataFrame] = None
         effective_locus_r: Optional[np.ndarray] = None
         if ld_route == "raw":
             # Establish canonical BIM identity for every regional row before
@@ -5750,7 +5754,7 @@ def _postgwas_run_susie_finemap_body(
         locus_output = locus_output.reset_index(drop=True)
         plot_records.append(
             _postgwas_build_susie_locus_plot_record(
-                prepared_source,
+                plot_source,
                 locus_output,
                 fitted_output_rows,
                 pip,
@@ -5784,6 +5788,8 @@ def _postgwas_run_susie_finemap_body(
         del (
             locus_gwas,
             prepared_source,
+            plot_source,
+            effective_source,
             prepared,
             fold_groups,
             aligned,
@@ -5798,6 +5804,7 @@ def _postgwas_run_susie_finemap_body(
             cs_locus_output,
             locus_base_output,
             locus_output,
+            effective_locus_r,
         )
 
     if len(output_frames) == 0:
@@ -9989,6 +9996,21 @@ def _postgwas_project_susie_locus_x(
     return x_values
 
 
+def _postgwas_susie_locus_axis_limits(
+    bimrange_tuples: Sequence[tuple[str, int, int]],
+    layout: Sequence[dict[str, object]],
+) -> tuple[float, float]:
+    """Return the exact x limits used by local Manhattan for this layout."""
+    if len(layout) == 0 or len(layout) != len(bimrange_tuples):
+        raise ValueError("SuSiE locus plot layout/range dimensions differ.")
+    if len(layout) == 1:
+        return (
+            float(bimrange_tuples[0][1]),
+            float(layout[0].get("end", bimrange_tuples[0][2])),
+        )
+    return (float(layout[0]["x_start"]), float(layout[-1]["x_end"]))
+
+
 def _postgwas_susie_locus_palette(
     cs_names: Sequence[str],
     palette_spec: Optional[Tuple[str, Any]] = None,
@@ -10263,14 +10285,21 @@ def _postgwas_plot_susie_locus_records(
         )
     if len(ranges) == 1:
         chrom, start, end = ranges[0]
-        _apply_bimrange_manhattan_axis(ax_pip, chrom, int(start), int(end))
+        _apply_bimrange_manhattan_axis(
+            ax_pip,
+            chrom,
+            int(start),
+            int(layout[0].get("end", end)),
+        )
     else:
         _apply_multi_bimrange_manhattan_axis(
             ax_pip,
             layout,
             label_fontsize=float(getattr(args, "_postgwas_base_fontsize", 8.0)),
         )
-    ax_z.set_xlim(ax_pip.get_xlim())
+    axis_limits = _postgwas_susie_locus_axis_limits(ranges, layout)
+    ax_pip.set_xlim(axis_limits)
+    ax_z.set_xlim(axis_limits)
     ax_z.set_position([ax_pip.get_position().x0, ax_z.get_position().y0,
                        ax_pip.get_position().width, ax_z.get_position().height])
     fig.suptitle(
