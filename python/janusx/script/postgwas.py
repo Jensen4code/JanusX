@@ -88,7 +88,7 @@ from janusx.gfreader import load_genotype_chunks, prepare_cli_input_cache
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.markers import MarkerStyle
-from matplotlib.patches import ConnectionPatch
+from matplotlib.patches import ConnectionPatch, Patch
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 import pandas as pd
 import numpy as np
@@ -1611,6 +1611,18 @@ _POSTGWAS_FVLMM_LD_UNIT_DIAGONAL_ATOL = 1e-10
 _POSTGWAS_FVLMM_LD_PSD_ATOL = 1e-10
 _POSTGWAS_FVLMM_LD_PSD_RTOL = 1e-8
 _POSTGWAS_FINEMAP_LDCLUMP_R2 = 0.99
+_POSTGWAS_FINEMAP_PURITY_R2_DEFAULT = 0.25
+_POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR = "#9A9A91"
+_POSTGWAS_SUSIE_LOCUS_DEFAULT_COLORS = (
+    "#6F8F72",
+    "#89739B",
+    "#B07D62",
+    "#5E7899",
+    "#A18A59",
+    "#7C6C68",
+    "#6D8D8B",
+    "#9B6B7A",
+)
 _POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES = (
     (".fvlmm.tsv", "fvlmm"),
     (".lmm.tsv", "lmm"),
@@ -3636,6 +3648,12 @@ def _validate_postgwas_finemap_args(
         parser.error("finemap-max-iter must be > 0.")
     if not np.isfinite(float(args.finemap_tol)) or float(args.finemap_tol) < 0.0:
         parser.error("finemap-tol must be a finite number >= 0.")
+    purity_r2 = float(
+        getattr(args, "finemap_purity_r2", _POSTGWAS_FINEMAP_PURITY_R2_DEFAULT)
+    )
+    if not np.isfinite(purity_r2) or not 0.0 <= purity_r2 <= 1.0:
+        parser.error("finemap-purity-r2 must be a finite number in [0, 1].")
+    args.finemap_purity_r2 = purity_r2
     if not np.isfinite(float(args.memory)) or float(args.memory) <= 0.0:
         parser.error("-mem must be a finite number > 0 (GB).")
     args.finemap_memory_bytes = int(round(float(args.memory) * 1024**3))
@@ -4232,6 +4250,89 @@ def _postgwas_build_finemap_credible_sets(
     return credible_sets
 
 
+def _postgwas_filter_finemap_credible_sets_by_purity(
+    credible_sets: Sequence[tuple[int, tuple[int, ...], float]],
+    ld_matrix: object,
+    *,
+    purity_r2_threshold: float = _POSTGWAS_FINEMAP_PURITY_R2_DEFAULT,
+) -> tuple[list[tuple[int, tuple[int, ...], float]], list[dict[str, object]]]:
+    """Filter SuSiE CSs by minimum pairwise absolute LD among fitted tags.
+
+    ``credible_sets`` contains indices in the same matrix order as
+    ``ld_matrix``.  The matrix is the route-selected LD used by SuSiE: raw LD
+    for the LM route or projected/effective LD for the FvLMM route.  Clumped
+    proxy SNPs are deliberately excluded from this calculation; they are
+    restored only after the CS-level purity decision.
+    """
+    threshold = float(purity_r2_threshold)
+    if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Fine-mapping purity r2 threshold must be in [0, 1].")
+
+    matrix = np.asarray(ld_matrix, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("Fine-mapping purity LD matrix must be square.")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("Fine-mapping purity LD matrix must be finite.")
+
+    n_variants = int(matrix.shape[0])
+    kept: list[tuple[int, tuple[int, ...], float]] = []
+    diagnostics: list[dict[str, object]] = []
+    for cs_number, (
+        effect_index_raw,
+        representative_indices_raw,
+        coverage_raw,
+    ) in enumerate(credible_sets, start=1):
+        effect_index = int(effect_index_raw)
+        representative_indices = tuple(
+            int(index) for index in representative_indices_raw
+        )
+        if not representative_indices:
+            raise ValueError("Fine-mapping credible set cannot be empty.")
+        if len(set(representative_indices)) != len(representative_indices):
+            raise ValueError(
+                "Fine-mapping credible-set tag indices must be unique."
+            )
+        if any(
+            index < 0 or index >= n_variants for index in representative_indices
+        ):
+            raise ValueError(
+                "Fine-mapping credible-set tag index is outside the LD matrix."
+            )
+
+        n_tags = len(representative_indices)
+        if n_tags == 1:
+            min_abs_corr = 1.0
+            purity_r2 = 1.0
+        else:
+            submatrix = matrix[np.ix_(representative_indices, representative_indices)]
+            upper = submatrix[np.triu_indices(n_tags, k=1)]
+            if upper.size == 0 or not np.all(np.isfinite(upper)):
+                raise ValueError(
+                    "Fine-mapping credible-set purity submatrix is invalid."
+                )
+            min_abs_corr = float(np.min(np.abs(upper)))
+            purity_r2 = float(np.min(np.square(upper)))
+
+        kept_flag = bool(purity_r2 >= threshold)
+        diagnostic = {
+            "cs_number": cs_number,
+            "effect_index": effect_index,
+            "n_tags": n_tags,
+            "coverage": float(coverage_raw),
+            "min_abs_corr": min_abs_corr,
+            "purity_r2": purity_r2,
+            "threshold": threshold,
+            "kept": kept_flag,
+        }
+        diagnostics.append(diagnostic)
+        if kept_flag:
+            kept.append(
+                (effect_index, representative_indices, float(coverage_raw))
+            )
+
+    return kept, diagnostics
+
+
 def _postgwas_expand_finemap_credible_sets(
     aligned_representatives: pd.DataFrame,
     prepared_rows: pd.DataFrame,
@@ -4240,6 +4341,7 @@ def _postgwas_expand_finemap_credible_sets(
     credible_sets: object,
     *,
     locus: str,
+    cs_numbers: Optional[Sequence[int]] = None,
 ) -> pd.DataFrame:
     """Restore clumped prepared rows into deterministic credible-set rows."""
     fitted = aligned_representatives.reset_index(drop=True)
@@ -4250,6 +4352,18 @@ def _postgwas_expand_finemap_credible_sets(
             "Fine-mapping credible-set expansion PIP length does not match "
             f"aligned representatives: got {pip_array.shape[0]}, expected {len(fitted)}."
         )
+    if cs_numbers is not None:
+        cs_numbers = tuple(int(number) for number in cs_numbers)
+        if len(cs_numbers) != len(credible_sets):
+            raise ValueError(
+                "Fine-mapping credible-set number count does not match credible sets."
+            )
+        if any(number <= 0 for number in cs_numbers) or len(set(cs_numbers)) != len(
+            cs_numbers
+        ):
+            raise ValueError(
+                "Fine-mapping credible-set numbers must be unique and positive."
+            )
     for frame_name, frame, required in (
         (
             "aligned representative",
@@ -4305,7 +4419,11 @@ def _postgwas_expand_finemap_credible_sets(
 
     rows: list[dict[str, object]] = []
     next_cs_number = 1
-    for _effect_index, representative_indices, achieved_coverage in credible_sets:
+    for credible_set_index, (
+        _effect_index,
+        representative_indices,
+        achieved_coverage,
+    ) in enumerate(credible_sets):
         cs_rows: list[dict[str, object]] = []
         seen_groups: set[tuple[str, int]] = set()
         for fitted_index_raw in representative_indices:
@@ -4393,11 +4511,17 @@ def _postgwas_expand_finemap_credible_sets(
 
         if not cs_rows:
             continue
-        cs_name = f"CS_{next_cs_number}"
+        cs_number = (
+            int(cs_numbers[credible_set_index])
+            if cs_numbers is not None
+            else next_cs_number
+        )
+        cs_name = f"CS_{cs_number}"
         for row in cs_rows:
             row["cs"] = cs_name
         rows.extend(cs_rows)
-        next_cs_number += 1
+        if cs_numbers is None:
+            next_cs_number += 1
 
     return pd.DataFrame(rows, columns=_POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS)
 
@@ -5190,9 +5314,23 @@ def _postgwas_run_susie_finemap_body(
     )
     if len(loci) == 0:
         raise ValueError("Fine-mapping requires at least one bimrange locus.")
-
+    plot_bimrange_tuples = list(
+        getattr(args, "bimrange_tuples", None) or loci
+    )
     gwas, gwas_index = _postgwas_load_finemap_gwas(
         gwas_files[0], str(args.chr), str(args.pos)
+    )
+    _, plot_seg_defs, _ = _filter_df_by_bimranges(
+        gwas,
+        str(args.chr),
+        str(args.pos),
+        plot_bimrange_tuples,
+        logger,
+        gwas_files[0],
+    )
+    plot_layout = _build_bimrange_layout(
+        plot_seg_defs,
+        interval_ratio=float(getattr(args, "interval", 0.5)),
     )
     if ld_route == "raw":
         raw_sample_ids, raw_sample_indices = _postgwas_resolve_finemap_sample_ids(
@@ -5232,13 +5370,20 @@ def _postgwas_run_susie_finemap_body(
     out_stem = str(getattr(args, "prefix", "JanusX") or "JanusX").strip() or "JanusX"
     output_path = os.path.join(out_dir, f"{out_stem}.susie.pip.tsv")
     cs_output_path = os.path.join(out_dir, f"{out_stem}.susie.cs.tsv")
+    figure_path = os.path.join(
+        out_dir, f"{out_stem}.susie.locus.{str(getattr(args, 'format', 'png')).lower()}"
+    )
     temporary_path = f"{output_path}.tmp"
     cs_temporary_path = f"{cs_output_path}.tmp"
+    figure_temporary_path = _postgwas_finemap_figure_temp_path(figure_path)
     os.makedirs(out_dir, mode=0o755, exist_ok=True)
-    _postgwas_cleanup_finemap_paths((temporary_path, cs_temporary_path))
+    _postgwas_cleanup_finemap_paths(
+        (temporary_path, cs_temporary_path, figure_temporary_path)
+    )
 
     output_frames: list[pd.DataFrame] = []
     cs_output_frames: list[pd.DataFrame] = []
+    plot_records: list[dict[str, object]] = []
     warned_assumed_direction = False
     gwas_has_allele_columns = {"allele0", "allele1"}.issubset(gwas.columns)
 
@@ -5265,6 +5410,10 @@ def _postgwas_run_susie_finemap_body(
             continue
 
         prepared_source = prepared.reset_index(drop=True)
+        plot_source = prepared_source.loc[
+            :, ["chrom", "pos", "snp", "z"]
+        ].reset_index(drop=True)
+        effective_source: Optional[pd.DataFrame] = None
         effective_locus_r: Optional[np.ndarray] = None
         if ld_route == "raw":
             # Establish canonical BIM identity for every regional row before
@@ -5511,6 +5660,43 @@ def _postgwas_run_susie_finemap_body(
             raise RuntimeError(
                 f"SuSiE locus {locus_label} credible-set construction failed: {exc}"
             ) from exc
+        purity_threshold = float(
+            getattr(
+                args,
+                "finemap_purity_r2",
+                _POSTGWAS_FINEMAP_PURITY_R2_DEFAULT,
+            )
+        )
+        try:
+            credible_sets, purity_diagnostics = (
+                _postgwas_filter_finemap_credible_sets_by_purity(
+                    credible_sets,
+                    locus_r,
+                    purity_r2_threshold=purity_threshold,
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"SuSiE locus {locus_label} credible-set purity check failed: {exc}"
+            ) from exc
+        kept_cs_numbers: list[int] = []
+        for diagnostic in purity_diagnostics:
+            cs_number = int(diagnostic["cs_number"])
+            kept = bool(diagnostic["kept"])
+            if kept:
+                kept_cs_numbers.append(cs_number)
+            logger.info(
+                "SuSiE locus %s CS_%d purity: tags=%d coverage=%.6f "
+                "min_abs_corr=%.6f purity_r2=%.6f threshold=%.6f kept=%s.",
+                locus_label,
+                cs_number,
+                int(diagnostic["n_tags"]),
+                float(diagnostic["coverage"]),
+                float(diagnostic["min_abs_corr"]),
+                float(diagnostic["purity_r2"]),
+                purity_threshold,
+                kept,
+            )
 
         metadata_columns = ("chrom", "pos", "snp", "allele0", "allele1")
         missing_metadata = [
@@ -5533,6 +5719,7 @@ def _postgwas_run_susie_finemap_body(
                 pip,
                 credible_sets,
                 locus=locus_label,
+                cs_numbers=kept_cs_numbers,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -5565,6 +5752,19 @@ def _postgwas_run_susie_finemap_body(
             ),
         )
         locus_output = locus_output.reset_index(drop=True)
+        plot_records.append(
+            _postgwas_build_susie_locus_plot_record(
+                plot_source,
+                locus_output,
+                fitted_output_rows,
+                pip,
+                locus=locus_label,
+                bimrange_tuples=plot_bimrange_tuples,
+                interval_ratio=float(getattr(args, "interval", 0.5)),
+                palette_spec=getattr(args, "palette_spec", None),
+                layout=plot_layout,
+            )
+        )
         output_frames.append(locus_output)
         cs_output_frames.append(cs_locus_output)
         logger.info(
@@ -5588,6 +5788,8 @@ def _postgwas_run_susie_finemap_body(
         del (
             locus_gwas,
             prepared_source,
+            plot_source,
+            effective_source,
             prepared,
             fold_groups,
             aligned,
@@ -5602,6 +5804,7 @@ def _postgwas_run_susie_finemap_body(
             cs_locus_output,
             locus_base_output,
             locus_output,
+            effective_locus_r,
         )
 
     if len(output_frames) == 0:
@@ -5611,12 +5814,12 @@ def _postgwas_run_susie_finemap_body(
         pd.concat(output_frames, ignore_index=True)
     )
     merged_cs = pd.concat(cs_output_frames, ignore_index=True)
-    final_paths = (output_path, cs_output_path)
-    temporary_paths = (temporary_path, cs_temporary_path)
-    backup_paths: list[Optional[str]] = [None, None]
+    final_paths = (output_path, cs_output_path, figure_path)
+    temporary_paths = (temporary_path, cs_temporary_path, figure_temporary_path)
+    backup_paths: list[Optional[str]] = [None, None, None]
     had_prior = [os.path.exists(path) for path in final_paths]
-    backed_up = [False, False]
-    published = [False, False]
+    backed_up = [False, False, False]
+    published = [False, False, False]
     try:
         merged.to_csv(
             temporary_path,
@@ -5635,6 +5838,12 @@ def _postgwas_run_susie_finemap_body(
             float_format=_postgwas_format_finemap_float,
             na_rep="",
             lineterminator="\n",
+        )
+        _postgwas_plot_susie_locus_records(
+            plot_records,
+            args,
+            figure_temporary_path,
+            logger=logger,
         )
         for index, final_path in enumerate(final_paths):
             if had_prior[index]:
@@ -5675,6 +5884,7 @@ def _postgwas_run_susie_finemap_body(
     )
     logger.info("SuSiE fine-mapping output: %s", format_path_for_display(output_path))
     logger.info("SuSiE credible-set output: %s", format_path_for_display(cs_output_path))
+    logger.info("SuSiE locus figure: %s", format_path_for_display(figure_path))
     return output_path
 
 
@@ -5686,7 +5896,14 @@ def _run_postgwas_susie_finemap(
     out_stem = str(getattr(args, "prefix", "JanusX") or "JanusX").strip() or "JanusX"
     output_path = os.path.join(out_dir, f"{out_stem}.susie.pip.tsv")
     cs_output_path = os.path.join(out_dir, f"{out_stem}.susie.cs.tsv")
-    temporary_paths = (f"{output_path}.tmp", f"{cs_output_path}.tmp")
+    figure_path = os.path.join(
+        out_dir, f"{out_stem}.susie.locus.{str(getattr(args, 'format', 'png')).lower()}"
+    )
+    temporary_paths = (
+        f"{output_path}.tmp",
+        f"{cs_output_path}.tmp",
+        _postgwas_finemap_figure_temp_path(figure_path),
+    )
     try:
         return _postgwas_run_susie_finemap_body(args, logger)
     except FineMapSkip as exc:
@@ -9732,6 +9949,378 @@ def _build_layout_from_bimrange_tuples(
     return _build_bimrange_layout(seg_defs, interval_ratio=float(interval_ratio))
 
 
+def _postgwas_project_susie_locus_x(
+    chrom: object,
+    pos: object,
+    bimrange_tuples: Sequence[tuple[str, int, int]],
+    layout: Sequence[dict[str, object]],
+) -> np.ndarray:
+    """Project locus positions into the local-Manhattan ``bimrange`` x-axis."""
+    chrom_values = np.asarray([_normalize_chr(value) for value in list(chrom)], dtype=object)
+    pos_values = pd.to_numeric(pd.Series(list(pos)), errors="coerce").to_numpy(
+        dtype=float,
+        na_value=np.nan,
+    )
+    if chrom_values.shape != pos_values.shape:
+        raise ValueError("SuSiE locus plot chromosome and position lengths differ.")
+    if len(layout) != len(bimrange_tuples):
+        raise ValueError("SuSiE locus plot layout does not match bimrange tuples.")
+    x_values = np.empty(pos_values.shape[0], dtype=np.float64)
+    for row_index, (chrom_value, pos_value) in enumerate(
+        zip(chrom_values.tolist(), pos_values.tolist())
+    ):
+        if not np.isfinite(pos_value) or pos_value != np.floor(pos_value):
+            raise ValueError("SuSiE locus plot position is not a finite integer.")
+        matches: list[int] = []
+        for segment_index, (segment, bimrange) in enumerate(
+            zip(layout, bimrange_tuples)
+        ):
+            segment_chrom = _normalize_chr(segment.get("chrom", bimrange[0]))
+            start = int(bimrange[1])
+            end = int(bimrange[2])
+            if segment_chrom == chrom_value and start <= int(pos_value) <= end:
+                matches.append(segment_index)
+        if len(matches) == 0:
+            raise ValueError(
+                "SuSiE locus plot position is outside requested bimrange: "
+                f"{chrom_value}:{int(pos_value)}"
+            )
+        segment = layout[matches[0]]
+        start = int(bimrange_tuples[matches[0]][1])
+        if len(layout) == 1:
+            x_values[row_index] = float(pos_value)
+            continue
+        length = float(segment.get("length", int(bimrange_tuples[matches[0]][2]) - start))
+        relative = min(max(float(pos_value) - float(start), 0.0), max(length, 1.0))
+        x_values[row_index] = float(segment["offset"]) + relative
+    return x_values
+
+
+def _postgwas_susie_locus_axis_limits(
+    bimrange_tuples: Sequence[tuple[str, int, int]],
+    layout: Sequence[dict[str, object]],
+) -> tuple[float, float]:
+    """Return the exact x limits used by local Manhattan for this layout."""
+    if len(layout) == 0 or len(layout) != len(bimrange_tuples):
+        raise ValueError("SuSiE locus plot layout/range dimensions differ.")
+    if len(layout) == 1:
+        return (
+            float(bimrange_tuples[0][1]),
+            float(layout[0].get("end", bimrange_tuples[0][2])),
+        )
+    return (float(layout[0]["x_start"]), float(layout[-1]["x_end"]))
+
+
+def _postgwas_susie_locus_palette(
+    cs_names: Sequence[str],
+    palette_spec: Optional[Tuple[str, Any]] = None,
+) -> dict[str, str]:
+    """Return deterministic muted colors keyed by numeric CS name."""
+    unique = {str(name) for name in cs_names if str(name).strip() != ""}
+
+    def _cs_sort_key(value: str) -> tuple[int, str]:
+        match = re.search(r"(\d+)$", value)
+        return (int(match.group(1)), value) if match else (10**9, value)
+
+    ordered = sorted(unique, key=_cs_sort_key)
+    if len(ordered) == 0:
+        return {}
+    if palette_spec is None:
+        colors = list(_POSTGWAS_SUSIE_LOCUS_DEFAULT_COLORS)
+    else:
+        numeric_ids = [
+            int(match.group(1))
+            for name in ordered
+            if (match := re.search(r"(\d+)$", name)) is not None
+        ]
+        color_count = max(len(ordered), max(numeric_ids, default=0))
+        colors = _resolve_merge_series_colors(palette_spec, color_count)
+        if len(colors) == 0:
+            colors = list(_POSTGWAS_SUSIE_LOCUS_DEFAULT_COLORS)
+    mapping: dict[str, str] = {}
+    for index, name in enumerate(ordered):
+        match = re.search(r"(\d+)$", name)
+        color_index = int(match.group(1)) - 1 if match else index
+        mapping[name] = str(colors[color_index % len(colors)])
+    return mapping
+
+
+def _postgwas_build_susie_locus_plot_record(
+    prepared_source: pd.DataFrame,
+    locus_output: pd.DataFrame,
+    fitted_output_rows: pd.DataFrame,
+    pip: object,
+    *,
+    locus: str,
+    bimrange_tuples: Sequence[tuple[str, int, int]],
+    interval_ratio: float = 0.5,
+    palette_spec: Optional[Tuple[str, Any]] = None,
+    layout: Optional[Sequence[dict[str, object]]] = None,
+) -> dict[str, object]:
+    """Build compact plot data without retaining genotype or LD matrices."""
+    prepared = prepared_source.reset_index(drop=True)
+    output = locus_output.reset_index(drop=True)
+    fitted = fitted_output_rows.reset_index(drop=True)
+    required_prepared = {"chrom", "pos", "snp"}
+    missing = sorted(required_prepared.difference(prepared.columns))
+    if missing:
+        raise ValueError("SuSiE locus plot input is missing: " + ", ".join(missing))
+    if "z" not in prepared.columns:
+        if not {"beta", "se"}.issubset(prepared.columns):
+            raise ValueError("SuSiE locus plot input requires z or beta/se columns.")
+        beta_values = pd.to_numeric(prepared["beta"], errors="coerce").to_numpy(dtype=float)
+        se_values = pd.to_numeric(prepared["se"], errors="coerce").to_numpy(dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z_values = beta_values / se_values
+    else:
+        z_values = pd.to_numeric(prepared["z"], errors="coerce").to_numpy(dtype=float)
+    if not np.all(np.isfinite(z_values)):
+        raise ValueError("SuSiE locus plot upper-panel Z values must be finite.")
+    if not {"chrom", "pos", "snp"}.issubset(fitted.columns):
+        raise ValueError("SuSiE locus plot fitted rows are missing metadata.")
+    pip_values = np.asarray(pip, dtype=np.float64).reshape(-1)
+    if pip_values.shape != (len(fitted),) or not np.all(np.isfinite(pip_values)):
+        raise ValueError("SuSiE locus plot fitted PIP values are invalid.")
+    if np.any((pip_values < 0.0) | (pip_values > 1.0)):
+        raise ValueError("SuSiE locus plot fitted PIP values must be in [0, 1].")
+
+    annotation_by_key: dict[tuple[str, int], pd.Series] = {}
+    if not output.empty:
+        for _, row in output.iterrows():
+            key = _postgwas_finemap_row_key(row)
+            if key in annotation_by_key:
+                raise ValueError(
+                    "SuSiE locus plot output contains duplicate coordinates: "
+                    f"{key[0]}:{key[1]}"
+                )
+            annotation_by_key[key] = row
+
+    def _annotation_value(row: pd.Series, name: str) -> object:
+        value = row.get(name, pd.NA)
+        return value
+
+    def _cs_name(value: object) -> Optional[str]:
+        if value is None or pd.isna(value):
+            return None
+        text_value = str(value).strip()
+        return text_value if text_value else None
+
+    upper_keys = [
+        _postgwas_finemap_row_key(row)
+        for _, row in prepared.iterrows()
+    ]
+    upper_chrom = prepared["chrom"].tolist()
+    upper_pos = pd.to_numeric(prepared["pos"], errors="raise").astype(np.int64).tolist()
+    if layout is None:
+        layout = _build_layout_from_bimrange_tuples(
+            [(str(chrom), int(start), int(end)) for chrom, start, end in bimrange_tuples],
+            interval_ratio=float(interval_ratio),
+        )
+    else:
+        layout = [dict(segment) for segment in layout]
+    upper_x = _postgwas_project_susie_locus_x(
+        upper_chrom, upper_pos, bimrange_tuples, layout
+    )
+    upper_cs: list[Optional[str]] = []
+    upper_rsqr = np.full(len(prepared), np.nan, dtype=np.float64)
+    for row_index, key in enumerate(upper_keys):
+        annotation = annotation_by_key.get(key)
+        cs = _cs_name(_annotation_value(annotation, "cs_set")) if annotation is not None else None
+        upper_cs.append(cs)
+        if annotation is not None:
+            rsqr_value = pd.to_numeric(
+                pd.Series([_annotation_value(annotation, "rsqr")]), errors="coerce"
+            ).to_numpy(dtype=float)[0]
+            if np.isfinite(rsqr_value):
+                upper_rsqr[row_index] = float(np.clip(rsqr_value, 0.0, 1.0))
+
+    fitted_chrom = fitted["chrom"].tolist()
+    fitted_pos = pd.to_numeric(fitted["pos"], errors="raise").astype(np.int64).tolist()
+    fitted_x = _postgwas_project_susie_locus_x(
+        fitted_chrom, fitted_pos, bimrange_tuples, layout
+    )
+    fitted_cs = []
+    for _, row in fitted.iterrows():
+        annotation = annotation_by_key.get(_postgwas_finemap_row_key(row))
+        fitted_cs.append(
+            _cs_name(_annotation_value(annotation, "cs_set"))
+            if annotation is not None
+            else None
+        )
+    cs_colors = _postgwas_susie_locus_palette(
+        [name for name in upper_cs + fitted_cs if name is not None],
+        palette_spec,
+    )
+
+    def _color_for(cs: Optional[str]) -> str:
+        return cs_colors.get(cs, _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR)
+
+    assigned = np.isfinite(upper_rsqr)
+    upper_size = np.full(len(prepared), 15.0, dtype=np.float64)
+    upper_size[assigned] = 24.0 + 72.0 * upper_rsqr[assigned]
+    return {
+        "locus": str(locus),
+        "layout": layout,
+        "bimrange_tuples": [tuple(item) for item in bimrange_tuples],
+        "cs_colors": cs_colors,
+        "upper": {
+            "x": upper_x,
+            "z": z_values,
+            "color": [_color_for(value) for value in upper_cs],
+            "size": upper_size,
+            "snp": [str(value) for value in prepared["snp"].tolist()],
+            "cs": upper_cs,
+            "rsqr": upper_rsqr,
+        },
+        "fitted": {
+            "x": fitted_x,
+            "pip": pip_values,
+            "color": [_color_for(value) for value in fitted_cs],
+            "snp": [str(value) for value in fitted["snp"].tolist()],
+            "cs": fitted_cs,
+        },
+    }
+
+
+def _postgwas_plot_susie_locus_records(
+    records: Sequence[dict[str, object]],
+    args: argparse.Namespace,
+    path: str,
+    *,
+    logger: logging.Logger,
+) -> None:
+    """Render the shared-x signed-Z/PIP SuSiE locus figure."""
+    if len(records) == 0:
+        raise ValueError("SuSiE locus plot requires at least one record.")
+    _apply_postgwas_matplotlib_style(args)
+    first = records[0]
+    layout = list(first["layout"])
+    ranges = list(first["bimrange_tuples"])
+    if len(layout) != len(ranges):
+        raise ValueError("SuSiE locus plot layout/range dimensions differ.")
+    for record in records[1:]:
+        if record["bimrange_tuples"] != first["bimrange_tuples"]:
+            raise ValueError("SuSiE locus plot records do not share bimrange coordinates.")
+
+    fig, axes, _width, _heights = _create_stacked_panel_figure(
+        panel_width_in=float(_PANEL_WIDTH_IN),
+        panel_heights_in=[3.2, 2.4],
+        dpi=300,
+        reserve_right_in=1.25,
+        vspace_in=0.34,
+    )
+    ax_z, ax_pip = axes
+    ax_z.sharex(ax_pip)
+    all_cs_names = [
+        str(cs_name)
+        for record in records
+        for panel in (record["upper"], record["fitted"])
+        for cs_name in list(panel["cs"])
+        if cs_name is not None and not pd.isna(cs_name)
+    ]
+    global_cs_colors = _postgwas_susie_locus_palette(
+        all_cs_names,
+        getattr(args, "palette_spec", None),
+    )
+    legend_handles: dict[str, Patch] = {}
+    for record in records:
+        upper = record["upper"]
+        fitted = record["fitted"]
+        upper_colors = [
+            global_cs_colors.get(str(cs_name), _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR)
+            if cs_name is not None and not pd.isna(cs_name)
+            else _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR
+            for cs_name in list(upper["cs"])
+        ]
+        fitted_colors = [
+            global_cs_colors.get(str(cs_name), _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR)
+            if cs_name is not None and not pd.isna(cs_name)
+            else _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR
+            for cs_name in list(fitted["cs"])
+        ]
+        ax_z.scatter(
+            np.asarray(upper["x"], dtype=float),
+            np.asarray(upper["z"], dtype=float),
+            s=np.asarray(upper["size"], dtype=float),
+            c=upper_colors,
+            alpha=0.82,
+            edgecolors="none",
+            linewidths=0.0,
+            rasterized=False,
+            zorder=3,
+        )
+        ax_pip.scatter(
+            np.asarray(fitted["x"], dtype=float),
+            np.asarray(fitted["pip"], dtype=float),
+            s=44.0,
+            c=fitted_colors,
+            alpha=0.95,
+            edgecolors="none",
+            linewidths=0.0,
+            rasterized=False,
+            zorder=3,
+        )
+        for cs_name, color in global_cs_colors.items():
+            legend_handles.setdefault(
+                str(cs_name), Patch(facecolor=str(color), edgecolor="none", label=str(cs_name))
+            )
+
+    ax_z.axhline(0.0, color="#777777", linewidth=0.8, linestyle="--", zorder=1)
+    ax_z.set_ylabel("Signed Z-score")
+    ax_pip.set_ylabel("PIP")
+    ax_pip.set_xlabel("Genomic position")
+    ax_pip.set_ylim(0.0, 1.0)
+    ax_z.grid(axis="y", color="#D9D9D2", linewidth=0.6, alpha=0.7)
+    ax_pip.grid(axis="y", color="#D9D9D2", linewidth=0.6, alpha=0.7)
+    ax_z.tick_params(axis="x", labelbottom=False)
+    ax_z.set_title("SuSiE locus fine-mapping", loc="left", pad=5.0)
+    if legend_handles:
+        ax_z.legend(
+            list(legend_handles.values()),
+            list(legend_handles.keys()),
+            title="Credible set",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.01, 1.0),
+        )
+    if len(ranges) == 1:
+        chrom, start, end = ranges[0]
+        _apply_bimrange_manhattan_axis(
+            ax_pip,
+            chrom,
+            int(start),
+            int(layout[0].get("end", end)),
+        )
+    else:
+        _apply_multi_bimrange_manhattan_axis(
+            ax_pip,
+            layout,
+            label_fontsize=float(getattr(args, "_postgwas_base_fontsize", 8.0)),
+        )
+    axis_limits = _postgwas_susie_locus_axis_limits(ranges, layout)
+    ax_pip.set_xlim(axis_limits)
+    ax_z.set_xlim(axis_limits)
+    ax_z.set_position([ax_pip.get_position().x0, ax_z.get_position().y0,
+                       ax_pip.get_position().width, ax_z.get_position().height])
+    fig.suptitle(
+        "; ".join(str(record["locus"]) for record in records),
+        x=0.08,
+        y=0.995,
+        ha="left",
+        va="top",
+        fontsize=float(getattr(args, "_postgwas_base_fontsize", 8.0)),
+    )
+    os.makedirs(os.path.dirname(path) or ".", mode=0o755, exist_ok=True)
+    _save_figure_and_close(fig, path)
+    logger.info("SuSiE locus figure: %s", format_path_for_display(path))
+
+
+def _postgwas_finemap_figure_temp_path(path: str) -> str:
+    """Keep the requested image extension while making a sibling temp file."""
+    stem, extension = os.path.splitext(str(path))
+    return f"{stem}.tmp{extension}"
+
+
 def _load_gene_like_records_from_anno(
     annofile: str,
     bimrange_tuples: list[tuple[str, int, int]],
@@ -13673,6 +14262,19 @@ def main(argv: Optional[list[str]] = None):
             else argparse.SUPPRESS
         ),
     )
+    finemap_group.add_argument(
+        "-finemap-purity-r2",
+        "--finemap-purity-r2",
+        dest="finemap_purity_r2",
+        type=float,
+        default=_POSTGWAS_FINEMAP_PURITY_R2_DEFAULT,
+        help=(
+            "Minimum within-CS pairwise tag LD r2 for retaining a SuSiE credible set "
+            f"(default: %(default)g)."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Manhattan Plot
@@ -14581,7 +15183,8 @@ def main(argv: Optional[list[str]] = None):
                 "Fine-mapping",
                 "SuSiE "
                 f"(L={int(args.finemap_l)}, max_iter={int(args.finemap_max_iter)}, "
-                f"tol={float(args.finemap_tol):g})",
+                f"tol={float(args.finemap_tol):g}, "
+                f"purity_r2>={float(args.finemap_purity_r2):g})",
             )
         )
         base_rows.append(("Fine-map memory", f"{float(args.memory):g} GB limit"))
