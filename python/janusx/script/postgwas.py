@@ -5356,23 +5356,15 @@ def _postgwas_run_susie_finemap_body(
         clump_available_bytes // max(1, clump_sample_count * 4),
     )
 
-    out_dir = str(getattr(args, "out", ".") or ".")
-    out_stem = str(getattr(args, "prefix", "JanusX") or "JanusX").strip() or "JanusX"
-    output_path = os.path.join(out_dir, f"{out_stem}.susie.pip.tsv")
-    cs_output_path = os.path.join(out_dir, f"{out_stem}.susie.cs.tsv")
-    figure_path = os.path.join(
-        out_dir, f"{out_stem}.susie.locus.{str(getattr(args, 'format', 'png')).lower()}"
-    )
-    temporary_path = f"{output_path}.tmp"
-    cs_temporary_path = f"{cs_output_path}.tmp"
-    figure_temporary_path = _postgwas_finemap_figure_temp_path(figure_path)
+    output_path, final_paths, temporary_paths = _postgwas_susie_finemap_output_paths(args)
+    plot_requested = len(final_paths) > 1
+    temporary_path = temporary_paths[0]
+    figure_path = final_paths[1] if plot_requested else None
+    figure_temporary_path = temporary_paths[1] if plot_requested else None
     os.makedirs(out_dir, mode=0o755, exist_ok=True)
-    _postgwas_cleanup_finemap_paths(
-        (temporary_path, cs_temporary_path, figure_temporary_path)
-    )
+    _postgwas_cleanup_finemap_paths(temporary_paths)
 
     output_frames: list[pd.DataFrame] = []
-    cs_output_frames: list[pd.DataFrame] = []
     plot_records: list[dict[str, object]] = []
     warned_assumed_direction = False
     gwas_has_allele_columns = {"allele0", "allele1"}.issubset(gwas.columns)
@@ -5742,21 +5734,28 @@ def _postgwas_run_susie_finemap_body(
             ),
         )
         locus_output = locus_output.reset_index(drop=True)
-        plot_records.append(
-            _postgwas_build_susie_locus_plot_record(
-                plot_source,
-                locus_output,
-                fitted_output_rows,
-                pip,
-                locus=locus_label,
-                bimrange_tuples=plot_bimrange_tuples,
-                interval_ratio=float(getattr(args, "interval", 0.5)),
-                palette_spec=getattr(args, "palette_spec", None),
-                layout=plot_layout,
+        if plot_requested:
+            plot_records.append(
+                _postgwas_build_susie_locus_plot_record(
+                    plot_source,
+                    locus_output,
+                    fitted_output_rows,
+                    pip,
+                    locus=locus_label,
+                    bimrange_tuples=plot_bimrange_tuples,
+                    interval_ratio=float(getattr(args, "interval", 0.5)),
+                    palette_spec=getattr(args, "palette_spec", None),
+                    scatter_size=float(
+                        getattr(
+                            args,
+                            "_postgwas_single_scatter_size",
+                            _DEFAULT_SCATTER_SIZE,
+                        )
+                    ),
+                    layout=plot_layout,
+                )
             )
-        )
         output_frames.append(locus_output)
-        cs_output_frames.append(cs_locus_output)
         logger.info(
             "SuSiE locus %s: GWAS=%d invalid=%d BED=%d monomorphic=%d matched=%d "
             "flips=%d conflicts=%d assumed_direction=%d unresolved=%d iterations=%d "
@@ -5803,13 +5802,10 @@ def _postgwas_run_susie_finemap_body(
     merged = _postgwas_sort_finemap_output_rows(
         pd.concat(output_frames, ignore_index=True)
     )
-    merged_cs = pd.concat(cs_output_frames, ignore_index=True)
-    final_paths = (output_path, cs_output_path, figure_path)
-    temporary_paths = (temporary_path, cs_temporary_path, figure_temporary_path)
-    backup_paths: list[Optional[str]] = [None, None, None]
+    backup_paths: list[Optional[str]] = [None] * len(final_paths)
     had_prior = [os.path.exists(path) for path in final_paths]
-    backed_up = [False, False, False]
-    published = [False, False, False]
+    backed_up = [False] * len(final_paths)
+    published = [False] * len(final_paths)
     try:
         merged.to_csv(
             temporary_path,
@@ -5820,21 +5816,13 @@ def _postgwas_run_susie_finemap_body(
             na_rep="",
             lineterminator="\n",
         )
-        merged_cs.to_csv(
-            cs_temporary_path,
-            sep="\t",
-            index=False,
-            columns=_POSTGWAS_FINEMAP_CS_OUTPUT_COLUMNS,
-            float_format=_postgwas_format_finemap_float,
-            na_rep="",
-            lineterminator="\n",
-        )
-        _postgwas_plot_susie_locus_records(
-            plot_records,
-            args,
-            figure_temporary_path,
-            logger=logger,
-        )
+        if plot_requested:
+            _postgwas_plot_susie_locus_records(
+                plot_records,
+                args,
+                str(figure_temporary_path),
+                logger=logger,
+            )
         for index, final_path in enumerate(final_paths):
             if had_prior[index]:
                 backup_path = _postgwas_create_finemap_backup_path(final_path)
@@ -5873,8 +5861,8 @@ def _postgwas_run_susie_finemap_body(
         tuple(path for path in backup_paths if path is not None)
     )
     logger.info("SuSiE fine-mapping output: %s", format_path_for_display(output_path))
-    logger.info("SuSiE credible-set output: %s", format_path_for_display(cs_output_path))
-    logger.info("SuSiE locus figure: %s", format_path_for_display(figure_path))
+    if plot_requested and figure_path is not None:
+        logger.info("SuSiE locus figure: %s", format_path_for_display(figure_path))
     return output_path
 
 
@@ -5882,25 +5870,13 @@ def _run_postgwas_susie_finemap(
     args: argparse.Namespace, logger: logging.Logger
 ) -> Optional[str]:
     """Run fine-mapping, warning-and-skipping expected compatibility failures."""
-    out_dir = str(getattr(args, "out", ".") or ".")
-    out_stem = str(getattr(args, "prefix", "JanusX") or "JanusX").strip() or "JanusX"
-    output_path = os.path.join(out_dir, f"{out_stem}.susie.pip.tsv")
-    cs_output_path = os.path.join(out_dir, f"{out_stem}.susie.cs.tsv")
-    figure_path = os.path.join(
-        out_dir, f"{out_stem}.susie.locus.{str(getattr(args, 'format', 'png')).lower()}"
-    )
-    temporary_paths = (
-        f"{output_path}.tmp",
-        f"{cs_output_path}.tmp",
-        _postgwas_finemap_figure_temp_path(figure_path),
-    )
+    _output_path, _final_paths, temporary_paths = _postgwas_susie_finemap_output_paths(args)
     try:
         return _postgwas_run_susie_finemap_body(args, logger)
     except FineMapSkip as exc:
         _postgwas_cleanup_finemap_paths(temporary_paths)
         logger.warning(
-            "fine-mapping skipped: %s; no new PIP/CS was generated; "
-            "pre-existing PIP/CS outputs may be stale.",
+            "fine-mapping skipped: %s; no new PIP output was generated.",
             str(exc),
         )
         return None
@@ -10008,9 +9984,9 @@ def _postgwas_susie_locus_palette(
     """Return deterministic colors keyed by numeric CS name.
 
     SuSiE credible sets use the same ordered palette semantics as other
-    post-GWAS series.  With no explicit ``-palette``, ``tab10`` is the stable
-    default, and a numeric CS suffix keeps CS_2 on the second palette color
-    even when CS_1 is absent after purity filtering.
+    post-GWAS series.  With no explicit ``-palette``, the native Matplotlib
+    ``tab10`` colors are used in the order of the retained CS labels.  A
+    filtered-out CS therefore does not consume a palette slot.
     """
     unique = {str(name) for name in cs_names if str(name).strip() != ""}
 
@@ -10021,22 +9997,43 @@ def _postgwas_susie_locus_palette(
     ordered = sorted(unique, key=_cs_sort_key)
     if len(ordered) == 0:
         return {}
-    numeric_ids = [
-        int(match.group(1))
-        for name in ordered
-        if (match := re.search(r"(\d+)$", name)) is not None
-    ]
-    effective_spec = palette_spec or ("cmap", "tab10")
-    color_count = max(len(ordered), max(numeric_ids, default=0))
-    colors = _resolve_merge_series_colors(effective_spec, color_count)
+    if palette_spec is None:
+        cmap = plt.get_cmap("tab10")
+        colors = [
+            mcolors.to_hex(cmap(index % max(1, int(getattr(cmap, "N", 10)))))
+            for index in range(len(ordered))
+        ]
+    else:
+        colors = _resolve_merge_series_colors(palette_spec, len(ordered))
     if len(colors) == 0:
-        colors = _resolve_merge_series_colors(("cmap", "tab10"), color_count)
+        cmap = plt.get_cmap("tab10")
+        colors = [
+            mcolors.to_hex(cmap(index % max(1, int(getattr(cmap, "N", 10)))))
+            for index in range(len(ordered))
+        ]
     mapping: dict[str, str] = {}
     for index, name in enumerate(ordered):
-        match = re.search(r"(\d+)$", name)
-        color_index = int(match.group(1)) - 1 if match else index
-        mapping[name] = str(colors[color_index % len(colors)])
+        mapping[name] = str(colors[index % len(colors)])
     return mapping
+
+
+def _postgwas_susie_finemap_output_paths(
+    args: argparse.Namespace,
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return PIP output paths and optional plot paths for one fine-map run."""
+    out_dir = str(getattr(args, "out", ".") or ".")
+    out_stem = str(getattr(args, "prefix", "JanusX") or "JanusX").strip() or "JanusX"
+    output_path = os.path.join(out_dir, f"{out_stem}.susie.pip.tsv")
+    final_paths: list[str] = [output_path]
+    temporary_paths: list[str] = [f"{output_path}.tmp"]
+    if getattr(args, "manh_ratio", None) is not None:
+        figure_path = os.path.join(
+            out_dir,
+            f"{out_stem}.susie.locus.{str(getattr(args, 'format', 'png')).lower()}",
+        )
+        final_paths.append(figure_path)
+        temporary_paths.append(_postgwas_finemap_figure_temp_path(figure_path))
+    return output_path, tuple(final_paths), tuple(temporary_paths)
 
 
 def _postgwas_build_susie_locus_plot_record(
@@ -10049,6 +10046,7 @@ def _postgwas_build_susie_locus_plot_record(
     bimrange_tuples: Sequence[tuple[str, int, int]],
     interval_ratio: float = 0.5,
     palette_spec: Optional[Tuple[str, Any]] = None,
+    scatter_size: float = _DEFAULT_SCATTER_SIZE,
     layout: Optional[Sequence[dict[str, object]]] = None,
 ) -> dict[str, object]:
     """Build compact PIP plot data without retaining genotype or LD matrices.
@@ -10073,6 +10071,9 @@ def _postgwas_build_susie_locus_plot_record(
         raise ValueError("SuSiE locus plot fitted PIP values are invalid.")
     if np.any((pip_values < 0.0) | (pip_values > 1.0)):
         raise ValueError("SuSiE locus plot fitted PIP values must be in [0, 1].")
+    scatter_size_value = float(scatter_size)
+    if not np.isfinite(scatter_size_value) or scatter_size_value <= 0.0:
+        raise ValueError("SuSiE locus plot scatter size must be finite and > 0.")
 
     annotation_by_key: dict[tuple[str, int], pd.Series] = {}
     if not output.empty:
@@ -10130,23 +10131,36 @@ def _postgwas_build_susie_locus_plot_record(
         annotation = annotation_by_key.get(key)
         cs = _cs_name(_annotation_value(annotation, "cs_set")) if annotation is not None else None
         tag_key = None
+        tag_snp: Optional[str] = None
         if annotation is not None:
             tag_value = _annotation_value(annotation, "tag")
             if tag_value is not None and not pd.isna(tag_value):
                 tag_snp = str(tag_value).strip()
+                if tag_snp == "":
+                    tag_snp = None
+            if cs is not None and key not in fitted_by_key and tag_snp is None:
+                raise ValueError(
+                    "SuSiE locus plot proxy Tag does not match exactly one fitted Tag: "
+                    f"{key[0]}:{key[1]} has no Tag SNP"
+                )
+            if cs is not None and key not in fitted_by_key and tag_snp is not None:
                 matching = fitted_by_snp.get(tag_snp, [])
                 if len(matching) > 1:
                     raise ValueError(
                         "SuSiE locus plot tag SNP is ambiguous in fitted rows: "
                         f"{tag_snp}"
                     )
-                if matching:
-                    tag_key = matching[0]
+                if len(matching) != 1:
+                    raise ValueError(
+                        "SuSiE locus plot proxy Tag does not match exactly one fitted Tag: "
+                        f"{tag_snp}"
+                    )
+                tag_key = matching[0]
         is_tag = cs is not None and key in fitted_by_key
         if not is_tag and annotation is not None and tag_key is not None:
             is_tag = cs is not None and key == tag_key
         role = "tag" if is_tag else ("proxy" if cs is not None else "non_cs")
-        if role == "proxy" and annotation is not None and tag_key in fitted_by_key:
+        if role == "proxy" and annotation is not None and tag_key is not None:
             point_pip[row_index] = float(pip_values[fitted_by_key[tag_key]])
         elif key in fitted_by_key:
             point_pip[row_index] = float(pip_values[fitted_by_key[key]])
@@ -10175,7 +10189,10 @@ def _postgwas_build_susie_locus_plot_record(
 
     point_marker = ["D" if role == "tag" else "o" for role in point_roles]
     point_size = np.asarray(
-        [90.0 if role == "tag" else (24.0 if role == "proxy" else 18.0) for role in point_roles],
+        [
+            scatter_size_value if role == "tag" else scatter_size_value / 3.0
+            for role in point_roles
+        ],
         dtype=np.float64,
     )
     return {
@@ -10217,8 +10234,14 @@ def _postgwas_plot_susie_locus_records(
         if record["bimrange_tuples"] != first["bimrange_tuples"]:
             raise ValueError("SuSiE locus plot records do not share bimrange coordinates.")
 
+    manh_ratio = getattr(args, "manh_ratio", None)
+    if manh_ratio is None:
+        raise ValueError("SuSiE locus plotting requires -manh/--manh.")
+    manh_ratio = float(manh_ratio)
+    if not np.isfinite(manh_ratio) or manh_ratio <= 0.0:
+        raise ValueError("SuSiE locus plotting requires a finite positive Manhattan ratio.")
     fig, ax_pip, _width, _height = _create_ratio_panel_figure(
-        ratio=1.8,
+        ratio=manh_ratio,
         dpi=300,
         panel_width_in=float(_PANEL_WIDTH_IN),
         reserve_right_in=1.25,
