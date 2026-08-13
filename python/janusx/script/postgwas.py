@@ -1613,6 +1613,8 @@ _POSTGWAS_FVLMM_LD_PSD_RTOL = 1e-8
 _POSTGWAS_FINEMAP_LDCLUMP_R2 = 0.99
 _POSTGWAS_FINEMAP_PURITY_R2_DEFAULT = 0.25
 _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR = "#9A9A91"
+_POSTGWAS_SUSIE_PIP_HEADROOM_THRESHOLD = 0.98
+_POSTGWAS_SUSIE_PIP_Y_MAX_WITH_HEADROOM = 1.05
 _POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES = (
     (".fvlmm.tsv", "fvlmm"),
     (".lmm.tsv", "lmm"),
@@ -10293,7 +10295,17 @@ def _postgwas_plot_susie_locus_records(
 
     ax_pip.set_ylabel("PIP")
     ax_pip.set_xlabel("Genomic position")
-    ax_pip.set_ylim(0.0, 1.0)
+    pip_values = np.concatenate(
+        [
+            np.asarray(record["points"]["pip"], dtype=np.float64).reshape(-1)
+            for record in records
+        ]
+    )
+    finite_pip = pip_values[np.isfinite(pip_values)]
+    pip_y_max = 1.0
+    if finite_pip.size > 0 and float(np.max(finite_pip)) >= _POSTGWAS_SUSIE_PIP_HEADROOM_THRESHOLD:
+        pip_y_max = _POSTGWAS_SUSIE_PIP_Y_MAX_WITH_HEADROOM
+    ax_pip.set_ylim(0.0, pip_y_max)
     ax_pip.grid(axis="y", color="#D9D9D2", linewidth=0.6, alpha=0.7)
     ax_pip.set_title("SuSiE PIP", loc="left", pad=5.0)
     if legend_handles:
