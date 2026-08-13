@@ -1613,16 +1613,6 @@ _POSTGWAS_FVLMM_LD_PSD_RTOL = 1e-8
 _POSTGWAS_FINEMAP_LDCLUMP_R2 = 0.99
 _POSTGWAS_FINEMAP_PURITY_R2_DEFAULT = 0.25
 _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR = "#9A9A91"
-_POSTGWAS_SUSIE_LOCUS_DEFAULT_COLORS = (
-    "#6F8F72",
-    "#89739B",
-    "#B07D62",
-    "#5E7899",
-    "#A18A59",
-    "#7C6C68",
-    "#6D8D8B",
-    "#9B6B7A",
-)
 _POSTGWAS_MIXED_MODEL_RESULT_SUFFIXES = (
     (".fvlmm.tsv", "fvlmm"),
     (".lmm.tsv", "lmm"),
@@ -10015,7 +10005,13 @@ def _postgwas_susie_locus_palette(
     cs_names: Sequence[str],
     palette_spec: Optional[Tuple[str, Any]] = None,
 ) -> dict[str, str]:
-    """Return deterministic muted colors keyed by numeric CS name."""
+    """Return deterministic colors keyed by numeric CS name.
+
+    SuSiE credible sets use the same ordered palette semantics as other
+    post-GWAS series.  With no explicit ``-palette``, ``tab10`` is the stable
+    default, and a numeric CS suffix keeps CS_2 on the second palette color
+    even when CS_1 is absent after purity filtering.
+    """
     unique = {str(name) for name in cs_names if str(name).strip() != ""}
 
     def _cs_sort_key(value: str) -> tuple[int, str]:
@@ -10025,18 +10021,16 @@ def _postgwas_susie_locus_palette(
     ordered = sorted(unique, key=_cs_sort_key)
     if len(ordered) == 0:
         return {}
-    if palette_spec is None:
-        colors = list(_POSTGWAS_SUSIE_LOCUS_DEFAULT_COLORS)
-    else:
-        numeric_ids = [
-            int(match.group(1))
-            for name in ordered
-            if (match := re.search(r"(\d+)$", name)) is not None
-        ]
-        color_count = max(len(ordered), max(numeric_ids, default=0))
-        colors = _resolve_merge_series_colors(palette_spec, color_count)
-        if len(colors) == 0:
-            colors = list(_POSTGWAS_SUSIE_LOCUS_DEFAULT_COLORS)
+    numeric_ids = [
+        int(match.group(1))
+        for name in ordered
+        if (match := re.search(r"(\d+)$", name)) is not None
+    ]
+    effective_spec = palette_spec or ("cmap", "tab10")
+    color_count = max(len(ordered), max(numeric_ids, default=0))
+    colors = _resolve_merge_series_colors(effective_spec, color_count)
+    if len(colors) == 0:
+        colors = _resolve_merge_series_colors(("cmap", "tab10"), color_count)
     mapping: dict[str, str] = {}
     for index, name in enumerate(ordered):
         match = re.search(r"(\d+)$", name)
@@ -10057,7 +10051,14 @@ def _postgwas_build_susie_locus_plot_record(
     palette_spec: Optional[Tuple[str, Any]] = None,
     layout: Optional[Sequence[dict[str, object]]] = None,
 ) -> dict[str, object]:
-    """Build compact plot data without retaining genotype or LD matrices."""
+    """Build compact PIP plot data without retaining genotype or LD matrices.
+
+    The plot contains every prepared GWAS row. Fitted representatives are Tag
+    SNPs and receive the fitted PIP; restored clump members are proxy points
+    that inherit their Tag PIP for visualization only. Rows outside a retained
+    CS remain neutral background points, retaining their fitted PIP when one
+    exists and otherwise using zero.
+    """
     prepared = prepared_source.reset_index(drop=True)
     output = locus_output.reset_index(drop=True)
     fitted = fitted_output_rows.reset_index(drop=True)
@@ -10065,17 +10066,6 @@ def _postgwas_build_susie_locus_plot_record(
     missing = sorted(required_prepared.difference(prepared.columns))
     if missing:
         raise ValueError("SuSiE locus plot input is missing: " + ", ".join(missing))
-    if "z" not in prepared.columns:
-        if not {"beta", "se"}.issubset(prepared.columns):
-            raise ValueError("SuSiE locus plot input requires z or beta/se columns.")
-        beta_values = pd.to_numeric(prepared["beta"], errors="coerce").to_numpy(dtype=float)
-        se_values = pd.to_numeric(prepared["se"], errors="coerce").to_numpy(dtype=float)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            z_values = beta_values / se_values
-    else:
-        z_values = pd.to_numeric(prepared["z"], errors="coerce").to_numpy(dtype=float)
-    if not np.all(np.isfinite(z_values)):
-        raise ValueError("SuSiE locus plot upper-panel Z values must be finite.")
     if not {"chrom", "pos", "snp"}.issubset(fitted.columns):
         raise ValueError("SuSiE locus plot fitted rows are missing metadata.")
     pip_values = np.asarray(pip, dtype=np.float64).reshape(-1)
@@ -10105,12 +10095,12 @@ def _postgwas_build_susie_locus_plot_record(
         text_value = str(value).strip()
         return text_value if text_value else None
 
-    upper_keys = [
+    point_keys = [
         _postgwas_finemap_row_key(row)
         for _, row in prepared.iterrows()
     ]
-    upper_chrom = prepared["chrom"].tolist()
-    upper_pos = pd.to_numeric(prepared["pos"], errors="raise").astype(np.int64).tolist()
+    point_chrom = prepared["chrom"].tolist()
+    point_pos = pd.to_numeric(prepared["pos"], errors="raise").astype(np.int64).tolist()
     if layout is None:
         layout = _build_layout_from_bimrange_tuples(
             [(str(chrom), int(start), int(end)) for chrom, start, end in bimrange_tuples],
@@ -10118,66 +10108,91 @@ def _postgwas_build_susie_locus_plot_record(
         )
     else:
         layout = [dict(segment) for segment in layout]
-    upper_x = _postgwas_project_susie_locus_x(
-        upper_chrom, upper_pos, bimrange_tuples, layout
+    point_x = _postgwas_project_susie_locus_x(
+        point_chrom, point_pos, bimrange_tuples, layout
     )
-    upper_cs: list[Optional[str]] = []
-    upper_rsqr = np.full(len(prepared), np.nan, dtype=np.float64)
-    for row_index, key in enumerate(upper_keys):
+    point_cs: list[Optional[str]] = []
+    point_roles: list[str] = []
+    point_pip = np.zeros(len(prepared), dtype=np.float64)
+    point_rsqr = np.full(len(prepared), np.nan, dtype=np.float64)
+    fitted_by_key: dict[tuple[str, int], int] = {}
+    fitted_by_snp: dict[str, list[tuple[str, int]]] = {}
+    for index, (_, row) in enumerate(fitted.iterrows()):
+        fitted_key = _postgwas_finemap_row_key(row)
+        if fitted_key in fitted_by_key:
+            raise ValueError(
+                "SuSiE locus plot fitted rows contain duplicate coordinates: "
+                f"{fitted_key[0]}:{fitted_key[1]}"
+            )
+        fitted_by_key[fitted_key] = int(index)
+        fitted_by_snp.setdefault(str(row["snp"]), []).append(fitted_key)
+    for row_index, key in enumerate(point_keys):
         annotation = annotation_by_key.get(key)
         cs = _cs_name(_annotation_value(annotation, "cs_set")) if annotation is not None else None
-        upper_cs.append(cs)
+        tag_key = None
+        if annotation is not None:
+            tag_value = _annotation_value(annotation, "tag")
+            if tag_value is not None and not pd.isna(tag_value):
+                tag_snp = str(tag_value).strip()
+                matching = fitted_by_snp.get(tag_snp, [])
+                if len(matching) > 1:
+                    raise ValueError(
+                        "SuSiE locus plot tag SNP is ambiguous in fitted rows: "
+                        f"{tag_snp}"
+                    )
+                if matching:
+                    tag_key = matching[0]
+        is_tag = cs is not None and key in fitted_by_key
+        if not is_tag and annotation is not None and tag_key is not None:
+            is_tag = cs is not None and key == tag_key
+        role = "tag" if is_tag else ("proxy" if cs is not None else "non_cs")
+        if role == "proxy" and annotation is not None and tag_key in fitted_by_key:
+            point_pip[row_index] = float(pip_values[fitted_by_key[tag_key]])
+        elif key in fitted_by_key:
+            point_pip[row_index] = float(pip_values[fitted_by_key[key]])
+        elif annotation is not None:
+            annotation_pip = pd.to_numeric(
+                pd.Series([_annotation_value(annotation, "pip")]), errors="coerce"
+            ).to_numpy(dtype=float)[0]
+            if np.isfinite(annotation_pip):
+                point_pip[row_index] = float(np.clip(annotation_pip, 0.0, 1.0))
+        point_roles.append(role)
+        point_cs.append(cs)
         if annotation is not None:
             rsqr_value = pd.to_numeric(
                 pd.Series([_annotation_value(annotation, "rsqr")]), errors="coerce"
             ).to_numpy(dtype=float)[0]
             if np.isfinite(rsqr_value):
-                upper_rsqr[row_index] = float(np.clip(rsqr_value, 0.0, 1.0))
+                point_rsqr[row_index] = float(np.clip(rsqr_value, 0.0, 1.0))
 
-    fitted_chrom = fitted["chrom"].tolist()
-    fitted_pos = pd.to_numeric(fitted["pos"], errors="raise").astype(np.int64).tolist()
-    fitted_x = _postgwas_project_susie_locus_x(
-        fitted_chrom, fitted_pos, bimrange_tuples, layout
-    )
-    fitted_cs = []
-    for _, row in fitted.iterrows():
-        annotation = annotation_by_key.get(_postgwas_finemap_row_key(row))
-        fitted_cs.append(
-            _cs_name(_annotation_value(annotation, "cs_set"))
-            if annotation is not None
-            else None
-        )
     cs_colors = _postgwas_susie_locus_palette(
-        [name for name in upper_cs + fitted_cs if name is not None],
+        [name for name in point_cs if name is not None],
         palette_spec,
     )
 
     def _color_for(cs: Optional[str]) -> str:
         return cs_colors.get(cs, _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR)
 
-    assigned = np.isfinite(upper_rsqr)
-    upper_size = np.full(len(prepared), 15.0, dtype=np.float64)
-    upper_size[assigned] = 24.0 + 72.0 * upper_rsqr[assigned]
+    point_marker = ["D" if role == "tag" else "o" for role in point_roles]
+    point_size = np.asarray(
+        [90.0 if role == "tag" else (24.0 if role == "proxy" else 18.0) for role in point_roles],
+        dtype=np.float64,
+    )
     return {
         "locus": str(locus),
         "layout": layout,
         "bimrange_tuples": [tuple(item) for item in bimrange_tuples],
         "cs_colors": cs_colors,
-        "upper": {
-            "x": upper_x,
-            "z": z_values,
-            "color": [_color_for(value) for value in upper_cs],
-            "size": upper_size,
+        "points": {
+            "x": point_x,
+            "pip": point_pip,
+            "color": [_color_for(value) for value in point_cs],
+            "size": point_size,
+            "marker": point_marker,
             "snp": [str(value) for value in prepared["snp"].tolist()],
-            "cs": upper_cs,
-            "rsqr": upper_rsqr,
-        },
-        "fitted": {
-            "x": fitted_x,
-            "pip": pip_values,
-            "color": [_color_for(value) for value in fitted_cs],
-            "snp": [str(value) for value in fitted["snp"].tolist()],
-            "cs": fitted_cs,
+            "cs": point_cs,
+            "role": point_roles,
+            "rsqr": point_rsqr,
         },
     }
 
@@ -10189,7 +10204,7 @@ def _postgwas_plot_susie_locus_records(
     *,
     logger: logging.Logger,
 ) -> None:
-    """Render the shared-x signed-Z/PIP SuSiE locus figure."""
+    """Render the single-panel PIP SuSiE locus figure."""
     if len(records) == 0:
         raise ValueError("SuSiE locus plot requires at least one record.")
     _apply_postgwas_matplotlib_style(args)
@@ -10202,19 +10217,16 @@ def _postgwas_plot_susie_locus_records(
         if record["bimrange_tuples"] != first["bimrange_tuples"]:
             raise ValueError("SuSiE locus plot records do not share bimrange coordinates.")
 
-    fig, axes, _width, _heights = _create_stacked_panel_figure(
-        panel_width_in=float(_PANEL_WIDTH_IN),
-        panel_heights_in=[3.2, 2.4],
+    fig, ax_pip, _width, _height = _create_ratio_panel_figure(
+        ratio=1.8,
         dpi=300,
+        panel_width_in=float(_PANEL_WIDTH_IN),
         reserve_right_in=1.25,
-        vspace_in=0.34,
     )
-    ax_z, ax_pip = axes
-    ax_z.sharex(ax_pip)
     all_cs_names = [
         str(cs_name)
         for record in records
-        for panel in (record["upper"], record["fitted"])
+        for panel in (record["points"],)
         for cs_name in list(panel["cs"])
         if cs_name is not None and not pd.isna(cs_name)
     ]
@@ -10224,58 +10236,45 @@ def _postgwas_plot_susie_locus_records(
     )
     legend_handles: dict[str, Patch] = {}
     for record in records:
-        upper = record["upper"]
-        fitted = record["fitted"]
-        upper_colors = [
-            global_cs_colors.get(str(cs_name), _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR)
-            if cs_name is not None and not pd.isna(cs_name)
-            else _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR
-            for cs_name in list(upper["cs"])
-        ]
-        fitted_colors = [
-            global_cs_colors.get(str(cs_name), _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR)
-            if cs_name is not None and not pd.isna(cs_name)
-            else _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR
-            for cs_name in list(fitted["cs"])
-        ]
-        ax_z.scatter(
-            np.asarray(upper["x"], dtype=float),
-            np.asarray(upper["z"], dtype=float),
-            s=np.asarray(upper["size"], dtype=float),
-            c=upper_colors,
-            alpha=0.82,
-            edgecolors="none",
-            linewidths=0.0,
-            rasterized=False,
-            zorder=3,
-        )
-        ax_pip.scatter(
-            np.asarray(fitted["x"], dtype=float),
-            np.asarray(fitted["pip"], dtype=float),
-            s=44.0,
-            c=fitted_colors,
-            alpha=0.95,
-            edgecolors="none",
-            linewidths=0.0,
-            rasterized=False,
-            zorder=3,
-        )
+        points = record["points"]
+        for role, marker in (("non_cs", "o"), ("proxy", "o"), ("tag", "D")):
+            indices = np.asarray(
+                [index for index, value in enumerate(points["role"]) if value == role],
+                dtype=np.int64,
+            )
+            if indices.size == 0:
+                continue
+            colors = [
+                global_cs_colors.get(str(points["cs"][index]), _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR)
+                if points["cs"][index] is not None and not pd.isna(points["cs"][index])
+                else _POSTGWAS_SUSIE_LOCUS_NEUTRAL_COLOR
+                for index in indices.tolist()
+            ]
+            ax_pip.scatter(
+                np.asarray(points["x"], dtype=float)[indices],
+                np.asarray(points["pip"], dtype=float)[indices],
+                s=np.asarray(points["size"], dtype=float)[indices],
+                c=colors,
+                marker=marker,
+                alpha=0.92 if role != "non_cs" else 0.75,
+                edgecolors="none",
+                linewidths=0.0,
+                rasterized=False,
+                zorder=4 if role == "tag" else (3 if role == "proxy" else 2),
+            )
         for cs_name, color in global_cs_colors.items():
             legend_handles.setdefault(
-                str(cs_name), Patch(facecolor=str(color), edgecolor="none", label=str(cs_name))
+                str(cs_name),
+                Patch(facecolor=str(color), edgecolor="none", label=str(cs_name)),
             )
 
-    ax_z.axhline(0.0, color="#777777", linewidth=0.8, linestyle="--", zorder=1)
-    ax_z.set_ylabel("Signed Z-score")
     ax_pip.set_ylabel("PIP")
     ax_pip.set_xlabel("Genomic position")
     ax_pip.set_ylim(0.0, 1.0)
-    ax_z.grid(axis="y", color="#D9D9D2", linewidth=0.6, alpha=0.7)
     ax_pip.grid(axis="y", color="#D9D9D2", linewidth=0.6, alpha=0.7)
-    ax_z.tick_params(axis="x", labelbottom=False)
-    ax_z.set_title("SuSiE locus fine-mapping", loc="left", pad=5.0)
+    ax_pip.set_title("SuSiE PIP", loc="left", pad=5.0)
     if legend_handles:
-        ax_z.legend(
+        ax_pip.legend(
             list(legend_handles.values()),
             list(legend_handles.keys()),
             title="Credible set",
@@ -10299,9 +10298,6 @@ def _postgwas_plot_susie_locus_records(
         )
     axis_limits = _postgwas_susie_locus_axis_limits(ranges, layout)
     ax_pip.set_xlim(axis_limits)
-    ax_z.set_xlim(axis_limits)
-    ax_z.set_position([ax_pip.get_position().x0, ax_z.get_position().y0,
-                       ax_pip.get_position().width, ax_z.get_position().height])
     fig.suptitle(
         "; ".join(str(record["locus"]) for record in records),
         x=0.08,
