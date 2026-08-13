@@ -5358,6 +5358,7 @@ def _postgwas_run_susie_finemap_body(
         clump_available_bytes // max(1, clump_sample_count * 4),
     )
 
+    out_dir = str(getattr(args, "out", ".") or ".")
     output_path, final_paths, temporary_paths = _postgwas_susie_finemap_output_paths(args)
     plot_requested = len(final_paths) > 1
     temporary_path = temporary_paths[0]
