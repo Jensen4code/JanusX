@@ -130,13 +130,21 @@ def determine_genotype_source(
     hmp: str | None,
     file: str | None,
     bfile: str | None,
+    kfile: str | None = None,
     prefix: str | None = None,
     snps_only: bool = False,
     delimiter: str | None = None,
     apply_cache: bool = False,
     threads: int = 0,
 ) -> tuple[str, str]:
-    if vcf:
+    if kfile:
+        gfile = str(kfile)
+        low_kfile = gfile.lower()
+        if low_kfile.endswith(".meta.json"):
+            auto_prefix = os.path.basename(gfile[: -len(".meta.json")])
+        else:
+            auto_prefix = os.path.basename(gfile.rstrip("/\\"))
+    elif vcf:
         gfile = str(vcf)
         auto_prefix = strip_default_prefix_suffix(gfile)
     elif hmp:
@@ -149,15 +157,21 @@ def determine_genotype_source(
         gfile = str(bfile)
         auto_prefix = os.path.basename(gfile.rstrip("/\\"))
     else:
-        raise ValueError("No genotype input specified. Use -vcf, -hmp, -file or -bfile.")
+        raise ValueError(
+            "No genotype input specified. Use -vcf, -hmp, -file, -bfile or -kfile."
+        )
 
     gfile_norm = gfile.replace("\\", "/")
-    if apply_cache:
+    # A k-file is already an on-disk, random-access genotype cache.  Passing it
+    # through the legacy text/PLINK cache builder would either reject the
+    # source or, worse, make a large unintended copy of the bitmatrix.
+    if apply_cache and not kfile:
         force_kind = determine_genotype_source_force_kind(
             vcf=vcf,
             hmp=hmp,
             file=file,
             bfile=bfile,
+            kfile=kfile,
         )
         gfile_norm = prepare_cli_input_cache(
             gfile_norm,
@@ -178,7 +192,10 @@ def determine_genotype_source_force_kind(
     hmp: str | None,
     file: str | None,
     bfile: str | None,
+    kfile: str | None = None,
 ) -> str | None:
+    if kfile:
+        return "kfile"
     if vcf:
         return "vcf"
     if hmp:
@@ -196,6 +213,7 @@ def determine_genotype_source_force_kind_from_args(args: Any) -> str | None:
         hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
+        kfile=getattr(args, "kfile", None),
     )
 
 
@@ -205,6 +223,7 @@ def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:
         hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
+        kfile=getattr(args, "kfile", None),
         prefix=getattr(args, "prefix", None),
         snps_only=bool(getattr(args, "snps_only", False)),
         delimiter=getattr(args, "delimiter", None),
