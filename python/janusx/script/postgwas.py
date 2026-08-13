@@ -6330,7 +6330,7 @@ def _apply_bimrange_manhattan_axis(
     ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / 1_000_000:g}Mb"))
     c = _sanitize_plot_text(chrom_label)
-    ax.set_xlabel(f"Chromosome {c}")
+    ax.set_xlabel(c)
 
 
 def _apply_multi_bimrange_manhattan_axis(
@@ -6346,18 +6346,53 @@ def _apply_multi_bimrange_manhattan_axis(
     if not right > left:
         return
     ax.set_xlim(left, right)
-    centers = [0.5 * (float(seg["x_start"]) + float(seg["x_end"])) for seg in layout]
-    labels = [_sanitize_plot_text(seg["chrom"]) for seg in layout]
-    ax.set_xticks(centers)
-    ax.set_xticklabels(labels)
-    ax.set_xlabel("Chromosome")
-    if label_fontsize is not None:
-        ax.tick_params(axis="x", labelsize=float(label_fontsize))
+    tick_positions: list[float] = []
+    tick_labels: list[str] = []
+    centers: list[float] = []
+    chromosomes: list[str] = []
     for i in range(len(layout) - 1):
         x_end = float(layout[i]["x_end"])
         x_next = float(layout[i + 1]["x_start"])
         xb = 0.5 * (x_end + x_next)
         ax.axvline(x=xb, color="black", linestyle=":", linewidth=0.7, alpha=0.9)
+    for segment in layout:
+        segment_start = float(segment["start"])
+        segment_end = float(segment["end"])
+        segment_ticks = MaxNLocator(nbins=4).tick_values(segment_start, segment_end)
+        segment_ticks = np.asarray(segment_ticks, dtype=np.float64)
+        segment_ticks = segment_ticks[
+            np.isfinite(segment_ticks)
+            & (segment_ticks >= segment_start)
+            & (segment_ticks <= segment_end)
+        ]
+        if segment_ticks.size == 0:
+            segment_ticks = np.asarray([segment_start, segment_end], dtype=np.float64)
+        segment_ticks = np.unique(segment_ticks)
+        offset = float(segment["offset"])
+        for tick in segment_ticks.tolist():
+            tick_positions.append(offset + float(tick) - segment_start)
+            tick_labels.append(f"{float(tick) / 1_000_000:g}Mb")
+        centers.append(0.5 * (float(segment["x_start"]) + float(segment["x_end"])))
+        chromosomes.append(_sanitize_plot_text(segment["chrom"]))
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels)
+    ax.set_xlabel("")
+    if label_fontsize is not None:
+        ax.tick_params(axis="x", labelsize=float(label_fontsize))
+    chromosome_transform = ax.get_xaxis_transform()
+    chromosome_fontsize = 5.0 if label_fontsize is None else float(label_fontsize)
+    for center, chromosome in zip(centers, chromosomes):
+        ax.text(
+            center,
+            -0.18,
+            chromosome,
+            transform=chromosome_transform,
+            ha="center",
+            va="top",
+            fontsize=chromosome_fontsize,
+            clip_on=False,
+            zorder=40,
+        )
 
 
 def _show_end_locs_without_xticks(
