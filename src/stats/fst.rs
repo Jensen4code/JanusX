@@ -16,9 +16,10 @@ use pyo3::prelude::*;
 use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BED_HEADER_LEN: usize = 3;
 const FST_BLOCK_SITES: usize = 4096;
@@ -903,6 +904,22 @@ fn read_fst_sites(reader: &mut FstBimReader, count: usize) -> Result<Vec<SiteInf
     Ok(sites)
 }
 
+fn temporary_fst_output_path(output_path: &str) -> PathBuf {
+    let output = Path::new(output_path);
+    let file_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fst.tsv");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    output.with_file_name(format!(
+        ".{file_name}.janusx-fst-{}-{stamp}.tmp",
+        std::process::id()
+    ))
+}
+
 fn write_fst_tsv_streaming(
     prefix: &str,
     within_path: &str,
@@ -913,26 +930,59 @@ fn write_fst_tsv_streaming(
     let input = open_fst_input(prefix, within_path, method_name)?;
     let mut bim_reader = FstBimReader::open(&normalize_plink_prefix(prefix))?;
     let method = input.method;
-    let file = File::create(output_path).map_err(|e| format!("{output_path}: {e}"))?;
-    let mut writer = BufWriter::with_capacity(FST_OUTPUT_BUFFER_SIZE, file);
-    write_fst_header(&mut writer, method, output_path)?;
+    let temporary_path = temporary_fst_output_path(output_path);
+    let mut temporary_created = false;
+    let result = (|| {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|e| {
+                format!(
+                    "{output_path}: unable to create temporary output {}: {e}",
+                    temporary_path.display()
+                )
+            })?;
+        temporary_created = true;
+        let mut writer = BufWriter::with_capacity(FST_OUTPUT_BUFFER_SIZE, file);
+        write_fst_header(&mut writer, method, output_path)?;
 
-    let mut start = 0usize;
-    while start < input.n_sites {
-        let end = (start + FST_BLOCK_SITES).min(input.n_sites);
-        let mut block = compute_fst_block(&input, start, end, threads)?;
-        block.sites = read_fst_sites(&mut bim_reader, end - start)?;
-        write_fst_rows(&mut writer, &block, method, output_path)?;
-        start = end;
+        let mut start = 0usize;
+        while start < input.n_sites {
+            let end = (start + FST_BLOCK_SITES).min(input.n_sites);
+            let mut block = compute_fst_block(&input, start, end, threads)?;
+            block.sites = read_fst_sites(&mut bim_reader, end - start)?;
+            write_fst_rows(&mut writer, &block, method, output_path)?;
+            start = end;
+        }
+        if bim_reader.next_site()?.is_some() {
+            return Err(format!(
+                "BED/BIM variant count mismatch while streaming: BED={}",
+                input.n_sites
+            ));
+        }
+        writer.flush().map_err(|e| format!("{output_path}: {e}"))?;
+        drop(writer);
+        std::fs::rename(&temporary_path, output_path).map_err(|e| {
+            format!(
+                "{output_path}: unable to atomically replace output from {}: {e}",
+                temporary_path.display()
+            )
+        })?;
+        Ok((input.n_sites, input.pair_names.len()))
+    })();
+
+    if result.is_err() && temporary_created {
+        if let Err(cleanup_err) = std::fs::remove_file(&temporary_path) {
+            if cleanup_err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "Warning: failed to remove temporary FST output {} after an earlier error: {cleanup_err}",
+                    temporary_path.display()
+                );
+            }
+        }
     }
-    if bim_reader.next_site()?.is_some() {
-        return Err(format!(
-            "BED/BIM variant count mismatch while streaming: BED={}",
-            input.n_sites
-        ));
-    }
-    writer.flush().map_err(|e| format!("{output_path}: {e}"))?;
-    Ok((input.n_sites, input.pair_names.len()))
+    result
 }
 
 fn read_population_indices(path: &str, fam_ids: &[(String, String)]) -> Result<Vec<usize>, String> {
@@ -1924,6 +1974,42 @@ mod tests {
             err.contains("variant count mismatch while streaming"),
             "{err}"
         );
+        for path in [
+            prefix.with_extension("bed"),
+            prefix.with_extension("bim"),
+            prefix.with_extension("fam"),
+            prefix.with_extension("within"),
+            output,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn streaming_preserves_existing_output_on_bim_mismatch() {
+        let prefix = fst_fixture_path("preserve_output");
+        let output = fst_fixture_path("preserve_output_result");
+        write_fst_fixture(&prefix, 1, 2);
+        std::fs::write(&output, "previous result\n").unwrap();
+
+        let err = write_fst_tsv_streaming(
+            prefix.to_str().unwrap(),
+            prefix.with_extension("within").to_str().unwrap(),
+            output.to_str().unwrap(),
+            "wc",
+            1,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("variant count mismatch while streaming"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous result\n"
+        );
+
         for path in [
             prefix.with_extension("bed"),
             prefix.with_extension("bim"),
