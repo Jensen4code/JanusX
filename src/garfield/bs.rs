@@ -9387,7 +9387,7 @@ mod tests {
         let literal_summaries =
             precompute_dual_literal_summaries(&y, &ge1, &ge2, row_words, n_rows, row_words, n);
         let parent_summary = literal_summaries[0];
-        let (train_n_ge1, train_n_ge2, train_sum_ge1, train_sum_ge2) =
+        let (_train_n_ge1, train_n_ge2, train_sum_ge1, train_sum_ge2) =
             literal_dual_summary_with_negation(sum_y, n, parent_summary, false);
         let parent_rule = BeamRule {
             first: BeamLiteral {

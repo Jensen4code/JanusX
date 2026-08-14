@@ -130,6 +130,7 @@ impl RuleNullPenaltyMethod {
     }
 
     #[inline]
+    #[cfg(test)]
     pub fn gev_default() -> Self {
         Self::GevGumbel {
             fwer_alpha: DEFAULT_RULE_NULL_GEV_FWER_ALPHA,
@@ -405,6 +406,7 @@ impl RuleNullCalibrator {
         self.global.test.push(score);
     }
 
+    #[cfg(test)]
     pub fn finalize_with_quantile(&self, quantile: f64) -> RuleNullPenaltyLookup {
         self.finalize_with_method(RuleNullPenaltyMethod::quantile(quantile))
     }

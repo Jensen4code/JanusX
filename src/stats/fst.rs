@@ -627,6 +627,7 @@ pub(crate) struct FstWindowSummary {
 /// mean.  The weighted value is the standard ratio of summed WC components;
 /// retaining the mean is useful for comparison with tools that report both
 /// window estimators.
+#[cfg(test)]
 pub(crate) fn wc_window_summary(sites: &[Vec<GroupStats>]) -> Option<FstWindowSummary> {
     let mut numerator = 0.0;
     let mut denominator = 0.0;
@@ -1167,6 +1168,7 @@ fn read_window_fst_input(
     })
 }
 
+#[cfg(test)]
 fn window_summary_for_pair(
     site_stats: &[Vec<GroupStats>],
     indices: &[usize],
@@ -1203,6 +1205,7 @@ fn window_summary_for_pair(
     }
 }
 
+#[cfg(test)]
 fn window_summaries_for_pairs(
     site_stats: &[Vec<GroupStats>],
     indices: &[usize],

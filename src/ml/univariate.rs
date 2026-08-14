@@ -146,62 +146,6 @@ pub fn feature_scores_abs_corr_dosage_x(x_rows: &[Vec<u8>], y: &[f64]) -> Vec<f6
     }
 }
 
-pub fn feature_scores_abs_corr_stage1(
-    sum_x: &[f64],
-    sum_x2: &[f64],
-    sum_xy: &[f64],
-    y: &[f64],
-) -> Vec<f64> {
-    feature_scores_abs_corr_stage1_with_parallel(sum_x, sum_x2, sum_xy, y, true)
-}
-
-pub fn feature_scores_abs_corr_stage1_with_parallel(
-    sum_x: &[f64],
-    sum_x2: &[f64],
-    sum_xy: &[f64],
-    y: &[f64],
-    allow_parallel: bool,
-) -> Vec<f64> {
-    if y.is_empty() {
-        return vec![0.0; sum_x.len()];
-    }
-    let n_features = sum_x.len().min(sum_x2.len()).min(sum_xy.len());
-    let n = y.len() as f64;
-    let sumy: f64 = y.iter().sum();
-    let sumy2: f64 = y.iter().map(|v| v * v).sum();
-    let meany = sumy / n;
-    let vary = (sumy2 / n) - meany * meany;
-    if !vary.is_finite() || vary <= 0.0 {
-        return vec![0.0; n_features];
-    }
-    if allow_parallel && should_parallel_row_scores(n_features, y.len()) {
-        (0..n_features)
-            .into_par_iter()
-            .map(|i| {
-                let meanx = sum_x[i] / n;
-                let varx = (sum_x2[i] / n) - meanx * meanx;
-                if !varx.is_finite() || varx <= 0.0 {
-                    return 0.0;
-                }
-                let cov = (sum_xy[i] / n) - meanx * meany;
-                (cov / (varx * vary).sqrt()).abs()
-            })
-            .collect()
-    } else {
-        (0..n_features)
-            .map(|i| {
-                let meanx = sum_x[i] / n;
-                let varx = (sum_x2[i] / n) - meanx * meanx;
-                if !varx.is_finite() || varx <= 0.0 {
-                    return 0.0;
-                }
-                let cov = (sum_xy[i] / n) - meanx * meany;
-                (cov / (varx * vary).sqrt()).abs()
-            })
-            .collect()
-    }
-}
-
 pub fn feature_scores_abs_mean_diff_binary_x(x_rows: &[Vec<u8>], y: &[f64]) -> Vec<f64> {
     if should_parallel_row_scores(x_rows.len(), y.len()) {
         x_rows

@@ -626,6 +626,7 @@ pub(crate) fn determine_c(r: f64, s: f64) -> f64 {
 }
 
 /// Mean XP-CLR drift statistic used as the variance multiplier.
+#[cfg(test)]
 pub(crate) fn determine_omega(q1: &[f64], q2: &[f64]) -> f64 {
     if q1.len() != q2.len() || q1.is_empty() {
         return f64::NAN;
@@ -647,6 +648,7 @@ pub(crate) fn determine_omega(q1: &[f64], q2: &[f64]) -> f64 {
 /// Return half-open genomic window starts as inclusive `(start, stop)`
 /// coordinates.  `stop` is the exclusive scan bound, matching the reference
 /// implementation's `arange(start, stop, step)` behavior.
+#[cfg(test)]
 pub(crate) fn window_starts(start: i64, stop: i64, window: i64, step: i64) -> Vec<(i64, i64)> {
     if stop <= start || window <= 0 || step <= 0 {
         return Vec::new();
@@ -661,6 +663,7 @@ pub(crate) fn window_starts(start: i64, stop: i64, window: i64, step: i64) -> Ve
 }
 
 /// Normalize finite XP-CLR scores while preserving invalid windows as NaN.
+#[cfg(test)]
 pub(crate) fn normalize_scores(values: &[f64]) -> Vec<f64> {
     let finite = values
         .iter()
@@ -921,6 +924,7 @@ fn rogers_huff_r_squared(lhs: &[i8], rhs: &[i8]) -> Option<f64> {
     }
 }
 
+#[cfg(test)]
 fn determine_weights_flat(
     dosages: &[i8],
     n_sites: usize,

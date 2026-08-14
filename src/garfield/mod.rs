@@ -5309,6 +5309,7 @@ fn ld_bounds_match_blocks(
     }
 }
 
+#[cfg(test)]
 fn prune_candidate_rows_by_ld_priority(
     candidate_global_rows: &[usize],
     priority_local_rows: &[usize],
@@ -5324,6 +5325,7 @@ fn prune_candidate_rows_by_ld_priority(
     )
 }
 
+#[cfg(test)]
 fn prune_candidate_rows_by_ld_priority_with_cache(
     candidate_global_rows: &[usize],
     priority_local_rows: &[usize],
@@ -5519,27 +5521,6 @@ fn prune_candidate_rows_by_ld_priority_impl(
         .into_iter()
         .map(|local_idx| candidate_global_rows[local_idx])
         .collect::<Vec<_>>())
-}
-
-fn select_geneset_window_candidate_pool_rows(
-    unit: &GarfieldLogicUnit,
-    candidate_global_rows: &[usize],
-    scores: &[f64],
-    per_window_keep_k: usize,
-    logic_bits: &GarfieldLogicBits,
-    sample_indices: &[usize],
-    prune_with_ld: bool,
-) -> Result<Vec<usize>, String> {
-    select_geneset_window_candidate_pool_rows_with_cache(
-        unit,
-        candidate_global_rows,
-        scores,
-        per_window_keep_k,
-        logic_bits,
-        sample_indices,
-        prune_with_ld,
-        None,
-    )
 }
 
 fn select_geneset_window_candidate_pool_rows_with_cache(
@@ -8145,29 +8126,6 @@ fn sample_indices_are_full_identity(sample_indices: &[usize], n_samples_all: usi
 }
 
 #[inline]
-fn dosage_stage1_stats_for_row_words(
-    row_ge1: &[u64],
-    row_ge2: Option<&[u64]>,
-    sample_indices: &[usize],
-    y: &[f64],
-) -> (f64, f64, f64) {
-    let mut sum_x = 0.0f64;
-    let mut sum_x2 = 0.0f64;
-    let mut sum_xy = 0.0f64;
-    for (dst_s, &src_s) in sample_indices.iter().enumerate() {
-        let ge1 = ((row_ge1[src_s >> 6] >> (src_s & 63)) & 1u64) as u8;
-        let ge2 = row_ge2
-            .map(|row| ((row[src_s >> 6] >> (src_s & 63)) & 1u64) as u8)
-            .unwrap_or(0);
-        let dosage = f64::from(ge1.saturating_add(ge2));
-        sum_x += dosage;
-        sum_x2 += dosage * dosage;
-        sum_xy += dosage * y[dst_s];
-    }
-    (sum_x, sum_x2, sum_xy)
-}
-
-#[inline]
 fn dosage_stage1_dual_summary_for_row_words(
     row_ge1: &[u64],
     row_ge2: Option<&[u64]>,
@@ -8461,244 +8419,6 @@ fn build_cached_literal_scores_from_selected_dual_summaries(
         });
     }
     Ok(out)
-}
-
-fn dosage_stage1_stats_from_full_bits(
-    bits_flat: &[u64],
-    bits_hi_flat: Option<&[u64]>,
-    row_words: usize,
-    row_indices: &[usize],
-    sample_indices: &[usize],
-    y: &[f64],
-    n_rows_all: usize,
-    n_samples_all: usize,
-    allow_parallel: bool,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), String> {
-    if row_words != words_for_samples(n_samples_all) {
-        return Err(format!(
-            "row_words mismatch for full bit matrix: got {row_words}, expected {}",
-            words_for_samples(n_samples_all)
-        ));
-    }
-    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
-        return Err("full bit matrix length mismatch".to_string());
-    }
-    if let Some(bits_hi_flat) = bits_hi_flat {
-        if bits_hi_flat.len() != n_rows_all.saturating_mul(row_words) {
-            return Err("full high-bit matrix length mismatch".to_string());
-        }
-    }
-    if sample_indices.len() != y.len() {
-        return Err(format!(
-            "sample_indices length ({}) != y length ({}) while computing dosage stage-1 stats",
-            sample_indices.len(),
-            y.len()
-        ));
-    }
-    if let Some(&row_idx) = row_indices.iter().find(|&&row_idx| row_idx >= n_rows_all) {
-        return Err(format!(
-            "row index out of range while computing dosage stage-1 stats: {row_idx}"
-        ));
-    }
-    if let Some(&sid) = sample_indices.iter().find(|&&sid| sid >= n_samples_all) {
-        return Err(format!(
-            "sample index out of range while computing dosage stage-1 stats: {sid}"
-        ));
-    }
-    let stats: Vec<(f64, f64, f64)> =
-        if sample_indices_are_full_identity(sample_indices, n_samples_all) {
-            let zero_hi = if bits_hi_flat.is_none() {
-                Some(vec![0u64; row_words])
-            } else {
-                None
-            };
-            if allow_parallel
-                && should_parallel_dense_decode(row_indices.len(), sample_indices.len())
-            {
-                row_indices
-                    .par_iter()
-                    .map(|&row_idx| {
-                        let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
-                        let row_ge2 = bits_hi_flat
-                            .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words])
-                            .unwrap_or_else(|| zero_hi.as_deref().expect("zero hi row must exist"));
-                        let (n_ge1, n_ge2, sum_ge1, sum_ge2) =
-                            dual_packed_summary(row_ge1, row_ge2, y, n_samples_all);
-                        (
-                            (n_ge1 + n_ge2) as f64,
-                            (n_ge1 + 3 * n_ge2) as f64,
-                            sum_ge1 + sum_ge2,
-                        )
-                    })
-                    .collect()
-            } else {
-                row_indices
-                    .iter()
-                    .map(|&row_idx| {
-                        let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
-                        let row_ge2 = bits_hi_flat
-                            .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words])
-                            .unwrap_or_else(|| zero_hi.as_deref().expect("zero hi row must exist"));
-                        let (n_ge1, n_ge2, sum_ge1, sum_ge2) =
-                            dual_packed_summary(row_ge1, row_ge2, y, n_samples_all);
-                        (
-                            (n_ge1 + n_ge2) as f64,
-                            (n_ge1 + 3 * n_ge2) as f64,
-                            sum_ge1 + sum_ge2,
-                        )
-                    })
-                    .collect()
-            }
-        } else if allow_parallel
-            && should_parallel_dense_decode(row_indices.len(), sample_indices.len())
-        {
-            row_indices
-                .par_iter()
-                .map(|&row_idx| {
-                    let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
-                    let row_ge2 = bits_hi_flat
-                        .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words]);
-                    dosage_stage1_stats_for_row_words(row_ge1, row_ge2, sample_indices, y)
-                })
-                .collect()
-        } else {
-            row_indices
-                .iter()
-                .map(|&row_idx| {
-                    let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
-                    let row_ge2 = bits_hi_flat
-                        .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words]);
-                    dosage_stage1_stats_for_row_words(row_ge1, row_ge2, sample_indices, y)
-                })
-                .collect()
-        };
-    let mut feat_sum_x = Vec::<f64>::with_capacity(stats.len());
-    let mut feat_sum_x2 = Vec::<f64>::with_capacity(stats.len());
-    let mut feat_sum_xy = Vec::<f64>::with_capacity(stats.len());
-    for (sum_x, sum_x2, sum_xy) in stats.into_iter() {
-        feat_sum_x.push(sum_x);
-        feat_sum_x2.push(sum_x2);
-        feat_sum_xy.push(sum_xy);
-    }
-    Ok((feat_sum_x, feat_sum_x2, feat_sum_xy))
-}
-
-fn dosage_stage1_stats_from_full_bits_range(
-    bits_flat: &[u64],
-    bits_hi_flat: Option<&[u64]>,
-    row_words: usize,
-    row_start: usize,
-    row_end: usize,
-    sample_indices: &[usize],
-    y: &[f64],
-    n_rows_all: usize,
-    n_samples_all: usize,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), String> {
-    if row_end <= row_start {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
-    }
-    if row_end > n_rows_all {
-        return Err(format!(
-            "row range out of bounds while computing dosage stage-1 stats: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
-        ));
-    }
-    if row_words != words_for_samples(n_samples_all) {
-        return Err(format!(
-            "row_words mismatch for full bit matrix: got {row_words}, expected {}",
-            words_for_samples(n_samples_all)
-        ));
-    }
-    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
-        return Err("full bit matrix length mismatch".to_string());
-    }
-    if let Some(bits_hi_flat) = bits_hi_flat {
-        if bits_hi_flat.len() != n_rows_all.saturating_mul(row_words) {
-            return Err("full high-bit matrix length mismatch".to_string());
-        }
-    }
-    if sample_indices.len() != y.len() {
-        return Err(format!(
-            "sample_indices length ({}) != y length ({}) while computing dosage stage-1 stats from range",
-            sample_indices.len(),
-            y.len()
-        ));
-    }
-    if let Some(&sid) = sample_indices.iter().find(|&&sid| sid >= n_samples_all) {
-        return Err(format!(
-            "sample index out of range while computing dosage stage-1 stats: {sid}"
-        ));
-    }
-    let n_rows = row_end.saturating_sub(row_start);
-    let stats: Vec<(f64, f64, f64)> =
-        if sample_indices_are_full_identity(sample_indices, n_samples_all) {
-            let zero_hi = if bits_hi_flat.is_none() {
-                Some(vec![0u64; row_words])
-            } else {
-                None
-            };
-            if should_parallel_dense_decode(n_rows, sample_indices.len()) {
-                (row_start..row_end)
-                    .into_par_iter()
-                    .map(|row_idx| {
-                        let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
-                        let row_ge2 = bits_hi_flat
-                            .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words])
-                            .unwrap_or_else(|| zero_hi.as_deref().expect("zero hi row must exist"));
-                        let (n_ge1, n_ge2, sum_ge1, sum_ge2) =
-                            dual_packed_summary(row_ge1, row_ge2, y, n_samples_all);
-                        (
-                            (n_ge1 + n_ge2) as f64,
-                            (n_ge1 + 3 * n_ge2) as f64,
-                            sum_ge1 + sum_ge2,
-                        )
-                    })
-                    .collect()
-            } else {
-                (row_start..row_end)
-                    .map(|row_idx| {
-                        let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
-                        let row_ge2 = bits_hi_flat
-                            .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words])
-                            .unwrap_or_else(|| zero_hi.as_deref().expect("zero hi row must exist"));
-                        let (n_ge1, n_ge2, sum_ge1, sum_ge2) =
-                            dual_packed_summary(row_ge1, row_ge2, y, n_samples_all);
-                        (
-                            (n_ge1 + n_ge2) as f64,
-                            (n_ge1 + 3 * n_ge2) as f64,
-                            sum_ge1 + sum_ge2,
-                        )
-                    })
-                    .collect()
-            }
-        } else if should_parallel_dense_decode(n_rows, sample_indices.len()) {
-            (row_start..row_end)
-                .into_par_iter()
-                .map(|row_idx| {
-                    let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
-                    let row_ge2 = bits_hi_flat
-                        .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words]);
-                    dosage_stage1_stats_for_row_words(row_ge1, row_ge2, sample_indices, y)
-                })
-                .collect()
-        } else {
-            (row_start..row_end)
-                .map(|row_idx| {
-                    let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
-                    let row_ge2 = bits_hi_flat
-                        .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words]);
-                    dosage_stage1_stats_for_row_words(row_ge1, row_ge2, sample_indices, y)
-                })
-                .collect()
-        };
-    let mut feat_sum_x = Vec::<f64>::with_capacity(stats.len());
-    let mut feat_sum_x2 = Vec::<f64>::with_capacity(stats.len());
-    let mut feat_sum_xy = Vec::<f64>::with_capacity(stats.len());
-    for (sum_x, sum_x2, sum_xy) in stats.into_iter() {
-        feat_sum_x.push(sum_x);
-        feat_sum_x2.push(sum_x2);
-        feat_sum_xy.push(sum_xy);
-    }
-    Ok((feat_sum_x, feat_sum_x2, feat_sum_xy))
 }
 
 static PACKED_EXTRACT_FLAT_NS: AtomicU64 = AtomicU64::new(0);
@@ -9245,6 +8965,7 @@ fn geneset_ld_support_cache(
     built
 }
 
+#[cfg(test)]
 fn maybe_prune_geneset_unit_rows_by_ld(
     unit: &GarfieldLogicUnit,
     candidate_global_rows: &[usize],
@@ -9506,23 +9227,6 @@ fn corr_candidate_pool_prescreen_k(n_region: usize, keep_k: usize) -> usize {
         GARFIELD_GENESET_CORR_PRESCREEN_SLACK_MAX,
     );
     n_region.min(keep_k.saturating_add(slack)).max(keep_k)
-}
-
-fn select_single_window_candidate_pool_rows(
-    candidate_global_rows: &[usize],
-    scores: &[f64],
-    target_k: usize,
-    logic_bits: &GarfieldLogicBits,
-    sample_indices: &[usize],
-) -> Result<Vec<usize>, String> {
-    select_single_window_candidate_pool_rows_with_cache(
-        candidate_global_rows,
-        scores,
-        target_k,
-        logic_bits,
-        sample_indices,
-        None,
-    )
 }
 
 fn select_single_window_candidate_pool_rows_with_cache(
@@ -9828,6 +9532,7 @@ fn select_ml_top_local_indices(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn select_logic_unit_global_rows(
     unit: &GarfieldLogicUnit,
     unit_kind_lc: &str,

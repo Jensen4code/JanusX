@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::bedmath::{packed_byte_lut, SubsetDecodePlan};
+#[cfg(test)]
+use crate::bedmath::packed_byte_lut;
+use crate::bedmath::SubsetDecodePlan;
 use crate::bitwise::and_popcount;
 use crate::decode::decode_prepared_additive_block_packed_f32;
 use crate::gfcore as core;
@@ -1600,6 +1602,7 @@ pub(crate) fn count_packed_row_pure_line_counts_selected_with_excluded_fast(
 /// Count selected pure-line calls by subtracting excluded lanes with the
 /// byte LUT. This keeps the full-row pass byte-oriented and avoids visiting
 /// every excluded sample individually for each SNP.
+#[cfg(test)]
 #[inline]
 pub(crate) fn count_packed_row_pure_line_counts_selected_with_excluded_lut(
     row: &[u8],

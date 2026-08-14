@@ -1339,6 +1339,7 @@ fn apply_grm_to_mat_f32_with_workspace_from_source(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn apply_grm_to_mat_f32_with_workspace(
     packed_flat: &[u8],
     bytes_per_snp: usize,
