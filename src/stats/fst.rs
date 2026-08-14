@@ -1626,10 +1626,40 @@ pub fn fst_bed_to_tsv(
 mod tests {
     use super::{
         build_group_masks, hudson_fst, read_within_groups, stats_for_row, wc_fst,
-        wc_window_summary, window_summaries_for_pairs, write_fst_window_emission, FstMethod,
-        FstWindowAccumulator, FstWindowEmission, FstWindowSummary, GroupMask, GroupStats,
-        WindowSiteStats,
+        wc_window_summary, window_summaries_for_pairs, write_fst_tsv_streaming,
+        write_fst_window_emission, FstMethod, FstWindowAccumulator, FstWindowEmission,
+        FstWindowSummary, GroupMask, GroupStats, WindowSiteStats,
     };
+
+    fn fst_fixture_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "janusx_fst_{label}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_fst_fixture(prefix: &std::path::Path, n_bed_sites: usize, n_bim_sites: usize) {
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F1 S1 0 0 0 -9\nF1 S2 0 0 0 -9\nF1 S3 0 0 0 -9\nF1 S4 0 0 0 -9\n",
+        )
+        .unwrap();
+        std::fs::write(
+            prefix.with_extension("within"),
+            "F1 S1 A\nF1 S2 A\nF1 S3 B\nF1 S4 B\n",
+        )
+        .unwrap();
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend(std::iter::repeat(0u8).take(n_bed_sites));
+        std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+        let bim = (1..=n_bim_sites)
+            .map(|site| format!("1 rs{site} 0 {site} A G\n"))
+            .collect::<String>();
+        std::fs::write(prefix.with_extension("bim"), bim).unwrap();
+    }
 
     fn close(actual: f64, expected: f64) {
         assert!(
@@ -1872,5 +1902,72 @@ mod tests {
         assert_eq!(super::format_fst_window_value(0.0001), "0.0001");
         assert_eq!(super::format_fst_window_value(-0.000099), "-9.9000e-5");
         assert_eq!(super::format_fst_window_value(1.0), "1.0000");
+    }
+
+    #[test]
+    fn streaming_rejects_bed_bim_mismatch_after_metadata_consumption() {
+        let prefix = fst_fixture_path("mismatch");
+        let output = fst_fixture_path("mismatch_output");
+        write_fst_fixture(&prefix, 1, 2);
+
+        let err = write_fst_tsv_streaming(
+            prefix.to_str().unwrap(),
+            prefix.with_extension("within").to_str().unwrap(),
+            output.to_str().unwrap(),
+            "wc",
+            1,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("variant count mismatch while streaming"),
+            "{err}"
+        );
+        for path in [
+            prefix.with_extension("bed"),
+            prefix.with_extension("bim"),
+            prefix.with_extension("fam"),
+            prefix.with_extension("within"),
+            output,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn streaming_keeps_compact_rows_contiguous_across_block_boundary() {
+        let prefix = fst_fixture_path("boundary");
+        let output = fst_fixture_path("boundary_output");
+        write_fst_fixture(&prefix, 4097, 4097);
+
+        let result = write_fst_tsv_streaming(
+            prefix.to_str().unwrap(),
+            prefix.with_extension("within").to_str().unwrap(),
+            output.to_str().unwrap(),
+            "wc",
+            1,
+        )
+        .unwrap();
+        let lines = std::fs::read_to_string(&output)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(result, (4097, 1));
+        assert_eq!(lines.len(), 4098);
+        assert_eq!(lines[0], "CHR\tSNP\tPOS\tNMISS\tFST");
+        assert_eq!(lines[4096], "1\trs4096\t4096\t4\tNaN");
+        assert_eq!(lines[4097], "1\trs4097\t4097\t4\tNaN");
+
+        for path in [
+            prefix.with_extension("bed"),
+            prefix.with_extension("bim"),
+            prefix.with_extension("fam"),
+            prefix.with_extension("within"),
+            output,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
