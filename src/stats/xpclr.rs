@@ -16,14 +16,17 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 use statrs::function::gamma::ln_gamma;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 
 const BED_HEADER_LEN: usize = 3;
 const XPCLR_BLOCK_SITES: usize = 4096;
+const XPCLR_HEADER: &str =
+    "chrom\tstart\tend\tmodelL\tnullL\tsel_coef\tnsnp\tnsnp_avail\tXPCLR\tnorm_XPCLR";
 const SELECTION_COEFFICIENTS: [f64; 16] = [
     0.0, 0.00001, 0.00005, 0.0001, 0.0002, 0.0004, 0.0006, 0.0008, 0.001, 0.003, 0.005, 0.01, 0.05,
     0.08, 0.1, 0.15,
@@ -81,6 +84,111 @@ struct XpclrWindowWork {
     stop: i64,
     n_snps_avail: usize,
     sites: Vec<SiteCounts>,
+}
+
+#[derive(Default)]
+struct XpclrResultReorder {
+    next_sequence: usize,
+    pending: BTreeMap<usize, RawWindowResult>,
+}
+
+impl XpclrResultReorder {
+    fn push(&mut self, sequence_id: usize, result: RawWindowResult) -> Vec<RawWindowResult> {
+        self.pending.insert(sequence_id, result);
+        let mut ready = Vec::new();
+        while let Some(result) = self.pending.remove(&self.next_sequence) {
+            ready.push(result);
+            self.next_sequence = self.next_sequence.saturating_add(1);
+        }
+        ready
+    }
+}
+
+struct XpclrWindowTaskResult {
+    sequence_id: usize,
+    result: Result<RawWindowResult, String>,
+}
+
+struct XpclrWindowPipeline {
+    sender: SyncSender<XpclrWindowTaskResult>,
+    receiver: Receiver<XpclrWindowTaskResult>,
+    reorder: XpclrResultReorder,
+    next_submit: usize,
+    in_flight: usize,
+    max_in_flight: usize,
+}
+
+impl XpclrWindowPipeline {
+    fn new(max_in_flight: usize) -> Self {
+        let capacity = max_in_flight.max(1);
+        let (sender, receiver) = sync_channel(capacity);
+        Self {
+            sender,
+            receiver,
+            reorder: XpclrResultReorder::default(),
+            next_submit: 0,
+            in_flight: 0,
+            max_in_flight: capacity,
+        }
+    }
+
+    fn submit(
+        &mut self,
+        pool: &rayon::ThreadPool,
+        work: XpclrWindowWork,
+        omega: f64,
+        ld_cutoff: f64,
+        minsnps: usize,
+        chrom: &str,
+        spool: &mut XpclrRawSpool,
+    ) -> Result<(), String> {
+        if self.in_flight >= self.max_in_flight {
+            self.drain_one(spool)?;
+        }
+        let sequence_id = self.next_submit;
+        self.next_submit = self.next_submit.saturating_add(1);
+        self.in_flight = self.in_flight.saturating_add(1);
+        let sender = self.sender.clone();
+        let chrom = chrom.to_string();
+        pool.spawn(move || {
+            // A panic in a detached Rayon task must become a receiver error;
+            // otherwise the bounded producer could wait forever for a result
+            // that will never be sent.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compute_window_work(&work, omega, ld_cutoff, minsnps, &chrom)
+            }))
+            .map_err(|_| "XP-CLR window task panicked".to_string());
+            let _ = sender.send(XpclrWindowTaskResult {
+                sequence_id,
+                result,
+            });
+        });
+        Ok(())
+    }
+
+    fn drain_one(&mut self, spool: &mut XpclrRawSpool) -> Result<(), String> {
+        let task = self.receiver.recv().map_err(|error| {
+            format!("XP-CLR window pipeline disconnected before result was received: {error}")
+        })?;
+        self.in_flight = self.in_flight.checked_sub(1).ok_or_else(|| {
+            "XP-CLR window pipeline received more results than submitted".to_string()
+        })?;
+        let result = task.result?;
+        let ready = self.reorder.push(task.sequence_id, result);
+        spool.append(&ready)
+    }
+
+    fn drain_all(&mut self, spool: &mut XpclrRawSpool) -> Result<(), String> {
+        while self.in_flight > 0 {
+            self.drain_one(spool)?;
+        }
+        if !self.reorder.pending.is_empty() {
+            return Err("XP-CLR window pipeline has a gap in result sequence".to_string());
+        }
+        self.reorder = XpclrResultReorder::default();
+        self.next_submit = 0;
+        Ok(())
+    }
 }
 
 struct XpclrRawSpool {
@@ -259,6 +367,14 @@ fn raw_xpclr_value(result: &RawWindowResult) -> Option<f64> {
         .then(|| 2.0 * (result.model_l - result.null_l))
 }
 
+fn format_xpclr_value(value: f64) -> String {
+    if value.is_finite() && value.abs() < 0.0001 {
+        format!("{value:.4e}")
+    } else {
+        format!("{value:.4}")
+    }
+}
+
 fn write_xpclr_row<W: Write>(
     writer: &mut W,
     raw: &RawWindowResult,
@@ -268,22 +384,17 @@ fn write_xpclr_row<W: Write>(
 ) -> Result<(), String> {
     writeln!(
         writer,
-        "{}_{:08}_{:08}\t{}\t{}\t{}\t{}\t{}\t{:.10e}\t{:.10e}\t{:.10e}\t{}\t{}\t{:.10e}\t{:.10e}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         raw.chrom,
         raw.start,
         raw.stop,
-        raw.chrom,
-        raw.start,
-        raw.stop,
-        raw.pos_start,
-        raw.pos_stop,
-        raw.model_l,
-        raw.null_l,
-        raw.sel_coef,
+        format_xpclr_value(raw.model_l),
+        format_xpclr_value(raw.null_l),
+        format_xpclr_value(raw.sel_coef),
         raw.n_snps,
         raw.n_snps_avail,
-        xpclr,
-        xpclr_norm,
+        format_xpclr_value(xpclr),
+        format_xpclr_value(xpclr_norm),
     )
     .map_err(|e| format!("{output}: {e}"))
 }
@@ -575,7 +686,15 @@ pub(crate) fn normalize_scores(values: &[f64]) -> Vec<f64> {
 }
 
 #[inline]
-fn binomial_pmf(k: usize, n: usize, p: f64) -> f64 {
+fn binomial_log_coefficient(k: usize, n: usize) -> f64 {
+    if k > n {
+        return f64::NEG_INFINITY;
+    }
+    ln_gamma((n + 1) as f64) - ln_gamma((k + 1) as f64) - ln_gamma((n - k + 1) as f64)
+}
+
+#[inline]
+fn binomial_pmf_with_log_coefficient(log_coefficient: f64, k: usize, n: usize, p: f64) -> f64 {
     if k > n || !(0.0..=1.0).contains(&p) {
         return 0.0;
     }
@@ -586,29 +705,26 @@ fn binomial_pmf(k: usize, n: usize, p: f64) -> f64 {
         return usize::from(k == n) as f64;
     }
     let log_probability =
-        ln_gamma((n + 1) as f64) - ln_gamma((k + 1) as f64) - ln_gamma((n - k + 1) as f64)
-            + k as f64 * libm::log(p)
-            + (n - k) as f64 * libm::log1p(-p);
+        log_coefficient + k as f64 * libm::log(p) + (n - k) as f64 * libm::log1p(-p);
     libm::exp(log_probability)
 }
 
 #[inline]
-fn xpclr_pdf(p1: f64, c: f64, p2: f64, variance: f64) -> f64 {
-    if !p1.is_finite() || !c.is_finite() || !p2.is_finite() || variance <= 0.0 {
-        return 0.0;
-    }
-    let c2 = c * c;
-    if c2 == 0.0 {
-        return 0.0;
-    }
-    let normalizer = (2.0 * std::f64::consts::PI * variance).sqrt().recip();
+fn xpclr_pdf_with_constants(
+    p1: f64,
+    c: f64,
+    p2: f64,
+    c2: f64,
+    normalizer: f64,
+    denominator: f64,
+) -> f64 {
     let mut result = 0.0;
     // The reference implementation adds both tails when c > 0.5; these are
     // deliberately independent conditions rather than an if/else chain.
     if p1 < c {
         let b = (c - p1) / c2;
         let centered = p1 - c * p2;
-        result += normalizer * b * libm::exp(-(centered * centered) / (2.0 * c2 * variance));
+        result += normalizer * b * libm::exp(-(centered * centered) / denominator);
     }
     // ``hardingnj/xpclr`` uses ``bisect_right`` on the scalar sample, so the
     // right tail starts strictly after ``1-c`` (not at the boundary).  This
@@ -617,7 +733,7 @@ fn xpclr_pdf(p1: f64, c: f64, p2: f64, variance: f64) -> f64 {
         let shifted = p1 + c - 1.0;
         let b = shifted / c2;
         let centered = shifted - c * p2;
-        result += normalizer * b * libm::exp(-(centered * centered) / (2.0 * c2 * variance));
+        result += normalizer * b * libm::exp(-(centered * centered) / denominator);
     }
     result
 }
@@ -692,9 +808,28 @@ pub(crate) fn chen_likelihood(data: (usize, usize, f64, f64, f64)) -> f64 {
         return 0.0;
     }
     let sample_frequency = xj as f64 / nj as f64;
-    let marginal = integrate_split(|p| xpclr_pdf(p, c, p2, variance), c, &[]);
+    // The binomial coefficient is independent of the quadrature point.  The
+    // previous implementation recomputed three lgamma values at every
+    // adaptive-Simpson evaluation, which dominated large XP-CLR windows.
+    // Hoisting it preserves the exact arithmetic expression while removing
+    // that redundant work from the hot loop.
+    let log_coefficient = binomial_log_coefficient(xj, nj);
+    let c2 = c * c;
+    if c2 == 0.0 {
+        return -1800.0;
+    }
+    let normalizer = (2.0 * std::f64::consts::PI * variance).sqrt().recip();
+    let denominator = 2.0 * c2 * variance;
+    let marginal = integrate_split(
+        |p| xpclr_pdf_with_constants(p, c, p2, c2, normalizer, denominator),
+        c,
+        &[],
+    );
     let integrated = integrate_split(
-        |p| xpclr_pdf(p, c, p2, variance) * binomial_pmf(xj, nj, p),
+        |p| {
+            xpclr_pdf_with_constants(p, c, p2, c2, normalizer, denominator)
+                * binomial_pmf_with_log_coefficient(log_coefficient, xj, nj, p)
+        },
         c,
         &[sample_frequency],
     );
@@ -793,27 +928,45 @@ fn determine_weights_flat(
     ld_cutoff: f64,
 ) -> Vec<f64> {
     debug_assert_eq!(dosages.len(), n_sites * n_samples);
-    let mut weights = vec![1.0; n_sites];
+    let mut highly_correlated = vec![0usize; n_sites];
     for lhs in 0..n_sites {
-        let mut highly_correlated = 0usize;
         let lhs_start = lhs * n_samples;
         let lhs_dosages = &dosages[lhs_start..lhs_start + n_samples];
-        for rhs in 0..n_sites {
-            if lhs == rhs {
-                continue;
-            }
+        for rhs in lhs + 1..n_sites {
             let rhs_start = rhs * n_samples;
             let above_cutoff =
                 rogers_huff_r_squared(lhs_dosages, &dosages[rhs_start..rhs_start + n_samples])
                     .map(|r_squared| r_squared > ld_cutoff)
                     .unwrap_or(true);
             if above_cutoff {
-                highly_correlated += 1;
+                highly_correlated[lhs] += 1;
+                highly_correlated[rhs] += 1;
             }
         }
-        weights[lhs] = 1.0 / (1.0 + highly_correlated as f64);
     }
-    weights
+    highly_correlated
+        .into_iter()
+        .map(|count| 1.0 / (1.0 + count as f64))
+        .collect()
+}
+
+fn determine_weights_for_sites(sites: &[SiteCounts], ld_cutoff: f64) -> Vec<f64> {
+    let mut highly_correlated = vec![0usize; sites.len()];
+    for lhs in 0..sites.len() {
+        for rhs in lhs + 1..sites.len() {
+            let above_cutoff = rogers_huff_r_squared(&sites[lhs].dosages, &sites[rhs].dosages)
+                .map(|r_squared| r_squared > ld_cutoff)
+                .unwrap_or(true);
+            if above_cutoff {
+                highly_correlated[lhs] += 1;
+                highly_correlated[rhs] += 1;
+            }
+        }
+    }
+    highly_correlated
+        .into_iter()
+        .map(|count| 1.0 / (1.0 + count as f64))
+        .collect()
 }
 
 fn read_fam(path: &str) -> Result<Vec<FamSample>, String> {
@@ -843,20 +996,35 @@ struct BimReader {
     path: String,
     reader: BufReader<File>,
     line_no: usize,
+    remaining_sites: Option<usize>,
 }
 
 impl BimReader {
-    fn open(prefix: &str) -> Result<Self, String> {
+    fn open_at(
+        prefix: &str,
+        bim_offset: u64,
+        remaining_sites: Option<usize>,
+    ) -> Result<Self, String> {
         let path = format!("{prefix}.bim");
         let file = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
+        let mut reader = BufReader::new(file);
+        if bim_offset > 0 {
+            reader
+                .seek(SeekFrom::Start(bim_offset))
+                .map_err(|e| format!("{path}: {e}"))?;
+        }
         Ok(Self {
             path,
-            reader: BufReader::new(file),
+            reader,
             line_no: 0,
+            remaining_sites,
         })
     }
 
     fn next_site(&mut self) -> Result<Option<BimSite>, String> {
+        if self.remaining_sites == Some(0) {
+            return Ok(None);
+        }
         let mut line = String::new();
         loop {
             line.clear();
@@ -887,12 +1055,107 @@ impl BimReader {
                 self.path, self.line_no
             )
         })?;
+        if let Some(remaining) = self.remaining_sites.as_mut() {
+            *remaining -= 1;
+        }
         Ok(Some(BimSite {
             chrom: columns[0].to_string(),
             snp: columns[1].to_string(),
             pos,
         }))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BimScanPlan {
+    site_start: usize,
+    n_sites: usize,
+    bim_offset: u64,
+    bed_offset: u64,
+}
+
+fn scan_bim_range(
+    prefix: &str,
+    chrom_filter: Option<&str>,
+    total_sites: usize,
+    bytes_per_snp: usize,
+) -> Result<BimScanPlan, String> {
+    let prefix = normalize_prefix(prefix);
+    let path = format!("{prefix}.bim");
+    let file = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
+    let mut reader = BufReader::new(file);
+    let Some(target) = chrom_filter
+        .map(str::trim)
+        .filter(|chrom| !chrom.is_empty())
+    else {
+        return Ok(BimScanPlan {
+            site_start: 0,
+            n_sites: total_sites,
+            bim_offset: 0,
+            bed_offset: BED_HEADER_LEN as u64,
+        });
+    };
+
+    let mut line = String::new();
+    let mut byte_offset = 0u64;
+    let mut site_idx = 0usize;
+    let mut site_start = None::<usize>;
+    let mut bim_offset = None::<u64>;
+    let mut n_sites = 0usize;
+    let mut left_target = false;
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("{path}: {e}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        let line_start = byte_offset;
+        byte_offset = byte_offset.saturating_add(bytes_read as u64);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let chrom = line
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| format!("malformed BIM line {}:{}", path, site_idx + 1))?;
+        if site_idx >= total_sites {
+            return Err(format!(
+                "BIM contains more variants than BED: BIM>{total_sites} at {}:{}",
+                path,
+                site_idx + 1
+            ));
+        }
+        if chrom == target {
+            if left_target {
+                return Err(format!(
+                    "BIM chromosome {target} reappears after a later chromosome; XP-CLR requires chromosome-sorted BIM"
+                ));
+            }
+            if site_start.is_none() {
+                site_start = Some(site_idx);
+                bim_offset = Some(line_start);
+            }
+            n_sites += 1;
+        } else if site_start.is_some() {
+            left_target = true;
+        }
+        site_idx += 1;
+    }
+    if site_idx != total_sites {
+        return Err(format!(
+            "BED/BIM variant count mismatch: BED={total_sites}, BIM={site_idx}"
+        ));
+    }
+    let site_start = site_start.unwrap_or(total_sites);
+    let bim_offset = bim_offset.unwrap_or(byte_offset);
+    Ok(BimScanPlan {
+        site_start,
+        n_sites,
+        bim_offset,
+        bed_offset: BED_HEADER_LEN as u64 + site_start as u64 * bytes_per_snp as u64,
+    })
 }
 
 fn normalize_prefix(prefix: &str) -> String {
@@ -1087,15 +1350,7 @@ fn compute_window_work(
         .map(|site| site.genetic_distance)
         .sum::<f64>()
         / work.sites.len() as f64;
-    let n_pop2 = work.sites[0].dosages.len();
-    let mut dosages = vec![0i8; work.sites.len() * n_pop2];
-    dosages
-        .par_chunks_mut(n_pop2)
-        .enumerate()
-        .for_each(|(row_idx, destination)| {
-            destination.copy_from_slice(&work.sites[row_idx].dosages);
-        });
-    let weights = determine_weights_flat(&dosages, work.sites.len(), n_pop2, ld_cutoff);
+    let weights = determine_weights_for_sites(&work.sites, ld_cutoff);
     let rows = work
         .sites
         .iter()
@@ -1189,44 +1444,51 @@ fn scan_site_counts(
     }))
 }
 
-fn compute_window_batch(
-    works: Vec<XpclrWindowWork>,
-    omega: f64,
-    ld_cutoff: f64,
-    minsnps: usize,
-    chrom: &str,
+fn scan_block_sites(
+    block_payload: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    block_sites: &[BimSite],
+    pop1_mask: &SampleMask,
+    pop2_mask: &SampleMask,
+    pop2_indices: &[usize],
+    map: Option<&HashMap<(String, i64), f64>>,
+    rrate: f64,
+    omega: Option<f64>,
+    decode_dosages: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Vec<RawWindowResult> {
-    let compute = || {
-        works
+) -> Vec<Result<Option<SiteCounts>, String>> {
+    debug_assert_eq!(block_payload.len(), block_sites.len() * bytes_per_snp);
+    let scan = || {
+        block_sites
             .par_iter()
-            .map(|work| compute_window_work(work, omega, ld_cutoff, minsnps, chrom))
+            .enumerate()
+            .map(|(offset, bim)| {
+                let row = &block_payload[offset * bytes_per_snp..(offset + 1) * bytes_per_snp];
+                scan_site_counts(
+                    row,
+                    n_samples,
+                    bim,
+                    pop1_mask,
+                    pop2_mask,
+                    pop2_indices,
+                    map,
+                    rrate,
+                    omega,
+                    decode_dosages,
+                )
+            })
             .collect::<Vec<_>>()
     };
     match pool {
-        Some(pool) => pool.install(compute),
-        None => compute(),
+        Some(pool) => pool.install(scan),
+        None => scan(),
     }
 }
 
-fn flush_xpclr_batch(
-    work_batch: &mut Vec<XpclrWindowWork>,
-    spool: &mut XpclrRawSpool,
-    omega: f64,
-    ld_cutoff: f64,
-    minsnps: usize,
-    chrom: &str,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(), String> {
-    if work_batch.is_empty() {
-        return Ok(());
-    }
-    let works = std::mem::take(work_batch);
-    let results = compute_window_batch(works, omega, ld_cutoff, minsnps, chrom, pool);
-    spool.append(&results)
-}
-
-fn flush_xpclr_chrom(
+fn finish_xpclr_chrom_pipeline(
+    pipeline: &mut XpclrWindowPipeline,
+    pool: &rayon::ThreadPool,
     accumulator: &mut Option<XpclrWindowAccumulator>,
     max_pos: i64,
     window: i64,
@@ -1234,25 +1496,21 @@ fn flush_xpclr_chrom(
     maxsnps: usize,
     sample_seed: u64,
     chrom_idx: usize,
-    work_batch: &mut Vec<XpclrWindowWork>,
     spool: &mut XpclrRawSpool,
+    writer: &mut BufWriter<File>,
     omega: f64,
     ld_cutoff: f64,
     minsnps: usize,
     chrom: &str,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(), String> {
+    output: &str,
+) -> Result<(usize, usize), String> {
     if let Some(mut accumulator) = accumulator.take() {
-        work_batch.extend(accumulator.finish(
-            max_pos,
-            window,
-            step,
-            maxsnps,
-            sample_seed,
-            chrom_idx,
-        ));
+        for work in accumulator.finish(max_pos, window, step, maxsnps, sample_seed, chrom_idx) {
+            pipeline.submit(pool, work, omega, ld_cutoff, minsnps, chrom, spool)?;
+        }
     }
-    flush_xpclr_batch(work_batch, spool, omega, ld_cutoff, minsnps, chrom, pool)
+    pipeline.drain_all(spool)?;
+    spool.finalize(writer, chrom, output)
 }
 
 fn run_xpclr(
@@ -1302,55 +1560,70 @@ fn run_xpclr(
         None => None,
     };
 
-    let progress_step = progress_step(input.n_sites, progress_every);
+    let bed_prefix = normalize_prefix(prefix);
+    let scan_plan = scan_bim_range(
+        &bed_prefix,
+        chrom_filter,
+        input.n_sites,
+        input.bytes_per_snp,
+    )?;
+    let scan_sites = scan_plan.n_sites;
+    // XP-CLR uses the same exact Rayon worker budget for the site scan and
+    // the window pipeline.  The Python wrapper validates positive `-t`, while
+    // the direct Rust/PyO3 API historically allowed zero to mean "default";
+    // make that case deterministic and serial rather than silently falling
+    // back to an unrelated global pool.
+    let effective_threads = threads.max(1);
+    let pool = get_cached_pool(effective_threads)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "XP-CLR failed to create its Rayon thread pool".to_string())?;
+    let progress_step = progress_step(scan_sites, progress_every);
     let mut next_progress = progress_step;
     if progress_callback.is_some() {
-        emit_progress_callback(progress_callback, 0, 0, input.n_sites)?;
+        emit_progress_callback(progress_callback, 0, 0, scan_sites)?;
     }
 
     // Pass 1: stream BIM/BED once to estimate the global omega.  No per-site
     // metadata or window index is retained.
-    let bed_prefix = normalize_prefix(prefix);
-    let mut bim_reader = BimReader::open(&bed_prefix)?;
+    let mut bim_reader = BimReader::open_at(&bed_prefix, scan_plan.bim_offset, Some(scan_sites))?;
     let mut bed = input
         .bed
         .try_clone()
         .map_err(|e| format!("{prefix}.bed: {e}"))?;
-    bed.seek(SeekFrom::Start(BED_HEADER_LEN as u64))
+    bed.seek(SeekFrom::Start(scan_plan.bed_offset))
         .map_err(|e| format!("{prefix}.bed: {e}"))?;
     let mut omega_sum = 0.0;
     let mut omega_sites = 0usize;
     let mut usable_sites = 0usize;
     let mut block_start = 0usize;
-    while block_start < input.n_sites {
-        let block_len = (input.n_sites - block_start).min(XPCLR_BLOCK_SITES);
+    while block_start < scan_sites {
+        let block_len = (scan_sites - block_start).min(XPCLR_BLOCK_SITES);
         let mut block_payload = vec![0u8; block_len * input.bytes_per_snp];
         bed.read_exact(&mut block_payload)
             .map_err(|e| format!("{prefix}.bed: {e}"))?;
-        for offset in 0..block_len {
-            let row =
-                &block_payload[offset * input.bytes_per_snp..(offset + 1) * input.bytes_per_snp];
-            let bim = bim_reader.next_site()?.ok_or_else(|| {
-                "BIM ended before all BED variants during XP-CLR omega scan".to_string()
-            })?;
-            if chrom_filter.is_some_and(|chrom| chrom != bim.chrom) {
-                continue;
-            }
-            let Some(site) = scan_site_counts(
-                row,
-                input.n_samples,
-                &bim,
-                &pop1_mask,
-                &pop2_mask,
-                &pop2,
-                map.as_ref(),
-                rrate,
-                None,
-                false,
-            )?
-            else {
-                continue;
-            };
+        let block_sites = (0..block_len)
+            .map(|_| {
+                bim_reader.next_site()?.ok_or_else(|| {
+                    "BIM ended before all BED variants during XP-CLR omega scan".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let block_results = scan_block_sites(
+            &block_payload,
+            input.bytes_per_snp,
+            input.n_samples,
+            &block_sites,
+            &pop1_mask,
+            &pop2_mask,
+            &pop2,
+            map.as_ref(),
+            rrate,
+            None,
+            false,
+            Some(&pool),
+        );
+        for result in block_results {
+            let Some(site) = result? else { continue };
             let q1 = site.alt1 as f64 / (site.calls1 * 2) as f64;
             let denominator = site.q2 * (1.0 - site.q2);
             omega_sum += (q1 - site.q2).powi(2) / denominator;
@@ -1358,11 +1631,10 @@ fn run_xpclr(
             usable_sites += 1;
         }
         if progress_callback.is_some()
-            && (block_start + block_len >= next_progress
-                || block_start + block_len == input.n_sites)
+            && (block_start + block_len >= next_progress || block_start + block_len == scan_sites)
         {
             let done = block_start + block_len;
-            emit_progress_callback(progress_callback, 0, done, input.n_sites)?;
+            emit_progress_callback(progress_callback, 0, done, scan_sites)?;
             while next_progress <= done {
                 next_progress = next_progress.saturating_add(progress_step);
             }
@@ -1372,7 +1644,7 @@ fn run_xpclr(
     if bim_reader.next_site()?.is_some() {
         return Err(format!(
             "BED/BIM variant count mismatch during XP-CLR omega scan: BED={}",
-            input.n_sites
+            scan_sites
         ));
     }
     if usable_sites == 0 || omega_sites == 0 {
@@ -1381,8 +1653,8 @@ fn run_xpclr(
     let omega = omega_sum / omega_sites as f64;
 
     if progress_callback.is_some() {
-        emit_progress_callback(progress_callback, 0, input.n_sites, input.n_sites)?;
-        emit_progress_callback(progress_callback, 1, 0, input.n_sites)?;
+        emit_progress_callback(progress_callback, 0, scan_sites, scan_sites)?;
+        emit_progress_callback(progress_callback, 1, 0, scan_sites)?;
         next_progress = progress_step;
     }
 
@@ -1395,48 +1667,51 @@ fn run_xpclr(
     }
     let file = File::create(output).map_err(|e| format!("{output}: {e}"))?;
     let mut writer = BufWriter::new(file);
-    writeln!(
-        writer,
-        "id\tchrom\tstart\tstop\tpos_start\tpos_stop\tmodelL\tnullL\tsel_coef\tnSNPs\tnSNPs_avail\txpclr\txpclr_norm"
-    )
-    .map_err(|e| format!("{output}: {e}"))?;
-    let mut valid = 0usize;
-    let mut total_windows = 0usize;
-    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-    let batch_size = threads.max(1).saturating_mul(2).max(8);
-    let mut bim_reader = BimReader::open(&bed_prefix)?;
-    let mut bed = input.bed;
-    bed.seek(SeekFrom::Start(BED_HEADER_LEN as u64))
-        .map_err(|e| format!("{prefix}.bed: {e}"))?;
-    let mut current_chrom = None::<String>;
-    let mut current_chrom_idx = 0usize;
-    let mut seen_chromosome = false;
-    let mut completed_chroms = HashSet::<String>::new();
-    let mut accumulator = None::<XpclrWindowAccumulator>;
-    let mut max_pos = 0i64;
-    let mut last_pos = None::<i64>;
-    let mut work_batch = Vec::<XpclrWindowWork>::new();
-    let mut spool = None::<XpclrRawSpool>;
-
-    let mut block_start = 0usize;
-    while block_start < input.n_sites {
-        let block_len = (input.n_sites - block_start).min(XPCLR_BLOCK_SITES);
-        let mut block_payload = vec![0u8; block_len * input.bytes_per_snp];
-        bed.read_exact(&mut block_payload)
+    writeln!(writer, "{XPCLR_HEADER}").map_err(|e| format!("{output}: {e}"))?;
+    let (total_windows, valid) = {
+        // Keep only a bounded number of window payloads in the Rayon task
+        // graph.  The producer can continue decoding while workers calculate;
+        // once the bound is reached it drains one completed result, which is
+        // both backpressure and dynamic scheduling for uneven windows.
+        let max_in_flight = effective_threads.saturating_mul(4).max(32);
+        let mut pipeline = XpclrWindowPipeline::new(max_in_flight);
+        let mut valid = 0usize;
+        let mut total_windows = 0usize;
+        let mut bim_reader =
+            BimReader::open_at(&bed_prefix, scan_plan.bim_offset, Some(scan_sites))?;
+        let mut bed = input
+            .bed
+            .try_clone()
             .map_err(|e| format!("{prefix}.bed: {e}"))?;
-        for offset in 0..block_len {
-            let row =
-                &block_payload[offset * input.bytes_per_snp..(offset + 1) * input.bytes_per_snp];
-            let bim = bim_reader.next_site()?.ok_or_else(|| {
-                "BIM ended before all BED variants during XP-CLR scan".to_string()
-            })?;
-            if chrom_filter.is_some_and(|chrom| chrom != bim.chrom) {
-                continue;
-            }
-            let Some(site) = scan_site_counts(
-                row,
+        bed.seek(SeekFrom::Start(scan_plan.bed_offset))
+            .map_err(|e| format!("{prefix}.bed: {e}"))?;
+        let mut current_chrom = None::<String>;
+        let mut current_chrom_idx = 0usize;
+        let mut seen_chromosome = false;
+        let mut completed_chroms = HashSet::<String>::new();
+        let mut accumulator = None::<XpclrWindowAccumulator>;
+        let mut max_pos = 0i64;
+        let mut last_pos = None::<i64>;
+        let mut spool = None::<XpclrRawSpool>;
+
+        let mut block_start = 0usize;
+        while block_start < scan_sites {
+            let block_len = (scan_sites - block_start).min(XPCLR_BLOCK_SITES);
+            let mut block_payload = vec![0u8; block_len * input.bytes_per_snp];
+            bed.read_exact(&mut block_payload)
+                .map_err(|e| format!("{prefix}.bed: {e}"))?;
+            let block_sites = (0..block_len)
+                .map(|_| {
+                    bim_reader.next_site()?.ok_or_else(|| {
+                        "BIM ended before all BED variants during XP-CLR scan".to_string()
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let block_results = scan_block_sites(
+                &block_payload,
+                input.bytes_per_snp,
                 input.n_samples,
-                &bim,
+                &block_sites,
                 &pop1_mask,
                 &pop2_mask,
                 &pop2,
@@ -1444,126 +1719,139 @@ fn run_xpclr(
                 rrate,
                 Some(omega),
                 true,
-            )?
-            else {
-                continue;
-            };
-            let site_chrom = bim.chrom.clone();
-            if current_chrom.as_deref() != Some(site_chrom.as_str()) {
-                if let Some(chrom) = current_chrom.take() {
-                    let mut chrom_spool = spool.take().ok_or_else(|| {
-                        "internal XP-CLR error: missing chromosome spool".to_string()
-                    })?;
-                    flush_xpclr_chrom(
-                        &mut accumulator,
-                        max_pos,
-                        window,
-                        step,
-                        maxsnps,
-                        sample_seed,
-                        current_chrom_idx,
-                        &mut work_batch,
-                        &mut chrom_spool,
+                Some(&pool),
+            );
+            for (bim, result) in block_sites.into_iter().zip(block_results) {
+                let Some(site) = result? else { continue };
+                let site_chrom = bim.chrom.clone();
+                if current_chrom.as_deref() != Some(site_chrom.as_str()) {
+                    if let Some(chrom) = current_chrom.take() {
+                        let mut chrom_spool = spool.take().ok_or_else(|| {
+                            "internal XP-CLR error: missing chromosome spool".to_string()
+                        })?;
+                        let (count, chrom_valid) = finish_xpclr_chrom_pipeline(
+                            &mut pipeline,
+                            &pool,
+                            &mut accumulator,
+                            max_pos,
+                            window,
+                            step,
+                            maxsnps,
+                            sample_seed,
+                            current_chrom_idx,
+                            &mut chrom_spool,
+                            &mut writer,
+                            omega,
+                            ld_cutoff,
+                            minsnps,
+                            &chrom,
+                            output,
+                        )?;
+                        total_windows += count;
+                        valid += chrom_valid;
+                        completed_chroms.insert(chrom);
+                    }
+                    if completed_chroms.contains(&site_chrom) {
+                        return Err(format!(
+                            "BIM chromosome {} reappears after a later chromosome; XP-CLR requires chromosome-sorted BIM",
+                            site_chrom
+                        ));
+                    }
+                    current_chrom = Some(site_chrom.clone());
+                    if seen_chromosome {
+                        current_chrom_idx += 1;
+                    }
+                    seen_chromosome = true;
+                    accumulator = Some(XpclrWindowAccumulator::new());
+                    spool = Some(XpclrRawSpool::new(output_path, current_chrom_idx)?);
+                    max_pos = 0;
+                    last_pos = None;
+                }
+                if last_pos.is_some_and(|previous| site.pos < previous) {
+                    return Err(format!(
+                        "BIM positions are not sorted within chromosome {}",
+                        site_chrom
+                    ));
+                }
+                last_pos = Some(site.pos);
+                max_pos = max_pos.max(site.pos);
+                let emitted = accumulator.as_mut().unwrap().push(
+                    site,
+                    window,
+                    step,
+                    maxsnps,
+                    sample_seed,
+                    current_chrom_idx,
+                );
+                let chrom = current_chrom.as_deref().unwrap().to_string();
+                for work in emitted {
+                    pipeline.submit(
+                        &pool,
+                        work,
                         omega,
                         ld_cutoff,
                         minsnps,
                         &chrom,
-                        pool.as_ref(),
+                        spool.as_mut().ok_or_else(|| {
+                            "internal XP-CLR error: missing chromosome spool".to_string()
+                        })?,
                     )?;
-                    let (count, chrom_valid) = chrom_spool.finalize(&mut writer, &chrom, output)?;
-                    total_windows += count;
-                    valid += chrom_valid;
-                    completed_chroms.insert(chrom);
                 }
-                if completed_chroms.contains(&site_chrom) {
-                    return Err(format!(
-                        "BIM chromosome {} reappears after a later chromosome; XP-CLR requires chromosome-sorted BIM",
-                        site_chrom
-                    ));
-                }
-                current_chrom = Some(site_chrom.clone());
-                if seen_chromosome {
-                    current_chrom_idx += 1;
-                }
-                seen_chromosome = true;
-                accumulator = Some(XpclrWindowAccumulator::new());
-                spool = Some(XpclrRawSpool::new(output_path, current_chrom_idx)?);
-                max_pos = 0;
-                last_pos = None;
             }
-            if last_pos.is_some_and(|previous| site.pos < previous) {
-                return Err(format!(
-                    "BIM positions are not sorted within chromosome {}",
-                    site_chrom
-                ));
+            if progress_callback.is_some()
+                && (block_start + block_len >= next_progress
+                    || block_start + block_len == scan_sites)
+            {
+                let done = block_start + block_len;
+                let progress_done = if done == scan_sites {
+                    done.saturating_sub(1)
+                } else {
+                    done
+                };
+                emit_progress_callback(progress_callback, 1, progress_done, scan_sites)?;
+                while next_progress <= done {
+                    next_progress = next_progress.saturating_add(progress_step);
+                }
             }
-            last_pos = Some(site.pos);
-            max_pos = max_pos.max(site.pos);
-            work_batch.extend(accumulator.as_mut().unwrap().push(
-                site,
+            block_start += block_len;
+        }
+        if bim_reader.next_site()?.is_some() {
+            return Err(format!(
+                "BED/BIM variant count mismatch during XP-CLR scan: BED={}",
+                scan_sites
+            ));
+        }
+        if let Some(chrom) = current_chrom.take() {
+            let mut chrom_spool = spool
+                .take()
+                .ok_or_else(|| "internal XP-CLR error: missing chromosome spool".to_string())?;
+            let (count, chrom_valid) = finish_xpclr_chrom_pipeline(
+                &mut pipeline,
+                &pool,
+                &mut accumulator,
+                max_pos,
                 window,
                 step,
                 maxsnps,
                 sample_seed,
                 current_chrom_idx,
-            ));
-            if work_batch.len() >= batch_size {
-                flush_xpclr_batch(
-                    &mut work_batch,
-                    spool.as_mut().ok_or_else(|| {
-                        "internal XP-CLR error: missing chromosome spool".to_string()
-                    })?,
-                    omega,
-                    ld_cutoff,
-                    minsnps,
-                    current_chrom.as_deref().unwrap(),
-                    pool.as_ref(),
-                )?;
-            }
+                &mut chrom_spool,
+                &mut writer,
+                omega,
+                ld_cutoff,
+                minsnps,
+                &chrom,
+                output,
+            )?;
+            total_windows += count;
+            valid += chrom_valid;
         }
-        if progress_callback.is_some()
-            && (block_start + block_len >= next_progress
-                || block_start + block_len == input.n_sites)
-        {
-            let done = block_start + block_len;
-            emit_progress_callback(progress_callback, 1, done, input.n_sites)?;
-            while next_progress <= done {
-                next_progress = next_progress.saturating_add(progress_step);
-            }
-        }
-        block_start += block_len;
-    }
-    if bim_reader.next_site()?.is_some() {
-        return Err(format!(
-            "BED/BIM variant count mismatch during XP-CLR scan: BED={}",
-            input.n_sites
-        ));
-    }
-    if let Some(chrom) = current_chrom.take() {
-        let mut chrom_spool = spool
-            .take()
-            .ok_or_else(|| "internal XP-CLR error: missing chromosome spool".to_string())?;
-        flush_xpclr_chrom(
-            &mut accumulator,
-            max_pos,
-            window,
-            step,
-            maxsnps,
-            sample_seed,
-            current_chrom_idx,
-            &mut work_batch,
-            &mut chrom_spool,
-            omega,
-            ld_cutoff,
-            minsnps,
-            &chrom,
-            pool.as_ref(),
-        )?;
-        let (count, chrom_valid) = chrom_spool.finalize(&mut writer, &chrom, output)?;
-        total_windows += count;
-        valid += chrom_valid;
-    }
+        (total_windows, valid)
+    };
     writer.flush().map_err(|e| format!("{output}: {e}"))?;
+    if progress_callback.is_some() {
+        emit_progress_callback(progress_callback, 1, scan_sites, scan_sites)?;
+    }
     Ok((total_windows, valid))
 }
 

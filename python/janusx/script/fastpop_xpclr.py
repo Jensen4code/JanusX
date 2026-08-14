@@ -164,6 +164,7 @@ def main() -> int:
         stages=2,
         stage_labels=("XP-CLR omega", "XP-CLR windows"),
         log_unit="site",
+        stage_weights=(0.2, 0.8),
     )
     try:
         with CliStatus(

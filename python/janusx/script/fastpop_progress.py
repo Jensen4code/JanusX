@@ -2,9 +2,28 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 from ._common.progress import ProgressAdapter, stdout_is_tty
+
+
+def _stage_bounds(total: int, weights: Sequence[float]) -> tuple[int, ...]:
+    """Return monotonic integer bounds for weighted progress stages."""
+
+    total_i = max(1, int(total))
+    values = tuple(float(weight) for weight in weights)
+    if not values or any((not math.isfinite(weight) or weight <= 0.0) for weight in values):
+        values = tuple(1.0 for _ in values) or (1.0,)
+    weight_sum = sum(values)
+    bounds = [0]
+    cumulative = 0.0
+    for weight in values[:-1]:
+        cumulative += weight
+        boundary = int(round(total_i * cumulative / weight_sum))
+        bounds.append(min(total_i, max(bounds[-1], boundary)))
+    bounds.append(total_i)
+    return tuple(bounds)
 
 
 class FastPopProgress:
@@ -22,9 +41,14 @@ class FastPopProgress:
         stages: int = 1,
         stage_labels: Sequence[str] | None = None,
         log_unit: str = "site",
+        stage_weights: Sequence[float] | None = None,
     ) -> None:
         self.enabled = bool(stdout_is_tty())
         self._stages = max(1, int(stages))
+        supplied_weights = tuple(float(weight) for weight in (stage_weights or ()))
+        if len(supplied_weights) != self._stages:
+            supplied_weights = tuple(1.0 for _ in range(self._stages))
+        self._stage_weights = supplied_weights
         labels = tuple(str(label) for label in (stage_labels or (description,)))
         self._labels = labels if labels else (str(description),)
         self._bar = None
@@ -58,7 +82,8 @@ class FastPopProgress:
         try:
             stage_i = min(max(0, int(stage)), self._stages - 1)
             total_i = max(1, int(total))
-            global_total = total_i * self._stages
+            bounds = _stage_bounds(total_i, self._stage_weights)
+            global_total = total_i
             if self._last_stage != stage_i:
                 self._bar.set_desc(self._label(stage_i))
                 self._bar.set_total(global_total)
@@ -66,9 +91,12 @@ class FastPopProgress:
             elif self._bar.total != global_total:
                 self._bar.set_total(global_total)
 
+            stage_start = bounds[stage_i]
+            stage_end = bounds[stage_i + 1]
+            stage_fraction = min(1.0, max(0.0, float(done) / total_i))
             global_done = min(
                 global_total,
-                stage_i * total_i + max(0, int(done)),
+                stage_start + int(round((stage_end - stage_start) * stage_fraction)),
             )
             delta = global_done - self._last_done
             if delta > 0:

@@ -50,6 +50,20 @@ def _sanitize_pvalues(values) -> np.ndarray:
     return np.clip(arr, _PVALUE_EPS, 1.0)
 
 
+def _sanitize_logpvalues(values) -> np.ndarray:
+    """Convert precomputed ``-log10(p)`` values to finite float64."""
+    p = pd.to_numeric(values, errors="coerce")
+    if isinstance(p, pd.Series):
+        arr = p.to_numpy(dtype=np.float64, copy=False)
+    else:
+        arr = np.asarray(p, dtype=np.float64)
+    arr = np.array(arr, dtype=np.float64, copy=True)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    arr[~np.isfinite(arr)] = 0.0
+    return arr
+
+
 def _finite_positive(values) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     return arr[np.isfinite(arr) & (arr > 0.0)]
@@ -520,6 +534,9 @@ class GWASPLOT:
     chr_order : list or None, default None
         Optional chromosome order. If None, chromosome labels are ordered
         automatically by natural chromosome order (1..N, X/Y/M/MT, then others).
+    pvalue_is_log10 : bool, default False
+        Treat ``pvalue`` as precomputed ``-log10(p)`` values and skip the
+        p-value logarithm in Manhattan, circular Manhattan, and QQ plots.
 
     Notes
     -----
@@ -538,13 +555,19 @@ class GWASPLOT:
         interval_rate: float = 0.1,
         compression: bool = True,
         chr_order: Union[list[object], None] = None,
+        pvalue_is_log10: bool = False,
     ) -> None:
         self.t_start = time.time()
+        self.pvalue_is_log10 = bool(pvalue_is_log10)
         # Ensure positional indices are contiguous for downstream iloc usage.
         df = df.reset_index(drop=True)
         # Global p-value sanitization: avoid log10 warnings in all plotting paths.
         if pvalue in df.columns:
-            df[pvalue] = _sanitize_pvalues(df[pvalue])
+            df[pvalue] = (
+                _sanitize_logpvalues(df[pvalue])
+                if self.pvalue_is_log10
+                else _sanitize_pvalues(df[pvalue])
+            )
 
         # ---- (1) Optional down-sampling for plotting ----
         # minidx is first computed on the original row order (after reset_index).
@@ -559,12 +582,23 @@ class GWASPLOT:
                 chunk_size = n_snp // 100_000 if n_snp >= 100_000 else 1
 
                 # Use numpy arrays to avoid expensive pandas sort/copy chains.
-                pvals = _sanitize_pvalues(df[pvalue])
+                pvals = (
+                    _sanitize_logpvalues(df[pvalue])
+                    if self.pvalue_is_log10
+                    else _sanitize_pvalues(df[pvalue])
+                )
 
-                # p-value threshold: small p => highly significant
-                # we keep all SNPs with p <= p_thresh without compression
+                # Keep all highly significant SNPs without compression. In
+                # logP mode, significance increases with the value rather
+                # than decreasing as it does for raw p-values.
                 p_thresh = 10_000.0 / float(n_snp)
-                mask_large_p = pvals > p_thresh
+                if self.pvalue_is_log10:
+                    p_thresh = -np.log10(
+                        np.clip(p_thresh, _PVALUE_EPS, 1.0)
+                    )
+                    mask_large_p = pvals < p_thresh
+                else:
+                    mask_large_p = pvals > p_thresh
 
                 idx_large = np.flatnonzero(mask_large_p)
                 n_large = int(idx_large.size)
@@ -573,13 +607,21 @@ class GWASPLOT:
                 if n_chunks > 0:
                     n_take = n_chunks * chunk_size
                     large_vals = pvals[idx_large]
-                    # Descending by p-value among "large p", then keep top n_take.
-                    ord_desc = np.argsort(-large_vals, kind="mergesort")
-                    idx_take = idx_large[ord_desc[:n_take]]
+                    # Select the least significant values first, then retain
+                    # the most significant value within each original chunk.
+                    if self.pvalue_is_log10:
+                        ord_candidate = np.argsort(large_vals, kind="mergesort")
+                    else:
+                        ord_candidate = np.argsort(-large_vals, kind="mergesort")
+                    idx_take = idx_large[ord_candidate[:n_take]]
                     # Reorder by original row index (equivalent to previous sort_index()).
                     idx_take.sort()
                     p_take = pvals[idx_take].reshape(n_chunks, chunk_size)
-                    local_min_pos = np.argmin(p_take, axis=1)
+                    local_min_pos = (
+                        np.argmax(p_take, axis=1)
+                        if self.pvalue_is_log10
+                        else np.argmin(p_take, axis=1)
+                    )
                     row_base = np.arange(n_chunks, dtype=np.int64) * chunk_size
                     keep_idx_large = idx_take[row_base + local_min_pos]
                 else:
@@ -712,6 +754,11 @@ class GWASPLOT:
         # store as MultiIndex (chr, pos) for easier masking later
         self.df = df.set_index([chr, pos])
 
+    def _to_logp(self, values) -> np.ndarray:
+        if self.pvalue_is_log10:
+            return _sanitize_logpvalues(values)
+        return -np.log10(_sanitize_pvalues(values))
+
     # ------------------------------------------------------------------
     # Manhattan plot
     # ------------------------------------------------------------------
@@ -798,7 +845,7 @@ class GWASPLOT:
 
         # subset to plotting SNPs
         df = self.df.iloc[self.minidx, -3:].copy()
-        df["y"] = -np.log10(_sanitize_pvalues(df["y"]))
+        df["y"] = self._to_logp(df["y"])
         if min_logp is not None:
             df = df[df["y"] >= float(min_logp)]
         if max_logp is not None:
@@ -917,6 +964,7 @@ class GWASPLOT:
         link_pos2: str = "pos2",
         link_type_col: Union[str, None] = None,
         link_pvalue_col: Union[str, None] = None,
+        link_pvalue_is_log10: Union[bool, None] = None,
         marker: str = "o",
         scatter_size: float = 8.0,
         scatter_alpha: float = 0.76,
@@ -952,7 +1000,7 @@ class GWASPLOT:
         interaction arcs.
         """
         df = self.df.iloc[self.minidx, -3:].copy()
-        df["y"] = -np.log10(_sanitize_pvalues(df["y"]))
+        df["y"] = self._to_logp(df["y"])
         if min_logp is not None:
             df = df[df["y"] >= float(min_logp)]
         if max_logp is not None:
@@ -1345,7 +1393,16 @@ class GWASPLOT:
                         resolved_p_col = candidate
                         break
             if resolved_p_col is not None and resolved_p_col in link_table.columns:
-                link_p = _sanitize_pvalues(link_table[resolved_p_col])
+                link_is_log10 = (
+                    self.pvalue_is_log10
+                    if link_pvalue_is_log10 is None
+                    else bool(link_pvalue_is_log10)
+                )
+                link_p = (
+                    _sanitize_logpvalues(link_table[resolved_p_col])
+                    if link_is_log10
+                    else _sanitize_pvalues(link_table[resolved_p_col])
+                )
                 link_table = link_table.assign(__link_p=link_p)
 
             keep_mask = np.zeros(link_table.shape[0], dtype=bool)
@@ -1385,8 +1442,14 @@ class GWASPLOT:
                 else:
                     link_types = np.full(link_table.shape[0], "OTHER", dtype=object)
                 if "__link_p" in link_table.columns:
-                    strength_arr = -np.log10(
-                        link_table["__link_p"].to_numpy(dtype=np.float64, copy=False)
+                    link_values = link_table["__link_p"].to_numpy(
+                        dtype=np.float64,
+                        copy=False,
+                    )
+                    strength_arr = (
+                        np.array(link_values, dtype=np.float64, copy=True)
+                        if link_is_log10
+                        else -np.log10(link_values)
                     )
                 else:
                     strength_arr = np.full(link_table.shape[0], float("nan"), dtype=np.float64)
@@ -1622,23 +1685,37 @@ class GWASPLOT:
         n = p.size
         if n == 0:
             raise ValueError("No p-values found for QQ plot.")
-        p[~np.isfinite(p)] = 1.0
-        p = np.clip(p, np.finfo(np.float64).tiny, 1.0)
-        if sig_p_threshold is None:
-            sig_thr = 1.0 / float(n)
+        if self.pvalue_is_log10:
+            p = _sanitize_logpvalues(p)
+            if sig_p_threshold is None:
+                sig_thr = float(np.log10(max(1, n)))
+            else:
+                sig_thr = float(sig_p_threshold)
+            if not np.isfinite(sig_thr):
+                sig_thr = float(np.log10(max(1, n)))
         else:
-            sig_thr = float(sig_p_threshold)
-        if not np.isfinite(sig_thr):
-            sig_thr = 1.0 / float(n)
-        sig_thr = float(np.clip(sig_thr, np.finfo(np.float64).tiny, 1.0))
+            p[~np.isfinite(p)] = 1.0
+            p = np.clip(p, np.finfo(np.float64).tiny, 1.0)
+            if sig_p_threshold is None:
+                sig_thr = 1.0 / float(n)
+            else:
+                sig_thr = float(sig_p_threshold)
+            if not np.isfinite(sig_thr):
+                sig_thr = 1.0 / float(n)
+            sig_thr = float(np.clip(sig_thr, np.finfo(np.float64).tiny, 1.0))
 
         resolved_mode = mode_key
         if mode_key == "auto":
             resolved_mode = "fast" if n > int(qq_auto_threshold) else "full"
 
-        # Full sorted p-values are the canonical QQ backbone.
-        p_sorted = np.sort(p, kind="mergesort")
-        sig_n = int(np.searchsorted(p_sorted, sig_thr, side="right"))
+        # Full sorted p-values are the canonical QQ backbone. The ordering is
+        # reversed for logP because larger values are more significant.
+        if self.pvalue_is_log10:
+            p_sorted = np.sort(p, kind="mergesort")[::-1]
+            sig_n = int(np.sum(p_sorted >= sig_thr))
+        else:
+            p_sorted = np.sort(p, kind="mergesort")
+            sig_n = int(np.searchsorted(p_sorted, sig_thr, side="right"))
 
         if resolved_mode == "full":
             # Exact QQ: all SNPs
@@ -1659,7 +1736,11 @@ class GWASPLOT:
 
         p_draw = p_sorted[draw_idx]
         ranks_draw = draw_idx.astype(np.float64) + 1.0
-        obs_scatter = -np.log10(p_draw)
+        obs_scatter = (
+            p_draw
+            if self.pvalue_is_log10
+            else -np.log10(p_draw)
+        )
         exp_scatter = -np.log10(ranks_draw / (n + 1.0))
 
         x_band, lower, upper = _qq_confidence_band_logp(

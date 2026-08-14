@@ -6470,14 +6470,22 @@ def _extract_ld_site_set(
     p_col: str,
     threshold: float,
     use_all_sites: bool,
+    no_logtrans: bool = False,
 ) -> set[tuple[str, int]]:
     pvals = pd.to_numeric(df[p_col], errors="coerce")
     pos = pd.to_numeric(df[pos_col], errors="coerce")
-    mask_valid = pos.notna() & pvals.notna() & np.isfinite(pvals) & (pvals > 0.0)
+    mask_valid = pos.notna() & _postgwas_valid_p_mask(
+        pvals,
+        no_logtrans=no_logtrans,
+    )
     if use_all_sites:
         mask = mask_valid
     else:
-        mask = mask_valid & (pvals <= threshold)
+        mask = mask_valid & _postgwas_significant_p_mask(
+            pvals,
+            threshold,
+            no_logtrans=no_logtrans,
+        )
     out: set[tuple[str, int]] = set()
     if not bool(mask.any()):
         return out
@@ -8741,6 +8749,7 @@ def _postgwas_build_circle_link_table_from_groups(
     p_col: Optional[str],
     type_col: Optional[str] = None,
     group_tokens: Optional[list[str]] = None,
+    pvalue_is_log10: bool = False,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Optional[str]]]:
     if df.shape[0] == 0:
         return None, {
@@ -8812,7 +8821,10 @@ def _postgwas_build_circle_link_table_from_groups(
         if p_col is not None and p_col in grp.columns:
             pvals = pd.to_numeric(grp[p_col], errors="coerce")
             pvals = pvals[np.isfinite(pvals)]
-            pvalue_value = float(pvals.min()) if pvals.shape[0] > 0 else float("nan")
+            if pvals.shape[0] > 0:
+                pvalue_value = float(pvals.max() if pvalue_is_log10 else pvals.min())
+            else:
+                pvalue_value = float("nan")
         else:
             pvalue_value = float("nan")
 
@@ -8854,6 +8866,7 @@ def _postgwas_build_circle_link_table(
     chr_col: str,
     pos_col: str,
     p_col: str,
+    pvalue_is_log10: bool = False,
 ) -> tuple[Optional[pd.DataFrame], dict[str, Optional[str]]]:
     group_col = _postgwas_first_present_column(
         df.columns,
@@ -8886,6 +8899,7 @@ def _postgwas_build_circle_link_table(
             p_col=resolved_p_col,
             type_col=resolved_type_col,
             group_tokens=None,
+            pvalue_is_log10=pvalue_is_log10,
         )
         if link_df is not None and link_df.shape[0] > 0:
             return link_df, meta
@@ -8900,6 +8914,7 @@ def _postgwas_build_circle_link_table(
             p_col=resolved_p_col,
             type_col=str(snp_col),
             group_tokens=["|", "&", "*"],
+            pvalue_is_log10=pvalue_is_log10,
         )
     return None, {
         "group_col": None,
@@ -9074,6 +9089,7 @@ def _ldclump_significant_snps(
     r2_thr: float,
     logger: logging.Logger,
     show_progress: bool = True,
+    pvalue_is_log10: bool = False,
     preload_max_rows: Optional[int] = None,
     sample_ids: Optional[Sequence[str]] = None,
     fold_r2: Optional[
@@ -9108,7 +9124,11 @@ def _ldclump_significant_snps(
 
     work[pos_col] = work[pos_col].astype(int)
     work = (
-        work.sort_values(p_col, ascending=True, kind="mergesort")
+        work.sort_values(
+            p_col,
+            ascending=not bool(pvalue_is_log10),
+            kind="mergesort",
+        )
         .drop_duplicates(subset=[chr_col, pos_col], keep="first")
         .reset_index(drop=True)
     )
@@ -9376,7 +9396,17 @@ def _ldclump_significant_snps(
                     )
                     clumped = sorted(
                         clumped,
-                        key=lambda k: (float(key_to_p.get(k, np.inf)), int(k[1])),
+                        key=(
+                            lambda k: (
+                                -float(key_to_p.get(k, -np.inf)),
+                                int(k[1]),
+                            )
+                        )
+                        if bool(pvalue_is_log10)
+                        else lambda k: (
+                            float(key_to_p.get(k, np.inf)),
+                            int(k[1]),
+                        ),
                     )
                     if fold_r2 is not None:
                         fold_r2[lead_key] = {
@@ -10673,7 +10703,7 @@ def _overlay_manhattan_threshold_points(
     Overlay threshold line and significant points on top of Manhattan base points.
     Significant points are enlarged by 1.5x.
     """
-    if not np.isfinite(threshold) or threshold <= 0:
+    if not np.isfinite(threshold):
         return
 
     if ignore is None:
@@ -10682,18 +10712,25 @@ def _overlay_manhattan_threshold_points(
 
     dfp = plotmodel.df.iloc[plotmodel.minidx, -3:].copy()
     pvals = pd.to_numeric(dfp["y"], errors="coerce")
-    keep = pvals.notna() & np.isfinite(pvals) & (pvals > 0.0)
+    no_logtrans = bool(getattr(plotmodel, "pvalue_is_log10", False))
+    keep = _postgwas_valid_p_mask(pvals, no_logtrans=no_logtrans)
     if not bool(keep.any()):
         return
     dfp = dfp.loc[keep].copy()
-    dfp["ylog"] = _safe_neglog10_p(dfp["y"])
+    dfp["ylog"] = _postgwas_plot_logp_values(
+        dfp["y"],
+        no_logtrans=no_logtrans,
+    )
     dfp = dfp[dfp["ylog"] >= float(min_logp)]
     if max_logp is not None:
         dfp = dfp[dfp["ylog"] <= float(max_logp)]
     if dfp.shape[0] == 0:
         return
 
-    thr_log = float(-np.log10(threshold))
+    thr_log = _postgwas_threshold_to_logp(
+        threshold,
+        no_logtrans=no_logtrans,
+    )
     if not np.isfinite(thr_log):
         return
 
@@ -10772,11 +10809,15 @@ def _overlay_manhattan_interaction_padj_points(
     ignore_set = set(ignore)
 
     pvals = pd.to_numeric(df_full["y"], errors="coerce")
-    keep = pvals.notna() & np.isfinite(pvals) & (pvals > 0.0)
+    no_logtrans = bool(getattr(plotmodel, "pvalue_is_log10", False))
+    keep = _postgwas_valid_p_mask(pvals, no_logtrans=no_logtrans)
     if not bool(keep.any()):
         return True
     dfp = df_full.loc[keep].copy()
-    dfp["ylog"] = _safe_neglog10_p(dfp["y"])
+    dfp["ylog"] = _postgwas_plot_logp_values(
+        dfp["y"],
+        no_logtrans=no_logtrans,
+    )
     dfp = dfp[dfp["ylog"] >= float(min_logp)]
     if max_logp is not None:
         dfp = dfp[dfp["ylog"] <= float(max_logp)]
@@ -10807,8 +10848,11 @@ def _overlay_manhattan_interaction_padj_points(
             **_marker_scatter_style(str(marker)),
         )
 
-    if np.isfinite(threshold) and threshold > 0:
-        thr_log = float(-np.log10(threshold))
+    if np.isfinite(threshold):
+        thr_log = _postgwas_threshold_to_logp(
+            threshold,
+            no_logtrans=no_logtrans,
+        )
         if np.isfinite(thr_log):
             ax.axhline(
                 y=thr_log,
@@ -10861,10 +10905,23 @@ def _overlay_postgwas_manhattan_hits(
 
 def _safe_neglog10_p(values: object) -> np.ndarray:
     """
-    Safe -log10 transform for p-values:
-    - coerce non-numeric to NaN
-    - replace non-finite with 1.0
-    - clamp to (0, 1]
+    Backward-compatible safe ``-log10(p)`` transform for p-values.
+    """
+    return _postgwas_plot_logp_values(values, no_logtrans=False)
+
+
+def _postgwas_plot_logp_values(
+    values: object,
+    *,
+    no_logtrans: bool = False,
+) -> np.ndarray:
+    """
+    Return values in the plot's ``-log10(p)`` scale.
+
+    With ``no_logtrans=True`` the input is already treated as ``-log10(p)``
+    and finite values are returned unchanged. Non-finite values are mapped
+    to zero in that mode, matching the neutral ``p=1`` value used by the
+    normal transform.
     """
     p = pd.to_numeric(values, errors="coerce")
     if isinstance(p, pd.Series):
@@ -10874,9 +10931,82 @@ def _safe_neglog10_p(values: object) -> np.ndarray:
     arr = np.array(arr, dtype=float, copy=True)
     if arr.ndim == 0:
         arr = arr.reshape(1)
+    if bool(no_logtrans):
+        arr[~np.isfinite(arr)] = 0.0
+        return arr
     arr[~np.isfinite(arr)] = 1.0
     arr = np.clip(arr, np.nextafter(0.0, 1.0), 1.0)
     return -np.log10(arr)
+
+
+def _postgwas_valid_p_mask(
+    values: object,
+    *,
+    no_logtrans: bool = False,
+) -> np.ndarray:
+    numeric = pd.to_numeric(values, errors="coerce")
+    if isinstance(numeric, pd.Series):
+        arr = numeric.to_numpy(dtype=float, copy=False)
+    else:
+        arr = np.asarray(numeric, dtype=float)
+    finite = np.isfinite(arr)
+    if bool(no_logtrans):
+        return finite & (arr >= 0.0)
+    return finite & (arr > 0.0)
+
+
+def _postgwas_significant_p_mask(
+    values: object,
+    threshold: object,
+    *,
+    no_logtrans: bool = False,
+) -> np.ndarray:
+    numeric = pd.to_numeric(values, errors="coerce")
+    if isinstance(numeric, pd.Series):
+        arr = numeric.to_numpy(dtype=float, copy=False)
+    else:
+        arr = np.asarray(numeric, dtype=float)
+    try:
+        thr = float(threshold)
+    except (TypeError, ValueError):
+        return np.zeros(arr.shape, dtype=bool)
+    valid = _postgwas_valid_p_mask(arr, no_logtrans=no_logtrans)
+    if not np.isfinite(thr):
+        return np.zeros(arr.shape, dtype=bool)
+    if bool(no_logtrans):
+        return valid & (arr >= thr)
+    return valid & (arr <= thr)
+
+
+def _postgwas_threshold_to_logp(
+    threshold: object,
+    *,
+    no_logtrans: bool = False,
+) -> float:
+    try:
+        value = float(threshold)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(value):
+        return float("nan")
+    if bool(no_logtrans):
+        return value
+    if value <= 0.0:
+        return float("nan")
+    return float(_postgwas_plot_logp_values([value], no_logtrans=False)[0])
+
+
+def _postgwas_default_threshold(
+    n_snp: int,
+    *,
+    no_logtrans: bool = False,
+) -> float:
+    if int(n_snp) <= 0:
+        return float("nan")
+    raw_threshold = 0.05 / float(n_snp)
+    if bool(no_logtrans):
+        return float(_postgwas_plot_logp_values([raw_threshold], no_logtrans=False)[0])
+    return raw_threshold
 
 
 def _postgwas_output_format_from_path(path: str) -> str:
@@ -10933,6 +11063,7 @@ def _qq_select_points_with_threshold(
     sig_p_threshold: Optional[float],
     max_points: int = _QQ_FAST_MAX_POINTS,
     keep_all: bool = False,
+    no_logtrans: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Select QQ scatter points with deterministic down-sampling:
@@ -10940,24 +11071,38 @@ def _qq_select_points_with_threshold(
     - for remaining points, keep an evenly spaced rank grid up to max_points
     """
     p = np.asarray(pvals, dtype=float)
-    p = p[np.isfinite(p) & (p > 0.0)]
+    if bool(no_logtrans):
+        p = p[np.isfinite(p) & (p >= 0.0)]
+    else:
+        p = p[np.isfinite(p) & (p > 0.0)]
     if p.size == 0:
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    p = np.clip(p, np.nextafter(0.0, 1.0), 1.0)
-    p_sorted = np.sort(p, kind="mergesort")
+    if bool(no_logtrans):
+        p_sorted = np.sort(p, kind="mergesort")[::-1]
+    else:
+        p = np.clip(p, np.nextafter(0.0, 1.0), 1.0)
+        p_sorted = np.sort(p, kind="mergesort")
     n = int(p_sorted.size)
 
     if sig_p_threshold is None or (not np.isfinite(sig_p_threshold)):
-        sig_thr = 1.0 / float(max(1, n))
+        sig_thr = (
+            float(np.log10(max(1, n)))
+            if bool(no_logtrans)
+            else 1.0 / float(max(1, n))
+        )
     else:
         sig_thr = float(sig_p_threshold)
-    sig_thr = float(np.clip(sig_thr, np.nextafter(0.0, 1.0), 1.0))
+    if not bool(no_logtrans):
+        sig_thr = float(np.clip(sig_thr, np.nextafter(0.0, 1.0), 1.0))
 
     if keep_all or n <= int(max_points):
         draw_idx = np.arange(n, dtype=np.int64)
     else:
         base_idx = np.linspace(0, n - 1, int(max_points), dtype=np.int64)
-        sig_n = int(np.searchsorted(p_sorted, sig_thr, side="right"))
+        if bool(no_logtrans):
+            sig_n = int(np.sum(p_sorted >= sig_thr))
+        else:
+            sig_n = int(np.searchsorted(p_sorted, sig_thr, side="right"))
         if sig_n > 0:
             sig_idx = np.arange(sig_n, dtype=np.int64)
             draw_idx = np.unique(np.concatenate([base_idx, sig_idx]))
@@ -10966,7 +11111,11 @@ def _qq_select_points_with_threshold(
 
     ranks = draw_idx.astype(float) + 1.0
     exp = -np.log10(ranks / (n + 1.0))
-    obs = -np.log10(p_sorted[draw_idx])
+    obs = (
+        p_sorted[draw_idx]
+        if bool(no_logtrans)
+        else -np.log10(p_sorted[draw_idx])
+    )
     keep = np.isfinite(exp) & np.isfinite(obs)
     return exp[keep], obs[keep]
 
@@ -11230,6 +11379,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     )
 
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
+    no_logtrans = bool(getattr(args, "no_logtrans", False))
     anno_is_gff = _postgwas_annotation_is_gff(
         args.anno_file,
         annotation_kind=getattr(args, "_postgwas_annotation_kind", None),
@@ -11315,9 +11465,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
     # Bonferroni-style default threshold if not provided
     threshold = (
-        args.thr
+        float(args.thr)
         if args.thr is not None
-        else (0.05 / df.shape[0] if df.shape[0] > 0 else np.nan)
+        else _postgwas_default_threshold(
+            int(df.shape[0]),
+            no_logtrans=no_logtrans,
+        )
     )
     effective_ldblock_ratio = (
         args.ldblock_ratio
@@ -11358,6 +11511,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 p_col,
                 float(args.interval),
                 compression=(not args.disable_compression),
+                pvalue_is_log10=no_logtrans,
             )
             if args.bimrange_tuples is not None and len(bim_layout) > 1:
                 _apply_segmented_x_to_plotmodel(plotmodel, df, chr_col, pos_col, bim_layout)
@@ -11371,6 +11525,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     p_col,
                     float(args.interval),
                     compression=False,
+                    pvalue_is_log10=no_logtrans,
                 )
         width_in = float(_PANEL_WIDTH_IN)
         dpi = 300
@@ -11453,6 +11608,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     p_col=interact_p_col,
                     type_col=group_col,
                     group_tokens=[str(x) for x in list(spec.get("group_tokens", []))],
+                    pvalue_is_log10=no_logtrans,
                 )
             else:
                 circle_links_df, circle_link_meta = _postgwas_build_circle_link_table(
@@ -11460,22 +11616,27 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     chr_col=chr_col,
                     pos_col=pos_col,
                     p_col=p_col,
+                    pvalue_is_log10=no_logtrans,
                 )
             if (
                 circle_links_df is not None
                 and circle_links_df.shape[0] > 0
                 and np.isfinite(threshold)
-                and float(threshold) > 0.0
                 and "link_pvalue" in circle_links_df.columns
             ):
                 before_n = int(circle_links_df.shape[0])
                 circle_links_df = circle_links_df.loc[
-                    pd.to_numeric(circle_links_df["link_pvalue"], errors="coerce") <= float(threshold)
+                    _postgwas_significant_p_mask(
+                        circle_links_df["link_pvalue"],
+                        threshold,
+                        no_logtrans=no_logtrans,
+                    )
                 ].copy()
                 after_n = int(circle_links_df.shape[0])
                 logger.info(
                     "Circular Manhattan: "
-                    f"kept {after_n}/{before_n} interaction link(s) with p<=thr ({float(threshold):.4g})."
+                    f"kept {after_n}/{before_n} interaction link(s) with "
+                    f"{'logP>=thr' if no_logtrans else 'p<=thr'} ({float(threshold):.4g})."
                 )
             if circle_links_df is None or circle_links_df.shape[0] == 0:
                 logger.info("Circular Manhattan: no interaction links were detected; drawing track only.")
@@ -11548,7 +11709,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         max_logp=manh_max_logp,
                     )
                 else:
-                    y_hl = _safe_neglog10_p(plotmodel.df.loc[df_hl_idx, "y"])
+                    y_hl = _postgwas_plot_logp_values(
+                        plotmodel.df.loc[df_hl_idx, "y"],
+                        no_logtrans=no_logtrans,
+                    )
                     keep_hl = np.isfinite(y_hl) & (y_hl >= float(manh_min_logp))
                     if manh_max_logp is not None:
                         keep_hl = keep_hl & (y_hl <= float(manh_max_logp))
@@ -11569,7 +11733,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         text = _sanitize_plot_text(df_hl.loc[idx, 3])
                         ax.text(
                             plotmodel.df.loc[idx, "x"],
-                            float(_safe_neglog10_p(plotmodel.df.loc[idx, "y"])[0]),
+                            float(
+                                _postgwas_plot_logp_values(
+                                    plotmodel.df.loc[idx, "y"],
+                                    no_logtrans=no_logtrans,
+                                )[0]
+                            ),
                             s=text,
                             ha="center",
                             zorder=11,
@@ -11697,8 +11866,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
                 plotmodel.circle_manhattan(
                     threshold=(
-                        float(_safe_neglog10_p([threshold])[0])
-                        if (np.isfinite(threshold) and float(threshold) > 0.0)
+                        _postgwas_threshold_to_logp(
+                            threshold,
+                            no_logtrans=no_logtrans,
+                        )
+                        if np.isfinite(threshold)
                         else None
                     ),
                     color_set=plot_colors,
@@ -11706,6 +11878,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     links_df=circle_links_df,
                     link_type_col="link_type",
                     link_pvalue_col="link_pvalue",
+                    link_pvalue_is_log10=no_logtrans,
                     marker=single_marker,
                     scatter_size=single_scatter_size,
                     scatter_alpha=(
@@ -11852,6 +12025,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 p_col,
                 threshold,
                 use_all_sites=ld_use_all_sites,
+                no_logtrans=no_logtrans,
             )
             n_sig_sites = max(2, len(ld_sites))
             ld_overlay_text = None
@@ -11981,9 +12155,16 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 # use compressed subset (minidx), then select by ld mode.
                 map_df = plotmodel.df.iloc[plotmodel.minidx, -3:].copy()
                 p_vals = pd.to_numeric(map_df["y"], errors="coerce").to_numpy(dtype=float)
-                keep_mask = np.isfinite(p_vals) & (p_vals > 0.0)
+                keep_mask = _postgwas_valid_p_mask(
+                    p_vals,
+                    no_logtrans=no_logtrans,
+                )
                 if not ld_use_all_sites:
-                    keep_mask = keep_mask & (p_vals <= threshold)
+                    keep_mask = keep_mask & _postgwas_significant_p_mask(
+                        p_vals,
+                        threshold,
+                        no_logtrans=no_logtrans,
+                    )
                 if not bool(np.any(keep_mask)):
                     return []
 
@@ -12001,7 +12182,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     if chrom_norm is None:
                         continue
                     key = (chrom_norm, int(p))
-                    is_sig = bool(np.isfinite(pv) and (pv <= threshold))
+                    is_sig = bool(
+                        _postgwas_significant_p_mask(
+                            [pv],
+                            threshold,
+                            no_logtrans=no_logtrans,
+                        )[0]
+                    )
                     if key not in key_to_meta:
                         key_to_meta[key] = (float(x), is_sig)
                     else:
@@ -12307,7 +12494,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     use_gff_batch_annotation = False
 
                     # Keep SNPs passing threshold
-                    df_filter_raw = df.loc[df[p_col] <= threshold].copy()
+                    df_filter_raw = df.loc[
+                        _postgwas_significant_p_mask(
+                            df[p_col],
+                            threshold,
+                            no_logtrans=no_logtrans,
+                        )
+                    ].copy()
                     original_columns = df_filter_raw.columns.tolist()
                     annotation_col_map = _resolve_annotation_append_colnames(
                         [str(col) for col in original_columns]
@@ -12334,6 +12527,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             r2_thr=float(args.ldclump_r2),
                             logger=logger,
                             show_progress=(len(args.gwasfile) == 1),
+                            pvalue_is_log10=no_logtrans,
                         )
                         idx_chr = pd.Index(df_clump_meta.index.get_level_values(0).astype(str))
                         idx_pos = pd.to_numeric(
@@ -12472,6 +12666,7 @@ def _read_merge_gwas_table(
     pos_col: str,
     p_col: str,
     logger: logging.Logger,
+    pvalue_is_log10: bool = False,
 ) -> pd.DataFrame:
     try:
         df = pd.read_csv(file, sep="\t", usecols=[chr_col, pos_col, p_col])
@@ -12494,7 +12689,7 @@ def _read_merge_gwas_table(
         & np.isfinite(pos_num.to_numpy(dtype=float))
         & p_num.notna()
         & np.isfinite(p_num.to_numpy(dtype=float))
-        & (p_num > 0.0)
+        & (p_num >= 0.0 if bool(pvalue_is_log10) else p_num > 0.0)
     )
     df = df.loc[mask, [chr_col, pos_col, p_col]].copy()
     if df.shape[0] == 0:
@@ -12513,6 +12708,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         return
 
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
+    no_logtrans = bool(getattr(args, "no_logtrans", False))
     t_merge = time.time()
     logger.info("Visualizing merged post-GWAS results...")
     merge_manh_ratio = args._merge_manh_ratio
@@ -12563,7 +12759,14 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     chrom_sets: list[tuple[int, str, set[str]]] = []
     pvals_by_series: dict[int, np.ndarray] = {}
     for i, file in enumerate(files):
-        df = _read_merge_gwas_table(file, chr_col, pos_col, p_col, logger)
+        df = _read_merge_gwas_table(
+            file,
+            chr_col,
+            pos_col,
+            p_col,
+            logger,
+            pvalue_is_log10=no_logtrans,
+        )
         if df.shape[0] == 0:
             logger.warning(f"Warning: no valid SNP rows in merged file {i}: {file}; skipped.")
             continue
@@ -12571,7 +12774,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         chrom_set = set(df[chr_col].astype(str).tolist())
         chrom_sets.append((i, file, chrom_set))
         pvals = np.asarray(df[p_col], dtype=float)
-        pvals = np.clip(pvals, np.nextafter(0.0, 1.0), np.inf)
+        if no_logtrans:
+            pvals = _postgwas_plot_logp_values(pvals, no_logtrans=True)
+        else:
+            pvals = np.clip(pvals, np.nextafter(0.0, 1.0), np.inf)
         pvals_by_series[i] = pvals
 
         dfi = pd.DataFrame(
@@ -12650,9 +12856,12 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             )
 
     threshold_merge = (
-        args.thr
+        float(args.thr)
         if args.thr is not None
-        else (0.05 / plot_df.shape[0] if plot_df.shape[0] > 0 else np.nan)
+        else _postgwas_default_threshold(
+            int(plot_df.shape[0]),
+            no_logtrans=no_logtrans,
+        )
     )
 
     xticks: list[float] = []
@@ -12745,7 +12954,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
     if plot_df.shape[0] > 0:
         pvals_draw = np.asarray(plot_df[p_col], dtype=float)
-        plot_df["_ylog"] = _safe_neglog10_p(pvals_draw)
+        plot_df["_ylog"] = _postgwas_plot_logp_values(
+            pvals_draw,
+            no_logtrans=no_logtrans,
+        )
     else:
         plot_df["_ylog"] = np.asarray([], dtype=float)
 
@@ -12764,8 +12976,11 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         draw_xmins: list[float] = []
         draw_xmaxs: list[float] = []
         thr_log = (
-            float(-np.log10(float(threshold_merge)))
-            if (np.isfinite(threshold_merge) and float(threshold_merge) > 0.0)
+            _postgwas_threshold_to_logp(
+                threshold_merge,
+                no_logtrans=no_logtrans,
+            )
+            if np.isfinite(threshold_merge)
             else None
         )
         if thr_log is not None and np.isfinite(thr_log):
@@ -12793,7 +13008,11 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             x_keep = np.asarray(dfi.loc[keep, "_x"], dtype=float)
             y_keep = yy[keep]
             p_keep = pvals_i[keep]
-            sig_keep = np.isfinite(p_keep) & (p_keep <= float(threshold_merge))
+            sig_keep = _postgwas_significant_p_mask(
+                p_keep,
+                threshold_merge,
+                no_logtrans=no_logtrans,
+            )
             nonsig_keep = ~sig_keep
             alpha_i = float(series_alphas[i])
             size_i = float(series_sizes[i])
@@ -12951,12 +13170,22 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             if not (
                 np.isfinite(posv)
                 and np.isfinite(xv)
-                and np.isfinite(pv)
-                and float(pv) > 0.0
+                and bool(
+                    _postgwas_valid_p_mask(
+                        [pv],
+                        no_logtrans=no_logtrans,
+                    )[0]
+                )
             ):
                 continue
             key = (str(chrom_norm), int(round(float(posv))))
-            is_sig = bool(float(pv) <= float(threshold_merge))
+            is_sig = bool(
+                _postgwas_significant_p_mask(
+                    [pv],
+                    threshold_merge,
+                    no_logtrans=no_logtrans,
+                )[0]
+            )
             if key not in key_to_meta:
                 key_to_meta[key] = (float(xv), is_sig)
             else:
@@ -13077,7 +13306,14 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             pvals_arr = np.asarray(pvals, dtype=float)
             qq_band_n = max(
                 int(qq_band_n),
-                int(np.sum(np.isfinite(pvals_arr) & (pvals_arr > 0.0))),
+                int(
+                    np.sum(
+                        _postgwas_valid_p_mask(
+                            pvals_arr,
+                            no_logtrans=no_logtrans,
+                        )
+                    )
+                ),
             )
             exp, obs = _qq_select_points_with_threshold(
                 pvals_arr,
@@ -13088,6 +13324,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 ),
                 max_points=_QQ_FAST_MAX_POINTS,
                 keep_all=bool(args.fullscatter),
+                no_logtrans=no_logtrans,
             )
             if exp.size == 0 or obs.size == 0:
                 continue
@@ -13213,6 +13450,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             p_col,
             threshold_merge,
             use_all_sites=ld_use_all_sites,
+            no_logtrans=no_logtrans,
         )
         n_sig_sites = max(2, len(ld_sites))
         ld_overlay_text = None
@@ -14508,8 +14746,20 @@ def main(argv: Optional[list[str]] = None):
         help="Column name for p-value (default: %(default)s).",
     )
     common_group.add_argument(
+        "--no-logtrans",
+        dest="no_logtrans",
+        action="store_true",
+        help=(
+            "Treat the selected p-value column as already being -log10(p); "
+            "--thr is then used directly on the logP scale."
+        ),
+    )
+    common_group.add_argument(
         "-thr", "--thr", dest="thr", type=float, default=None,
-        help="P-value threshold; if not set, use 0.05 / nSNP (default: %(default)s).",
+        help=(
+            "P-value threshold; if not set, use 0.05 / nSNP. With --no-logtrans, "
+            "an explicitly supplied value is interpreted directly as -log10(p)."
+        ),
     )
     common_group.add_argument(
         "-threshold", "--threshold", dest="thr", type=float, default=argparse.SUPPRESS,
@@ -15180,6 +15430,8 @@ def main(argv: Optional[list[str]] = None):
         ("Threshold", threshold_text),
         ("Bimrange", bimrange_text),
     ]
+    if bool(getattr(args, "no_logtrans", False)):
+        base_rows.insert(4, ("P-value scale", "precomputed -log10(p)"))
     if finemap_requested:
         if combined_finemap_range_work:
             base_rows.append(
