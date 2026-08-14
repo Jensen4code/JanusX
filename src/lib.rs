@@ -29,6 +29,8 @@ mod decode;
 mod farmcpu;
 #[path = "stats/fastlmm_lowrank.rs"]
 mod fastlmm_lowrank;
+#[path = "stats/fst.rs"]
+mod fst;
 #[path = "stats/fvlmm.rs"]
 mod fvlmm;
 #[path = "stats/fvlmm2.rs"]
@@ -91,6 +93,8 @@ mod susie;
 mod top;
 #[path = "stats/tree.rs"]
 mod tree;
+#[path = "stats/xpclr.rs"]
+mod xpclr;
 
 // io
 #[path = "io/assoc2tsv.rs"]
@@ -206,6 +210,7 @@ use farmcpu::{
     farmcpu_packed_to_tsv, farmcpu_rem_packed, farmcpu_super_packed, farmcpu_write_assoc_tsv,
 };
 use fast_math::fastlmm_prepare_lowrank_f64;
+use fst::{fst_bed, fst_bed_to_tsv, fst_bed_window_to_tsv};
 use fvlmm::{
     fastlmm_assoc_chunk_f32, fastlmm_assoc_from_snp_f32, fastlmm_reml_chunk_f32,
     fastlmm_reml_null_f32, fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32,
@@ -333,6 +338,7 @@ use tree::{
     geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8, nj_newick_from_alignment_u8,
     nj_newick_from_distance_matrix,
 };
+use xpclr::xpclr_bed_to_tsv;
 
 pub use aireml::{ai_reml_null_from_spectral, AiRemlNullResult};
 pub use algwas::{AlgwasConfig, AlgwasStage1PathPoint, AlgwasStage1Result};
@@ -912,6 +918,10 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gstats_bed_joint_stats, m)?)?;
     m.add_function(wrap_pyfunction!(gstats_bed_individual_stats, m)?)?;
     m.add_function(wrap_pyfunction!(gstats_bed_ldscore, m)?)?;
+    m.add_function(wrap_pyfunction!(fst_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(fst_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(fst_bed_window_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(xpclr_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(packed_mtm_f64, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_q_packed_grm_pca_f32, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;
