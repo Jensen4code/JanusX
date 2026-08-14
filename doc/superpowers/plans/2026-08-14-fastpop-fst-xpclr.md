@@ -31,10 +31,10 @@
 - Preserve the existing per-site FST Rust functions for compatibility.
 - Add tested helpers for window boundaries, WC window aggregation, Rogers–Huff correlation, XP-CLR likelihood integration, and normalization.
 
-- [ ] Write failing unit tests for weighted/mean WC FST windows and XP-CLR likelihood/window behavior.
-- [ ] Run the focused Rust tests and confirm failure because the new helpers do not exist.
-- [ ] Implement the minimal tested helpers.
-- [ ] Run focused tests and confirm they pass.
+- [x] Write failing unit tests for weighted/mean WC FST windows and XP-CLR likelihood/window behavior.
+- [x] Run the focused Rust tests and confirm failure because the new helpers do not exist.
+- [x] Implement the minimal tested helpers.
+- [x] Run focused tests and confirm they pass.
 
 ### Task 2: Rust streaming backends
 
@@ -48,10 +48,10 @@
 - Add `xpclr_bed_to_tsv(prefix, population1, population2, map, chromosome, window, step, maxsnps, minsnps, ld_cutoff, recombination_rate, threads, output)`.
 - Both APIs return the number of windows/rows written and release the Python GIL while scanning.
 
-- [ ] Add direct BED/BIM/FAM population alignment and map validation.
-- [ ] Implement windowed BED decoding with packed genotype planes and Rayon-parallel window jobs.
-- [ ] Implement XP-CLR preprocessing, LD weights, selection-coefficient search, and streaming TSV output.
-- [ ] Run `cargo fmt`, `cargo check --lib`, and focused Rust tests.
+- [x] Add direct BED/BIM/FAM population alignment and map validation.
+- [x] Implement windowed BED decoding with packed genotype planes and Rayon-parallel window jobs.
+- [x] Implement XP-CLR preprocessing, LD weights, selection-coefficient search, and streaming TSV output.
+- [x] Run `cargo fmt`, `cargo check --lib`, and focused Rust tests.
 
 ### Task 3: FastPop CLI integration
 
@@ -66,18 +66,17 @@
 - `jx fastpop fst -bfile PREFIX -p1 FILE -p2 FILE -window N -step N [-method wc|hudson] [-matrix] -o PREFIX`.
 - `jx fastpop xpclr -bfile PREFIX -p1 FILE -p2 FILE -window N -step N [-map FILE] [-maxsnps N] [-minsnps N] [-ld FLOAT] [-rrate FLOAT] [-chr CHROM] -o PREFIX`.
 
-- [ ] Add parser smoke tests/commands for all three help paths.
-- [ ] Parse exact FID/IID or IID population lists and reject overlaps/missing IDs.
-- [ ] Create output directories and write predictable `.windowed.fst`/`.xpclr.tsv` plus logs.
-- [ ] Run Python compilation and CLI help checks.
+- [x] Add parser smoke tests/commands for all three help paths.
+- [x] Parse exact FID/IID or IID population lists and reject overlaps/missing IDs.
+- [x] Create output directories and write predictable `.windowed.fst`/`.xpclr.tsv` plus logs.
+- [x] Run Python compilation and CLI help checks.
 
 ### Task 4: Reference comparison and handoff
 
 **Files:**
 - No tracked test or benchmark fixtures; use `/tmp` only.
 
-- [ ] Compare WC window values against PLINK/VCFtools-compatible calculations, including weighted and mean columns.
-- [ ] Compare XP-CLR against hardingnj/xpclr v1.1.2 fixture/reference output within documented numerical tolerance.
-- [ ] Run direct PyO3 and CLI smoke tests with multiple threads.
-- [ ] Inspect staged paths, commit only source/CLI changes, and verify `main` remains untouched.
-
+- [x] Compare WC window values against PLINK/VCFtools-compatible calculations, including weighted and mean columns.
+- [x] Compare XP-CLR against hardingnj/xpclr v1.1.2 fixture/reference output within documented numerical tolerance.
+- [x] Run direct PyO3 and CLI smoke tests with multiple threads.
+- [x] Inspect staged paths, commit only source/CLI changes, and verify `main` remains untouched.

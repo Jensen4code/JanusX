@@ -6,16 +6,19 @@
 
 use crate::bitwise::and_popcount;
 use crate::gfcore::SiteInfo;
-use crate::stats_common::{get_cached_pool, map_err_string_to_py};
+use crate::stats_common::{
+    emit_progress_callback, get_cached_pool, map_err_string_to_py, progress_step,
+};
 use memmap2::Mmap;
 use numpy::PyArray2;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::BoundObject;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 const BED_HEADER_LEN: usize = 3;
 const FST_BLOCK_SITES: usize = 4096;
@@ -98,6 +101,131 @@ struct FstInput {
     masks: Vec<GroupMask>,
     pair_names: Vec<(String, String)>,
     method: FstMethod,
+}
+
+/// Windowed FST input keeps only a file handle and fixed-size decode buffers.
+/// The site-level API still uses `FstInput`/mmap because it returns the full
+/// per-site matrix to Python; window scans do not need that materialization.
+struct FstWindowInput {
+    bed: File,
+    n_samples: usize,
+    n_sites: usize,
+    bytes_per_snp: usize,
+    masks: Vec<GroupMask>,
+}
+
+const FST_WINDOW_BLOCK_SITES: usize = 4096;
+
+#[derive(Clone, Debug)]
+struct WindowSiteStats {
+    pos: i64,
+    stats: Vec<GroupStats>,
+}
+
+#[derive(Clone, Debug)]
+struct FstWindowEmission {
+    start: i64,
+    stop: i64,
+    summaries: Vec<Option<FstWindowSummary>>,
+}
+
+/// Bounded-memory rolling window state for the windowed FST path.
+///
+/// BED/BIM rows are consumed in coordinate order.  Only sites that can still
+/// contribute to the next overlapping window remain in `pending`; empty
+/// genomic gaps are skipped arithmetically rather than materialized as jobs.
+struct FstWindowAccumulator {
+    next_start: i64,
+    pending: VecDeque<WindowSiteStats>,
+}
+
+impl FstWindowAccumulator {
+    fn new(_chrom: &str) -> Self {
+        Self {
+            next_start: 1,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        site: WindowSiteStats,
+        window: i64,
+        step: i64,
+        method: FstMethod,
+        pairs: &[(usize, usize)],
+    ) -> Vec<FstWindowEmission> {
+        let mut emitted = Vec::new();
+        while self.next_start <= site.pos {
+            let stop = self.next_start.saturating_add(window - 1);
+            if stop >= site.pos {
+                break;
+            }
+            if self.pending.is_empty() {
+                self.next_start = first_window_start_covering(site.pos, window, step);
+                continue;
+            }
+            if let Some(summary) = summarize_window_sites(&self.pending, stop, method, pairs) {
+                emitted.push(FstWindowEmission {
+                    start: self.next_start,
+                    stop,
+                    summaries: summary,
+                });
+            }
+            self.advance(step);
+        }
+        if site.pos >= self.next_start && site.pos <= self.next_start.saturating_add(window - 1) {
+            self.pending.push_back(site);
+        }
+        emitted
+    }
+
+    fn finish(
+        &mut self,
+        max_pos: i64,
+        window: i64,
+        step: i64,
+        method: FstMethod,
+        pairs: &[(usize, usize)],
+    ) -> Vec<FstWindowEmission> {
+        let mut emitted = Vec::new();
+        while self.next_start <= max_pos {
+            let stop = self.next_start.saturating_add(window - 1);
+            if self.pending.is_empty() {
+                break;
+            }
+            if let Some(summary) = summarize_window_sites(&self.pending, stop, method, pairs) {
+                emitted.push(FstWindowEmission {
+                    start: self.next_start,
+                    stop,
+                    summaries: summary,
+                });
+            }
+            self.advance(step);
+        }
+        emitted
+    }
+
+    fn advance(&mut self, step: i64) {
+        self.next_start = self.next_start.saturating_add(step);
+        while self
+            .pending
+            .front()
+            .is_some_and(|site| site.pos < self.next_start)
+        {
+            self.pending.pop_front();
+        }
+    }
+}
+
+fn first_window_start_covering(pos: i64, window: i64, step: i64) -> i64 {
+    let lower = pos.saturating_sub(window - 1).max(1);
+    if lower <= 1 {
+        return 1;
+    }
+    let offset = lower - 1;
+    let jumps = (offset - 1) / step + 1;
+    1i64.saturating_add(jumps.saturating_mul(step))
 }
 
 struct FstBimReader {
@@ -440,6 +568,12 @@ fn allele_frequency(stats: &GroupStats) -> Option<f64> {
 
 /// Weir--Cockerham's per-site theta estimator.
 pub(crate) fn wc_fst(groups: &[GroupStats]) -> Option<f64> {
+    wc_components(groups).map(|(a, denominator)| a / denominator)
+}
+
+/// Return the Weir--Cockerham numerator and denominator used by the
+/// ratio-of-sums window estimator.
+fn wc_components(groups: &[GroupStats]) -> Option<(f64, f64)> {
     if groups.len() < 2 || groups.iter().any(|g| g.n < 2) {
         return None;
     }
@@ -473,12 +607,52 @@ pub(crate) fn wc_fst(groups: &[GroupStats]) -> Option<f64> {
     if !denominator.is_finite() || denominator == 0.0 {
         None
     } else {
-        Some(a / denominator)
+        Some((a, denominator))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FstWindowSummary {
+    pub(crate) weighted: f64,
+    pub(crate) mean: f64,
+    pub(crate) n_variants: usize,
+}
+
+/// Aggregate per-site WC estimates as both a weighted ratio and an arithmetic
+/// mean.  The weighted value is the standard ratio of summed WC components;
+/// retaining the mean is useful for comparison with tools that report both
+/// window estimators.
+pub(crate) fn wc_window_summary(sites: &[Vec<GroupStats>]) -> Option<FstWindowSummary> {
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    let mut mean_sum = 0.0;
+    let mut n_variants = 0usize;
+    for groups in sites {
+        let Some((a, d)) = wc_components(groups) else {
+            continue;
+        };
+        numerator += a;
+        denominator += d;
+        mean_sum += a / d;
+        n_variants += 1;
+    }
+    if n_variants == 0 || denominator == 0.0 || !denominator.is_finite() {
+        None
+    } else {
+        Some(FstWindowSummary {
+            weighted: numerator / denominator,
+            mean: mean_sum / n_variants as f64,
+            n_variants,
+        })
     }
 }
 
 /// Hudson's unbiased two-population per-site estimator.
 pub(crate) fn hudson_fst(lhs: &GroupStats, rhs: &GroupStats) -> Option<f64> {
+    hudson_components(lhs, rhs).map(|(numerator, denominator)| numerator / denominator)
+}
+
+fn hudson_components(lhs: &GroupStats, rhs: &GroupStats) -> Option<(f64, f64)> {
     if lhs.n < 2 || rhs.n < 2 {
         return None;
     }
@@ -493,7 +667,7 @@ pub(crate) fn hudson_fst(lhs: &GroupStats, rhs: &GroupStats) -> Option<f64> {
     let within_rhs = 2.0 * (rhs.alt_alleles as f64) * ((2 * rhs.n - rhs.alt_alleles) as f64)
         / ((2 * rhs.n) as f64 * (2 * rhs.n - 1) as f64);
     let numerator = between - 0.5 * (within_lhs + within_rhs);
-    Some(numerator / between)
+    Some((numerator, between))
 }
 
 fn normalize_plink_prefix(prefix: &str) -> String {
@@ -758,6 +932,593 @@ fn write_fst_tsv_streaming(
     Ok((input.n_sites, input.pair_names.len()))
 }
 
+fn read_population_indices(path: &str, fam_ids: &[(String, String)]) -> Result<Vec<usize>, String> {
+    let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut by_key = HashMap::<(String, String), usize>::new();
+    let mut by_iid = HashMap::<String, Vec<usize>>::new();
+    for (idx, (fid, iid)) in fam_ids.iter().enumerate() {
+        by_key.insert((fid.clone(), iid.clone()), idx);
+        by_iid.entry(iid.clone()).or_default().push(idx);
+    }
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("{path}: {e}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let cols = trimmed.split_whitespace().collect::<Vec<_>>();
+        let sample_idx = if cols.len() >= 2 {
+            by_key
+                .get(&(cols[0].to_string(), cols[1].to_string()))
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "{path}: FID/IID {} {} at line {} is absent from FAM",
+                        cols[0],
+                        cols[1],
+                        line_no + 1
+                    )
+                })?
+        } else {
+            let matches = by_iid.get(cols[0]).ok_or_else(|| {
+                format!(
+                    "{path}: IID {} at line {} is absent from FAM",
+                    cols[0],
+                    line_no + 1
+                )
+            })?;
+            if matches.len() != 1 {
+                return Err(format!(
+                    "{path}: IID {} at line {} is ambiguous; provide FID IID",
+                    cols[0],
+                    line_no + 1
+                ));
+            }
+            matches[0]
+        };
+        if !seen.insert(sample_idx) {
+            return Err(format!("{path}: duplicate sample at line {}", line_no + 1));
+        }
+        selected.push(sample_idx);
+    }
+    if selected.is_empty() {
+        return Err(format!("{path}: no samples found"));
+    }
+    Ok(selected)
+}
+
+fn build_named_population_masks(
+    groups: &[(String, Vec<usize>)],
+    n_samples: usize,
+) -> Result<Vec<GroupMask>, String> {
+    if groups.len() < 2 {
+        return Err("FST requires at least two populations".to_string());
+    }
+    let words = words_for_samples(n_samples);
+    let mut used = HashSet::new();
+    let mut masks = Vec::with_capacity(groups.len());
+    for (name, sample_indices) in groups {
+        if name.trim().is_empty() {
+            return Err("population names must not be empty".to_string());
+        }
+        if sample_indices.len() < 2 {
+            return Err(format!(
+                "population {name:?} has only {} assigned samples; at least 2 are required",
+                sample_indices.len()
+            ));
+        }
+        let mut mask = GroupMask {
+            name: name.clone(),
+            words: vec![0u64; words],
+            n_samples: 0,
+        };
+        for &sample_idx in sample_indices {
+            if sample_idx >= n_samples {
+                return Err(format!(
+                    "population {name:?} contains sample index {sample_idx} >= {n_samples}"
+                ));
+            }
+            if !used.insert(sample_idx) {
+                return Err(format!(
+                    "sample index {sample_idx} occurs in more than one population"
+                ));
+            }
+            set_bit(&mut mask.words, sample_idx);
+            mask.n_samples += 1;
+        }
+        masks.push(mask);
+    }
+    Ok(masks)
+}
+
+fn read_window_fst_input(
+    prefix: &str,
+    pop1_path: &str,
+    pop2_path: &str,
+    within_path: &str,
+    matrix: bool,
+) -> Result<FstWindowInput, String> {
+    let bed_prefix = normalize_plink_prefix(prefix);
+    let fam_ids = read_fam_keys(&format!("{bed_prefix}.fam"))?;
+    let n_samples = fam_ids.len();
+    let groups = if matrix {
+        if within_path.trim().is_empty() {
+            return Err("-matrix requires -within groups.tsv".to_string());
+        }
+        let assignments = read_within_groups(within_path, &fam_ids)?;
+        let mut names = Vec::new();
+        let mut indices_by_name = HashMap::<String, Vec<usize>>::new();
+        for (idx, assignment) in assignments.into_iter().enumerate() {
+            if let Some(name) = assignment {
+                if !names.contains(&name) {
+                    names.push(name.clone());
+                }
+                indices_by_name.entry(name).or_default().push(idx);
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| {
+                let indices = indices_by_name.remove(&name).unwrap_or_default();
+                (name, indices)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        if pop1_path.trim().is_empty() || pop2_path.trim().is_empty() {
+            return Err("FST requires -p1 and -p2 unless -matrix is used".to_string());
+        }
+        vec![
+            (
+                "pop1".to_string(),
+                read_population_indices(pop1_path, &fam_ids)?,
+            ),
+            (
+                "pop2".to_string(),
+                read_population_indices(pop2_path, &fam_ids)?,
+            ),
+        ]
+    };
+    let masks = build_named_population_masks(&groups, n_samples)?;
+    let bed_path = format!("{bed_prefix}.bed");
+    let bed = File::open(&bed_path).map_err(|e| format!("{bed_path}: {e}"))?;
+    let metadata = bed.metadata().map_err(|e| format!("{bed_path}: {e}"))?;
+    if metadata.len() < BED_HEADER_LEN as u64 {
+        return Err(format!("{bed_path}: BED file is shorter than its header"));
+    }
+    let mut header = [0u8; BED_HEADER_LEN];
+    let mut header_reader = bed.try_clone().map_err(|e| format!("{bed_path}: {e}"))?;
+    header_reader
+        .read_exact(&mut header)
+        .map_err(|e| format!("{bed_path}: {e}"))?;
+    if header != [0x6c, 0x1b, 0x01] {
+        return Err(format!(
+            "{bed_path}: expected SNP-major PLINK BED header 0x6c 0x1b 0x01"
+        ));
+    }
+    let bytes_per_snp = n_samples.div_ceil(4);
+    let payload = metadata.len() as usize - BED_HEADER_LEN;
+    if bytes_per_snp == 0 || payload == 0 || payload % bytes_per_snp != 0 {
+        return Err(format!(
+            "{bed_path}: invalid payload length {payload} for {bytes_per_snp} bytes/SNP"
+        ));
+    }
+    let n_sites = payload / bytes_per_snp;
+    Ok(FstWindowInput {
+        bed,
+        n_samples,
+        n_sites,
+        bytes_per_snp,
+        masks,
+    })
+}
+
+fn window_summary_for_pair(
+    site_stats: &[Vec<GroupStats>],
+    indices: &[usize],
+    method: FstMethod,
+    lhs: usize,
+    rhs: usize,
+) -> Option<FstWindowSummary> {
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    let mut mean_sum = 0.0;
+    let mut n_variants = 0usize;
+    for &site_idx in indices {
+        let stats = &site_stats[site_idx];
+        let components = match method {
+            FstMethod::Wc => wc_components(&[stats[lhs], stats[rhs]]),
+            FstMethod::Hudson => hudson_components(&stats[lhs], &stats[rhs]),
+        };
+        let Some(components) = components else {
+            continue;
+        };
+        numerator += components.0;
+        denominator += components.1;
+        mean_sum += components.0 / components.1;
+        n_variants += 1;
+    }
+    if n_variants == 0 || denominator == 0.0 || !denominator.is_finite() {
+        None
+    } else {
+        Some(FstWindowSummary {
+            weighted: numerator / denominator,
+            mean: mean_sum / n_variants as f64,
+            n_variants,
+        })
+    }
+}
+
+fn window_summaries_for_pairs(
+    site_stats: &[Vec<GroupStats>],
+    indices: &[usize],
+    method: FstMethod,
+    pairs: &[(usize, usize)],
+) -> Vec<Option<FstWindowSummary>> {
+    let mut accumulators = pairs
+        .iter()
+        .map(|_| (0.0, 0.0, 0.0, 0usize))
+        .collect::<Vec<_>>();
+    for &site_idx in indices {
+        let stats = &site_stats[site_idx];
+        for ((lhs, rhs), accumulator) in pairs.iter().zip(accumulators.iter_mut()) {
+            let components = match method {
+                FstMethod::Wc => wc_components(&[stats[*lhs], stats[*rhs]]),
+                FstMethod::Hudson => hudson_components(&stats[*lhs], &stats[*rhs]),
+            };
+            let Some((numerator, denominator)) = components else {
+                continue;
+            };
+            accumulator.0 += numerator;
+            accumulator.1 += denominator;
+            accumulator.2 += numerator / denominator;
+            accumulator.3 += 1;
+        }
+    }
+    accumulators
+        .into_iter()
+        .map(|(numerator, denominator, mean_sum, n_variants)| {
+            if n_variants == 0 || denominator == 0.0 || !denominator.is_finite() {
+                None
+            } else {
+                Some(FstWindowSummary {
+                    weighted: numerator / denominator,
+                    mean: mean_sum / n_variants as f64,
+                    n_variants,
+                })
+            }
+        })
+        .collect()
+}
+
+fn summarize_window_sites(
+    sites: &VecDeque<WindowSiteStats>,
+    stop: i64,
+    method: FstMethod,
+    pairs: &[(usize, usize)],
+) -> Option<Vec<Option<FstWindowSummary>>> {
+    let mut accumulators = pairs
+        .iter()
+        .map(|_| (0.0, 0.0, 0.0, 0usize))
+        .collect::<Vec<_>>();
+    for site in sites.iter().take_while(|site| site.pos <= stop) {
+        for ((lhs, rhs), accumulator) in pairs.iter().zip(accumulators.iter_mut()) {
+            let components = match method {
+                FstMethod::Wc => wc_components(&[site.stats[*lhs], site.stats[*rhs]]),
+                FstMethod::Hudson => hudson_components(&site.stats[*lhs], &site.stats[*rhs]),
+            };
+            let Some((numerator, denominator)) = components else {
+                continue;
+            };
+            accumulator.0 += numerator;
+            accumulator.1 += denominator;
+            accumulator.2 += numerator / denominator;
+            accumulator.3 += 1;
+        }
+    }
+    let summaries = accumulators
+        .into_iter()
+        .map(|(numerator, denominator, mean_sum, n_variants)| {
+            if n_variants == 0 || denominator == 0.0 || !denominator.is_finite() {
+                None
+            } else {
+                Some(FstWindowSummary {
+                    weighted: numerator / denominator,
+                    mean: mean_sum / n_variants as f64,
+                    n_variants,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    summaries.iter().any(Option::is_some).then_some(summaries)
+}
+
+fn write_fst_window_emission<W: Write>(
+    writer: &mut W,
+    chrom: &str,
+    emission: &FstWindowEmission,
+    pairs: &[(usize, usize)],
+    masks: &[GroupMask],
+    matrix: bool,
+    path: &str,
+) -> Result<usize, String> {
+    let mut written = 0usize;
+    for (pair_idx, summary) in emission.summaries.iter().enumerate() {
+        let Some(summary) = summary else { continue };
+        let (lhs, rhs) = pairs[pair_idx];
+        if matrix {
+            writeln!(
+                writer,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{:.10e}\t{:.10e}",
+                masks[lhs].name,
+                masks[rhs].name,
+                chrom,
+                emission.start,
+                emission.stop,
+                summary.n_variants,
+                summary.weighted,
+                summary.mean
+            )
+        } else {
+            writeln!(
+                writer,
+                "{}\t{}\t{}\t{}\t{:.10e}\t{:.10e}",
+                chrom,
+                emission.start,
+                emission.stop,
+                summary.n_variants,
+                summary.weighted,
+                summary.mean
+            )
+        }
+        .map_err(|e| format!("{path}: {e}"))?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+fn run_windowed_fst(
+    prefix: &str,
+    pop1_path: &str,
+    pop2_path: &str,
+    within_path: &str,
+    output_path: &str,
+    window: i64,
+    step: i64,
+    method_name: &str,
+    matrix: bool,
+    chrom_filter: Option<&str>,
+    threads: usize,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+) -> Result<(usize, usize), String> {
+    if window <= 0 || step <= 0 {
+        return Err("window and step must be positive".to_string());
+    }
+    let method = FstMethod::parse(method_name)?;
+    let input = read_window_fst_input(prefix, pop1_path, pop2_path, within_path, matrix)?;
+    let pair_indices = if matrix {
+        let mut pairs = Vec::new();
+        for lhs in 0..input.masks.len() {
+            for rhs in (lhs + 1)..input.masks.len() {
+                pairs.push((lhs, rhs));
+            }
+        }
+        pairs.sort_by(|lhs, rhs| {
+            input.masks[lhs.0]
+                .name
+                .cmp(&input.masks[rhs.0].name)
+                .then(input.masks[lhs.1].name.cmp(&input.masks[rhs.1].name))
+        });
+        pairs
+    } else {
+        vec![(0, 1)]
+    };
+    let output = Path::new(output_path);
+    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let file = File::create(output_path).map_err(|e| format!("{output_path}: {e}"))?;
+    let mut writer = BufWriter::new(file);
+    if matrix {
+        writeln!(
+            writer,
+            "POP1\tPOP2\tCHROM\tBIN_START\tBIN_END\tN_VARIANTS\tWEIGHTED_FST\tMEAN_FST"
+        )
+        .map_err(|e| format!("{output_path}: {e}"))?;
+    } else {
+        writeln!(
+            writer,
+            "CHROM\tBIN_START\tBIN_END\tN_VARIANTS\tWEIGHTED_FST\tMEAN_FST"
+        )
+        .map_err(|e| format!("{output_path}: {e}"))?;
+    }
+
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let progress_step = progress_step(input.n_sites, progress_every);
+    let mut next_progress = progress_step;
+    if progress_callback.is_some() {
+        emit_progress_callback(progress_callback, 0, 0, input.n_sites)?;
+    }
+    let mut bed = input.bed;
+    bed.seek(SeekFrom::Start(BED_HEADER_LEN as u64))
+        .map_err(|e| format!("{prefix}.bed: {e}"))?;
+    let mut bim_reader = FstBimReader::open(&normalize_plink_prefix(prefix))?;
+    let mut site_idx = 0usize;
+    let mut total_rows = 0usize;
+    let mut current_chrom = None::<String>;
+    let mut completed_chroms = HashSet::<String>::new();
+    let mut accumulator = None::<FstWindowAccumulator>;
+    let mut max_pos = 0i64;
+    let mut last_pos = None::<i64>;
+
+    while site_idx < input.n_sites {
+        let block_start = site_idx;
+        let block_len = (input.n_sites - block_start).min(FST_WINDOW_BLOCK_SITES);
+        let mut block_payload = vec![0u8; block_len * input.bytes_per_snp];
+        bed.read_exact(&mut block_payload)
+            .map_err(|e| format!("{prefix}.bed: {e}"))?;
+        let mut block_sites = Vec::with_capacity(block_len);
+        for _ in 0..block_len {
+            block_sites.push(
+                bim_reader
+                    .next_site()?
+                    .ok_or_else(|| "BIM ended while streaming windowed FST".to_string())?,
+            );
+        }
+        let mut block_stats = (0..block_len)
+            .map(|_| vec![GroupStats::default(); input.masks.len()])
+            .collect::<Vec<_>>();
+        let mut compute_stats = || {
+            block_stats.par_iter_mut().enumerate().for_each_init(
+                || FstScratch::new(input.n_samples, input.masks.len()),
+                |scratch, (offset, stats)| {
+                    let row = &block_payload
+                        [offset * input.bytes_per_snp..(offset + 1) * input.bytes_per_snp];
+                    stats_for_row_into(row, input.n_samples, &input.masks, scratch);
+                    stats.copy_from_slice(&scratch.stats);
+                },
+            );
+        };
+        if let Some(pool) = pool.as_ref() {
+            pool.install(&mut compute_stats);
+        } else {
+            compute_stats();
+        }
+
+        for (site, stats) in block_sites.into_iter().zip(block_stats) {
+            site_idx += 1;
+            if chrom_filter.is_some_and(|chrom| chrom != site.chrom) {
+                continue;
+            }
+            if current_chrom.as_deref() != Some(site.chrom.as_str()) {
+                if let (Some(chrom), Some(mut previous)) =
+                    (current_chrom.take(), accumulator.take())
+                {
+                    for emission in previous.finish(max_pos, window, step, method, &pair_indices) {
+                        total_rows += write_fst_window_emission(
+                            &mut writer,
+                            &chrom,
+                            &emission,
+                            &pair_indices,
+                            &input.masks,
+                            matrix,
+                            output_path,
+                        )?;
+                    }
+                    completed_chroms.insert(chrom);
+                }
+                if completed_chroms.contains(&site.chrom) {
+                    return Err(format!(
+                        "BIM chromosome {} reappears after a later chromosome; windowed FST requires chromosome-sorted BIM",
+                        site.chrom
+                    ));
+                }
+                current_chrom = Some(site.chrom.clone());
+                accumulator = Some(FstWindowAccumulator::new(&site.chrom));
+                max_pos = 0;
+                last_pos = None;
+            }
+            if last_pos.is_some_and(|previous| i64::from(site.pos) < previous) {
+                return Err(format!(
+                    "BIM positions are not sorted within chromosome {}",
+                    site.chrom
+                ));
+            }
+            last_pos = Some(i64::from(site.pos));
+            max_pos = max_pos.max(i64::from(site.pos));
+            let emissions = accumulator.as_mut().unwrap().push(
+                WindowSiteStats {
+                    pos: i64::from(site.pos),
+                    stats,
+                },
+                window,
+                step,
+                method,
+                &pair_indices,
+            );
+            for emission in emissions {
+                total_rows += write_fst_window_emission(
+                    &mut writer,
+                    current_chrom.as_deref().unwrap(),
+                    &emission,
+                    &pair_indices,
+                    &input.masks,
+                    matrix,
+                    output_path,
+                )?;
+            }
+        }
+        if progress_callback.is_some() && (site_idx >= next_progress || site_idx == input.n_sites) {
+            emit_progress_callback(progress_callback, 0, site_idx, input.n_sites)?;
+            while next_progress <= site_idx {
+                next_progress = next_progress.saturating_add(progress_step);
+            }
+        }
+    }
+    if bim_reader.next_site()?.is_some() {
+        return Err(format!(
+            "BED/BIM variant count mismatch while streaming windowed FST: BED={}",
+            input.n_sites
+        ));
+    }
+    if let (Some(chrom), Some(mut previous)) = (current_chrom, accumulator) {
+        for emission in previous.finish(max_pos, window, step, method, &pair_indices) {
+            total_rows += write_fst_window_emission(
+                &mut writer,
+                &chrom,
+                &emission,
+                &pair_indices,
+                &input.masks,
+                matrix,
+                output_path,
+            )?;
+        }
+    }
+    writer.flush().map_err(|e| format!("{output_path}: {e}"))?;
+    Ok((total_rows, pair_indices.len()))
+}
+
+#[pyfunction]
+#[pyo3(signature = (prefix, pop1, pop2, within, output, window=50000, step=50000, method="wc", matrix=false, chrom=None, threads=0, progress_callback=None, progress_every=0))]
+pub fn fst_bed_window_to_tsv(
+    py: Python<'_>,
+    prefix: String,
+    pop1: String,
+    pop2: String,
+    within: String,
+    output: String,
+    window: i64,
+    step: i64,
+    method: &str,
+    matrix: bool,
+    chrom: Option<String>,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(usize, usize)> {
+    let method_owned = method.to_string();
+    py.detach(move || {
+        run_windowed_fst(
+            &prefix,
+            &pop1,
+            &pop2,
+            &within,
+            &output,
+            window,
+            step,
+            &method_owned,
+            matrix,
+            chrom.as_deref(),
+            threads,
+            progress_callback.as_ref(),
+            progress_every,
+        )
+    })
+    .map_err(map_err_string_to_py)
+}
+
 #[pyfunction]
 #[pyo3(signature = (prefix, within, method="wc", threads=0))]
 pub fn fst_bed<'py>(
@@ -860,7 +1621,9 @@ pub fn fst_bed_to_tsv(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_group_masks, hudson_fst, read_within_groups, stats_for_row, wc_fst, GroupStats,
+        build_group_masks, hudson_fst, read_within_groups, stats_for_row, wc_fst,
+        wc_window_summary, window_summaries_for_pairs, FstMethod, FstWindowAccumulator, GroupStats,
+        WindowSiteStats,
     };
 
     fn close(actual: f64, expected: f64) {
@@ -977,5 +1740,79 @@ mod tests {
         let err = read_within_groups(path.to_str().unwrap(), &fam).unwrap_err();
         assert!(err.contains("F2 S1"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wc_window_summary_has_weighted_and_mean_estimators() {
+        let sites = vec![
+            vec![
+                GroupStats::from_counts(4, 0, 0),
+                GroupStats::from_counts(4, 8, 0),
+            ],
+            vec![
+                GroupStats::from_counts(4, 2, 0),
+                GroupStats::from_counts(4, 6, 0),
+            ],
+        ];
+        let summary = wc_window_summary(&sites).unwrap();
+        assert!((summary.weighted - (9.0 / 13.0)).abs() < 1e-12);
+        assert!((summary.mean - 0.6).abs() < 1e-12);
+        assert_eq!(summary.n_variants, 2);
+    }
+
+    #[test]
+    fn matrix_window_batch_matches_individual_pair_summaries() {
+        let site_stats = vec![
+            vec![
+                GroupStats::from_counts(4, 0, 0),
+                GroupStats::from_counts(4, 8, 0),
+                GroupStats::from_counts(4, 4, 2),
+            ],
+            vec![
+                GroupStats::from_counts(4, 2, 0),
+                GroupStats::from_counts(4, 6, 0),
+                GroupStats::from_counts(4, 5, 2),
+            ],
+        ];
+        let indices = [0usize, 1];
+        let pairs = [(0usize, 1usize), (0, 2), (1, 2)];
+        let batched = window_summaries_for_pairs(&site_stats, &indices, FstMethod::Wc, &pairs);
+        let individual = pairs
+            .iter()
+            .map(|&(lhs, rhs)| {
+                super::window_summary_for_pair(&site_stats, &indices, FstMethod::Wc, lhs, rhs)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batched, individual);
+    }
+
+    #[test]
+    fn streaming_window_accumulator_matches_overlapping_window_contract() {
+        let mut accumulator = FstWindowAccumulator::new("chr1");
+        let pairs = [(0usize, 1usize)];
+        let make_site = |pos, lhs_alt, rhs_alt| WindowSiteStats {
+            pos,
+            stats: vec![
+                GroupStats::from_counts(4, lhs_alt, 0),
+                GroupStats::from_counts(4, rhs_alt, 0),
+            ],
+        };
+
+        let mut emitted = Vec::new();
+        emitted.extend(accumulator.push(make_site(10, 0, 8), 20, 10, FstMethod::Wc, &pairs));
+        emitted.extend(accumulator.push(make_site(25, 2, 6), 20, 10, FstMethod::Wc, &pairs));
+        emitted.extend(accumulator.finish(25, 20, 10, FstMethod::Wc, &pairs));
+
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|window| (
+                    window.start,
+                    window.stop,
+                    window.summaries[0].unwrap().n_variants
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 20, 1), (11, 30, 1), (21, 40, 1)],
+        );
     }
 }

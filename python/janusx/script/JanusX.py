@@ -150,7 +150,7 @@ _CLI_MODULE_SECTIONS = [
             ("gstats", "Genotype basic statistics and LD score"),
             ("fst", "Compute WC/Hudson population FST from PLINK BED"),
             ("reml", "Estimate broad/narrow heritability and BLUE by REML"),
-            ("fastpop", "FastPop ancestry inference"),
+            ("fastpop", "FastPop structure, windowed FST, and XP-CLR"),
             ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
             ("gmerge", "Merge genotype/variant tables"),
         ],

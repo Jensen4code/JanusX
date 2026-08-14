@@ -84,6 +84,42 @@ pub(crate) fn map_err_string_to_py(err: String) -> PyErr {
     }
 }
 
+/// Call a Python-side progress hook from a detached Rust computation.
+///
+/// Callers are expected to invoke this only at coarse block boundaries.  The
+/// callback is intentionally kept out of the inner genotype loops so a TTY
+/// progress bar cannot perturb the hot path.
+#[inline]
+pub(crate) fn emit_progress_callback(
+    callback: Option<&Py<PyAny>>,
+    stage: usize,
+    done: usize,
+    total: usize,
+) -> Result<(), String> {
+    let total_use = total.max(1);
+    let done_use = done.min(total_use);
+    if let Some(callback) = callback {
+        Python::attach(|py| -> PyResult<()> {
+            py.check_signals()?;
+            callback.call1(py, (stage, done_use, total_use))?;
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Choose a bounded callback cadence without requiring callers to scan BIM
+/// twice just to determine a display interval.
+#[inline]
+pub(crate) fn progress_step(total: usize, requested: usize) -> usize {
+    if requested > 0 {
+        requested
+    } else {
+        total.div_ceil(200).max(1)
+    }
+}
+
 #[inline]
 pub(crate) fn env_truthy(name: &str) -> bool {
     std::env::var(name)
@@ -463,5 +499,20 @@ impl Drop for AsyncTsvWriter {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::progress_step;
+
+    #[test]
+    fn progress_step_is_bounded_to_about_two_hundred_updates() {
+        assert_eq!(progress_step(0, 0), 1);
+        assert_eq!(progress_step(1, 0), 1);
+        assert_eq!(progress_step(200, 0), 1);
+        assert_eq!(progress_step(201, 0), 2);
+        assert_eq!(progress_step(1_604_281, 0), 8_022);
+        assert_eq!(progress_step(1_604_281, 17), 17);
     }
 }
