@@ -605,8 +605,10 @@ jobs:
           command -v python >/dev/null 2>&1 || PY=python3
           "$PY" -m pip install --upgrade pip
           "$PY" -m pip install --force-reinstall dist/*.whl
-          jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o test
-          jx grm -bfile test/mouse_hs1940 -o test
+          mkdir -p test
+          TEST_PREFIX="test/mouse_hs1940"
+          jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o "$TEST_PREFIX"
+          jx grm -bfile "$TEST_PREFIX" -o test
           "$PY" - <<'PY'
           import os
           import janusx.janusx as _jx
