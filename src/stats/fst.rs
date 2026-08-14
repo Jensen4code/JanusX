@@ -115,6 +115,8 @@ struct FstWindowInput {
 }
 
 const FST_WINDOW_BLOCK_SITES: usize = 4096;
+const FST_WINDOW_HEADER: &str = "chrom\tstart\tend\tnsnp\tweightedFst\tmeanFst";
+const FST_MATRIX_WINDOW_HEADER: &str = "pop1\tpop2\tchrom\tstart\tend\tnsnp\tweightedFst\tmeanFst";
 
 #[derive(Clone, Debug)]
 struct WindowSiteStats {
@@ -1247,35 +1249,40 @@ fn write_fst_window_emission<W: Write>(
     for (pair_idx, summary) in emission.summaries.iter().enumerate() {
         let Some(summary) = summary else { continue };
         let (lhs, rhs) = pairs[pair_idx];
+        let weighted = format_fst_window_value(summary.weighted);
+        let mean = format_fst_window_value(summary.mean);
         if matrix {
             writeln!(
                 writer,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{:.10e}\t{:.10e}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 masks[lhs].name,
                 masks[rhs].name,
                 chrom,
                 emission.start,
                 emission.stop,
                 summary.n_variants,
-                summary.weighted,
-                summary.mean
+                weighted,
+                mean
             )
         } else {
             writeln!(
                 writer,
-                "{}\t{}\t{}\t{}\t{:.10e}\t{:.10e}",
-                chrom,
-                emission.start,
-                emission.stop,
-                summary.n_variants,
-                summary.weighted,
-                summary.mean
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                chrom, emission.start, emission.stop, summary.n_variants, weighted, mean
             )
         }
         .map_err(|e| format!("{path}: {e}"))?;
         written += 1;
     }
     Ok(written)
+}
+
+fn format_fst_window_value(value: f64) -> String {
+    if value.is_finite() && value.abs() < 0.0001 {
+        format!("{value:.4e}")
+    } else {
+        format!("{value:.4}")
+    }
 }
 
 fn run_windowed_fst(
@@ -1321,19 +1328,16 @@ fn run_windowed_fst(
     }
     let file = File::create(output_path).map_err(|e| format!("{output_path}: {e}"))?;
     let mut writer = BufWriter::new(file);
-    if matrix {
-        writeln!(
-            writer,
-            "POP1\tPOP2\tCHROM\tBIN_START\tBIN_END\tN_VARIANTS\tWEIGHTED_FST\tMEAN_FST"
-        )
-        .map_err(|e| format!("{output_path}: {e}"))?;
-    } else {
-        writeln!(
-            writer,
-            "CHROM\tBIN_START\tBIN_END\tN_VARIANTS\tWEIGHTED_FST\tMEAN_FST"
-        )
-        .map_err(|e| format!("{output_path}: {e}"))?;
-    }
+    writeln!(
+        writer,
+        "{}",
+        if matrix {
+            FST_MATRIX_WINDOW_HEADER
+        } else {
+            FST_WINDOW_HEADER
+        }
+    )
+    .map_err(|e| format!("{output_path}: {e}"))?;
 
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let progress_step = progress_step(input.n_sites, progress_every);
@@ -1622,7 +1626,8 @@ pub fn fst_bed_to_tsv(
 mod tests {
     use super::{
         build_group_masks, hudson_fst, read_within_groups, stats_for_row, wc_fst,
-        wc_window_summary, window_summaries_for_pairs, FstMethod, FstWindowAccumulator, GroupStats,
+        wc_window_summary, window_summaries_for_pairs, write_fst_window_emission, FstMethod,
+        FstWindowAccumulator, FstWindowEmission, FstWindowSummary, GroupMask, GroupStats,
         WindowSiteStats,
     };
 
@@ -1814,5 +1819,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, 20, 1), (11, 30, 1), (21, 40, 1)],
         );
+    }
+
+    #[test]
+    fn window_fst_rows_use_compact_header_value_precision() {
+        let emission = FstWindowEmission {
+            start: 1,
+            stop: 100,
+            summaries: vec![Some(FstWindowSummary {
+                weighted: 0.123456,
+                mean: 0.00001234,
+                n_variants: 3,
+            })],
+        };
+        let pairs = [(0usize, 1usize)];
+        let masks = vec![
+            GroupMask {
+                name: "A".to_string(),
+                words: Vec::new(),
+                n_samples: 0,
+            },
+            GroupMask {
+                name: "B".to_string(),
+                words: Vec::new(),
+                n_samples: 0,
+            },
+        ];
+        let mut output = Vec::new();
+        write_fst_window_emission(&mut output, "1", &emission, &pairs, &masks, false, "test")
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "1\t1\t100\t3\t0.1235\t1.2340e-5\n"
+        );
+    }
+
+    #[test]
+    fn window_fst_headers_use_lowercase_analysis_names() {
+        assert_eq!(
+            super::FST_WINDOW_HEADER,
+            "chrom\tstart\tend\tnsnp\tweightedFst\tmeanFst"
+        );
+        assert_eq!(
+            super::FST_MATRIX_WINDOW_HEADER,
+            "pop1\tpop2\tchrom\tstart\tend\tnsnp\tweightedFst\tmeanFst"
+        );
+    }
+
+    #[test]
+    fn window_fst_value_switches_to_scientific_notation_below_threshold() {
+        assert_eq!(super::format_fst_window_value(0.0001), "0.0001");
+        assert_eq!(super::format_fst_window_value(-0.000099), "-9.9000e-5");
+        assert_eq!(super::format_fst_window_value(1.0), "1.0000");
     }
 }
