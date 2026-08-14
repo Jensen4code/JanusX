@@ -22,6 +22,8 @@ use std::path::Path;
 
 const BED_HEADER_LEN: usize = 3;
 const FST_BLOCK_SITES: usize = 4096;
+const FST_SITE_TASK_SITES: usize = 256;
+const FST_OUTPUT_BUFFER_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GroupStats {
@@ -719,16 +721,6 @@ fn open_fst_input(prefix: &str, within_path: &str, method_name: &str) -> Result<
             "BED/FAM sample count mismatch: BED/FAM={bed_n_samples}, FAM metadata={n_samples}"
         ));
     }
-    let mut bim_reader = FstBimReader::open(&bed_prefix)?;
-    let mut bim_sites = 0usize;
-    while bim_reader.next_site()?.is_some() {
-        bim_sites += 1;
-    }
-    if bim_sites != n_sites {
-        return Err(format!(
-            "BED/BIM variant count mismatch: BED={n_sites}, BIM={bim_sites}"
-        ));
-    }
     let pair_names = pair_names(&masks, method);
     Ok(FstInput {
         mmap,
@@ -763,32 +755,41 @@ fn compute_fst_block(
 
     let mut run = || {
         values
-            .par_chunks_mut(pair_count)
-            .zip(nmiss_left.par_chunks_mut(pair_count))
-            .zip(nmiss_right.par_chunks_mut(pair_count))
+            .par_chunks_mut(FST_SITE_TASK_SITES * pair_count)
+            .zip(nmiss_left.par_chunks_mut(FST_SITE_TASK_SITES * pair_count))
+            .zip(nmiss_right.par_chunks_mut(FST_SITE_TASK_SITES * pair_count))
             .enumerate()
             .for_each_init(
                 || FstScratch::new(input.n_samples, input.masks.len()),
-                |scratch, (site_idx, ((value_row, left_row), right_row))| {
-                    let source_site_idx = start + site_idx;
-                    let row = &payload[source_site_idx * input.bytes_per_snp
-                        ..(source_site_idx + 1) * input.bytes_per_snp];
-                    stats_for_row_into(row, input.n_samples, &input.masks, scratch);
-                    let stats = &scratch.stats;
-                    match input.method {
-                        FstMethod::Wc => {
-                            left_row[0] = stats.iter().map(|group| group.n).sum();
-                            value_row[0] = wc_fst(&stats).unwrap_or(f64::NAN);
-                        }
-                        FstMethod::Hudson => {
-                            let mut pair_idx = 0usize;
-                            for lhs in 0..stats.len() {
-                                for rhs in (lhs + 1)..stats.len() {
-                                    left_row[pair_idx] = stats[lhs].n;
-                                    right_row[pair_idx] = stats[rhs].n;
-                                    value_row[pair_idx] =
-                                        hudson_fst(&stats[lhs], &stats[rhs]).unwrap_or(f64::NAN);
-                                    pair_idx += 1;
+                |scratch, (chunk_idx, ((values_chunk, nmiss_left_chunk), nmiss_right_chunk))| {
+                    let chunk_start = chunk_idx * FST_SITE_TASK_SITES;
+                    let chunk_sites = values_chunk.len() / pair_count;
+                    for local_site_idx in 0..chunk_sites {
+                        let row_start = local_site_idx * pair_count;
+                        let row_end = row_start + pair_count;
+                        let value_row = &mut values_chunk[row_start..row_end];
+                        let left_row = &mut nmiss_left_chunk[row_start..row_end];
+                        let right_row = &mut nmiss_right_chunk[row_start..row_end];
+                        let source_site_idx = start + chunk_start + local_site_idx;
+                        let row = &payload[source_site_idx * input.bytes_per_snp
+                            ..(source_site_idx + 1) * input.bytes_per_snp];
+                        stats_for_row_into(row, input.n_samples, &input.masks, scratch);
+                        let stats = &scratch.stats;
+                        match input.method {
+                            FstMethod::Wc => {
+                                left_row[0] = stats.iter().map(|group| group.n).sum();
+                                value_row[0] = wc_fst(&stats).unwrap_or(f64::NAN);
+                            }
+                            FstMethod::Hudson => {
+                                let mut pair_idx = 0usize;
+                                for lhs in 0..stats.len() {
+                                    for rhs in (lhs + 1)..stats.len() {
+                                        left_row[pair_idx] = stats[lhs].n;
+                                        right_row[pair_idx] = stats[rhs].n;
+                                        value_row[pair_idx] = hudson_fst(&stats[lhs], &stats[rhs])
+                                            .unwrap_or(f64::NAN);
+                                        pair_idx += 1;
+                                    }
                                 }
                             }
                         }
@@ -913,7 +914,7 @@ fn write_fst_tsv_streaming(
     let mut bim_reader = FstBimReader::open(&normalize_plink_prefix(prefix))?;
     let method = input.method;
     let file = File::create(output_path).map_err(|e| format!("{output_path}: {e}"))?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(FST_OUTPUT_BUFFER_SIZE, file);
     write_fst_header(&mut writer, method, output_path)?;
 
     let mut start = 0usize;
