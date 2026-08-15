@@ -1,18 +1,22 @@
-use crate::breader::{open_bkmer_mmap, open_bsite_mmap};
+use crate::breader::{parse_bkmer_header, parse_bsite_header};
 use crate::kmer::encode::{canonical_code, decode_kmer_u64, encode_kmer_u64, ENCODING_NAME};
 use crate::kmer::format::{
     BkmerHeader, BsiteHeader, KmergeMeta, SampleEntry, BKMER_HEADER_SIZE, BSITE_HEADER_SIZE,
 };
 use crate::kmer::writer::{write_idv_file, write_meta_json};
 use anyhow::{bail, Context, Result};
-#[cfg(unix)]
-use memmap2::Advice;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
+#[cfg(not(unix))]
+use std::io::Read;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc::sync_channel, Arc, Mutex};
 use std::thread;
@@ -26,6 +30,192 @@ struct KformatLayout {
     bsite_path: PathBuf,
     meta: KmergeMeta,
     samples: Vec<SampleEntry>,
+}
+
+struct KformatInput {
+    bkmer: File,
+    bsite: File,
+    n_kmers: usize,
+    n_samples: usize,
+    bytes_per_col: usize,
+}
+
+struct InputBlock {
+    block_idx: usize,
+    start: usize,
+    bkmer: Vec<u8>,
+    bsite: Vec<u8>,
+    selected: Vec<u32>,
+}
+
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<()> {
+    #[cfg(unix)]
+    {
+        file.read_exact_at(buffer, offset)?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut handle = file.try_clone()?;
+        handle.seek(SeekFrom::Start(offset))?;
+        handle.read_exact(buffer)?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn discard_file_range(file: &File, offset: u64, length: u64) {
+    if length == 0 {
+        return;
+    }
+    let _ = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset as libc::off_t,
+            length as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        )
+    };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn discard_file_range(_file: &File, _offset: u64, _length: u64) {}
+
+impl KformatInput {
+    fn open(layout: &KformatLayout) -> Result<Self> {
+        let bkmer = File::open(&layout.bkmer_path)
+            .with_context(|| format!("failed to open bkmer: {}", layout.bkmer_path.display()))?;
+        let bsite = File::open(&layout.bsite_path)
+            .with_context(|| format!("failed to open bsite: {}", layout.bsite_path.display()))?;
+        let mut bkmer_header = [0u8; BKMER_HEADER_SIZE];
+        read_exact_at(&bkmer, &mut bkmer_header, 0).with_context(|| {
+            format!(
+                "failed to read bkmer header: {}",
+                layout.bkmer_path.display()
+            )
+        })?;
+        let bkmer_header =
+            parse_bkmer_header(&bkmer_header, "kformat bkmer").map_err(anyhow::Error::msg)?;
+        if bkmer_header.k != layout.meta.k || bkmer_header.n_kmers != layout.meta.n_kmers {
+            bail!("bkmer header does not match kfile metadata");
+        }
+        let expected_bkmer_len = (BKMER_HEADER_SIZE as u64)
+            .checked_add(
+                layout
+                    .meta
+                    .n_kmers
+                    .checked_mul(8)
+                    .ok_or_else(|| anyhow::anyhow!("bkmer payload length overflow"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("bkmer file length overflow"))?;
+        let actual_bkmer_len = bkmer
+            .metadata()
+            .with_context(|| format!("failed to stat bkmer: {}", layout.bkmer_path.display()))?
+            .len();
+        if actual_bkmer_len != expected_bkmer_len {
+            bail!(
+                "bkmer payload length mismatch: expected {}, got {}",
+                expected_bkmer_len,
+                actual_bkmer_len
+            );
+        }
+
+        let mut bsite_header = [0u8; BSITE_HEADER_SIZE];
+        read_exact_at(&bsite, &mut bsite_header, 0).with_context(|| {
+            format!(
+                "failed to read bsite header: {}",
+                layout.bsite_path.display()
+            )
+        })?;
+        let bsite_header =
+            parse_bsite_header(&bsite_header, "kformat bsite").map_err(anyhow::Error::msg)?;
+        if bsite_header.n_samples != layout.meta.n_samples
+            || bsite_header.n_kmers != layout.meta.n_kmers
+            || bsite_header.bytes_per_col != layout.meta.bytes_per_col
+        {
+            bail!("bsite header does not match kfile metadata");
+        }
+        let expected_bsite_len = (BSITE_HEADER_SIZE as u64)
+            .checked_add(
+                layout
+                    .meta
+                    .n_kmers
+                    .checked_mul(layout.meta.bytes_per_col)
+                    .ok_or_else(|| anyhow::anyhow!("bsite payload length overflow"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("bsite file length overflow"))?;
+        let actual_bsite_len = bsite
+            .metadata()
+            .with_context(|| format!("failed to stat bsite: {}", layout.bsite_path.display()))?
+            .len();
+        if actual_bsite_len != expected_bsite_len {
+            bail!(
+                "bsite payload length mismatch: expected {}, got {}",
+                expected_bsite_len,
+                actual_bsite_len
+            );
+        }
+
+        Ok(Self {
+            bkmer,
+            bsite,
+            n_kmers: usize::try_from(layout.meta.n_kmers)
+                .map_err(|_| anyhow::anyhow!("k-mer count does not fit platform usize"))?,
+            n_samples: usize::try_from(layout.meta.n_samples)
+                .map_err(|_| anyhow::anyhow!("sample count does not fit platform usize"))?,
+            bytes_per_col: usize::try_from(layout.meta.bytes_per_col)
+                .map_err(|_| anyhow::anyhow!("bytes_per_col does not fit platform usize"))?,
+        })
+    }
+
+    fn read_block(&self, block_idx: usize, start: usize, end: usize) -> Result<InputBlock> {
+        if start > end || end > self.n_kmers {
+            bail!(
+                "invalid kformat block range: block={} start={} end={} n_kmers={}",
+                block_idx,
+                start,
+                end,
+                self.n_kmers
+            );
+        }
+        let rows = end - start;
+        let bkmer_len = rows
+            .checked_mul(8)
+            .ok_or_else(|| anyhow::anyhow!("bkmer block length overflow"))?;
+        let bsite_len = rows
+            .checked_mul(self.bytes_per_col)
+            .ok_or_else(|| anyhow::anyhow!("bsite block length overflow"))?;
+        let start_u64 =
+            u64::try_from(start).map_err(|_| anyhow::anyhow!("block start does not fit u64"))?;
+        let bkmer_offset = (BKMER_HEADER_SIZE as u64)
+            .checked_add(
+                start_u64
+                    .checked_mul(8)
+                    .ok_or_else(|| anyhow::anyhow!("bkmer block offset overflow"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("bkmer block offset overflow"))?;
+        let bsite_offset = (BSITE_HEADER_SIZE as u64)
+            .checked_add(
+                start_u64
+                    .checked_mul(self.bytes_per_col as u64)
+                    .ok_or_else(|| anyhow::anyhow!("bsite block offset overflow"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("bsite block offset overflow"))?;
+        let mut bkmer = vec![0u8; bkmer_len];
+        let mut bsite = vec![0u8; bsite_len];
+        read_exact_at(&self.bkmer, &mut bkmer, bkmer_offset)
+            .with_context(|| format!("failed to read bkmer block {block_idx}"))?;
+        read_exact_at(&self.bsite, &mut bsite, bsite_offset)
+            .with_context(|| format!("failed to read bsite block {block_idx}"))?;
+        Ok(InputBlock {
+            block_idx,
+            start,
+            bkmer,
+            bsite,
+            selected: Vec::new(),
+        })
+    }
 }
 
 fn resolve_meta_path(prefix_or_meta: &Path) -> PathBuf {
@@ -138,25 +328,6 @@ fn load_layout(prefix_or_meta: &Path) -> Result<KformatLayout> {
         }
     }
 
-    let bkmer = open_bkmer_mmap(&bkmer_path, "kformat bkmer").map_err(anyhow::Error::msg)?;
-    if bkmer.header.k != meta.k || bkmer.header.n_kmers != meta.n_kmers {
-        bail!("bkmer header does not match kfile metadata");
-    }
-    let bkmer_len = BKMER_HEADER_SIZE as u64 + meta.n_kmers * 8;
-    if bkmer.mmap.len() as u64 != bkmer_len {
-        bail!("bkmer payload length mismatch for {}", bkmer_path.display());
-    }
-    let bsite = open_bsite_mmap(&bsite_path, "kformat bsite").map_err(anyhow::Error::msg)?;
-    if bsite.header.n_samples != meta.n_samples
-        || bsite.header.n_kmers != meta.n_kmers
-        || bsite.header.bytes_per_col != meta.bytes_per_col
-    {
-        bail!("bsite header does not match kfile metadata");
-    }
-    let bsite_len = BSITE_HEADER_SIZE as u64 + meta.n_kmers * meta.bytes_per_col;
-    if bsite.mmap.len() as u64 != bsite_len {
-        bail!("bsite payload length mismatch for {}", bsite_path.display());
-    }
     let samples = read_idv_file(&idv_path)?;
     if samples.len() as u64 != meta.n_samples {
         bail!("idv sample count does not match kfile metadata");
@@ -237,32 +408,6 @@ fn bkmer_code_at(body: &[u8], row: usize) -> u64 {
     )
 }
 
-fn validate_scan_inputs(
-    bkmer_body: &[u8],
-    bsite_body: &[u8],
-    n_kmers: usize,
-    n_samples: usize,
-    maf_threshold: f64,
-) -> Result<usize> {
-    if n_samples == 0 {
-        bail!("kformat requires at least one sample");
-    }
-    let bytes_per_col = n_samples.div_ceil(8);
-    let expected_bkmer_len = n_kmers
-        .checked_mul(8)
-        .ok_or_else(|| anyhow::anyhow!("bkmer row count overflow"))?;
-    let expected_bsite_len = n_kmers
-        .checked_mul(bytes_per_col)
-        .ok_or_else(|| anyhow::anyhow!("bsite row count overflow"))?;
-    if bkmer_body.len() != expected_bkmer_len || bsite_body.len() != expected_bsite_len {
-        bail!("bsite body and bkmer row counts do not match");
-    }
-    if !(0.0..=0.5).contains(&maf_threshold) {
-        bail!("maf must be within [0, 0.5]");
-    }
-    Ok(bytes_per_col)
-}
-
 #[inline]
 fn row_is_selected(
     bkmer_body: &[u8],
@@ -284,15 +429,13 @@ fn row_is_selected(
 fn selected_rows_in_block(
     bkmer_body: &[u8],
     bsite_body: &[u8],
-    start: usize,
-    end: usize,
     n_samples: usize,
     bytes_per_col: usize,
     maf_threshold: f64,
     extract: Option<&HashSet<u64>>,
 ) -> Vec<u32> {
     let mut rows = Vec::new();
-    for row in start..end {
+    for row in 0..bkmer_body.len() / 8 {
         if row_is_selected(
             bkmer_body,
             bsite_body,
@@ -302,7 +445,7 @@ fn selected_rows_in_block(
             maf_threshold,
             extract,
         ) {
-            rows.push((row - start) as u32);
+            rows.push(row as u32);
         }
     }
     rows
@@ -314,26 +457,27 @@ fn selected_rows_in_block(
 /// at most a small number of completed blocks in the `BTreeMap`, so memory does
 /// not grow with the number of selected k-mers.
 fn stream_selected_rows<F>(
-    bkmer_body: &[u8],
-    bsite_body: &[u8],
-    n_kmers: usize,
-    n_samples: usize,
+    input: &KformatInput,
     maf_threshold: f64,
     extract: Option<&HashSet<u64>>,
     threads: usize,
     mut visit: F,
 ) -> Result<u64>
 where
-    F: FnMut(usize) -> Result<()>,
+    F: FnMut(usize, u64, &[u8], &[u8]) -> Result<()>,
 {
-    let bytes_per_col =
-        validate_scan_inputs(bkmer_body, bsite_body, n_kmers, n_samples, maf_threshold)?;
-    if n_kmers == 0 {
+    if input.n_samples == 0 {
+        bail!("kformat requires at least one sample");
+    }
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        bail!("maf must be within [0, 0.5]");
+    }
+    if input.n_kmers == 0 {
         return Ok(0);
     }
 
     let block = DEFAULT_SCAN_BLOCK_ROWS;
-    let n_blocks = n_kmers.div_ceil(block);
+    let n_blocks = input.n_kmers.div_ceil(block);
     let available_workers = thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1);
@@ -341,26 +485,44 @@ where
 
     if worker_count == 1 {
         let mut count = 0u64;
-        for row in 0..n_kmers {
-            if row_is_selected(
-                bkmer_body,
-                bsite_body,
-                row,
-                n_samples,
-                bytes_per_col,
+        for block_idx in 0..n_blocks {
+            let start = block_idx * block;
+            let end = (start + block).min(input.n_kmers);
+            let mut input_block = input.read_block(block_idx, start, end)?;
+            input_block.selected = selected_rows_in_block(
+                &input_block.bkmer,
+                &input_block.bsite,
+                input.n_samples,
+                input.bytes_per_col,
                 maf_threshold,
                 extract,
-            ) {
-                visit(row)?;
+            );
+            for local_row in input_block.selected.iter().copied() {
+                let local_row = local_row as usize;
+                let kmer_bytes = &input_block.bkmer[local_row * 8..(local_row + 1) * 8];
+                let code = bkmer_code_at(&input_block.bkmer, local_row);
+                let col = &input_block.bsite
+                    [local_row * input.bytes_per_col..(local_row + 1) * input.bytes_per_col];
+                visit(input_block.start + local_row, code, kmer_bytes, col)?;
                 count += 1;
             }
+            discard_file_range(
+                &input.bkmer,
+                BKMER_HEADER_SIZE as u64 + (start as u64) * 8,
+                input_block.bkmer.len() as u64,
+            );
+            discard_file_range(
+                &input.bsite,
+                BSITE_HEADER_SIZE as u64 + (start as u64) * input.bytes_per_col as u64,
+                input_block.bsite.len() as u64,
+            );
         }
         return Ok(count);
     }
 
     let channel_capacity = worker_count.saturating_mul(2).max(1);
     let (job_tx, job_rx) = sync_channel::<(usize, usize, usize)>(channel_capacity);
-    let (result_tx, result_rx) = sync_channel::<(usize, Vec<u32>)>(channel_capacity);
+    let (result_tx, result_rx) = sync_channel::<Result<InputBlock>>(channel_capacity);
     let shared_job_rx = Arc::new(Mutex::new(job_rx));
 
     thread::scope(|scope| -> Result<u64> {
@@ -375,24 +537,27 @@ where
                 let Ok((block_idx, start, end)) = job else {
                     return;
                 };
-                let rows = selected_rows_in_block(
-                    bkmer_body,
-                    bsite_body,
-                    start,
-                    end,
-                    n_samples,
-                    bytes_per_col,
-                    maf_threshold,
-                    extract,
-                );
-                if worker_result_tx.send((block_idx, rows)).is_err() {
+                let result = input
+                    .read_block(block_idx, start, end)
+                    .and_then(|mut block| {
+                        block.selected = selected_rows_in_block(
+                            &block.bkmer,
+                            &block.bsite,
+                            input.n_samples,
+                            input.bytes_per_col,
+                            maf_threshold,
+                            extract,
+                        );
+                        Ok(block)
+                    });
+                if worker_result_tx.send(result).is_err() {
                     return;
                 }
             });
         }
         drop(result_tx);
 
-        let mut pending: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        let mut pending: BTreeMap<usize, InputBlock> = BTreeMap::new();
         let mut next_block = 0usize;
         let mut next_to_dispatch = 0usize;
         let mut count = 0u64;
@@ -403,7 +568,7 @@ where
         let window = channel_capacity;
         while next_to_dispatch < n_blocks && next_to_dispatch - next_block < window {
             let start = next_to_dispatch * block;
-            let end = (start + block).min(n_kmers);
+            let end = (start + block).min(input.n_kmers);
             job_tx
                 .send((next_to_dispatch, start, end))
                 .map_err(|_| anyhow::anyhow!("kformat worker pipeline stopped early"))?;
@@ -411,22 +576,38 @@ where
         }
 
         for _ in 0..n_blocks {
-            let (block_idx, rows) = result_rx
+            let result_block = result_rx
                 .recv()
                 .map_err(|_| anyhow::anyhow!("kformat worker pipeline stopped early"))?;
-            pending.insert(block_idx, rows);
-            while let Some(rows) = pending.remove(&next_block) {
-                let start = next_block * block;
-                for local_row in rows {
-                    visit(start + local_row as usize)?;
+            let input_block = result_block?;
+            pending.insert(input_block.block_idx, input_block);
+            while let Some(input_block) = pending.remove(&next_block) {
+                for local_row in input_block.selected.iter().copied() {
+                    let local_row = local_row as usize;
+                    let kmer_bytes = &input_block.bkmer[local_row * 8..(local_row + 1) * 8];
+                    let code = bkmer_code_at(&input_block.bkmer, local_row);
+                    let col = &input_block.bsite
+                        [local_row * input.bytes_per_col..(local_row + 1) * input.bytes_per_col];
+                    visit(input_block.start + local_row, code, kmer_bytes, col)?;
                     count += 1;
                 }
+                discard_file_range(
+                    &input.bkmer,
+                    BKMER_HEADER_SIZE as u64 + (input_block.start as u64) * 8,
+                    input_block.bkmer.len() as u64,
+                );
+                discard_file_range(
+                    &input.bsite,
+                    BSITE_HEADER_SIZE as u64
+                        + (input_block.start as u64) * input.bytes_per_col as u64,
+                    input_block.bsite.len() as u64,
+                );
                 next_block += 1;
             }
 
             while next_to_dispatch < n_blocks && next_to_dispatch - next_block < window {
                 let start = next_to_dispatch * block;
-                let end = (start + block).min(n_kmers);
+                let end = (start + block).min(input.n_kmers);
                 job_tx
                     .send((next_to_dispatch, start, end))
                     .map_err(|_| anyhow::anyhow!("kformat worker pipeline stopped early"))?;
@@ -478,9 +659,7 @@ fn plink_row_from_bitset(col: &[u8], n_samples: usize) -> Vec<u8> {
 fn write_bfile(
     out_prefix: &Path,
     layout: &KformatLayout,
-    bkmer_body: &[u8],
-    bsite_body: &[u8],
-    n_kmers: usize,
+    input: &KformatInput,
     maf_threshold: f64,
     extract: Option<&HashSet<u64>>,
     threads: usize,
@@ -501,20 +680,15 @@ fn write_bfile(
     let mut bed =
         BufWriter::with_capacity(8 * 1024 * 1024, File::create(format!("{out_prefix}.bed"))?);
     bed.write_all(&[0x6c, 0x1b, 0x01])?;
-    let bytes_per_col = layout.meta.bytes_per_col as usize;
     let mut out_idx = 0u64;
     let written = stream_selected_rows(
-        bkmer_body,
-        bsite_body,
-        n_kmers,
-        layout.samples.len(),
+        input,
         maf_threshold,
         extract,
         threads,
-        |row| {
-            let kmer = decode_kmer_u64(bkmer_code_at(bkmer_body, row), layout.meta.k);
+        |_row, code, _kmer_bytes, col| {
+            let kmer = decode_kmer_u64(code, layout.meta.k);
             writeln!(bim, "0\t{kmer}\t0\t{}\tA\tG", out_idx + 1)?;
-            let col = &bsite_body[row * bytes_per_col..(row + 1) * bytes_per_col];
             bed.write_all(&plink_row_from_bitset(col, layout.samples.len()))?;
             out_idx += 1;
             Ok(())
@@ -529,9 +703,7 @@ fn write_kfile(
     out_prefix: &Path,
     output_name: &str,
     layout: &KformatLayout,
-    bkmer_body: &[u8],
-    bsite_body: &[u8],
-    n_kmers: usize,
+    input: &KformatInput,
     maf_threshold: f64,
     extract: Option<&HashSet<u64>>,
     threads: usize,
@@ -558,18 +730,14 @@ fn write_kfile(
         bytes_per_col: layout.meta.bytes_per_col,
     }
     .write_to(&mut bsite_writer)?;
-    let bytes_per_col = layout.meta.bytes_per_col as usize;
     let written = stream_selected_rows(
-        bkmer_body,
-        bsite_body,
-        n_kmers,
-        layout.samples.len(),
+        input,
         maf_threshold,
         extract,
         threads,
-        |row| {
-            bkmer_writer.write_all(&bkmer_body[row * 8..(row + 1) * 8])?;
-            bsite_writer.write_all(&bsite_body[row * bytes_per_col..(row + 1) * bytes_per_col])?;
+        |_row, _code, kmer_bytes, col| {
+            bkmer_writer.write_all(kmer_bytes)?;
+            bsite_writer.write_all(col)?;
             Ok(())
         },
     )?;
@@ -751,25 +919,13 @@ fn run_kformat(
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
+    let input_reader = KformatInput::open(&layout)?;
     let output_name = output
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("output prefix must have a valid file name"))?
         .to_string();
     let (temp_dir, temp_prefix) = make_temp_output_prefix(&output)?;
-    let bkmer = open_bkmer_mmap(&layout.bkmer_path, "kformat bkmer").map_err(anyhow::Error::msg)?;
-    let bsite = open_bsite_mmap(&layout.bsite_path, "kformat bsite").map_err(anyhow::Error::msg)?;
-    #[cfg(unix)]
-    {
-        let _ = bkmer.mmap.advise(Advice::Sequential);
-        let _ = bsite.mmap.advise(Advice::Sequential);
-    }
-    let bkmer_body = bkmer
-        .body_prefix_for_rows(bkmer.header.n_kmers)
-        .map_err(anyhow::Error::msg)?;
-    let bsite_body = bsite.body().map_err(anyhow::Error::msg)?;
-    let n_kmers = usize::try_from(layout.meta.n_kmers)
-        .map_err(|_| anyhow::anyhow!("kfile row count does not fit platform usize"))?;
     let extract = extract_kmers
         .map(|items| normalize_extract_codes(items, layout.meta.k, layout.meta.canonical))
         .transpose()?;
@@ -778,9 +934,7 @@ fn run_kformat(
         write_bfile(
             &temp_prefix,
             &layout,
-            bkmer_body,
-            bsite_body,
-            n_kmers,
+            &input_reader,
             maf,
             extract.as_ref(),
             thread,
@@ -790,9 +944,7 @@ fn run_kformat(
             &temp_prefix,
             &output_name,
             &layout,
-            bkmer_body,
-            bsite_body,
-            n_kmers,
+            &input_reader,
             maf,
             extract.as_ref(),
             thread,
@@ -828,15 +980,89 @@ fn run_kformat(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::fs;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::Write;
     use std::path::PathBuf;
 
     use super::{
         maf_from_bitset, normalize_extract_codes, plink_row_from_presence, stream_selected_rows,
-        write_kfile, KformatLayout, DEFAULT_SCAN_BLOCK_ROWS,
+        write_kfile, KformatInput, KformatLayout, DEFAULT_SCAN_BLOCK_ROWS,
     };
     use crate::kmer::encode::{canonical_code, encode_kmer_u64};
-    use crate::kmer::format::{KmergeMeta, SampleEntry};
+    use crate::kmer::format::{BkmerHeader, BsiteHeader, KmergeMeta, SampleEntry};
+    use crate::kmer::writer::{write_idv_file, write_meta_json};
+
+    fn test_fixture(
+        n_kmers: usize,
+        n_samples: usize,
+    ) -> (PathBuf, KformatLayout, Vec<u8>, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_kformat_windowed_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp directory");
+        let bytes_per_col = n_samples.div_ceil(8);
+        let mut bkmer_body = Vec::with_capacity(n_kmers * 8);
+        for code in 0u64..n_kmers as u64 {
+            bkmer_body.extend_from_slice(&code.to_le_bytes());
+        }
+        let bsite_body = vec![1u8; n_kmers * bytes_per_col];
+        let bkmer_path = dir.join("input.bkmer");
+        let bsite_path = dir.join("input.bsite");
+        let mut bkmer = File::create(&bkmer_path).expect("create bkmer");
+        BkmerHeader {
+            k: 4,
+            n_kmers: n_kmers as u64,
+            canonical: 1,
+        }
+        .write_to(&mut bkmer)
+        .expect("write bkmer header");
+        bkmer.write_all(&bkmer_body).expect("write bkmer body");
+        let mut bsite = File::create(&bsite_path).expect("create bsite");
+        BsiteHeader {
+            n_samples: n_samples as u64,
+            n_kmers: n_kmers as u64,
+            bytes_per_col: bytes_per_col as u64,
+        }
+        .write_to(&mut bsite)
+        .expect("write bsite header");
+        bsite.write_all(&bsite_body).expect("write bsite body");
+        let samples = (0..n_samples)
+            .map(|idx| SampleEntry {
+                index: idx as u32,
+                sample_id: format!("S{}", idx + 1),
+                kmc_prefix: String::new(),
+            })
+            .collect();
+        let layout = KformatLayout {
+            bkmer_path,
+            bsite_path,
+            meta: KmergeMeta {
+                format: "janusx-kmer-bitmatrix-v1".to_string(),
+                k: 4,
+                n_samples: n_samples as u64,
+                n_kmers: n_kmers as u64,
+                bytes_per_col: bytes_per_col as u64,
+                encoding: "ACGT_2BIT_A00_C01_G10_T11".to_string(),
+                canonical: true,
+                matrix_layout: "column_major_bitset".to_string(),
+                value_type: "binary_presence".to_string(),
+                bit_order: "little_bit_order".to_string(),
+                bkmer_file: "input.bkmer".to_string(),
+                bsite_file: "input.bsite".to_string(),
+                idv_file: "input.idv".to_string(),
+                min_count: 1,
+                min_presence_rate: 0.0,
+                max_presence_rate: 1.0,
+                bucket_bits: 0,
+                compression: "none".to_string(),
+            },
+            samples,
+        };
+        (dir, layout, bkmer_body, bsite_body)
+    }
 
     #[test]
     fn maf_uses_valid_sample_bits_only() {
@@ -852,24 +1078,32 @@ mod tests {
 
     #[test]
     fn packed_selection_keeps_source_order() {
-        let codes = vec![11u64, 22, 33, 44];
-        let mut bkmer = Vec::with_capacity(codes.len() * 8);
-        for code in &codes {
-            bkmer.extend_from_slice(&code.to_le_bytes());
+        let (dir, layout, mut bkmer_body, _bsite_body) = test_fixture(4, 3);
+        let codes = [11u64, 22, 33, 44];
+        bkmer_body.clear();
+        for code in codes {
+            bkmer_body.extend_from_slice(&code.to_le_bytes());
         }
-        let bsite = vec![0b0000_0001, 0b0000_0011, 0b0000_0000, 0b0000_0111];
+        let mut rewritten = File::create(&layout.bkmer_path).expect("rewrite bkmer");
+        BkmerHeader {
+            k: 4,
+            n_kmers: 4,
+            canonical: 1,
+        }
+        .write_to(&mut rewritten)
+        .expect("write bkmer header");
+        rewritten.write_all(&bkmer_body).expect("write bkmer body");
         let mut extract = HashSet::new();
         extract.insert(44u64);
         let mut keep = Vec::new();
+        let input = KformatInput::open(&layout).expect("open input");
         let written = stream_selected_rows(
-            &bkmer,
-            &bsite,
-            codes.len(),
-            3,
+            &input,
             0.0,
             Some(&extract),
             2,
-            |row| {
+            |row, code, _kmer_bytes, _presence| {
+                assert_eq!(code, 44);
                 keep.push(row);
                 Ok(())
             },
@@ -877,36 +1111,31 @@ mod tests {
         .expect("select");
         assert_eq!(written, 1);
         assert_eq!(keep, vec![3]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn streaming_selection_counts_rows_without_materializing_indices() {
-        let codes = vec![11u64, 22, 33, 44];
-        let mut bkmer = Vec::with_capacity(codes.len() * 8);
-        for code in &codes {
-            bkmer.extend_from_slice(&code.to_le_bytes());
-        }
-        let bsite = vec![0b0000_0001, 0b0000_0011, 0b0000_0000, 0b0000_0111];
+        let (dir, layout, _bkmer_body, _bsite_body) = test_fixture(4, 3);
+        let input = KformatInput::open(&layout).expect("open input");
         let mut count = 0usize;
-        let written = stream_selected_rows(&bkmer, &bsite, codes.len(), 3, 0.0, None, 2, |_| {
+        let written = stream_selected_rows(&input, 0.0, None, 2, |_, _, _, _| {
             count += 1;
             Ok(())
         })
         .expect("count selected rows");
         assert_eq!(written, count as u64);
         assert_eq!(count, 4);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn streaming_selection_preserves_order_across_parallel_blocks() {
         let n_kmers = DEFAULT_SCAN_BLOCK_ROWS * 3 + 17;
-        let mut bkmer = Vec::with_capacity(n_kmers * 8);
-        for code in 0u64..n_kmers as u64 {
-            bkmer.extend_from_slice(&code.to_le_bytes());
-        }
-        let bsite = vec![1u8; n_kmers];
+        let (dir, layout, _bkmer_body, _bsite_body) = test_fixture(n_kmers, 8);
+        let input = KformatInput::open(&layout).expect("open input");
         let mut keep = Vec::with_capacity(n_kmers);
-        let written = stream_selected_rows(&bkmer, &bsite, n_kmers, 8, 0.0, None, 3, |row| {
+        let written = stream_selected_rows(&input, 0.0, None, 3, |row, _, _, _| {
             keep.push(row);
             Ok(())
         })
@@ -915,77 +1144,74 @@ mod tests {
         assert_eq!(written, n_kmers as u64);
         assert_eq!(keep.len(), n_kmers);
         assert!(keep.iter().copied().eq(0..n_kmers));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window_reader_reads_middle_block() {
+        let n_kmers = DEFAULT_SCAN_BLOCK_ROWS * 2 + 7;
+        let (dir, layout, bkmer_body, bsite_body) = test_fixture(n_kmers, 8);
+        let input = KformatInput::open(&layout).expect("open input");
+        let start = DEFAULT_SCAN_BLOCK_ROWS;
+        let end = DEFAULT_SCAN_BLOCK_ROWS * 2;
+        let block = input.read_block(1, start, end).expect("read middle block");
+        assert_eq!(block.block_idx, 1);
+        assert_eq!(&block.bkmer[..8], &bkmer_body[start * 8..start * 8 + 8]);
+        assert_eq!(&block.bsite[..8], &bsite_body[start..start + 8]);
+        assert_eq!(block.bkmer.len(), (end - start) * 8);
+        assert_eq!(block.bsite.len(), end - start);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window_reader_rejects_truncated_payload() {
+        let (dir, layout, _bkmer_body, bsite_body) = test_fixture(32, 8);
+        let truncated_len = (super::BSITE_HEADER_SIZE + bsite_body.len() - 1) as u64;
+        OpenOptions::new()
+            .write(true)
+            .open(&layout.bsite_path)
+            .expect("open bsite")
+            .set_len(truncated_len)
+            .expect("truncate bsite");
+        let error = match KformatInput::open(&layout) {
+            Ok(_) => panic!("truncated bsite must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("payload length"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn kfile_writer_patches_streamed_row_count_and_preserves_payload_order() {
-        let dir = std::env::temp_dir().join(format!(
-            "janusx_kformat_streaming_{}_{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("t")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create temp directory");
-        let layout = KformatLayout {
-            bkmer_path: PathBuf::new(),
-            bsite_path: PathBuf::new(),
-            meta: KmergeMeta {
-                format: "janusx-kmer-bitmatrix-v1".to_string(),
-                k: 4,
-                n_samples: 3,
-                n_kmers: 4,
-                bytes_per_col: 1,
-                encoding: "ACGT-2bit-u64".to_string(),
-                canonical: true,
-                matrix_layout: "column_major_bitset".to_string(),
-                value_type: "binary_presence".to_string(),
-                bit_order: "little_bit_order".to_string(),
-                bkmer_file: "input.bkmer".to_string(),
-                bsite_file: "input.bsite".to_string(),
-                idv_file: "input.idv".to_string(),
-                min_count: 1,
-                min_presence_rate: 0.0,
-                max_presence_rate: 1.0,
-                bucket_bits: 0,
-                compression: "none".to_string(),
-            },
-            samples: vec![
-                SampleEntry {
-                    index: 0,
-                    sample_id: "S1".to_string(),
-                    kmc_prefix: String::new(),
-                },
-                SampleEntry {
-                    index: 1,
-                    sample_id: "S2".to_string(),
-                    kmc_prefix: String::new(),
-                },
-                SampleEntry {
-                    index: 2,
-                    sample_id: "S3".to_string(),
-                    kmc_prefix: String::new(),
-                },
-            ],
-        };
+        let (dir, layout, mut bkmer_body, _fixture_bsite_body) = test_fixture(4, 3);
         let codes = [11u64, 22, 33, 44];
-        let mut bkmer_body = Vec::with_capacity(codes.len() * 8);
+        bkmer_body.clear();
         for code in codes {
             bkmer_body.extend_from_slice(&code.to_le_bytes());
         }
         let bsite_body = vec![0b0000_0001, 0b0000_0011, 0b0000_0000, 0b0000_0111];
+        let mut bkmer = File::create(&layout.bkmer_path).expect("rewrite bkmer");
+        BkmerHeader {
+            k: 4,
+            n_kmers: 4,
+            canonical: 1,
+        }
+        .write_to(&mut bkmer)
+        .expect("write bkmer header");
+        bkmer.write_all(&bkmer_body).expect("write bkmer body");
+        let mut bsite = File::create(&layout.bsite_path).expect("rewrite bsite");
+        BsiteHeader {
+            n_samples: 3,
+            n_kmers: 4,
+            bytes_per_col: 1,
+        }
+        .write_to(&mut bsite)
+        .expect("write bsite header");
+        bsite.write_all(&bsite_body).expect("write bsite body");
+        let input = KformatInput::open(&layout).expect("open input");
 
-        let written = write_kfile(
-            &dir.join("out"),
-            "out",
-            &layout,
-            &bkmer_body,
-            &bsite_body,
-            codes.len(),
-            0.25,
-            None,
-            2,
-        )
-        .expect("write streamed kfile");
+        let written = write_kfile(&dir.join("out"), "out", &layout, &input, 0.25, None, 2)
+            .expect("write streamed kfile");
         assert_eq!(written, 2);
 
         let bkmer = fs::read(dir.join("out.bkmer")).expect("read bkmer");
@@ -998,6 +1224,48 @@ mod tests {
             serde_json::from_slice(&fs::read(dir.join("out.meta.json")).expect("read meta"))
                 .expect("parse meta");
         assert_eq!(meta.n_kmers, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_kformat_writes_bfile_from_windowed_input() {
+        let (dir, layout, _bkmer_body, _bsite_body) = test_fixture(4, 3);
+        write_idv_file(&dir.join("input.idv"), &layout.samples).expect("write idv");
+        write_meta_json(&dir.join("input.meta.json"), &layout.meta).expect("write meta");
+
+        let output = dir.join("out");
+        let summary = super::run_kformat(
+            &dir.join("input.meta.json").to_string_lossy(),
+            &output.to_string_lossy(),
+            "bfile",
+            0.25,
+            None,
+            3,
+            false,
+        )
+        .expect("run windowed bfile conversion");
+        assert_eq!(summary.n_kmers_in, 4);
+        assert_eq!(summary.n_kmers_out, 4);
+        assert_eq!(
+            fs::read(output.with_extension("bed"))
+                .expect("read bed")
+                .len(),
+            3 + 4
+        );
+        assert_eq!(
+            fs::read_to_string(output.with_extension("bim"))
+                .expect("read bim")
+                .lines()
+                .count(),
+            4
+        );
+        assert_eq!(
+            fs::read_to_string(output.with_extension("fam"))
+                .expect("read fam")
+                .lines()
+                .count(),
+            3
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

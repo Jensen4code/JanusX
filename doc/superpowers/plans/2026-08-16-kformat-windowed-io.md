@@ -27,11 +27,11 @@
 **Interfaces:**
 - Tests will exercise `KformatInput::open`, `KformatInput::read_block`, and the refactored `stream_selected_rows` callback contract.
 
-- [ ] **Step 1: Add a test fixture helper that writes valid packed input files.**
+- [x] **Step 1: Add a test fixture helper that writes valid packed input files.**
 
 Create a test-only helper that writes the real binary headers followed by supplied `.bkmer` and `.bsite` bodies into a unique temporary directory. It must return a `KformatLayout` whose paths point to those files and remove the directory at the end of each test.
 
-- [ ] **Step 2: Add a failing positional-read test.**
+- [x] **Step 2: Add a failing positional-read test.**
 
 Write a fixture with more than one `DEFAULT_SCAN_BLOCK_ROWS` block, open it through the wished-for `KformatInput::open`, read a middle block, and assert that its first and last row bytes match the source body. Run:
 
@@ -41,11 +41,11 @@ cargo test --offline kmer::kformat::tests::window_reader_reads_middle_block --li
 
 Expected result before implementation: compile failure because `KformatInput` is not defined.
 
-- [ ] **Step 3: Add a failing short-read test.**
+- [x] **Step 3: Add a failing short-read test.**
 
 Truncate one fixture payload after writing a valid header and assert that `KformatInput::open` or `read_block` returns an error containing `payload length` or `short read`. Run the focused test and confirm the failure is due to the missing reader behavior, not a test typo.
 
-- [ ] **Step 4: Update the selection tests to the block-reader API.**
+- [x] **Step 4: Update the selection tests to the block-reader API.**
 
 Change the existing source-order, count, and multi-block ordering tests to create a fixture and call the new `stream_selected_rows` callback with `(row, code, kmer_bytes, presence_bytes)`. Keep assertions on selected row order and payload bytes.
 
@@ -60,23 +60,23 @@ Change the existing source-order, count, and multi-block ordering tests to creat
 - Add `InputBlock { block_idx, start, bkmer, bsite, selected }`.
 - Refactor `stream_selected_rows` to accept `&KformatInput` and call `FnMut(usize, u64, &[u8], &[u8])` for each selected source row.
 
-- [ ] **Step 1: Add header-only validation.**
+- [x] **Step 1: Add header-only validation.**
 
 Replace `load_layout`’s full-file `open_*_mmap` validation with ordinary file opens, fixed-size header reads, `parse_bkmer_header`/`parse_bsite_header`, and `fs::metadata` length checks. Preserve every existing metadata mismatch error and close the validation handles before conversion.
 
-- [ ] **Step 2: Implement checked positional reads.**
+- [x] **Step 2: Implement checked positional reads.**
 
 Use `FileExt::read_exact_at` on Unix and a cloned-file seek/read fallback for non-Unix builds. Calculate header-plus-row offsets with checked `u64` arithmetic. Allocate exactly `8 * rows` and `bytes_per_col * rows` bytes for each block and return an error on overflow or short read.
 
-- [ ] **Step 3: Refactor block-local filtering.**
+- [x] **Step 3: Refactor block-local filtering.**
 
 Make `row_is_selected` and `selected_rows_in_block` consume block-local slices and local row indices. The worker reads its input block, filters it, and returns the block buffers plus `Vec<u32>` offsets. Preserve extract short-circuiting and MAF semantics.
 
-- [ ] **Step 4: Refactor the bounded ordered pipeline.**
+- [x] **Step 4: Refactor the bounded ordered pipeline.**
 
 Keep the existing worker count, sync-channel capacity, dispatch window, and `BTreeMap` ordering logic. Replace global mmap slices with `KformatInput::read_block`; when consuming a block, derive the code and presence slice from that block and invoke the new callback. Drop the block immediately after its rows are written.
 
-- [ ] **Step 5: Run the Task 1 focused tests.**
+- [x] **Step 5: Run the Task 1 focused tests.**
 
 Run:
 
@@ -95,19 +95,19 @@ Expected result: all kformat tests pass, including the new positional-read and s
 - `write_bfile` and `write_kfile` consume `&KformatInput` rather than body slices.
 - `run_kformat` opens one `KformatInput` and no longer calls `open_*_mmap`, `Advice::Sequential`, or full-body accessors.
 
-- [ ] **Step 1: Adapt bfile writing.**
+- [x] **Step 1: Adapt bfile writing.**
 
 Use the callback’s decoded code and block-local presence bytes for `.bim` and `.bed` output. Keep PLINK row encoding and output counters unchanged.
 
-- [ ] **Step 2: Adapt kfile writing.**
+- [x] **Step 2: Adapt kfile writing.**
 
 Write the callback’s original eight k-mer bytes and presence bytes, preserving exact payload order. Keep placeholder headers, seek-back count patching, metadata, and temporary-output commit behavior unchanged.
 
-- [ ] **Step 3: Add Linux page-cache discard advice.**
+- [x] **Step 3: Add Linux page-cache discard advice.**
 
 After ordered consumption of each block, call `libc::posix_fadvise` with `POSIX_FADV_DONTNEED` for the corresponding input ranges on Linux. Ignore non-zero advisory return codes and compile the helper as a no-op on platforms without this API.
 
-- [ ] **Step 4: Run formatting and focused tests.**
+- [x] **Step 4: Run formatting and focused tests.**
 
 Run:
 
@@ -126,27 +126,26 @@ cargo test --offline kmer::kformat::tests --lib
 **Interfaces:**
 - Python `jxrs.kformat_run` remains unchanged.
 
-- [ ] **Step 1: Rebuild the local PyO3 extension.**
+- [x] **Step 1: Rebuild the local PyO3 extension.**
 
 Use the `jxfu` environment and the existing `maturin develop --release --locked --features python-extension` workflow from the JanusX project instructions.
 
-- [ ] **Step 2: Run kfile and bfile Python smoke conversions.**
+- [x] **Step 2: Run kfile and bfile Python smoke conversions.**
 
 Verify both output formats, MAF filtering, multi-thread ordering, and header counts with a small generated fixture.
 
-- [ ] **Step 3: Run a larger local memory smoke test.**
+- [x] **Step 3: Run a larger local memory smoke test.**
 
 Generate enough rows to span many blocks and execute under `/usr/bin/time -l`; verify RSS stays near a fixed bound as row count increases rather than scaling with total input bytes.
 
-- [ ] **Step 4: Review the final diff and record known unrelated failures.**
+- [x] **Step 4: Review the final diff and record known unrelated failures.**
 
 Inspect staged paths to ensure no local test/benchmark script is committed. Run the focused suite and report the existing unrelated full-suite failures separately.
 
-- [ ] **Step 5: Commit implementation.**
+- [x] **Step 5: Commit implementation.**
 
 ```bash
 git add src/kmer/kformat.rs
 git diff --cached --name-only
 git commit -m "fix(kformat): bound input memory with windowed reads"
 ```
-
