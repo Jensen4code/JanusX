@@ -10691,6 +10691,7 @@ def _overlay_manhattan_threshold_points(
     plotmodel: GWASPLOT,
     *,
     threshold: float,
+    draw_threshold_line: bool = True,
     base_size: float,
     marker: str,
     rasterized: bool,
@@ -10754,12 +10755,13 @@ def _overlay_manhattan_threshold_points(
             zorder=6,
             **_marker_scatter_style(str(marker)),
         )
-    ax.axhline(
-        y=thr_log,
-        linestyle="dashed",
-        color="grey",
-        linewidth=1.0,
-    )
+    if bool(draw_threshold_line):
+        ax.axhline(
+            y=thr_log,
+            linestyle="dashed",
+            color="grey",
+            linewidth=1.0,
+        )
 
 
 def _postgwas_logic_combo_mask(df: pd.DataFrame) -> np.ndarray:
@@ -10783,6 +10785,7 @@ def _overlay_manhattan_interaction_padj_points(
     plotmodel: GWASPLOT,
     *,
     threshold: float,
+    draw_threshold_line: bool = True,
     base_size: float,
     marker: str,
     rasterized: bool,
@@ -10848,7 +10851,7 @@ def _overlay_manhattan_interaction_padj_points(
             **_marker_scatter_style(str(marker)),
         )
 
-    if np.isfinite(threshold):
+    if bool(draw_threshold_line) and np.isfinite(threshold):
         thr_log = _postgwas_threshold_to_logp(
             threshold,
             no_logtrans=no_logtrans,
@@ -10868,6 +10871,7 @@ def _overlay_postgwas_manhattan_hits(
     plotmodel: GWASPLOT,
     *,
     threshold: float,
+    draw_threshold_line: bool = True,
     base_size: float,
     marker: str,
     rasterized: bool,
@@ -10880,6 +10884,7 @@ def _overlay_postgwas_manhattan_hits(
         ax,
         plotmodel,
         threshold=threshold,
+        draw_threshold_line=draw_threshold_line,
         base_size=base_size,
         marker=marker,
         rasterized=rasterized,
@@ -10893,6 +10898,7 @@ def _overlay_postgwas_manhattan_hits(
         ax,
         plotmodel,
         threshold=threshold,
+        draw_threshold_line=draw_threshold_line,
         base_size=base_size,
         marker=marker,
         rasterized=rasterized,
@@ -11007,6 +11013,27 @@ def _postgwas_default_threshold(
     if bool(no_logtrans):
         return float(_postgwas_plot_logp_values([raw_threshold], no_logtrans=False)[0])
     return raw_threshold
+
+
+def _postgwas_manhattan_y_label(
+    pvalue_column: object,
+    *,
+    no_logtrans: bool = False,
+) -> Optional[str]:
+    """Return the explicit Manhattan y-axis label for precomputed logP."""
+    if not bool(no_logtrans):
+        return None
+    label = str(pvalue_column).strip()
+    return label if label != "" else None
+
+
+def _postgwas_should_draw_threshold_line(
+    explicit_threshold: object,
+    *,
+    no_logtrans: bool = False,
+) -> bool:
+    """Disable only the automatic threshold line for precomputed logP."""
+    return not (bool(no_logtrans) and explicit_threshold is None)
 
 
 def _postgwas_output_format_from_path(path: str) -> str:
@@ -11472,6 +11499,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             no_logtrans=no_logtrans,
         )
     )
+    draw_threshold_line = _postgwas_should_draw_threshold_line(
+        args.thr,
+        no_logtrans=no_logtrans,
+    )
     effective_ldblock_ratio = (
         args.ldblock_ratio
         if bool(getattr(args, "_postgwas_single_ldblock_requested", False))
@@ -11693,6 +11724,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
                         y_min=manh_ymin,
+                        y_label=_postgwas_manhattan_y_label(
+                            p_col,
+                            no_logtrans=no_logtrans,
+                        ),
                         s=single_scatter_size,
                         alpha=(float(single_alpha) if single_alpha is not None else 0.78),
                         rasterized=rasterized,
@@ -11701,6 +11736,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax,
                         plotmodel,
                         threshold=threshold,
+                        draw_threshold_line=draw_threshold_line,
                         base_size=single_scatter_size,
                         marker=single_marker,
                         rasterized=rasterized,
@@ -11752,6 +11788,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
                         y_min=manh_ymin,
+                        y_label=_postgwas_manhattan_y_label(
+                            p_col,
+                            no_logtrans=no_logtrans,
+                        ),
                         s=single_scatter_size,
                         alpha=(float(single_alpha) if single_alpha is not None else 0.78),
                         ignore=df_hl_idx,
@@ -11761,6 +11801,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax,
                         plotmodel,
                         threshold=threshold,
+                        draw_threshold_line=draw_threshold_line,
                         base_size=single_scatter_size,
                         marker=single_marker,
                         rasterized=rasterized,
@@ -11778,6 +11819,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     min_logp=manh_min_logp,
                     max_logp=manh_max_logp,
                     y_min=manh_ymin,
+                    y_label=_postgwas_manhattan_y_label(
+                        p_col,
+                        no_logtrans=no_logtrans,
+                    ),
                     s=single_scatter_size,
                     alpha=(float(single_alpha) if single_alpha is not None else 0.78),
                     rasterized=rasterized,
@@ -11786,6 +11831,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax,
                     plotmodel,
                     threshold=threshold,
+                    draw_threshold_line=draw_threshold_line,
                     base_size=single_scatter_size,
                     marker=single_marker,
                     rasterized=rasterized,
@@ -11879,6 +11925,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     link_type_col="link_type",
                     link_pvalue_col="link_pvalue",
                     link_pvalue_is_log10=no_logtrans,
+                    draw_threshold_line=draw_threshold_line,
                     marker=single_marker,
                     scatter_size=single_scatter_size,
                     scatter_alpha=(
@@ -12863,6 +12910,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             no_logtrans=no_logtrans,
         )
     )
+    draw_threshold_line = _postgwas_should_draw_threshold_line(
+        args.thr,
+        no_logtrans=no_logtrans,
+    )
 
     xticks: list[float] = []
     xticklabels: list[str] = []
@@ -12980,7 +13031,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 threshold_merge,
                 no_logtrans=no_logtrans,
             )
-            if np.isfinite(threshold_merge)
+            if draw_threshold_line and np.isfinite(threshold_merge)
             else None
         )
         if thr_log is not None and np.isfinite(thr_log):
@@ -13056,7 +13107,13 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 draw_xmaxs.append(float(np.nanmax(x_keep)))
 
         ax.set_xlabel("Chromosome")
-        ax.set_ylabel("-log10(p)")
+        ax.set_ylabel(
+            _postgwas_manhattan_y_label(
+                p_col,
+                no_logtrans=no_logtrans,
+            )
+            or "-log10(p)"
+        )
         if (
             x_axis_left is not None
             and x_axis_right is not None
@@ -14751,7 +14808,8 @@ def main(argv: Optional[list[str]] = None):
         action="store_true",
         help=(
             "Treat the selected p-value column as already being -log10(p); "
-            "--thr is then used directly on the logP scale."
+            "--thr is then used directly on the logP scale, and no automatic "
+            "threshold line is drawn unless --thr is supplied."
         ),
     )
     common_group.add_argument(

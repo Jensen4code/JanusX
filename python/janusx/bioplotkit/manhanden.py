@@ -815,6 +815,7 @@ class GWASPLOT:
         min_logp: Union[float, None] = 0.5,
         max_logp: Union[float, None] = None,
         y_min: Union[float, None] = None,
+        y_label: Union[str, None] = None,
         **kwargs,
     ) -> plt.Axes:
         """
@@ -842,6 +843,7 @@ class GWASPLOT:
             color_set = ["black", "grey"]
         if ignore is None:
             ignore = []
+        axis_y_label = "-log10(p-value)" if y_label is None else str(y_label)
 
         # subset to plotting SNPs
         df = self.df.iloc[self.minidx, -3:].copy()
@@ -860,7 +862,7 @@ class GWASPLOT:
             ax.text(0.5, 0.5, "No SNPs", ha="center", va="center", transform=ax.transAxes)
             ax.set_xticks(self.ticks_loc, self.chr_labels)
             ax.set_xlabel("Chromosome")
-            ax.set_ylabel("-log10(p-value)")
+            ax.set_ylabel(axis_y_label)
             return ax
 
         # color per chromosome (alternating colors)
@@ -948,7 +950,7 @@ class GWASPLOT:
             top = base_ymin + 1.0
         ax.set_ylim([base_ymin, top])
         ax.set_xlabel("Chromosome")
-        ax.set_ylabel("-log10(p-value)")
+        ax.set_ylabel(axis_y_label)
         apply_integer_yticks(ax)
         return ax
 
@@ -989,6 +991,7 @@ class GWASPLOT:
         label_fontsize: float = 10.0,
         radial_tick_fontsize: float = 8.0,
         rasterized: bool = True,
+        draw_threshold_line: bool = True,
         **kwargs,
     ) -> plt.Axes:
         """
@@ -1269,7 +1272,12 @@ class GWASPLOT:
                     zorder=5,
                 )
 
-        if draw_background and threshold is not None and np.isfinite(float(threshold)):
+        if (
+            draw_background
+            and bool(draw_threshold_line)
+            and threshold is not None
+            and np.isfinite(float(threshold))
+        ):
             thr_radius = float(
                 _scale_values_to_range(
                     [float(threshold)],
