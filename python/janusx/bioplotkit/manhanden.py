@@ -11,6 +11,7 @@ from matplotlib.markers import MarkerStyle
 from matplotlib.patches import PathPatch, Wedge
 from matplotlib.path import Path
 from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import MaxNLocator
 from scipy.stats import beta
 from janusx.gtools.cleaner import chrom_sort_key
 
@@ -445,6 +446,52 @@ def _integer_colorbar_ticks(
     return np.asarray(keep, dtype=np.float64), labels
 
 
+def _decimal_tick_values(
+    ymin: float,
+    ymax: float,
+    *,
+    max_ticks: int = 7,
+) -> np.ndarray:
+    """Build readable decimal ticks when an axis is narrower than one unit."""
+    lo = float(min(ymin, ymax))
+    hi = float(max(ymin, ymax))
+    if (not np.isfinite(lo)) or (not np.isfinite(hi)):
+        return np.asarray([], dtype=np.float64)
+    if hi - lo <= 1e-12:
+        return np.asarray([lo], dtype=np.float64)
+
+    locator = MaxNLocator(
+        nbins=max(2, int(max_ticks)),
+        integer=False,
+        min_n_ticks=2,
+    )
+    tick_values = np.asarray(locator.tick_values(lo, hi), dtype=np.float64)
+    tick_values = tick_values[np.isfinite(tick_values)]
+    tick_values = tick_values[
+        (tick_values >= lo - 1e-12) & (tick_values <= hi + 1e-12)
+    ]
+    tick_values = np.unique(tick_values)
+    if tick_values.size >= 2:
+        return tick_values
+
+    # MaxNLocator can produce only out-of-range ticks for extremely narrow
+    # limits.  Keep the limits unchanged and provide a deterministic fallback.
+    return np.linspace(lo, hi, num=min(max(2, int(max_ticks)), 5), dtype=np.float64)
+
+
+def _format_tick_labels(values: np.ndarray, *, integer: bool) -> list[str]:
+    if integer:
+        return [str(int(round(float(value)))) for value in values]
+    labels: list[str] = []
+    for value in values:
+        numeric = float(value)
+        if abs(numeric) <= 1e-15:
+            labels.append("0")
+        else:
+            labels.append(f"{numeric:.6g}")
+    return labels
+
+
 def _apply_integer_ticks(
     ax: plt.Axes,
     *,
@@ -452,7 +499,8 @@ def _apply_integer_ticks(
     ticks: Union[np.ndarray, list[float], None] = None,
     max_ticks: int = 7,
 ) -> np.ndarray:
-    if str(axis).lower() == "x":
+    is_x_axis = str(axis).lower() == "x"
+    if is_x_axis:
         a0, a1 = ax.get_xlim()
         setter = ax.set_xticks
         label_setter = ax.set_xticklabels
@@ -464,21 +512,36 @@ def _apply_integer_ticks(
         restore = lambda: ax.set_ylim(a0, a1)
     lo = float(min(a0, a1))
     hi = float(max(a0, a1))
+    use_integer_labels = True
 
     if ticks is None:
         tick_values = _integer_tick_values(lo, hi, max_ticks=max_ticks)
+        if (not is_x_axis) and tick_values.size < 2 and hi - lo > 1e-12:
+            tick_values = _decimal_tick_values(lo, hi, max_ticks=max_ticks)
+            use_integer_labels = False
     else:
         tick_values = np.asarray(ticks, dtype=np.float64).reshape(-1)
         tick_values = tick_values[np.isfinite(tick_values)]
         tick_values = tick_values[
             (tick_values >= lo - 1e-12) & (tick_values <= hi + 1e-12)
         ]
-        tick_values = np.unique(np.round(tick_values).astype(np.int64)).astype(np.float64)
+        if is_x_axis:
+            tick_values = np.unique(np.round(tick_values).astype(np.int64)).astype(np.float64)
+        else:
+            tick_values = np.unique(tick_values)
+            use_integer_labels = bool(
+                tick_values.size > 0
+                and np.all(np.isclose(tick_values, np.round(tick_values), atol=1e-12))
+            )
         if tick_values.size == 0:
-            tick_values = _integer_tick_values(lo, hi, max_ticks=max_ticks)
+            if is_x_axis:
+                tick_values = _integer_tick_values(lo, hi, max_ticks=max_ticks)
+            else:
+                tick_values = _decimal_tick_values(lo, hi, max_ticks=max_ticks)
+                use_integer_labels = False
 
     if tick_values.size > 0:
-        labels = [str(int(round(float(v)))) for v in tick_values]
+        labels = _format_tick_labels(tick_values, integer=use_integer_labels)
         setter(tick_values)
         label_setter(labels)
         restore()
@@ -492,7 +555,11 @@ def apply_integer_yticks(
     max_ticks: int = 7,
 ) -> np.ndarray:
     """
-    Force y-axis ticks to integer values while preserving current limits.
+    Prefer integer y-axis ticks, falling back to decimal ticks for narrow ranges.
+
+    This keeps conventional GWAS ``-log10(p)`` axes compact while preserving
+    visible coordinates for statistics such as FST that commonly lie in
+    ``[0, 1)``.
     """
     return _apply_integer_ticks(ax, axis="y", ticks=ticks, max_ticks=max_ticks)
 
