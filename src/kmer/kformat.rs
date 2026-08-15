@@ -1,18 +1,21 @@
-use crate::breader::{open_bkmer_mmap, open_bsite_mmap, BkmerMmapView, BsiteMmapView};
+use crate::breader::{open_bkmer_mmap, open_bsite_mmap};
 use crate::kmer::encode::{canonical_code, decode_kmer_u64, encode_kmer_u64, ENCODING_NAME};
 use crate::kmer::format::{
     BkmerHeader, BsiteHeader, KmergeMeta, SampleEntry, BKMER_HEADER_SIZE, BSITE_HEADER_SIZE,
 };
 use crate::kmer::writer::{write_idv_file, write_meta_json};
 use anyhow::{bail, Context, Result};
+#[cfg(unix)]
+use memmap2::Advice;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc::sync_channel, Arc, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SCAN_BLOCK_ROWS: usize = 16_384;
@@ -234,7 +237,83 @@ fn bkmer_code_at(body: &[u8], row: usize) -> u64 {
     )
 }
 
-fn select_rows(
+fn validate_scan_inputs(
+    bkmer_body: &[u8],
+    bsite_body: &[u8],
+    n_kmers: usize,
+    n_samples: usize,
+    maf_threshold: f64,
+) -> Result<usize> {
+    if n_samples == 0 {
+        bail!("kformat requires at least one sample");
+    }
+    let bytes_per_col = n_samples.div_ceil(8);
+    let expected_bkmer_len = n_kmers
+        .checked_mul(8)
+        .ok_or_else(|| anyhow::anyhow!("bkmer row count overflow"))?;
+    let expected_bsite_len = n_kmers
+        .checked_mul(bytes_per_col)
+        .ok_or_else(|| anyhow::anyhow!("bsite row count overflow"))?;
+    if bkmer_body.len() != expected_bkmer_len || bsite_body.len() != expected_bsite_len {
+        bail!("bsite body and bkmer row counts do not match");
+    }
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        bail!("maf must be within [0, 0.5]");
+    }
+    Ok(bytes_per_col)
+}
+
+#[inline]
+fn row_is_selected(
+    bkmer_body: &[u8],
+    bsite_body: &[u8],
+    row: usize,
+    n_samples: usize,
+    bytes_per_col: usize,
+    maf_threshold: f64,
+    extract: Option<&HashSet<u64>>,
+) -> bool {
+    let code = bkmer_code_at(bkmer_body, row);
+    if extract.is_some_and(|set| !set.contains(&code)) {
+        return false;
+    }
+    let col = &bsite_body[row * bytes_per_col..(row + 1) * bytes_per_col];
+    maf_from_bitset(col, n_samples) + f64::EPSILON >= maf_threshold
+}
+
+fn selected_rows_in_block(
+    bkmer_body: &[u8],
+    bsite_body: &[u8],
+    start: usize,
+    end: usize,
+    n_samples: usize,
+    bytes_per_col: usize,
+    maf_threshold: f64,
+    extract: Option<&HashSet<u64>>,
+) -> Vec<u32> {
+    let mut rows = Vec::new();
+    for row in start..end {
+        if row_is_selected(
+            bkmer_body,
+            bsite_body,
+            row,
+            n_samples,
+            bytes_per_col,
+            maf_threshold,
+            extract,
+        ) {
+            rows.push((row - start) as u32);
+        }
+    }
+    rows
+}
+
+/// Scan selected rows with bounded parallel workers and visit them in input order.
+///
+/// Workers retain only a block-local `u32` offset list.  The ordered writer keeps
+/// at most a small number of completed blocks in the `BTreeMap`, so memory does
+/// not grow with the number of selected k-mers.
+fn stream_selected_rows<F>(
     bkmer_body: &[u8],
     bsite_body: &[u8],
     n_kmers: usize,
@@ -242,45 +321,124 @@ fn select_rows(
     maf_threshold: f64,
     extract: Option<&HashSet<u64>>,
     threads: usize,
-) -> Result<Vec<usize>> {
-    let bytes_per_col = n_samples.div_ceil(8);
-    if bkmer_body.len() != n_kmers * 8 || bsite_body.len() != n_kmers * bytes_per_col {
-        bail!("bsite body and bkmer row counts do not match");
+    mut visit: F,
+) -> Result<u64>
+where
+    F: FnMut(usize) -> Result<()>,
+{
+    let bytes_per_col =
+        validate_scan_inputs(bkmer_body, bsite_body, n_kmers, n_samples, maf_threshold)?;
+    if n_kmers == 0 {
+        return Ok(0);
     }
-    if !(0.0..=0.5).contains(&maf_threshold) {
-        bail!("maf must be within [0, 0.5]");
-    }
+
     let block = DEFAULT_SCAN_BLOCK_ROWS;
-    let jobs = (0..n_kmers)
-        .step_by(block)
-        .map(|start| {
-            let end = (start + block).min(n_kmers);
-            (start, end)
-        })
-        .collect::<Vec<_>>();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.max(1))
-        .build()
-        .map_err(|e| anyhow::anyhow!("kformat rayon pool: {e}"))?;
-    let selected = pool.install(|| {
-        jobs.par_iter()
-            .map(|&(start, end)| {
-                let mut local = Vec::new();
-                for row in start..end {
-                    let code = bkmer_code_at(bkmer_body, row);
-                    if extract.is_some_and(|set| !set.contains(&code)) {
-                        continue;
-                    }
-                    let col = &bsite_body[row * bytes_per_col..(row + 1) * bytes_per_col];
-                    if maf_from_bitset(col, n_samples) + f64::EPSILON >= maf_threshold {
-                        local.push(row);
-                    }
+    let n_blocks = n_kmers.div_ceil(block);
+    let available_workers = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let worker_count = threads.max(1).min(n_blocks).min(available_workers);
+
+    if worker_count == 1 {
+        let mut count = 0u64;
+        for row in 0..n_kmers {
+            if row_is_selected(
+                bkmer_body,
+                bsite_body,
+                row,
+                n_samples,
+                bytes_per_col,
+                maf_threshold,
+                extract,
+            ) {
+                visit(row)?;
+                count += 1;
+            }
+        }
+        return Ok(count);
+    }
+
+    let channel_capacity = worker_count.saturating_mul(2).max(1);
+    let (job_tx, job_rx) = sync_channel::<(usize, usize, usize)>(channel_capacity);
+    let (result_tx, result_rx) = sync_channel::<(usize, Vec<u32>)>(channel_capacity);
+    let shared_job_rx = Arc::new(Mutex::new(job_rx));
+
+    thread::scope(|scope| -> Result<u64> {
+        for _ in 0..worker_count {
+            let worker_job_rx = Arc::clone(&shared_job_rx);
+            let worker_result_tx = result_tx.clone();
+            scope.spawn(move || loop {
+                let job = match worker_job_rx.lock() {
+                    Ok(receiver) => receiver.recv(),
+                    Err(_) => return,
+                };
+                let Ok((block_idx, start, end)) = job else {
+                    return;
+                };
+                let rows = selected_rows_in_block(
+                    bkmer_body,
+                    bsite_body,
+                    start,
+                    end,
+                    n_samples,
+                    bytes_per_col,
+                    maf_threshold,
+                    extract,
+                );
+                if worker_result_tx.send((block_idx, rows)).is_err() {
+                    return;
                 }
-                local
-            })
-            .collect::<Vec<_>>()
-    });
-    Ok(selected.into_iter().flatten().collect())
+            });
+        }
+        drop(result_tx);
+
+        let mut pending: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        let mut next_block = 0usize;
+        let mut next_to_dispatch = 0usize;
+        let mut count = 0u64;
+
+        // Keep only a bounded number of blocks in flight.  This prevents a
+        // slow early block from allowing all later results to accumulate in
+        // `pending` while preserving deterministic input order.
+        let window = channel_capacity;
+        while next_to_dispatch < n_blocks && next_to_dispatch - next_block < window {
+            let start = next_to_dispatch * block;
+            let end = (start + block).min(n_kmers);
+            job_tx
+                .send((next_to_dispatch, start, end))
+                .map_err(|_| anyhow::anyhow!("kformat worker pipeline stopped early"))?;
+            next_to_dispatch += 1;
+        }
+
+        for _ in 0..n_blocks {
+            let (block_idx, rows) = result_rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("kformat worker pipeline stopped early"))?;
+            pending.insert(block_idx, rows);
+            while let Some(rows) = pending.remove(&next_block) {
+                let start = next_block * block;
+                for local_row in rows {
+                    visit(start + local_row as usize)?;
+                    count += 1;
+                }
+                next_block += 1;
+            }
+
+            while next_to_dispatch < n_blocks && next_to_dispatch - next_block < window {
+                let start = next_to_dispatch * block;
+                let end = (start + block).min(n_kmers);
+                job_tx
+                    .send((next_to_dispatch, start, end))
+                    .map_err(|_| anyhow::anyhow!("kformat worker pipeline stopped early"))?;
+                next_to_dispatch += 1;
+            }
+        }
+        drop(job_tx);
+        if next_block != n_blocks || !pending.is_empty() {
+            bail!("kformat worker pipeline did not preserve all input blocks");
+        }
+        Ok(count)
+    })
 }
 
 #[cfg(test)]
@@ -320,10 +478,13 @@ fn plink_row_from_bitset(col: &[u8], n_samples: usize) -> Vec<u8> {
 fn write_bfile(
     out_prefix: &Path,
     layout: &KformatLayout,
-    bkmer: &BkmerMmapView,
-    bsite: &BsiteMmapView,
-    selected: &[usize],
-) -> Result<()> {
+    bkmer_body: &[u8],
+    bsite_body: &[u8],
+    n_kmers: usize,
+    maf_threshold: f64,
+    extract: Option<&HashSet<u64>>,
+    threads: usize,
+) -> Result<u64> {
     let out_prefix = out_prefix.to_string_lossy();
     let mut fam =
         BufWriter::with_capacity(4 * 1024 * 1024, File::create(format!("{out_prefix}.fam"))?);
@@ -340,30 +501,41 @@ fn write_bfile(
     let mut bed =
         BufWriter::with_capacity(8 * 1024 * 1024, File::create(format!("{out_prefix}.bed"))?);
     bed.write_all(&[0x6c, 0x1b, 0x01])?;
-    let bkmer_body = bkmer
-        .body_prefix_for_rows(bkmer.header.n_kmers)
-        .map_err(anyhow::Error::msg)?;
-    let body = bsite.body().map_err(anyhow::Error::msg)?;
     let bytes_per_col = layout.meta.bytes_per_col as usize;
-    for (out_idx, &row) in selected.iter().enumerate() {
-        let kmer = decode_kmer_u64(bkmer_code_at(bkmer_body, row), layout.meta.k);
-        writeln!(bim, "0\t{kmer}\t0\t{}\tA\tG", out_idx + 1)?;
-        let col = &body[row * bytes_per_col..(row + 1) * bytes_per_col];
-        bed.write_all(&plink_row_from_bitset(col, layout.samples.len()))?;
-    }
+    let mut out_idx = 0u64;
+    let written = stream_selected_rows(
+        bkmer_body,
+        bsite_body,
+        n_kmers,
+        layout.samples.len(),
+        maf_threshold,
+        extract,
+        threads,
+        |row| {
+            let kmer = decode_kmer_u64(bkmer_code_at(bkmer_body, row), layout.meta.k);
+            writeln!(bim, "0\t{kmer}\t0\t{}\tA\tG", out_idx + 1)?;
+            let col = &bsite_body[row * bytes_per_col..(row + 1) * bytes_per_col];
+            bed.write_all(&plink_row_from_bitset(col, layout.samples.len()))?;
+            out_idx += 1;
+            Ok(())
+        },
+    )?;
     bim.flush()?;
     bed.flush()?;
-    Ok(())
+    Ok(written)
 }
 
 fn write_kfile(
     out_prefix: &Path,
     output_name: &str,
     layout: &KformatLayout,
-    bkmer: &BkmerMmapView,
-    bsite: &BsiteMmapView,
-    selected: &[usize],
-) -> Result<()> {
+    bkmer_body: &[u8],
+    bsite_body: &[u8],
+    n_kmers: usize,
+    maf_threshold: f64,
+    extract: Option<&HashSet<u64>>,
+    threads: usize,
+) -> Result<u64> {
     let prefix = out_prefix.to_string_lossy();
     let idv_path = PathBuf::from(format!("{prefix}.idv"));
     let bkmer_path = PathBuf::from(format!("{prefix}.bkmer"));
@@ -374,34 +546,62 @@ fn write_kfile(
     let mut bkmer_writer = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&bkmer_path)?);
     BkmerHeader {
         k: layout.meta.k,
-        n_kmers: selected.len() as u64,
+        n_kmers: 0,
         canonical: if layout.meta.canonical { 1 } else { 0 },
     }
     .write_to(&mut bkmer_writer)?;
-    let bkmer_body = bkmer
-        .body_prefix_for_rows(bkmer.header.n_kmers)
-        .map_err(anyhow::Error::msg)?;
-    for &row in selected {
-        bkmer_writer.write_all(&bkmer_body[row * 8..(row + 1) * 8])?;
-    }
-    bkmer_writer.flush()?;
 
     let mut bsite_writer = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&bsite_path)?);
     BsiteHeader {
         n_samples: layout.meta.n_samples,
-        n_kmers: selected.len() as u64,
+        n_kmers: 0,
         bytes_per_col: layout.meta.bytes_per_col,
     }
     .write_to(&mut bsite_writer)?;
-    let bsite_body = bsite.body().map_err(anyhow::Error::msg)?;
     let bytes_per_col = layout.meta.bytes_per_col as usize;
-    for &row in selected {
-        bsite_writer.write_all(&bsite_body[row * bytes_per_col..(row + 1) * bytes_per_col])?;
-    }
+    let written = stream_selected_rows(
+        bkmer_body,
+        bsite_body,
+        n_kmers,
+        layout.samples.len(),
+        maf_threshold,
+        extract,
+        threads,
+        |row| {
+            bkmer_writer.write_all(&bkmer_body[row * 8..(row + 1) * 8])?;
+            bsite_writer.write_all(&bsite_body[row * bytes_per_col..(row + 1) * bytes_per_col])?;
+            Ok(())
+        },
+    )?;
+    bkmer_writer.flush()?;
     bsite_writer.flush()?;
 
+    let mut bkmer_file = bkmer_writer
+        .into_inner()
+        .map_err(|err| anyhow::anyhow!("failed to finalize bkmer: {err}"))?;
+    bkmer_file.seek(SeekFrom::Start(0))?;
+    BkmerHeader {
+        k: layout.meta.k,
+        n_kmers: written,
+        canonical: if layout.meta.canonical { 1 } else { 0 },
+    }
+    .write_to(&mut bkmer_file)?;
+    bkmer_file.flush()?;
+
+    let mut bsite_file = bsite_writer
+        .into_inner()
+        .map_err(|err| anyhow::anyhow!("failed to finalize bsite: {err}"))?;
+    bsite_file.seek(SeekFrom::Start(0))?;
+    BsiteHeader {
+        n_samples: layout.meta.n_samples,
+        n_kmers: written,
+        bytes_per_col: layout.meta.bytes_per_col,
+    }
+    .write_to(&mut bsite_file)?;
+    bsite_file.flush()?;
+
     let mut meta = layout.meta.clone();
-    meta.n_kmers = selected.len() as u64;
+    meta.n_kmers = written;
     meta.bkmer_file = format!("{output_name}.bkmer");
     meta.bsite_file = format!("{output_name}.bsite");
     meta.idv_file = format!("{output_name}.idv");
@@ -409,7 +609,7 @@ fn write_kfile(
     meta.max_presence_rate = 1.0;
     meta.encoding = ENCODING_NAME.to_string();
     write_meta_json(&meta_path, &meta)?;
-    Ok(())
+    Ok(written)
 }
 
 fn append_suffix(prefix: &Path, suffix: &str) -> PathBuf {
@@ -559,43 +759,56 @@ fn run_kformat(
     let (temp_dir, temp_prefix) = make_temp_output_prefix(&output)?;
     let bkmer = open_bkmer_mmap(&layout.bkmer_path, "kformat bkmer").map_err(anyhow::Error::msg)?;
     let bsite = open_bsite_mmap(&layout.bsite_path, "kformat bsite").map_err(anyhow::Error::msg)?;
+    #[cfg(unix)]
+    {
+        let _ = bkmer.mmap.advise(Advice::Sequential);
+        let _ = bsite.mmap.advise(Advice::Sequential);
+    }
     let bkmer_body = bkmer
         .body_prefix_for_rows(bkmer.header.n_kmers)
         .map_err(anyhow::Error::msg)?;
     let bsite_body = bsite.body().map_err(anyhow::Error::msg)?;
+    let n_kmers = usize::try_from(layout.meta.n_kmers)
+        .map_err(|_| anyhow::anyhow!("kfile row count does not fit platform usize"))?;
     let extract = extract_kmers
         .map(|items| normalize_extract_codes(items, layout.meta.k, layout.meta.canonical))
         .transpose()?;
-    let selected = select_rows(
-        bkmer_body,
-        bsite_body,
-        layout.meta.n_kmers as usize,
-        layout.samples.len(),
-        maf,
-        extract.as_ref(),
-        thread,
-    )?;
-    if selected.is_empty() {
-        let _ = fs::remove_dir_all(&temp_dir);
-        bail!("no k-mers survived kformat filters");
-    }
 
-    let write_result = if format == "bfile" {
-        write_bfile(&temp_prefix, &layout, &bkmer, &bsite, &selected)
+    let n_kmers_out = if format == "bfile" {
+        write_bfile(
+            &temp_prefix,
+            &layout,
+            bkmer_body,
+            bsite_body,
+            n_kmers,
+            maf,
+            extract.as_ref(),
+            thread,
+        )
     } else {
         write_kfile(
             &temp_prefix,
             &output_name,
             &layout,
-            &bkmer,
-            &bsite,
-            &selected,
+            bkmer_body,
+            bsite_body,
+            n_kmers,
+            maf,
+            extract.as_ref(),
+            thread,
         )
     };
-    if let Err(err) = write_result {
-        let _ = fs::remove_dir_all(&temp_dir);
-        return Err(err);
-    }
+    let n_kmers_out = match n_kmers_out {
+        Ok(count) if count > 0 => count,
+        Ok(_) => {
+            let _ = fs::remove_dir_all(&temp_dir);
+            bail!("no k-mers survived kformat filters");
+        }
+        Err(err) => {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err(err);
+        }
+    };
     if let Err(err) = commit_output_files(&temp_prefix, &output, &format) {
         let _ = fs::remove_dir_all(&temp_dir);
         return Err(err.into());
@@ -607,7 +820,7 @@ fn run_kformat(
         format: format.to_string(),
         n_samples: layout.meta.n_samples,
         n_kmers_in: layout.meta.n_kmers,
-        n_kmers_out: selected.len() as u64,
+        n_kmers_out,
         maf,
     })
 }
@@ -615,9 +828,15 @@ fn run_kformat(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::fs;
+    use std::path::PathBuf;
 
-    use super::{maf_from_bitset, normalize_extract_codes, plink_row_from_presence, select_rows};
+    use super::{
+        maf_from_bitset, normalize_extract_codes, plink_row_from_presence, stream_selected_rows,
+        write_kfile, KformatLayout, DEFAULT_SCAN_BLOCK_ROWS,
+    };
     use crate::kmer::encode::{canonical_code, encode_kmer_u64};
+    use crate::kmer::format::{KmergeMeta, SampleEntry};
 
     #[test]
     fn maf_uses_valid_sample_bits_only() {
@@ -641,9 +860,145 @@ mod tests {
         let bsite = vec![0b0000_0001, 0b0000_0011, 0b0000_0000, 0b0000_0111];
         let mut extract = HashSet::new();
         extract.insert(44u64);
-        let keep =
-            select_rows(&bkmer, &bsite, codes.len(), 3, 0.0, Some(&extract), 2).expect("select");
+        let mut keep = Vec::new();
+        let written = stream_selected_rows(
+            &bkmer,
+            &bsite,
+            codes.len(),
+            3,
+            0.0,
+            Some(&extract),
+            2,
+            |row| {
+                keep.push(row);
+                Ok(())
+            },
+        )
+        .expect("select");
+        assert_eq!(written, 1);
         assert_eq!(keep, vec![3]);
+    }
+
+    #[test]
+    fn streaming_selection_counts_rows_without_materializing_indices() {
+        let codes = vec![11u64, 22, 33, 44];
+        let mut bkmer = Vec::with_capacity(codes.len() * 8);
+        for code in &codes {
+            bkmer.extend_from_slice(&code.to_le_bytes());
+        }
+        let bsite = vec![0b0000_0001, 0b0000_0011, 0b0000_0000, 0b0000_0111];
+        let mut count = 0usize;
+        let written = stream_selected_rows(&bkmer, &bsite, codes.len(), 3, 0.0, None, 2, |_| {
+            count += 1;
+            Ok(())
+        })
+        .expect("count selected rows");
+        assert_eq!(written, count as u64);
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn streaming_selection_preserves_order_across_parallel_blocks() {
+        let n_kmers = DEFAULT_SCAN_BLOCK_ROWS * 3 + 17;
+        let mut bkmer = Vec::with_capacity(n_kmers * 8);
+        for code in 0u64..n_kmers as u64 {
+            bkmer.extend_from_slice(&code.to_le_bytes());
+        }
+        let bsite = vec![1u8; n_kmers];
+        let mut keep = Vec::with_capacity(n_kmers);
+        let written = stream_selected_rows(&bkmer, &bsite, n_kmers, 8, 0.0, None, 3, |row| {
+            keep.push(row);
+            Ok(())
+        })
+        .expect("stream parallel blocks");
+
+        assert_eq!(written, n_kmers as u64);
+        assert_eq!(keep.len(), n_kmers);
+        assert!(keep.iter().copied().eq(0..n_kmers));
+    }
+
+    #[test]
+    fn kfile_writer_patches_streamed_row_count_and_preserves_payload_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_kformat_streaming_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp directory");
+        let layout = KformatLayout {
+            bkmer_path: PathBuf::new(),
+            bsite_path: PathBuf::new(),
+            meta: KmergeMeta {
+                format: "janusx-kmer-bitmatrix-v1".to_string(),
+                k: 4,
+                n_samples: 3,
+                n_kmers: 4,
+                bytes_per_col: 1,
+                encoding: "ACGT-2bit-u64".to_string(),
+                canonical: true,
+                matrix_layout: "column_major_bitset".to_string(),
+                value_type: "binary_presence".to_string(),
+                bit_order: "little_bit_order".to_string(),
+                bkmer_file: "input.bkmer".to_string(),
+                bsite_file: "input.bsite".to_string(),
+                idv_file: "input.idv".to_string(),
+                min_count: 1,
+                min_presence_rate: 0.0,
+                max_presence_rate: 1.0,
+                bucket_bits: 0,
+                compression: "none".to_string(),
+            },
+            samples: vec![
+                SampleEntry {
+                    index: 0,
+                    sample_id: "S1".to_string(),
+                    kmc_prefix: String::new(),
+                },
+                SampleEntry {
+                    index: 1,
+                    sample_id: "S2".to_string(),
+                    kmc_prefix: String::new(),
+                },
+                SampleEntry {
+                    index: 2,
+                    sample_id: "S3".to_string(),
+                    kmc_prefix: String::new(),
+                },
+            ],
+        };
+        let codes = [11u64, 22, 33, 44];
+        let mut bkmer_body = Vec::with_capacity(codes.len() * 8);
+        for code in codes {
+            bkmer_body.extend_from_slice(&code.to_le_bytes());
+        }
+        let bsite_body = vec![0b0000_0001, 0b0000_0011, 0b0000_0000, 0b0000_0111];
+
+        let written = write_kfile(
+            &dir.join("out"),
+            "out",
+            &layout,
+            &bkmer_body,
+            &bsite_body,
+            codes.len(),
+            0.25,
+            None,
+            2,
+        )
+        .expect("write streamed kfile");
+        assert_eq!(written, 2);
+
+        let bkmer = fs::read(dir.join("out.bkmer")).expect("read bkmer");
+        assert_eq!(u64::from_le_bytes(bkmer[16..24].try_into().unwrap()), 2);
+        assert_eq!(&bkmer[64..80], &bkmer_body[0..16]);
+        let bsite = fs::read(dir.join("out.bsite")).expect("read bsite");
+        assert_eq!(u64::from_le_bytes(bsite[24..32].try_into().unwrap()), 2);
+        assert_eq!(&bsite[80..82], &bsite_body[0..2]);
+        let meta: KmergeMeta =
+            serde_json::from_slice(&fs::read(dir.join("out.meta.json")).expect("read meta"))
+                .expect("parse meta");
+        assert_eq!(meta.n_kmers, 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
