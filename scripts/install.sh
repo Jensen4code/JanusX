@@ -28,10 +28,11 @@ if [ "$DEV" = "1" ]; then
     --index-strategy unsafe-best-match \
     $PACKAGE \
     --index-url https://test.pypi.org/simple/ \
-    --extra-index-url https://pypi.org/simple/
+    --extra-index-url https://pypi.org/simple/ \
+    --only-binary :all:
 else
   echo "Installing janusx from PyPI..."
-  uv pip install --python "$ENV_PATH/bin/python" $PACKAGE
+  uv pip install --python "$ENV_PATH/bin/python" $PACKAGE  --only-binary :all:
 fi
 $ENV_PATH/bin/jx -v
 echo ""

@@ -31,13 +31,14 @@ if ($Dev -eq "1") {
         "--index-strategy", "unsafe-best-match",
         $Package,
         "--index-url", "https://test.pypi.org/simple/",
-        "--extra-index-url", "https://pypi.org/simple/"
+        "--extra-index-url", "https://pypi.org/simple/",
+        "--only-binary", ":all:"
     )
     uv @InstallArgs
 }
 else {
     Write-Host "Installing janusx from PyPI..."
-    uv pip install --python "$EnvPath\Scripts\python.exe" $Package
+    uv pip install --python "$EnvPath\Scripts\python.exe" $Package --only-binary :all:
 }
 
 $JxPath = Join-Path $EnvPath "Scripts\jx.exe"
