@@ -124,6 +124,7 @@ from janusx.script._common.pathcheck import (
     safe_expanduser,
     safe_resolve,
 )
+from janusx.script._common.phenotype import inverse_normal_transform
 from janusx.script._common.progress import (
     CliStatus,
     is_skip_status_text,
@@ -1802,6 +1803,60 @@ def _ordered_gwas_summary_rows(
             _gwas_model_sort_key(r.get("model", "")),
         ),
     )
+
+
+def _ensure_farmcpu_tasks_in_trait_groups(
+    tasks: list[dict[str, object]],
+    has_farmcpu: bool,
+) -> list[dict[str, object]]:
+    """Keep FarmCPU in the same per-trait task group as other GWAS models.
+
+    Older native task schedulers may honor ``has_farmcpu`` only for startup
+    preparation and omit the FarmCPU execution task.  The compatibility
+    branch would then run FarmCPU separately, producing a second trait
+    summary and repeating trait-level metadata preparation.  Normalize the
+    task list here so all requested models for one trait are executed and
+    summarized as one group.
+    """
+    copied_tasks = [dict(item) for item in tasks if isinstance(item, dict)]
+    if (not bool(has_farmcpu)) or len(copied_tasks) == 0:
+        return copied_tasks
+
+    grouped: dict[str, list[dict[str, object]]] = {}
+    trait_order: list[str] = []
+    for item in copied_tasks:
+        trait_token = str(item.get("trait_token", item.get("trait", "")))
+        if trait_token not in grouped:
+            grouped[trait_token] = []
+            trait_order.append(trait_token)
+        grouped[trait_token].append(item)
+
+    normalized: list[dict[str, object]] = []
+    for trait_idx, trait_token in enumerate(trait_order):
+        trait_tasks = grouped[trait_token]
+        has_farmcpu_task = any(
+            str(item.get("route", "")).strip().lower() == "farmcpu"
+            or str(item.get("model", "")).strip().lower() in {"farm", "farmcpu"}
+            for item in trait_tasks
+        )
+        if not has_farmcpu_task:
+            last_task = trait_tasks[-1]
+            for item in trait_tasks:
+                item["emit_blank_after"] = False
+            trait_tasks.append(
+                {
+                    "model": "farmcpu",
+                    "route": "farmcpu",
+                    "trait": last_task.get("trait", trait_token),
+                    "trait_token": trait_token,
+                    "trait_label": last_task.get("trait_label", trait_token),
+                    "emit_trait_header": False,
+                    "emit_blank_after": trait_idx < (len(trait_order) - 1),
+                }
+            )
+        normalized.extend(trait_tasks)
+
+    return normalized
 
 
 def _ordered_saved_result_paths(
@@ -4037,6 +4092,7 @@ def prepare_streaming_context(
     working_buffers: int = 1,
     prewarm_global_scanmeta: bool = False,
     scanmeta_outprefix: Optional[str] = None,
+    inverse_normal: bool = False,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -4067,6 +4123,7 @@ def prepare_streaming_context(
             logger=logger,
             use_spinner=bool(use_spinner),
             require_grm=bool(require_kinship),
+            inverse_normal=bool(inverse_normal),
         )
         return (
             pheno_k,
@@ -4529,6 +4586,12 @@ def prepare_streaming_context(
     # reorder/trim
     ids = np.array(common_ids)
     pheno = pheno.loc[ids]
+    if bool(inverse_normal):
+        pheno = inverse_normal_transform(pheno, logger=logger)
+        logger.info(
+            "Phenotype transform: inverse-normal rank transform "
+            "(average ties; finite values only; transformed scale)."
+        )
 
     if grm is not None:
         grm_idx = np.ascontiguousarray([grm_index[sid] for sid in ids], dtype=np.int64)
@@ -4704,6 +4767,7 @@ def _prepare_kfile_stream_context(
     logger: logging.Logger,
     use_spinner: bool = False,
     require_grm: bool = False,
+    inverse_normal: bool = False,
 ) -> tuple[pd.DataFrame, np.ndarray, int, Optional[np.ndarray], np.ndarray, Optional[np.ndarray], int]:
     k_ids, n_kmers, _info = _inspect_kfile_source(prefix)
     pheno = _load_phenotype_with_status(
@@ -4741,6 +4805,12 @@ def _prepare_kfile_stream_context(
         cov_all = np.asarray(
             cov_all[[cov_pos[sid] for sid in ids]],
             dtype=np.float32,
+        )
+    if bool(inverse_normal):
+        pheno = inverse_normal_transform(pheno, logger=logger)
+        logger.info(
+            "Phenotype transform: inverse-normal rank transform "
+            "(average ties; finite values only; transformed scale)."
         )
     qdim = _parse_qcov_dim(qcov)
     grm = None
@@ -7337,6 +7407,17 @@ def parse_args(argv: Optional[list[str]] = None):
             "fixed-variance/mixed-model fallback switching."
         ),
     )
+    optional_group.add_argument(
+        "-int", "--intrans",
+        dest="intrans",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply a per-trait rank-based inverse-normal transformation to finite "
+            "phenotype values before GWAS. Results are reported on the transformed scale."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
     if enable_trait_level_arg:
         optional_group.add_argument(
             "-trait-level", "--trait-level",
@@ -7752,6 +7833,11 @@ def _run_gwas_pipeline(
         fvlmm_scan_spec = _gwas_fvlmm_scan_stage_thread_plan(int(args.thread))
     _append_advanced_note(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
     _append_advanced_note(format_affinity_cpu_summary(thread_budget))
+    if bool(getattr(args, "intrans", False)):
+        _append_advanced_note(
+            "Phenotype transform: inverse-normal rank transform "
+            "(average ties; finite values only; transformed scale)"
+        )
     _append_advanced_note(
         "Thread plan: "
         f"requested={requested_threads}, using={int(args.thread)}, "
@@ -8080,6 +8166,15 @@ def _run_gwas_pipeline(
             "Phenotype Cols",
             args.ncol if args.ncol is not None else "All",
         )
+        _emit_report_kv(
+            report_logger,
+            "Phenotype Transform",
+            (
+                "Inverse-normal rank transform"
+                if bool(getattr(args, "intrans", False))
+                else "None"
+            ),
+        )
         _emit_report_kv(report_logger, "Models Executed", _format_gwas_models_executed(args))
         _emit_report_kv(
             report_logger,
@@ -8104,6 +8199,10 @@ def _run_gwas_pipeline(
             ("Memory", memory_cfg),
             ("Force Model", bool(args.force_model)),
         ]
+        if bool(getattr(args, "intrans", False)):
+            advanced_config_rows.append(
+                ("Phenotype Transform", "inverse-normal rank transform")
+            )
         if len(scan_bimranges) > 0:
             advanced_config_rows.append(
                 ("Scan Bimrange", _format_scan_bimrange_summary(scan_bimranges))
@@ -8520,6 +8619,7 @@ def _run_gwas_pipeline(
                             and kfile_sparse_grm is None
                         )
                     ),
+                    inverse_normal=bool(getattr(args, "intrans", False)),
                 )
                 run_chunked_gwas_kfile(
                     model_names=list(stream_models),
@@ -8606,6 +8706,7 @@ def _run_gwas_pipeline(
                         and str(args.model).lower() == "add"
                     ),
                     scanmeta_outprefix=str(outprefix),
+                    inverse_normal=bool(getattr(args, "intrans", False)),
                 )
                 if bool(args.fvlmm):
                     null_sidecar_context = _build_gwas_sidecar_context(
@@ -9329,6 +9430,10 @@ def _run_gwas_pipeline(
                                 ),
                             }
                         )
+                    normalized_tasks = _ensure_farmcpu_tasks_in_trait_groups(
+                        normalized_tasks,
+                        has_farmcpu=bool(has_farmcpu),
+                    )
                     prefix_meta = (
                         _as_plink_prefix(genofile_stream)
                         if (

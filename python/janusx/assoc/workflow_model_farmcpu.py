@@ -21,6 +21,7 @@ from janusx.script._common.memory import (
     finalize_peak_memory_metrics,
     process_memory_info_bytes,
 )
+from janusx.script._common.phenotype import inverse_normal_transform
 
 from .workflow import (
     CliStatus,
@@ -1030,6 +1031,13 @@ def run_farmcpu_fullmem(
                     f"q={q_n}, cov={cov_n}, common={common_n}"
                 ),
                 use_spinner=bool(use_spinner),
+            )
+        if bool(getattr(args, "intrans", False)):
+            pheno = pheno.reindex(np.asarray(famid, dtype=str))
+            pheno = inverse_normal_transform(pheno, logger=logger)
+            logger.info(
+                "Phenotype transform: inverse-normal rank transform "
+                "(average ties; finite values only; transformed scale)."
             )
         farmcpu_cache = {
             "pheno": pheno,

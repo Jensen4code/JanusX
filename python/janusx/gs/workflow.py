@@ -144,6 +144,7 @@ from janusx.script._common.cli_args import (
 )
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.outprefix import apply_output_prefix_compat
+from janusx.script._common.phenotype import inverse_normal_transform
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -18597,7 +18598,13 @@ def _predict_hashed_gblup_test_from_compact(
 # CLI
 # ======================================================================
 
+def _dev_help_requested(argv: typing.Optional[list[str]] = None) -> bool:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    return any(str(token).strip() in {"-dev", "--dev"} for token in tokens)
+
+
 def parse_args(argv: typing.Optional[list[str]] = None):
+    show_dev_help = _dev_help_requested(argv)
     parser = CliArgumentParser(
         prog="jx gs",
         formatter_class=cli_help_formatter(),
@@ -18608,7 +18615,11 @@ def parse_args(argv: typing.Optional[list[str]] = None):
             "jx gs -bfile geno_prefix -p pheno.tsv -BLUP -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -RF -ET -GBDT -SVM -ENET -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -BLUP -BayesA -cv 5",
+            "jx gs -h -dev",
         ]),
+    )
+    parser.add_argument(
+        "-dev", "--dev", action="store_true", default=False, help=argparse.SUPPRESS
     )
 
     genotype_group = parser.add_argument_group("Genotype Arguments (Required: Select exactly one)")
@@ -19225,6 +19236,17 @@ def parse_args(argv: typing.Optional[list[str]] = None):
             "explicit -mem keeps the requested fixed budget."
         ),
         dest="memory",
+    )
+    optional_group.add_argument(
+        "-int", "--intrans",
+        dest="intrans",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply a per-trait rank-based inverse-normal transformation to finite "
+            "phenotype values before GS. Results and metrics are reported on the transformed scale."
+            if show_dev_help else argparse.SUPPRESS
+        ),
     )
     # Backward-compatible legacy flags (hidden): --hash-dim / --hash-seed
     optional_group.add_argument("-hash-dim", "--hash-dim", type=int, default=None, help=argparse.SUPPRESS)
@@ -20032,6 +20054,14 @@ def _run_gs_pipeline_impl(
                             ("Genotype", gfile),
                             ("Phenotype", args.pheno),
                             ("Trait/Pcol", ncol_cfg),
+                            (
+                                "Phenotype transform",
+                                (
+                                    "inverse-normal"
+                                    if bool(getattr(args, "intrans", False))
+                                    else "none"
+                                ),
+                            ),
                             ("Route", genotype_route_cfg),
                         ],
                     ),
@@ -20090,6 +20120,15 @@ def _run_gs_pipeline_impl(
         _emit_report_kv(report_logger, "Genotype File", format_path_for_display(str(gfile)))
         _emit_report_kv(report_logger, "Phenotype File", format_path_for_display(str(args.pheno)))
         _emit_report_kv(report_logger, "Trait Cols", ncol_cfg)
+        _emit_report_kv(
+            report_logger,
+            "Phenotype Transform",
+            (
+                "Inverse-normal rank transform"
+                if bool(getattr(args, "intrans", False))
+                else "None"
+            ),
+        )
         _emit_report_kv(report_logger, "Models Executed", _format_gs_models_executed(methods))
         _emit_report_kv(
             report_logger,
@@ -20264,6 +20303,13 @@ def _run_gs_pipeline_impl(
                 f"{invalid_specs}. valid_index=[0..{pheno.shape[1] - 1}]"
             )
         pheno = pheno.iloc[:, selected_cols]
+
+    if bool(getattr(args, "intrans", False)):
+        pheno = inverse_normal_transform(pheno, logger=logger)
+        logger.info(
+            "Phenotype transform: inverse-normal rank transform "
+            "(average ties; finite values only; transformed scale)."
+        )
 
     # Runtime-thread default tuning:
     # when policy is not explicitly set, prefer outer-cap mode so `-t`
