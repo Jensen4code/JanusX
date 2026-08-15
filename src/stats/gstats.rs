@@ -3,6 +3,7 @@ use memmap2::Advice;
 use memmap2::Mmap;
 use numpy::ndarray::Array1;
 use numpy::PyArray1;
+use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
 use pyo3::Bound;
 use pyo3::BoundObject;
@@ -782,6 +783,305 @@ fn compute_joint_stats_core(
     })
 }
 
+fn validate_selection_indices(
+    indices: Option<&[usize]>,
+    upper_bound: usize,
+    label: &str,
+) -> Result<Option<Vec<usize>>, String> {
+    let Some(indices) = indices else {
+        return Ok(None);
+    };
+    if indices.is_empty() {
+        return Err(format!("{label}_indices must not be empty"));
+    }
+    let mut previous = None;
+    for &index in indices {
+        if index >= upper_bound {
+            return Err(format!(
+                "{label}_indices contains out-of-range index {index} (size={upper_bound})"
+            ));
+        }
+        if previous.is_some_and(|value| index <= value) {
+            return Err(format!(
+                "{label}_indices must be strictly increasing and unique"
+            ));
+        }
+        previous = Some(index);
+    }
+    Ok(Some(indices.to_vec()))
+}
+
+#[inline]
+fn accumulate_individual_row_counts_selected(
+    row: &[u8],
+    sample_indices: &[usize],
+    miss_ct: &mut [u64],
+    nonmiss_ct: &mut [u64],
+    het_ct: &mut [u64],
+) {
+    for (output_idx, &sample_idx) in sample_indices.iter().enumerate() {
+        let code = (row[sample_idx >> 2] >> ((sample_idx & 3) << 1)) & 0b11;
+        match code {
+            0b01 => miss_ct[output_idx] += 1,
+            0b10 => {
+                nonmiss_ct[output_idx] += 1;
+                het_ct[output_idx] += 1;
+            }
+            0b00 | 0b11 => nonmiss_ct[output_idx] += 1,
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn compute_joint_stats_selected_core(
+    packed_src: &[u8],
+    n_samples_full: usize,
+    n_snps_full: usize,
+    bytes_per_snp: usize,
+    request: GstatsRequest,
+    sample_indices: Option<&[usize]>,
+    site_indices: Option<&[usize]>,
+    threads: usize,
+) -> Result<GstatsCombinedOutput, String> {
+    let sample_indices = validate_selection_indices(sample_indices, n_samples_full, "sample")?;
+    let site_indices = validate_selection_indices(site_indices, n_snps_full, "site")?;
+    if sample_indices.is_none() && site_indices.is_none() {
+        return compute_joint_stats_core(
+            packed_src,
+            n_samples_full,
+            n_snps_full,
+            bytes_per_snp,
+            request,
+            threads,
+        );
+    }
+
+    let n_samples = sample_indices
+        .as_ref()
+        .map_or(n_samples_full, |indices| indices.len());
+    let n_snps = site_indices
+        .as_ref()
+        .map_or(n_snps_full, |indices| indices.len());
+    let subset_plan = SampleSubsetPlan::from_optional_indices(
+        n_samples_full,
+        sample_indices.as_ref().map(Vec::as_slice),
+    );
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let code4_lut = &packed_byte_lut().code4;
+    let full_bytes = n_samples_full / 4;
+    let rem = n_samples_full % 4;
+    let block_rows = 2048usize;
+    let n_blocks = n_snps.div_ceil(block_rows);
+
+    let run = || {
+        (0..n_blocks)
+            .into_par_iter()
+            .map(|block_idx| {
+                let output_start = block_idx * block_rows;
+                let output_end = std::cmp::min(n_snps, output_start + block_rows);
+                let rows_in_block = output_end - output_start;
+                let mut site_maf = request.site_maf.then(|| vec![0.0_f32; rows_in_block]);
+                let mut site_miss = request.site_miss.then(|| vec![0.0_f32; rows_in_block]);
+                let mut site_het = request.site_het.then(|| vec![0.0_f32; rows_in_block]);
+                let mut miss_ct = request.needs_individual().then(|| vec![0u64; n_samples]);
+                let mut nonmiss_ct = request.needs_individual().then(|| vec![0u64; n_samples]);
+                let mut het_ct = request.needs_individual().then(|| vec![0u64; n_samples]);
+
+                for output_idx in output_start..output_end {
+                    let source_idx = site_indices
+                        .as_ref()
+                        .map_or(output_idx, |indices| indices[output_idx]);
+                    let row =
+                        &packed_src[source_idx * bytes_per_snp..(source_idx + 1) * bytes_per_snp];
+                    if request.needs_site() {
+                        let (missing, het_count, hom_alt) = if subset_plan.is_identity() {
+                            count_packed_row_counts_simd(row, n_samples_full)
+                        } else {
+                            count_packed_row_counts_selected_with_excluded(
+                                row,
+                                n_samples_full,
+                                subset_plan.selected().unwrap(),
+                                subset_plan.excluded(),
+                            )
+                        };
+                        let (maf_value, miss_value, het_value) =
+                            packed_site_rates(n_samples, missing, het_count, hom_alt);
+                        let local_idx = output_idx - output_start;
+                        if let Some(values) = site_maf.as_mut() {
+                            values[local_idx] = maf_value;
+                        }
+                        if let Some(values) = site_miss.as_mut() {
+                            values[local_idx] = miss_value;
+                        }
+                        if let Some(values) = site_het.as_mut() {
+                            values[local_idx] = het_value;
+                        }
+                    }
+                    if let (Some(miss), Some(nonmiss), Some(het)) =
+                        (miss_ct.as_mut(), nonmiss_ct.as_mut(), het_ct.as_mut())
+                    {
+                        if let Some(indices) = sample_indices.as_ref() {
+                            accumulate_individual_row_counts_selected(
+                                row, indices, miss, nonmiss, het,
+                            );
+                        } else {
+                            accumulate_individual_row_counts(
+                                row, code4_lut, full_bytes, rem, miss, nonmiss, het,
+                            );
+                        }
+                    }
+                }
+                (
+                    output_start,
+                    GstatsBlockResult {
+                        site_maf,
+                        site_miss,
+                        site_het,
+                        miss_ct,
+                        nonmiss_ct,
+                        het_ct,
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let blocks = if let Some(pool) = &pool {
+        pool.install(run)
+    } else {
+        run()
+    };
+
+    let mut site_maf = request.site_maf.then(|| vec![0.0_f32; n_snps]);
+    let mut site_miss = request.site_miss.then(|| vec![0.0_f32; n_snps]);
+    let mut site_het = request.site_het.then(|| vec![0.0_f32; n_snps]);
+    let mut total_miss = request.needs_individual().then(|| vec![0u64; n_samples]);
+    let mut total_nonmiss = request.needs_individual().then(|| vec![0u64; n_samples]);
+    let mut total_het = request.needs_individual().then(|| vec![0u64; n_samples]);
+    for (output_start, block) in blocks {
+        if let (Some(dst), Some(src)) = (site_maf.as_mut(), block.site_maf) {
+            dst[output_start..output_start + src.len()].copy_from_slice(&src);
+        }
+        if let (Some(dst), Some(src)) = (site_miss.as_mut(), block.site_miss) {
+            dst[output_start..output_start + src.len()].copy_from_slice(&src);
+        }
+        if let (Some(dst), Some(src)) = (site_het.as_mut(), block.site_het) {
+            dst[output_start..output_start + src.len()].copy_from_slice(&src);
+        }
+        if let (Some(dst), Some(src)) = (total_miss.as_mut(), block.miss_ct) {
+            for (left, right) in dst.iter_mut().zip(src) {
+                *left += right;
+            }
+        }
+        if let (Some(dst), Some(src)) = (total_nonmiss.as_mut(), block.nonmiss_ct) {
+            for (left, right) in dst.iter_mut().zip(src) {
+                *left += right;
+            }
+        }
+        if let (Some(dst), Some(src)) = (total_het.as_mut(), block.het_ct) {
+            for (left, right) in dst.iter_mut().zip(src) {
+                *left += right;
+            }
+        }
+    }
+    let (individual_miss, individual_het) = match (total_miss, total_nonmiss, total_het) {
+        (Some(miss), Some(nonmiss), Some(het)) => {
+            finalize_individual_rates(miss, nonmiss, het, n_snps, request)
+        }
+        _ => (None, None),
+    };
+    Ok(GstatsCombinedOutput {
+        site_maf,
+        site_miss,
+        site_het,
+        individual_miss,
+        individual_het,
+    })
+}
+
+fn contiguous_site_range(indices: &[usize]) -> Option<(usize, usize)> {
+    let (&start, rest) = indices.split_first()?;
+    if rest
+        .iter()
+        .enumerate()
+        .all(|(offset, &value)| value == start + offset + 1)
+    {
+        Some((start, start + indices.len()))
+    } else {
+        None
+    }
+}
+
+fn compact_bed_selection(
+    packed_src: &[u8],
+    bytes_per_snp_full: usize,
+    n_snps_full: usize,
+    site_indices: Option<&[usize]>,
+    sample_indices: Option<&[usize]>,
+) -> Vec<u8> {
+    let n_sites = site_indices.map_or(n_snps_full, <[usize]>::len);
+    if sample_indices.is_none() {
+        let mut output = Vec::with_capacity(n_sites * bytes_per_snp_full);
+        for output_idx in 0..n_sites {
+            let source_idx = site_indices.map_or(output_idx, |indices| indices[output_idx]);
+            output.extend_from_slice(
+                &packed_src[source_idx * bytes_per_snp_full..(source_idx + 1) * bytes_per_snp_full],
+            );
+        }
+        return output;
+    }
+
+    let samples = sample_indices.unwrap();
+    let bytes_per_snp = samples.len().div_ceil(4);
+    let mut output = vec![0_u8; n_sites * bytes_per_snp];
+    for output_site in 0..n_sites {
+        let source_site = site_indices.map_or(output_site, |indices| indices[output_site]);
+        let source_row =
+            &packed_src[source_site * bytes_per_snp_full..(source_site + 1) * bytes_per_snp_full];
+        let output_row =
+            &mut output[output_site * bytes_per_snp..(output_site + 1) * bytes_per_snp];
+        for (output_sample, &source_sample) in samples.iter().enumerate() {
+            let code = (source_row[source_sample >> 2] >> ((source_sample & 3) << 1)) & 0b11;
+            output_row[output_sample >> 2] |= code << ((output_sample & 3) << 1);
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+fn compact_selected_bed(
+    packed_src: &[u8],
+    bytes_per_snp_full: usize,
+    site_indices: &[usize],
+    sample_indices: Option<&[usize]>,
+) -> Vec<u8> {
+    compact_bed_selection(
+        packed_src,
+        bytes_per_snp_full,
+        site_indices.len(),
+        Some(site_indices),
+        sample_indices,
+    )
+}
+
+fn readonly_indices_to_usize(
+    values: Option<PyReadonlyArray1<'_, i64>>,
+    label: &str,
+) -> PyResult<Option<Vec<usize>>> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    let mut output = Vec::with_capacity(values.as_array().len());
+    for &value in values.as_array().iter() {
+        if value < 0 {
+            return Err(map_err_string_to_py(format!(
+                "{label}_indices contains negative index {value}"
+            )));
+        }
+        output.push(value as usize);
+    }
+    Ok(Some(output))
+}
+
 fn parse_bim_ldsc_meta(prefix: &str) -> Result<(Vec<i32>, Vec<i64>, Vec<f64>), String> {
     let bim_path = format!("{prefix}.bim");
     let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
@@ -1171,23 +1471,55 @@ fn compute_ldscore_core(
 }
 
 #[pyfunction]
-#[pyo3(signature = (prefix, threads=0))]
+#[pyo3(signature = (prefix, threads=0, sample_indices=None, site_indices=None))]
 pub fn gstats_bed_site_stats<'py>(
     py: Python<'py>,
     prefix: String,
     threads: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    site_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<(
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<f32>>,
     usize,
 )> {
+    let sample_indices = readonly_indices_to_usize(sample_indices, "sample")?;
+    let site_indices = readonly_indices_to_usize(site_indices, "site")?;
     let (maf, miss, het, n_samples) = py
         .detach(
             move || -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, usize), String> {
-                let (maf, miss, het, n_samples, _n_snps) =
-                    compute_site_stats_unified_from_prefix(&prefix, threads)?;
-                Ok((maf, miss, het, n_samples))
+                if sample_indices.is_none() && site_indices.is_none() {
+                    let (maf, miss, het, n_samples, _n_snps) =
+                        compute_site_stats_unified_from_prefix(&prefix, threads)?;
+                    return Ok((maf, miss, het, n_samples));
+                }
+                let bed_prefix = normalize_plink_prefix(&prefix);
+                let (mmap, n_samples_full, n_snps_full, bytes_per_snp) =
+                    open_bed_mmap(&bed_prefix)?;
+                let request = GstatsRequest {
+                    site_maf: true,
+                    site_miss: true,
+                    site_het: true,
+                    ..GstatsRequest::default()
+                };
+                let out = compute_joint_stats_selected_core(
+                    &mmap[3..],
+                    n_samples_full,
+                    n_snps_full,
+                    bytes_per_snp,
+                    request,
+                    sample_indices.as_deref(),
+                    site_indices.as_deref(),
+                    threads,
+                )?;
+                let n_samples = sample_indices.as_ref().map_or(n_samples_full, Vec::len);
+                Ok((
+                    out.site_maf.unwrap(),
+                    out.site_miss.unwrap(),
+                    out.site_het.unwrap(),
+                    n_samples,
+                ))
             },
         )
         .map_err(map_err_string_to_py)?;
@@ -1206,7 +1538,9 @@ pub fn gstats_bed_site_stats<'py>(
     site_het=true,
     individual_miss=true,
     individual_het=true,
-    threads=0
+    threads=0,
+    sample_indices=None,
+    site_indices=None
 ))]
 pub fn gstats_bed_joint_stats<'py>(
     py: Python<'py>,
@@ -1217,6 +1551,8 @@ pub fn gstats_bed_joint_stats<'py>(
     individual_miss: bool,
     individual_het: bool,
     threads: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    site_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<(
     Option<Bound<'py, PyArray1<f32>>>,
     Option<Bound<'py, PyArray1<f32>>>,
@@ -1226,6 +1562,8 @@ pub fn gstats_bed_joint_stats<'py>(
     usize,
     usize,
 )> {
+    let sample_indices = readonly_indices_to_usize(sample_indices, "sample")?;
+    let site_indices = readonly_indices_to_usize(site_indices, "site")?;
     let bed_prefix = normalize_plink_prefix(&prefix);
     let request = GstatsRequest {
         site_maf,
@@ -1237,19 +1575,25 @@ pub fn gstats_bed_joint_stats<'py>(
     let out = py
         .detach(
             move || -> Result<(GstatsCombinedOutput, usize, usize), String> {
-                if !request.needs_individual() {
+                if sample_indices.is_none() && site_indices.is_none() && !request.needs_individual()
+                {
                     compute_joint_site_only_via_meta(&bed_prefix, request, threads)
                 } else {
-                    let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
+                    let (mmap, n_samples_full, n_snps_full, bytes_per_snp) =
+                        open_bed_mmap(&bed_prefix)?;
                     let packed_src = &mmap[3..];
-                    let out = compute_joint_stats_core(
+                    let out = compute_joint_stats_selected_core(
                         packed_src,
-                        n_samples,
-                        n_snps,
+                        n_samples_full,
+                        n_snps_full,
                         bytes_per_snp,
                         request,
+                        sample_indices.as_deref(),
+                        site_indices.as_deref(),
                         threads,
                     )?;
+                    let n_samples = sample_indices.as_ref().map_or(n_samples_full, Vec::len);
+                    let n_snps = site_indices.as_ref().map_or(n_snps_full, Vec::len);
                     Ok((out, n_samples, n_snps))
                 }
             },
@@ -1329,25 +1673,52 @@ pub fn gstats_bed_site_stats_compare<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (prefix, threads=0))]
+#[pyo3(signature = (prefix, threads=0, sample_indices=None, site_indices=None))]
 pub fn gstats_bed_individual_stats<'py>(
     py: Python<'py>,
     prefix: String,
     threads: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    site_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray1<f32>>, usize)> {
+    let sample_indices = readonly_indices_to_usize(sample_indices, "sample")?;
+    let site_indices = readonly_indices_to_usize(site_indices, "site")?;
     let bed_prefix = normalize_plink_prefix(&prefix);
     let (miss_rate, het_rate, n_snps) = py
         .detach(move || -> Result<(Vec<f32>, Vec<f32>, usize), String> {
             let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
             let packed_src = &mmap[3..];
-            let (miss_rate, het_rate) = compute_individual_stats_core(
+            if sample_indices.is_none() && site_indices.is_none() {
+                let (miss_rate, het_rate) = compute_individual_stats_core(
+                    packed_src,
+                    n_samples,
+                    n_snps,
+                    bytes_per_snp,
+                    threads,
+                )?;
+                return Ok((miss_rate, het_rate, n_snps));
+            }
+            let request = GstatsRequest {
+                individual_miss: true,
+                individual_het: true,
+                ..GstatsRequest::default()
+            };
+            let out = compute_joint_stats_selected_core(
                 packed_src,
                 n_samples,
                 n_snps,
                 bytes_per_snp,
+                request,
+                sample_indices.as_deref(),
+                site_indices.as_deref(),
                 threads,
             )?;
-            Ok((miss_rate, het_rate, n_snps))
+            let selected_n_snps = site_indices.as_ref().map_or(n_snps, Vec::len);
+            Ok((
+                out.individual_miss.unwrap(),
+                out.individual_het.unwrap(),
+                selected_n_snps,
+            ))
         })
         .map_err(map_err_string_to_py)?;
 
@@ -1357,41 +1728,127 @@ pub fn gstats_bed_individual_stats<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (prefix, window_kind, window_value, threads=0))]
+#[pyo3(signature = (
+    prefix,
+    window_kind,
+    window_value,
+    threads=0,
+    sample_indices=None,
+    site_indices=None
+))]
 pub fn gstats_bed_ldscore<'py>(
     py: Python<'py>,
     prefix: String,
     window_kind: String,
     window_value: f64,
     threads: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    site_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>, usize)> {
+    let sample_indices = readonly_indices_to_usize(sample_indices, "sample")?;
+    let site_indices = readonly_indices_to_usize(site_indices, "site")?;
     let bed_prefix = normalize_plink_prefix(&prefix);
     let window = parse_ldsc_window(&window_kind, window_value).map_err(map_err_string_to_py)?;
     let (m_counts, ld_scores, n_samples) = py
         .detach(move || -> Result<(Vec<i64>, Vec<f64>, usize), String> {
-            let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
-            let (chrom_codes, positions, cm_positions) = parse_bim_ldsc_meta(&bed_prefix)?;
-            if chrom_codes.len() != n_snps
-                || positions.len() != n_snps
-                || cm_positions.len() != n_snps
+            let (mmap, n_samples_full, n_snps_full, bytes_per_snp_full) =
+                open_bed_mmap(&bed_prefix)?;
+            let (chrom_codes_full, positions_full, cm_positions_full) =
+                parse_bim_ldsc_meta(&bed_prefix)?;
+            if chrom_codes_full.len() != n_snps_full
+                || positions_full.len() != n_snps_full
+                || cm_positions_full.len() != n_snps_full
             {
                 return Err(format!(
-                    "BED/BIM row mismatch: bed={n_snps}, bim={}",
-                    chrom_codes.len()
+                    "BED/BIM row mismatch: bed={n_snps_full}, bim={}",
+                    chrom_codes_full.len()
                 ));
             }
+            if sample_indices.is_none() && site_indices.is_none() {
+                let (m_counts, ld_scores) = compute_ldscore_core(
+                    &mmap[3..],
+                    n_samples_full,
+                    n_snps_full,
+                    bytes_per_snp_full,
+                    &chrom_codes_full,
+                    &positions_full,
+                    &cm_positions_full,
+                    window,
+                    threads,
+                )?;
+                return Ok((m_counts, ld_scores, n_samples_full));
+            }
+            let sample_indices =
+                validate_selection_indices(sample_indices.as_deref(), n_samples_full, "sample")?;
+            let site_indices =
+                validate_selection_indices(site_indices.as_deref(), n_snps_full, "site")?;
+            let n_samples = sample_indices.as_ref().map_or(n_samples_full, Vec::len);
+            let n_snps = site_indices.as_ref().map_or(n_snps_full, Vec::len);
+            let select_meta = |values: &[i64]| -> Vec<i64> {
+                site_indices.as_ref().map_or_else(
+                    || values.to_vec(),
+                    |indices| indices.iter().map(|&index| values[index]).collect(),
+                )
+            };
+            let chrom_as_i64: Vec<i64> = chrom_codes_full.iter().map(|&v| i64::from(v)).collect();
+            let chrom_codes: Vec<i32> = select_meta(&chrom_as_i64)
+                .into_iter()
+                .map(|v| v as i32)
+                .collect();
+            let positions = select_meta(&positions_full);
+            let cm_positions: Vec<f64> = site_indices.as_ref().map_or_else(
+                || cm_positions_full.clone(),
+                |indices| {
+                    indices
+                        .iter()
+                        .map(|&index| cm_positions_full[index])
+                        .collect()
+                },
+            );
             let packed_src = &mmap[3..];
-            let (m_counts, ld_scores) = compute_ldscore_core(
-                packed_src,
-                n_samples,
-                n_snps,
-                bytes_per_snp,
-                chrom_codes.as_slice(),
-                positions.as_slice(),
-                cm_positions.as_slice(),
-                window,
-                threads,
-            )?;
+            let run_core = |data: &[u8], bytes_per_snp: usize| {
+                compute_ldscore_core(
+                    data,
+                    n_samples,
+                    n_snps,
+                    bytes_per_snp,
+                    &chrom_codes,
+                    &positions,
+                    &cm_positions,
+                    window,
+                    threads,
+                )
+            };
+            let (m_counts, ld_scores) = if sample_indices.is_none() {
+                if let Some(indices) = site_indices.as_ref() {
+                    if let Some((start, end)) = contiguous_site_range(indices) {
+                        run_core(
+                            &packed_src[start * bytes_per_snp_full..end * bytes_per_snp_full],
+                            bytes_per_snp_full,
+                        )?
+                    } else {
+                        let compact = compact_bed_selection(
+                            packed_src,
+                            bytes_per_snp_full,
+                            n_snps_full,
+                            Some(indices),
+                            None,
+                        );
+                        run_core(&compact, bytes_per_snp_full)?
+                    }
+                } else {
+                    run_core(packed_src, bytes_per_snp_full)?
+                }
+            } else {
+                let compact = compact_bed_selection(
+                    packed_src,
+                    bytes_per_snp_full,
+                    n_snps_full,
+                    site_indices.as_deref(),
+                    sample_indices.as_deref(),
+                );
+                run_core(&compact, n_samples.div_ceil(4))?
+            };
             Ok((m_counts, ld_scores, n_samples))
         })
         .map_err(map_err_string_to_py)?;
@@ -1399,4 +1856,60 @@ pub fn gstats_bed_ldscore<'py>(
     let m_arr = PyArray1::from_owned_array(py, Array1::from_vec(m_counts)).into_bound();
     let ld_arr = PyArray1::from_owned_array(py, Array1::from_vec(ld_scores)).into_bound();
     Ok((m_arr, ld_arr, n_samples))
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn selected_joint_stats_use_selected_samples_and_sites() {
+        // Four samples per row, PLINK codes packed low-to-high in one byte.
+        let packed = [120_u8, 47_u8, 233_u8];
+        let request = GstatsRequest {
+            site_maf: true,
+            site_miss: true,
+            site_het: true,
+            individual_miss: true,
+            individual_het: true,
+        };
+        let out = compute_joint_stats_selected_core(
+            &packed,
+            4,
+            3,
+            1,
+            request,
+            Some(&[1, 3]),
+            Some(&[0, 2]),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(out.site_maf.unwrap(), vec![0.5, 0.25]);
+        assert_eq!(out.site_miss.unwrap(), vec![0.5, 0.0]);
+        assert_eq!(out.site_het.unwrap(), vec![1.0, 0.5]);
+        assert_eq!(out.individual_miss.unwrap(), vec![0.0, 0.5]);
+        assert_eq!(out.individual_het.unwrap(), vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn selection_indices_must_be_strictly_increasing() {
+        assert!(validate_selection_indices(Some(&[1, 1]), 4, "sample").is_err());
+        assert!(validate_selection_indices(Some(&[2, 1]), 4, "sample").is_err());
+        assert!(validate_selection_indices(Some(&[4]), 4, "sample").is_err());
+        assert!(validate_selection_indices(Some(&[]), 4, "sample").is_err());
+        assert_eq!(
+            validate_selection_indices(Some(&[0, 2]), 4, "sample").unwrap(),
+            Some(vec![0, 2])
+        );
+    }
+
+    #[test]
+    fn selected_bed_repacking_preserves_plink_codes() {
+        let packed = [120_u8, 47_u8, 233_u8];
+        let compact = compact_selected_bed(&packed, 1, &[0, 2], Some(&[1, 3]));
+        assert_eq!(compact, vec![6_u8, 14_u8]);
+        assert_eq!(contiguous_site_range(&[1, 2]), Some((1, 3)));
+        assert_eq!(contiguous_site_range(&[0, 2]), None);
+    }
 }

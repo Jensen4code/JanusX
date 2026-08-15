@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import socket
 import time
+import warnings
 from contextlib import ExitStack
 from dataclasses import dataclass
 
@@ -45,6 +47,24 @@ class LdscWindowSpec:
     kind: str
     value: float
     label: str
+
+
+@dataclass(frozen=True)
+class GstatsFilterSelection:
+    sample_indices: np.ndarray | None
+    site_indices: np.ndarray | None
+    selected_fam: pd.DataFrame | None
+    selected_bim: pd.DataFrame | None
+    n_samples_total: int
+    n_sites_total: int
+
+    @property
+    def n_samples_selected(self) -> int:
+        return self.n_samples_total if self.selected_fam is None else int(len(self.selected_fam))
+
+    @property
+    def n_sites_selected(self) -> int:
+        return self.n_sites_total if self.selected_bim is None else int(len(self.selected_bim))
 
 
 # Keep dense LD-score point clouds out of the PDF vector layer.  The axes,
@@ -176,12 +196,292 @@ def _read_bim_table(prefix: str) -> pd.DataFrame:
     return out
 
 
+def _normalize_gstats_chrom(value: object) -> str:
+    token = str(value).strip()
+    if token[:3].lower() == "chr":
+        token = token[3:]
+    if not token:
+        raise ValueError("empty chromosome token")
+    return token.upper()
+
+
+def _parse_gstats_chr_filter(values: list[str] | None) -> set[str] | None:
+    if values is None:
+        return None
+    result: set[str] = set()
+    for raw in values:
+        for token in re.split(r"[\s,]+", str(raw).strip()):
+            if not token:
+                continue
+            normalized = _normalize_gstats_chrom(token)
+            match = re.fullmatch(r"([0-9]+)-([0-9]+)", normalized)
+            if match is None:
+                result.add(normalized)
+                continue
+            start, end = (int(match.group(1)), int(match.group(2)))
+            if start > end:
+                raise ValueError(f"invalid chromosome range: {token!r}")
+            result.update(str(chrom) for chrom in range(start, end + 1))
+    if not result:
+        raise ValueError("--chr did not contain any chromosome")
+    return result
+
+
+def _parse_gstats_extract(tokens: list[str] | None) -> tuple[str, list[str]] | None:
+    if tokens is None:
+        return None
+    values = [str(value).strip() for value in tokens if str(value).strip()]
+    if not values:
+        raise ValueError("--extract requires a site file or 'range <file>'")
+    if values[0].lower() == "range":
+        if len(values) == 1:
+            raise ValueError("--extract range requires at least one file")
+        return "range", values[1:]
+    return "site", values
+
+
+def _iter_filter_rows(path: str):
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            content = line.split("#", 1)[0].strip()
+            if content:
+                yield line_no, content.split()
+
+
+def _read_keep_iids(path: str) -> set[str]:
+    result: set[str] = set()
+    for line_no, fields in _iter_filter_rows(path):
+        if len(fields) != 1:
+            raise ValueError(f"{path}:{line_no}: --keep expects one IID per line")
+        result.add(fields[0])
+    if not result:
+        raise ValueError(f"{path}: --keep file contains no sample IDs")
+    return result
+
+
+def _parse_site_key(path: str, line_no: int, fields: list[str]) -> tuple[str, int]:
+    if len(fields) == 2:
+        chrom, pos_text = fields
+    elif len(fields) == 1:
+        token = fields[0]
+        if ":" in token:
+            chrom, pos_text = token.rsplit(":", 1)
+        elif "_" in token:
+            chrom, pos_text = token.rsplit("_", 1)
+        else:
+            raise ValueError(
+                f"{path}:{line_no}: site must be CHR POS, CHR:POS, or CHR_POS"
+            )
+    else:
+        raise ValueError(f"{path}:{line_no}: malformed site row")
+    try:
+        pos = int(pos_text)
+    except ValueError as exc:
+        raise ValueError(f"{path}:{line_no}: invalid position {pos_text!r}") from exc
+    if pos < 0:
+        raise ValueError(f"{path}:{line_no}: position must be >= 0")
+    return _normalize_gstats_chrom(chrom), pos
+
+
+def _read_extract_sites(paths: list[str]) -> set[tuple[str, int]]:
+    sites: set[tuple[str, int]] = set()
+    for path in paths:
+        for line_no, fields in _iter_filter_rows(path):
+            sites.add(_parse_site_key(path, line_no, fields))
+    if not sites:
+        raise ValueError("--extract site files contain no variants")
+    return sites
+
+
+def _read_extract_ranges(paths: list[str]) -> list[tuple[str, int, int]]:
+    ranges: list[tuple[str, int, int]] = []
+    for path in paths:
+        for line_no, fields in _iter_filter_rows(path):
+            if len(fields) != 3:
+                raise ValueError(f"{path}:{line_no}: range expects CHR START END")
+            chrom = _normalize_gstats_chrom(fields[0])
+            try:
+                start, end = int(fields[1]), int(fields[2])
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_no}: invalid range coordinates") from exc
+            if start < 0 or end < start:
+                raise ValueError(f"{path}:{line_no}: invalid inclusive range {start}..{end}")
+            ranges.append((chrom, start, end))
+    if not ranges:
+        raise ValueError("--extract range files contain no ranges")
+    return ranges
+
+
+def _resolve_gstats_selection(
+    prefix: str,
+    *,
+    keep_path: str | None,
+    extract_tokens: list[str] | None,
+    chr_values: list[str] | None,
+    from_bp: int | None,
+    to_bp: int | None,
+) -> GstatsFilterSelection:
+    has_sample_filter = keep_path is not None
+    has_site_filter = (
+        extract_tokens is not None
+        or chr_values is not None
+        or from_bp is not None
+        or to_bp is not None
+    )
+    if not has_sample_filter and not has_site_filter:
+        return GstatsFilterSelection(
+            sample_indices=None,
+            site_indices=None,
+            selected_fam=None,
+            selected_bim=None,
+            n_samples_total=0,
+            n_sites_total=0,
+        )
+
+    fam = _read_fam_table(prefix) if has_sample_filter else None
+    bim = _read_bim_table(prefix) if has_site_filter else None
+    n_samples_total = 0 if fam is None else int(len(fam))
+    n_sites_total = 0 if bim is None else int(len(bim))
+    if fam is not None and n_samples_total == 0:
+        raise ValueError("gstats input must contain at least one sample")
+    if bim is not None and n_sites_total == 0:
+        raise ValueError("gstats input must contain at least one variant")
+
+    chrom_filter = _parse_gstats_chr_filter(chr_values)
+    if from_bp is not None and int(from_bp) < 0:
+        raise ValueError("--from-bp must be >= 0")
+    if to_bp is not None and int(to_bp) < 0:
+        raise ValueError("--to-bp must be >= 0")
+    if from_bp is not None and to_bp is not None and int(from_bp) > int(to_bp):
+        raise ValueError("--from-bp must be <= --to-bp")
+    if (from_bp is not None or to_bp is not None) and (
+        chrom_filter is None or len(chrom_filter) != 1
+    ):
+        raise ValueError("--from-bp/--to-bp require a single chromosome in --chr")
+
+    sample_indices_raw: np.ndarray | None = None
+    selected_fam: pd.DataFrame | None = None
+    if has_sample_filter:
+        assert fam is not None and keep_path is not None
+        sample_mask = np.ones(n_samples_total, dtype=bool)
+        requested_iids = _read_keep_iids(str(keep_path))
+        observed_iids = set(fam["iid"].astype(str))
+        missing = requested_iids - observed_iids
+        if missing:
+            warnings.warn(
+                f"--keep: {len(missing)} sample ID(s) were not found",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        sample_mask &= fam["iid"].isin(requested_iids).to_numpy(dtype=bool)
+        sample_indices_raw = np.flatnonzero(sample_mask).astype(np.int64, copy=False)
+        if sample_indices_raw.size == 0:
+            raise ValueError("no samples remain after applying --keep")
+        selected_fam = fam.iloc[sample_indices_raw].reset_index(drop=True)
+
+    site_indices_raw: np.ndarray | None = None
+    selected_bim: pd.DataFrame | None = None
+    if has_site_filter:
+        assert bim is not None
+        site_mask = np.ones(n_sites_total, dtype=bool)
+        bim_chrom = bim["chr"].map(_normalize_gstats_chrom).to_numpy(dtype=object)
+        bim_pos = bim["pos"].to_numpy(dtype=np.int64)
+        if chrom_filter is not None:
+            site_mask &= np.isin(bim_chrom, list(chrom_filter))
+        if from_bp is not None:
+            site_mask &= bim_pos >= int(from_bp)
+        if to_bp is not None:
+            site_mask &= bim_pos <= int(to_bp)
+
+        extract = _parse_gstats_extract(extract_tokens)
+        if extract is not None:
+            mode, paths = extract
+            extract_mask = np.zeros(n_sites_total, dtype=bool)
+            if mode == "site":
+                requested_sites = _read_extract_sites(paths)
+                observed_sites = set(zip(bim_chrom.tolist(), bim_pos.tolist()))
+                missing = requested_sites - observed_sites
+                if missing:
+                    warnings.warn(
+                        f"--extract: {len(missing)} variant(s) were not found",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                extract_mask = np.fromiter(
+                    (
+                        (chrom, int(pos)) in requested_sites
+                        for chrom, pos in zip(bim_chrom, bim_pos)
+                    ),
+                    dtype=bool,
+                    count=n_sites_total,
+                )
+            else:
+                ranges = _read_extract_ranges(paths)
+                for chrom, start, end in ranges:
+                    extract_mask |= (
+                        (bim_chrom == chrom) & (bim_pos >= start) & (bim_pos <= end)
+                    )
+                if not bool(np.any(extract_mask)):
+                    warnings.warn(
+                        "--extract range: no input variant overlapped the requested ranges",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            site_mask &= extract_mask
+
+        site_indices_raw = np.flatnonzero(site_mask).astype(np.int64, copy=False)
+        if site_indices_raw.size == 0:
+            raise ValueError("no variants remain after applying gstats filters")
+        selected_bim = bim.iloc[site_indices_raw].reset_index(drop=True)
+
+    return GstatsFilterSelection(
+        sample_indices=sample_indices_raw,
+        site_indices=site_indices_raw,
+        selected_fam=selected_fam,
+        selected_bim=selected_bim,
+        n_samples_total=n_samples_total,
+        n_sites_total=n_sites_total,
+    )
+
+
 def _open_text_writer(path: str):
     return open(path, "w", encoding="utf-8", buffering=8 * 1024 * 1024)
 
 
+def _iter_bim_output_rows(source: str | pd.DataFrame):
+    if isinstance(source, pd.DataFrame):
+        for row in source.itertuples(index=False):
+            yield str(row.chr).strip(), int(row.pos)
+        return
+    path = f"{source}.bim"
+    with open(path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            fields = line.split()
+            if len(fields) < 4:
+                raise ValueError(f"Malformed BIM file: {path}:{line_no}")
+            yield fields[0].strip(), int(fields[3])
+
+
+def _iter_fam_output_rows(source: str | pd.DataFrame):
+    if isinstance(source, pd.DataFrame):
+        for row in source.itertuples(index=False):
+            yield str(row.fid).strip(), str(row.iid).strip()
+        return
+    path = f"{source}.fam"
+    with open(path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            fields = line.split()
+            if len(fields) < 2:
+                raise ValueError(f"Malformed FAM file: {path}:{line_no}")
+            yield fields[0].strip(), fields[1].strip()
+
+
 def _write_site_tables_from_bim(
-    prefix: str,
+    bim: str | pd.DataFrame,
     *,
     outprefix: str,
     freq: np.ndarray | None = None,
@@ -198,7 +498,8 @@ def _write_site_tables_from_bim(
         if arr is not None and int(arr.shape[0]) != int(expected):
             raise ValueError("site-stat arrays have inconsistent lengths")
 
-    bim_path = f"{prefix}.bim"
+    if isinstance(bim, pd.DataFrame) and len(bim) != int(expected):
+        raise ValueError(f"BIM/site-stat length mismatch: bim={len(bim)}, stats={expected}")
     outputs: list[str] = []
     with ExitStack() as stack:
         freq_fh = None
@@ -220,36 +521,25 @@ def _write_site_tables_from_bim(
             het_fh.write("chr\tpos\thet\n")
             outputs.append(het_path)
 
-        row_idx = 0
-        with open(bim_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as fh:
-            for line_no, line in enumerate(fh, start=1):
-                if not line.strip():
-                    continue
-                toks = line.split()
-                if len(toks) < 4:
-                    raise ValueError(f"Malformed BIM file: {bim_path}:{line_no}")
-                if row_idx >= int(expected):
-                    raise ValueError(
-                        f"BIM/site-stat length mismatch: bim has more rows than stats ({row_idx + 1} > {expected})"
-                    )
-                chrom = toks[0].strip()
-                pos = toks[3]
-                if freq_fh is not None:
-                    freq_fh.write(f"{chrom}\t{pos}\t{float(freq_arr[row_idx]):.6f}\n")
-                if miss_fh is not None:
-                    miss_fh.write(f"{chrom}\t{pos}\t{float(miss_arr[row_idx]):.6f}\n")
-                if het_fh is not None:
-                    het_fh.write(f"{chrom}\t{pos}\t{float(het_arr[row_idx]):.6f}\n")
-                row_idx += 1
-
-        if row_idx != int(expected):
-            raise ValueError(f"BIM/site-stat length mismatch: bim={row_idx}, stats={expected}")
+        row_count = 0
+        for row_idx, (chrom, pos) in enumerate(_iter_bim_output_rows(bim)):
+            if row_idx >= int(expected):
+                raise ValueError("BIM/site-stat length mismatch: BIM has more rows than stats")
+            if freq_fh is not None:
+                freq_fh.write(f"{chrom}\t{pos}\t{float(freq_arr[row_idx]):.6f}\n")
+            if miss_fh is not None:
+                miss_fh.write(f"{chrom}\t{pos}\t{float(miss_arr[row_idx]):.6f}\n")
+            if het_fh is not None:
+                het_fh.write(f"{chrom}\t{pos}\t{float(het_arr[row_idx]):.6f}\n")
+            row_count += 1
+        if row_count != int(expected):
+            raise ValueError(f"BIM/site-stat length mismatch: bim={row_count}, stats={expected}")
 
     return outputs
 
 
 def _write_individual_tables_from_fam(
-    prefix: str,
+    fam: str | pd.DataFrame,
     *,
     outprefix: str,
     miss: np.ndarray | None = None,
@@ -262,7 +552,8 @@ def _write_individual_tables_from_fam(
         if arr is not None and int(arr.shape[0]) != int(expected):
             raise ValueError("individual-stat arrays have inconsistent lengths")
 
-    fam_path = f"{prefix}.fam"
+    if isinstance(fam, pd.DataFrame) and len(fam) != int(expected):
+        raise ValueError(f"FAM/individual-stat length mismatch: fam={len(fam)}, stats={expected}")
     outputs: list[str] = []
     with ExitStack() as stack:
         miss_fh = None
@@ -278,28 +569,17 @@ def _write_individual_tables_from_fam(
             het_fh.write("fid\tiid\thet\n")
             outputs.append(het_path)
 
-        row_idx = 0
-        with open(fam_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as fh:
-            for line_no, line in enumerate(fh, start=1):
-                if not line.strip():
-                    continue
-                toks = line.split()
-                if len(toks) < 2:
-                    raise ValueError(f"Malformed FAM file: {fam_path}:{line_no}")
-                if row_idx >= int(expected):
-                    raise ValueError(
-                        f"FAM/individual-stat length mismatch: fam has more rows than stats ({row_idx + 1} > {expected})"
-                    )
-                fid = toks[0].strip()
-                iid = toks[1].strip()
-                if miss_fh is not None:
-                    miss_fh.write(f"{fid}\t{iid}\t{float(miss_arr[row_idx]):.6f}\n")
-                if het_fh is not None:
-                    het_fh.write(f"{fid}\t{iid}\t{float(het_arr[row_idx]):.6f}\n")
-                row_idx += 1
-
-        if row_idx != int(expected):
-            raise ValueError(f"FAM/individual-stat length mismatch: fam={row_idx}, stats={expected}")
+        row_count = 0
+        for row_idx, (fid, iid) in enumerate(_iter_fam_output_rows(fam)):
+            if row_idx >= int(expected):
+                raise ValueError("FAM/individual-stat length mismatch: FAM has more rows than stats")
+            if miss_fh is not None:
+                miss_fh.write(f"{fid}\t{iid}\t{float(miss_arr[row_idx]):.6f}\n")
+            if het_fh is not None:
+                het_fh.write(f"{fid}\t{iid}\t{float(het_arr[row_idx]):.6f}\n")
+            row_count += 1
+        if row_count != int(expected):
+            raise ValueError(f"FAM/individual-stat length mismatch: fam={row_count}, stats={expected}")
 
     return outputs
 
@@ -504,6 +784,41 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Write missing-rate tables: <prefix>.imiss / <prefix>.lmiss and a PDF distribution plot.",
     )
+
+    filters = parser.add_argument_group("Input filters")
+    filters.add_argument(
+        "-keep", "--keep", metavar="KEEP", default=None,
+        help="Keep only samples listed in file (one sample ID per line, no header).",
+    )
+    filters.add_argument(
+        "-extract", "--extract", nargs="+", metavar="MODE_OR_FILE", default=None,
+        help=(
+            "Keep only listed variants. Use '--extract <file>' for site list "
+            "(CHR POS or CHR:POS/CHR_POS), or '--extract range <file>' for range list "
+            "(CHR START END). No header."
+        ),
+    )
+    filters.add_argument(
+        "-chr", "--chr", dest="chr_filter", nargs="+", metavar="CHR_FILTER", default=None,
+        help=(
+            "Keep only variants on selected chromosome(s). Supports spaces/commas and "
+            "numeric ranges, e.g. '--chr 1-4,22,XY'."
+        ),
+    )
+    filters.add_argument(
+        "-from-bp", "--from-bp", dest="from_bp", type=int, default=None,
+        help=(
+            "Physical position range filter. Must be used with a single chromosome in --chr. "
+            "Both --from-bp and --to-bp are inclusive."
+        ),
+    )
+    filters.add_argument(
+        "-to-bp", "--to-bp", dest="to_bp", type=int, default=None,
+        help=(
+            "Physical position range filter. Must be used with a single chromosome in --chr. "
+            "Both --from-bp and --to-bp are inclusive."
+        ),
+    )
     stats.add_argument(
         "-het",
         action="store_true",
@@ -612,6 +927,16 @@ def main() -> None:
                 ],
             ),
             (
+                "Input filters",
+                [
+                    ("Keep", args.keep or "off"),
+                    ("Extract", " ".join(args.extract) if args.extract else "off"),
+                    ("Chromosome", " ".join(args.chr_filter) if args.chr_filter else "all"),
+                    ("From BP", args.from_bp if args.from_bp is not None else "off"),
+                    ("To BP", args.to_bp if args.to_bp is not None else "off"),
+                ],
+            ),
+            (
                 "Runtime",
                 [
                     (
@@ -655,6 +980,31 @@ def main() -> None:
     if not ensure_plink_prefix_exists(logger, bed_prefix, "Statistics BED prefix"):
         raise FileNotFoundError(bed_prefix)
 
+    selection = _resolve_gstats_selection(
+        str(bed_prefix),
+        keep_path=args.keep,
+        extract_tokens=args.extract,
+        chr_values=args.chr_filter,
+        from_bp=args.from_bp,
+        to_bp=args.to_bp,
+    )
+    if selection.selected_fam is not None:
+        logger.info(
+            "Sample selection: %s/%s",
+            f"{selection.n_samples_selected:,}",
+            f"{selection.n_samples_total:,}",
+        )
+    if selection.selected_bim is not None:
+        logger.info(
+            "Variant selection: %s/%s",
+            f"{selection.n_sites_selected:,}",
+            f"{selection.n_sites_total:,}",
+        )
+    selection_kwargs = {
+        "sample_indices": selection.sample_indices,
+        "site_indices": selection.site_indices,
+    }
+
     outputs: list[str] = []
 
     individual_stats = None
@@ -665,6 +1015,7 @@ def main() -> None:
                 maf_raw, lmiss_raw, lhet_raw, n_samples = jxrs.gstats_bed_site_stats(
                     str(bed_prefix),
                     threads=int(args.threads),
+                    **selection_kwargs,
                 )
                 imiss_raw = None
                 ihet_raw = None
@@ -678,6 +1029,7 @@ def main() -> None:
                     individual_miss=bool(args.miss),
                     individual_het=bool(args.het),
                     threads=int(args.threads),
+                    **selection_kwargs,
                 )
             task.complete("Computing genotype statistics ...Finished")
         site_stats = {
@@ -695,7 +1047,7 @@ def main() -> None:
     if args.freq or args.miss or args.het:
         assert site_stats is not None
         site_outputs = _write_site_tables_from_bim(
-            str(bed_prefix),
+            selection.selected_bim if selection.selected_bim is not None else str(bed_prefix),
             outprefix=outprefix,
             freq=site_stats["maf"] if args.freq else None,
             miss=site_stats["miss"] if args.miss else None,
@@ -706,7 +1058,7 @@ def main() -> None:
     if args.miss or args.het:
         assert site_stats is not None and individual_stats is not None
         sample_outputs = _write_individual_tables_from_fam(
-            str(bed_prefix),
+            selection.selected_fam if selection.selected_fam is not None else str(bed_prefix),
             outprefix=outprefix,
             miss=individual_stats["miss"] if args.miss else None,
             het=individual_stats["het"] if args.het else None,
@@ -759,13 +1111,18 @@ def main() -> None:
         log_success(logger, f"Heterozygosity PDF saved: {format_path_for_display(het_pdf)}")
 
     if ldsc_spec is not None:
-        bim_df = _read_bim_table(str(bed_prefix))
+        bim_df = (
+            selection.selected_bim
+            if selection.selected_bim is not None
+            else _read_bim_table(str(bed_prefix))
+        )
         with CliStatus("Computing LD scores...", enabled=True) as task:
             m_raw, ld_raw, ld_n_samples = jxrs.gstats_bed_ldscore(
                 str(bed_prefix),
                 str(ldsc_spec.kind),
                 float(ldsc_spec.value),
                 threads=int(args.threads),
+                **selection_kwargs,
             )
             task.complete("Computing LD scores ...Finished")
         ld_df = bim_df.copy()
