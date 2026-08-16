@@ -17,6 +17,7 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
+use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
@@ -44,9 +45,11 @@ use crate::gfcore::{read_fam, BimChunkReader};
 use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
     prepare_bed_logic_meta_owned_for_stats_samples,
+    prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
 };
 use crate::gload::{GenotypeMatrix, GlobalStats, UnifiedInput, WindowedBedMatrix};
 use crate::he::row_major_block_mul_mat_f32;
+use crate::kmer::{KfileAssocPrefetch, KfileAssocSource};
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
 use crate::pcg::{
     PcgMatrixSolveInfo, PcgSolveInfo, PcgSplmmNullModel, PcgSplmmNullModelInfo, PcgSplmmRHatResult,
@@ -57,7 +60,7 @@ use crate::splmm_approx::{
     estimate_residualized_approx_scan_sparse, estimate_residualized_approx_scan_to_tsv_sparse,
     fit_sparse_reml_on_residualized_response,
 };
-use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64};
+use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
 const SPLMM_TINY: f64 = 1e-30_f64;
 // Association denominators below the public scan `std_eps` default are
@@ -476,7 +479,9 @@ fn run_splmm_async_tsv_writer<R, F>(
     run_scan: F,
 ) -> Result<(R, SplmmTsvTiming), String>
 where
-    F: FnOnce(&mut dyn FnMut(usize, usize, &[f64]) -> Result<(), String>) -> Result<R, String>,
+    F: FnOnce(
+        &mut dyn FnMut(usize, usize, &[f64], Option<&[f32]>) -> Result<(), String>,
+    ) -> Result<R, String>,
 {
     const HEADER: &[u8] = b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n";
     const WRITER_CAPACITY: usize = 64 * 1024 * 1024;
@@ -753,19 +758,20 @@ where
             });
 
             let mut send_secs = 0.0_f64;
-            let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-                let t0 = stage_timing.then(Instant::now);
-                tx.send(SplmmTsvBlockPayload {
-                    row_start,
-                    rows_here,
-                    results: block.to_vec(),
-                })
-                .map_err(|e| format!("send {out_tsv}: {e}"))?;
-                if let Some(t0) = t0 {
-                    send_secs += t0.elapsed().as_secs_f64();
-                }
-                Ok(())
-            };
+            let mut sink =
+                |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+                    let t0 = stage_timing.then(Instant::now);
+                    tx.send(SplmmTsvBlockPayload {
+                        row_start,
+                        rows_here,
+                        results: block.to_vec(),
+                    })
+                    .map_err(|e| format!("send {out_tsv}: {e}"))?;
+                    if let Some(t0) = t0 {
+                        send_secs += t0.elapsed().as_secs_f64();
+                    }
+                    Ok(())
+                };
 
             let run_res = run_scan(&mut sink);
             drop(tx);
@@ -1256,6 +1262,8 @@ fn prepare_prefix_input(
     site_keep: Option<&[bool]>,
     sample_idx_probe: Option<&[usize]>,
     payload_mmap: Option<Arc<Mmap>>,
+    mmap_window_mb: Option<usize>,
+    retain_payload: bool,
 ) -> Result<SplmmPreparedInput, String> {
     let bed_prefix = normalize_plink_prefix_local(prefix);
     if bed_prefix.is_empty() {
@@ -1264,26 +1272,48 @@ fn prepare_prefix_input(
     if n_samples_full == 0 {
         return Err("No samples found in BED input.".to_string());
     }
-    let meta = prepare_bed_logic_meta_owned_for_stats_samples(
-        &bed_prefix,
-        0.0_f32,
-        1.0_f32,
-        0.0_f32,
-        false,
-        sample_idx_probe,
-        false,
-    )?;
-    let meta = filter_meta_with_site_keep(meta, site_keep)?;
-    let mmap = if let Some(mmap) = payload_mmap {
-        mmap
+    let meta = if !retain_payload {
+        let window_mb = mmap_window_mb.filter(|&v| v > 0).ok_or_else(|| {
+            "SparseLMM non-resident BED preparation requires mmap_window_mb > 0.".to_string()
+        })?;
+        prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+            &bed_prefix,
+            0.0_f32,
+            1.0_f32,
+            0.0_f32,
+            false,
+            sample_idx_probe,
+            true,
+            Some(window_mb),
+            rayon::current_num_threads().max(1),
+        )?
     } else {
-        let bed_path = format!("{bed_prefix}.bed");
-        let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-        Arc::new(unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?)
+        prepare_bed_logic_meta_owned_for_stats_samples(
+            &bed_prefix,
+            0.0_f32,
+            1.0_f32,
+            0.0_f32,
+            false,
+            sample_idx_probe,
+            false,
+        )?
+    };
+    let meta = filter_meta_with_site_keep(meta, site_keep)?;
+    let payload = if retain_payload {
+        let mmap = if let Some(mmap) = payload_mmap {
+            mmap
+        } else {
+            let bed_path = format!("{bed_prefix}.bed");
+            let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+            Arc::new(unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?)
+        };
+        Some(SplmmPreparedPayload::Mmap(mmap))
+    } else {
+        None
     };
     Ok(SplmmPreparedInput {
         bed_prefix: Some(bed_prefix),
-        payload: Some(SplmmPreparedPayload::Mmap(mmap)),
+        payload,
         n_samples_full,
         bytes_per_snp: meta.bytes_per_snp,
         row_flip: Arc::from(meta.row_flip),
@@ -1387,7 +1417,11 @@ fn prepare_splmm_assoc_inputs<'py>(
     )?
     .or_else(|| scan_sample_probe.clone());
     let windowed_requested = mmap_window_mb.filter(|&v| v > 0).is_some();
-    let skip_resident_bed_payload = use_external_mmap_meta && windowed_requested;
+    // A requested BED window must be authoritative even when callers do not
+    // provide precomputed row metadata.  Retaining the resident mmap in that
+    // case defeats the memory bound and also makes the r-hat path decode from
+    // the full BED payload.
+    let skip_resident_bed_payload = !use_external_packed && windowed_requested;
     let shared_bed_mmap = if use_external_packed {
         None
     } else if skip_resident_bed_payload {
@@ -1428,6 +1462,8 @@ fn prepare_splmm_assoc_inputs<'py>(
             site_keep_full.as_deref(),
             scan_sample_probe.as_deref(),
             shared_bed_mmap.as_ref().map(Arc::clone),
+            mmap_window_mb,
+            !skip_resident_bed_payload,
         )
         .map_err(PyRuntimeError::new_err)?
     };
@@ -1444,6 +1480,8 @@ fn prepare_splmm_assoc_inputs<'py>(
             site_keep_full.as_deref(),
             operator_sample_probe.as_deref(),
             shared_bed_mmap.as_ref().map(Arc::clone),
+            mmap_window_mb,
+            !skip_resident_bed_payload,
         )
         .map_err(PyRuntimeError::new_err)?
     };
@@ -1838,6 +1876,16 @@ fn packed_block_additive_sumsq_from_counts<G: GenotypeMatrix>(
         return rows_here == 0;
     }
     if !sample_identity && selected_excluded_sample_idx.is_none() {
+        return false;
+    }
+    let row_end = match row_start.checked_add(rows_here) {
+        Some(value) => value,
+        None => return false,
+    };
+    if row_end > input.stats.maf.len()
+        || row_end > input.stats.row_flip.len()
+        || row_end > input.stats.row_source_indices.len()
+    {
         return false;
     }
     let first_src_idx = input.stats.row_source_indices[row_start];
@@ -2588,7 +2636,7 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
     progress_done_offset: usize,
     progress_total_override: usize,
     _solve_workspace: &mut SparseJxgrmSolveWorkspace,
-    sink: &mut dyn FnMut(usize, usize, &[f64]) -> Result<(), String>,
+    sink: &mut dyn FnMut(usize, usize, &[f64], Option<&[f32]>) -> Result<(), String>,
 ) -> Result<(), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
     let total_t0 = stage_timing.then(Instant::now);
@@ -2847,7 +2895,8 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             timing.denom_secs += t0.elapsed().as_secs_f64();
         }
         let t0 = stage_timing.then(Instant::now);
-        sink(row_start, rows_here, out_slice)?;
+        let block_maf = input.matrix.block_maf(rows_here);
+        sink(row_start, rows_here, out_slice, block_maf)?;
         if let Some(t0) = t0 {
             timing.sink_secs += t0.elapsed().as_secs_f64();
         }
@@ -2907,10 +2956,11 @@ fn scan_with_py_and_exact_p_sparse(
 ) -> Result<Vec<f64>, String> {
     let m = scan_prepared.n_rows();
     let mut out = vec![0.0_f64; m * 3];
-    let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-        out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
-        Ok(())
-    };
+    let mut memory_sink =
+        |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+            out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+            Ok(())
+        };
     let mut input = unified_input_from_splmm_prepared(scan_prepared, mmap_window_mb)?;
     exact_scan_blocks_core(
         factor,
@@ -2954,7 +3004,7 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
     progress_stage: usize,
     progress_done_offset: usize,
     progress_total_override: usize,
-    sink: &mut dyn FnMut(usize, usize, &[f64]) -> Result<(), String>,
+    sink: &mut dyn FnMut(usize, usize, &[f64], Option<&[f32]>) -> Result<(), String>,
 ) -> Result<(), String> {
     let stage_timing = splmm_packed_stage_timing_enabled();
     let total_t0 = stage_timing.then(Instant::now);
@@ -3190,7 +3240,8 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                 timing.assoc_secs += t0.elapsed().as_secs_f64();
             }
             let t0 = stage_timing.then(Instant::now);
-            sink(row_start, rows_here, out_slice)?;
+            let block_maf = input.matrix.block_maf(rows_here);
+            sink(row_start, rows_here, out_slice, block_maf)?;
             if let Some(t0) = t0 {
                 timing.sink_secs += t0.elapsed().as_secs_f64();
             }
@@ -3281,7 +3332,8 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
             } else {
                 run_block();
             }
-            sink(row_start, rows_here, &out_block[..rows_here * 3])?;
+            let block_maf = input.matrix.block_maf(rows_here);
+            sink(row_start, rows_here, &out_block[..rows_here * 3], block_maf)?;
             let done_abs = progress_done_offset.saturating_add(row_end);
             if scan_progress_callback.is_some() && (row_end == m || done_abs >= next_progress_done)
             {
@@ -3340,10 +3392,11 @@ pub(crate) fn scan_with_py_and_rhat(
     let mut input = unified_input_from_splmm_prepared(scan_prepared, mmap_window_mb)?;
     let m = input.n_markers();
     let mut out = vec![0.0_f64; m * 3];
-    let mut memory_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-        out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
-        Ok(())
-    };
+    let mut memory_sink =
+        |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+            out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+            Ok(())
+        };
     grammar_scan_blocks_core(
         &mut input,
         x_design,
@@ -5030,6 +5083,456 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     ))
 }
 
+fn run_kfile_splmm_tsv_writer<F>(out_tsv: &str, run_scan: F) -> Result<(usize, f64), String>
+where
+    F: FnOnce(
+        &mut dyn FnMut(usize, usize, &[f64], Option<&[f32]>) -> Result<(), String>,
+    ) -> Result<(), String>,
+{
+    let writer =
+        AsyncTsvWriter::with_config(out_tsv, b"maf\tbeta\tse\tpwald\n", 64 * 1024 * 1024, 16)?;
+    let mut rows_written = 0usize;
+    let mut text_buf = String::new();
+    let mut sink = |row_start: usize,
+                    rows_here: usize,
+                    results: &[f64],
+                    block_maf: Option<&[f32]>|
+     -> Result<(), String> {
+        if row_start != rows_written {
+            return Err(format!(
+                "k-file SparseLMM writer received non-sequential row_start={row_start}, expected={rows_written}"
+            ));
+        }
+        let maf = block_maf.ok_or_else(|| {
+            "k-file SparseLMM scanner did not provide current-block MAF metadata".to_string()
+        })?;
+        if maf.len() != rows_here || results.len() != rows_here.saturating_mul(3) {
+            return Err(format!(
+                "k-file SparseLMM block shape mismatch: rows={rows_here}, maf={}, results={}, expected_results={}",
+                maf.len(),
+                results.len(),
+                rows_here.saturating_mul(3)
+            ));
+        }
+        text_buf.clear();
+        text_buf.reserve(rows_here.saturating_mul(48));
+        for row in 0..rows_here {
+            let result = &results[row * 3..(row + 1) * 3];
+            writeln!(
+                &mut text_buf,
+                "{:.4}\t{:.4}\t{:.4}\t{:.4e}",
+                maf[row], result[0], result[1], result[2]
+            )
+            .map_err(|e| format!("format k-file SparseLMM result: {e}"))?;
+        }
+        writer.send(text_buf.as_bytes().to_vec())?;
+        rows_written = rows_written.saturating_add(rows_here);
+        Ok(())
+    };
+    let scan_result = run_scan(&mut sink);
+    let writer_t0 = Instant::now();
+    let writer_result = writer.finish();
+    let writer_wait_secs = writer_t0.elapsed().as_secs_f64();
+    scan_result?;
+    writer_result?;
+    Ok((rows_written, writer_wait_secs))
+}
+
+/// Run an additive SparseLMM scan directly from a streaming k-file source.
+///
+/// The k-file contract has no BIM metadata, so this writer emits the same
+/// four-column schema as the other k-file association paths.  Only the
+/// current decoded block's MAF is retained; no marker-sized genotype or
+/// metadata array is created.
+#[pyfunction]
+#[pyo3(signature = (
+    kfile_prefix,
+    out_tsv,
+    y,
+    lbd,
+    sparse_jxgrm_path,
+    sample_indices,
+    x_cov=None,
+    sparse_sample_indices=None,
+    threads=0,
+    block_rows=0,
+    model="add",
+    scan_mode="exact",
+    rhat_markers=SPLMM_DEFAULT_RHAT_MARKERS,
+    rhat_seed=SPLMM_DEFAULT_RHAT_SEED,
+    tol=1e-3,
+    max_iter=200,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn splmm_assoc_pcg_kfile_to_tsv<'py>(
+    py: Python<'py>,
+    kfile_prefix: String,
+    out_tsv: String,
+    y: PyReadonlyArray1<'py, f64>,
+    lbd: f64,
+    sparse_jxgrm_path: String,
+    sample_indices: Vec<i64>,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    sparse_sample_indices: Option<Vec<i64>>,
+    threads: usize,
+    block_rows: usize,
+    model: &str,
+    scan_mode: &str,
+    rhat_markers: usize,
+    rhat_seed: u64,
+    tol: f64,
+    max_iter: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(
+    f64,
+    bool,
+    usize,
+    f64,
+    bool,
+    usize,
+    f64,
+    usize,
+    usize,
+    usize,
+    (f64, f64, f64, f64, f64, f64, f64),
+    usize,
+)> {
+    let gm = PackedGeneticModel::parse(model)?;
+    if !matches!(gm, PackedGeneticModel::Add) {
+        return Err(PyRuntimeError::new_err(
+            "k-file SparseLMM native scanner supports additive model only",
+        ));
+    }
+    let scan_mode = SplmmScanMode::parse(scan_mode)?;
+    if scan_mode.needs_rhat() && rhat_markers == 0 {
+        return Err(PyRuntimeError::new_err("rhat_markers must be > 0"));
+    }
+    if !(lbd.is_finite() && lbd >= 0.0) {
+        return Err(PyRuntimeError::new_err("lbd must be finite and >= 0"));
+    }
+    if max_iter == 0 {
+        return Err(PyRuntimeError::new_err("max_iter must be > 0"));
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyRuntimeError::new_err("tol must be finite and > 0"));
+    }
+    let y_owned = y.as_slice()?.to_vec();
+    let n = y_owned.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+    let sample_idx = sample_indices
+        .iter()
+        .enumerate()
+        .map(|(pos, &raw)| {
+            if raw < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "sample_indices[{pos}] must be non-negative, got {raw}"
+                )))
+            } else {
+                Ok(raw as usize)
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "sample_indices length {} != len(y) {n}",
+            sample_idx.len()
+        )));
+    }
+
+    let (x_cov_owned, p_cov) = if let Some(x_cov) = &x_cov {
+        let x_arr = x_cov.as_array();
+        if x_arr.ndim() != 2 || x_arr.shape()[0] != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov must have shape (n, p), got {:?}, expected first dimension {n}",
+                x_arr.shape()
+            )));
+        }
+        let owned = x_cov
+            .as_slice()
+            .map_err(|_| PyRuntimeError::new_err("x_cov must be contiguous (C-order)"))?
+            .to_vec();
+        (Some(owned), x_arr.shape()[1])
+    } else {
+        (None, 0usize)
+    };
+    let p = p_cov + 1;
+    if n <= p {
+        return Err(PyRuntimeError::new_err(format!(
+            "SparseLMM requires n > p, got n={n}, p={p}"
+        )));
+    }
+    let sparse_n =
+        sparse_jxgrm_header_n_samples(&sparse_jxgrm_path).map_err(PyRuntimeError::new_err)?;
+    let factor_sample_idx = if let Some(raw) = sparse_sample_indices.as_deref() {
+        parse_index_vec_i64(raw, sparse_n, "sparse_sample_indices")
+            .map_err(PyRuntimeError::new_err)?
+    } else {
+        if sparse_n != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "SparseLMM k-file scan requires sparse GRM n={sparse_n} to equal y n={n} when sparse_sample_indices is omitted"
+            )));
+        }
+        (0..n).collect()
+    };
+    if factor_sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "sparse_sample_indices length {} != len(y) {n}",
+            factor_sample_idx.len()
+        )));
+    }
+
+    let kfile_prefix_owned = kfile_prefix.clone();
+    let out_tsv_owned = out_tsv.clone();
+    let sparse_path_owned = sparse_jxgrm_path.clone();
+    let progress_cb = progress_callback;
+    let threads_use = threads.max(1);
+    let block_rows_use = block_rows.max(512);
+    let scan_out = py
+        .detach(move || -> Result<
+            (
+                f64,
+                PcgSplmmNullModelInfo,
+                PcgSplmmRHatResult,
+                usize,
+                usize,
+                f64,
+                f64,
+                f64,
+                f64,
+            ),
+            String,
+        > {
+            let stage_cb = progress_cb.as_ref();
+            let factor_load_t0 = Instant::now();
+            let factor = sparse_splmm_load_factor(
+                "",
+                Some(&sparse_path_owned),
+                n,
+                factor_sample_idx.as_slice(),
+                lbd,
+                threads_use,
+                stage_cb,
+            )?;
+            let factor_load_secs = factor_load_t0.elapsed().as_secs_f64();
+            let marker_count = KfileAssocSource::open(
+                Path::new(&kfile_prefix_owned),
+                sample_idx.as_slice(),
+            )
+            .map_err(|e| e.to_string())?
+            .n_kmers();
+            let scan_sample_idx: Vec<usize> = (0..n).collect();
+            let stats = GlobalStats {
+                maf: Vec::new(),
+                miss: Vec::new(),
+                row_flip: Vec::new(),
+                row_source_indices: Vec::new(),
+                site_keep: Vec::new(),
+                n_samples_full: n,
+                n_markers_total: marker_count,
+                bytes_per_snp: 0,
+            };
+            let x_design = build_design_with_intercept(x_cov_owned.as_deref(), n, p_cov);
+
+            if scan_mode == SplmmScanMode::Exact {
+                let prepare_t0 = Instant::now();
+                let scan_block_rows = adaptive_exact_block_rows(
+                    adaptive_grm_block_rows(block_rows_use, marker_count, n, 0, threads_use)
+                        .max(1),
+                    n,
+                );
+                let mut solve_workspace = factor.make_solve_workspace(scan_block_rows.max(p).max(1))?;
+                let null_state = build_sparse_splmm_null_state(
+                    &factor,
+                    x_design.as_slice(),
+                    y_owned.as_slice(),
+                    &mut solve_workspace,
+                    stage_cb,
+                )?;
+                let scan_prepare_secs = prepare_t0.elapsed().as_secs_f64();
+                let factor_nnz = factor.factor_nnz();
+                let scan_t0 = Instant::now();
+                let mut input = UnifiedInput {
+                    matrix: KfileSplmmMatrixAdapter::new(
+                        &kfile_prefix_owned,
+                        sample_idx.as_slice(),
+                        marker_count,
+                    )?,
+                    stats,
+                };
+                let (written_rows, writer_wait_secs) =
+                    run_kfile_splmm_tsv_writer(&out_tsv_owned, |sink| {
+                    exact_scan_blocks_core(
+                        &factor,
+                        &mut input,
+                        x_design.as_slice(),
+                        null_state.x_design_col_major.as_slice(),
+                        null_state.null_model.py.as_slice(),
+                        null_state.null_model.ypy,
+                        null_state.null_model.df,
+                        null_state.null_model.xt_w_x_chol.as_slice(),
+                        scan_sample_idx.as_slice(),
+                        gm,
+                        threads_use,
+                        block_rows_use,
+                        stage_cb,
+                        progress_every,
+                        9,
+                        0,
+                        0,
+                        &mut solve_workspace,
+                        sink,
+                    )
+                })?;
+                let scan_exec_secs = scan_t0.elapsed().as_secs_f64();
+                Ok((
+                    f64::NAN,
+                    null_state.null_info,
+                    trivial_pcg_rhat_info(n, 0, 0),
+                    factor_nnz,
+                    written_rows,
+                    factor_load_secs,
+                    scan_prepare_secs,
+                    scan_exec_secs,
+                    writer_wait_secs,
+                ))
+            } else {
+                if marker_count == 0 {
+                    return Err("k-file SparseLMM scan has no markers".to_string());
+                }
+                let prepare_t0 = Instant::now();
+                if stage_cb.is_some() {
+                    emit_progress_callback(stage_cb, 5, 0, 1)?;
+                }
+                let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+                    factor,
+                    x_design.as_slice(),
+                    y_owned.as_slice(),
+                    lbd,
+                )?;
+                if stage_cb.is_some() {
+                    emit_progress_callback(stage_cb, 5, 1, 1)?;
+                }
+                let rhat_rows = choose_rhat_rows(marker_count, rhat_markers, rhat_seed);
+                let rhat_total = n_rhat_progress_total(marker_count, rhat_markers);
+                if stage_cb.is_some() {
+                    emit_progress_callback(stage_cb, 8, 0, rhat_total)?;
+                }
+                let adapter = KfileSplmmMatrixAdapter::new(
+                    &kfile_prefix_owned,
+                    sample_idx.as_slice(),
+                    marker_count,
+                )?;
+                let (sampled_row_major, _sampled_maf) =
+                    adapter.prime_random_rows(rhat_rows.as_slice())?;
+                let n_rhat = rhat_rows.len();
+                let mut sampled_col_major = vec![0.0_f64; n * n_rhat];
+                for col in 0..n_rhat {
+                    for row in 0..n {
+                        sampled_col_major[col * n + row] =
+                            sampled_row_major[col * n + row] as f64;
+                    }
+                    if stage_cb.is_some() {
+                        emit_progress_callback(stage_cb, 8, col + 1, rhat_total)?;
+                    }
+                }
+                let (gamma, n_used) = fit.estimate_gamma_from_markers(
+                    x_design.as_slice(),
+                    sampled_col_major.as_slice(),
+                    n_rhat,
+                    rhat_markers,
+                )?;
+                if stage_cb.is_some() {
+                    emit_progress_callback(stage_cb, 8, rhat_total, rhat_total)?;
+                }
+                let scan_model = fit.build_scan_model(x_design.as_slice(), gamma)?;
+                let scan_prepare_secs = prepare_t0.elapsed().as_secs_f64();
+                let factor_nnz = fit.factor_nnz();
+                let scan_t0 = Instant::now();
+                let mut input = UnifiedInput {
+                    matrix: adapter,
+                    stats,
+                };
+                let (written_rows, writer_wait_secs) =
+                    run_kfile_splmm_tsv_writer(&out_tsv_owned, |sink| {
+                    grammar_scan_blocks_core(
+                        &mut input,
+                        x_design.as_slice(),
+                        scan_model.score_vec(),
+                        1.0,
+                        scan_model.xtx_chol(),
+                        scan_sample_idx.as_slice(),
+                        gm,
+                        scan_model.gamma(),
+                        1.0,
+                        threads_use,
+                        block_rows_use,
+                        stage_cb,
+                        progress_every,
+                        9,
+                        0,
+                        0,
+                        sink,
+                    )
+                })?;
+                let scan_exec_secs = scan_t0.elapsed().as_secs_f64();
+                Ok((
+                    gamma,
+                    trivial_pcg_null_info(n, p),
+                    trivial_pcg_rhat_info(n, rhat_markers, n_used),
+                    factor_nnz,
+                    written_rows,
+                    factor_load_secs,
+                    scan_prepare_secs,
+                    scan_exec_secs,
+                    writer_wait_secs,
+                ))
+            }
+        })
+        .map_err(PyRuntimeError::new_err);
+    match scan_out {
+        Ok((
+            r_hat,
+            null_info,
+            rhat_info,
+            factor_nnz,
+            written_rows,
+            factor_load_secs,
+            scan_prepare_secs,
+            scan_exec_secs,
+            writer_wait_secs,
+        )) => Ok((
+            r_hat,
+            null_info.v_inv_y.converged,
+            null_info.v_inv_y.iters,
+            null_info.v_inv_y.rel_res,
+            null_info.v_inv_x.converged_all,
+            null_info.v_inv_x.max_iters,
+            null_info.v_inv_x.max_rel_res,
+            rhat_info.n_markers_requested,
+            rhat_info.n_markers_used,
+            written_rows,
+            (
+                0.0,
+                0.0,
+                factor_load_secs + scan_prepare_secs + scan_exec_secs,
+                writer_wait_secs,
+                0.0,
+                0.0,
+                factor_load_secs + scan_prepare_secs + scan_exec_secs + writer_wait_secs,
+            ),
+            factor_nnz,
+        )),
+        Err(err) => {
+            let _ = std::fs::remove_file(&out_tsv);
+            Err(err)
+        }
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     py_vec,
@@ -5218,6 +5721,162 @@ pub fn splmm_scan_exact_packed<'py>(
         progress_callback,
         progress_every,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Streaming k-file adapter and gload::GenotypeMatrix adapters
+// ---------------------------------------------------------------------------
+
+/// Sequential centered dosage adapter for a k-file association scan.
+///
+/// The k-file source owns only a bounded decode buffer.  MAF is retained for
+/// the most recently decoded block so a TSV sink can write it without a
+/// marker-sized metadata allocation.
+pub(crate) struct KfileSplmmMatrixAdapter {
+    source: Option<KfileAssocSource>,
+    prefetch: Option<KfileAssocPrefetch>,
+    marker_count: usize,
+    n_selected: usize,
+    next_row: usize,
+    last_maf: Vec<f32>,
+}
+
+impl KfileSplmmMatrixAdapter {
+    pub(crate) fn new(
+        prefix: &str,
+        sample_indices: &[usize],
+        marker_count: usize,
+    ) -> Result<Self, String> {
+        let source =
+            KfileAssocSource::open(Path::new(prefix), sample_indices).map_err(|e| e.to_string())?;
+        if source.n_kmers() != marker_count {
+            return Err(format!(
+                "k-file marker count mismatch: metadata={} requested={marker_count}",
+                source.n_kmers()
+            ));
+        }
+        let n_selected = source.n_samples();
+        if n_selected == 0 {
+            return Err(
+                "k-file SparseLMM adapter requires at least one selected sample".to_string(),
+            );
+        }
+        Ok(Self {
+            source: Some(source),
+            prefetch: None,
+            marker_count,
+            n_selected,
+            next_row: 0,
+            last_maf: Vec::new(),
+        })
+    }
+
+    /// Read a small r-hat sample without moving the sequential scan cursor.
+    pub(crate) fn prime_random_rows(
+        &self,
+        row_indices: &[usize],
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        self.source
+            .as_ref()
+            .ok_or_else(|| "k-file SparseLMM source is already in scan mode".to_string())?
+            .read_centered_rows_at(row_indices)
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl GenotypeMatrix for KfileSplmmMatrixAdapter {
+    fn n_samples_full(&self) -> usize {
+        self.n_selected
+    }
+
+    fn bytes_per_snp(&self) -> usize {
+        0
+    }
+
+    fn packed_flat(&self) -> &[u8] {
+        &[]
+    }
+
+    fn source_row_bytes(&self, _source_idx: usize) -> &[u8] {
+        &[]
+    }
+
+    fn block_maf(&self, rows_here: usize) -> Option<&[f32]> {
+        (self.last_maf.len() >= rows_here).then(|| &self.last_maf[..rows_here])
+    }
+
+    fn decode_additive_block(
+        &mut self,
+        _stats: &GlobalStats,
+        row_start: usize,
+        out: &mut [f32],
+        sample_idx: &[usize],
+        sample_identity: bool,
+        _pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> Result<(), String> {
+        let cols = if sample_identity {
+            self.n_selected
+        } else {
+            sample_idx.len()
+        };
+        if cols != self.n_selected {
+            return Err(format!(
+                "k-file SparseLMM sample count mismatch: decode columns={cols}, selected={}",
+                self.n_selected
+            ));
+        }
+        if row_start != self.next_row {
+            return Err(format!(
+                "k-file SparseLMM source requires sequential rows: row_start={row_start}, next_row={}",
+                self.next_row
+            ));
+        }
+        if cols == 0 || out.len() % cols != 0 {
+            return Err("k-file SparseLMM decode buffer is not a whole number of rows".to_string());
+        }
+        let rows_here = out.len() / cols;
+        if rows_here == 0 {
+            self.last_maf.clear();
+            return Ok(());
+        }
+        if row_start.checked_add(rows_here).is_none() || row_start + rows_here > self.marker_count {
+            return Err(format!(
+                "k-file SparseLMM block out of bounds: row_start={row_start}, rows_here={rows_here}, markers={}",
+                self.marker_count
+            ));
+        }
+        self.last_maf.resize(rows_here, 0.0);
+        if self.prefetch.is_none() {
+            let source = self
+                .source
+                .take()
+                .ok_or_else(|| "k-file SparseLMM source prefetch is unavailable".to_string())?;
+            self.prefetch = Some(
+                source
+                    .into_prefetch(rows_here)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let prefetch = self
+            .prefetch
+            .as_mut()
+            .ok_or_else(|| "k-file SparseLMM prefetch is unavailable".to_string())?;
+        let block = prefetch
+            .next()?
+            .ok_or_else(|| "k-file SparseLMM source ended before block completion".to_string())?;
+        if block.row_start() != row_start || block.rows() != rows_here {
+            return Err(format!(
+                "k-file SparseLMM prefetch block mismatch: row_start={}, rows={}, expected row_start={row_start}, rows={rows_here}",
+                block.row_start(),
+                block.rows(),
+            ));
+        }
+        out.copy_from_slice(block.dosage());
+        self.last_maf.copy_from_slice(block.maf());
+        prefetch.recycle(block)?;
+        self.next_row += rows_here;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5616,10 +6275,11 @@ pub fn splmm_assoc_pcg_dense_f32<'py>(
                 stats: g_stats,
             };
             let mut out = vec![0.0_f64; m.saturating_mul(3)];
-            let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-                out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
-                Ok(())
-            };
+            let mut sink =
+                |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+                    out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+                    Ok(())
+                };
             exact_scan_blocks_core(
                 &factor,
                 &mut input,
@@ -5747,6 +6407,46 @@ mod tests {
         ));
 
         drop(input);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windowed_prefix_preparation_does_not_retain_resident_payload() {
+        pyo3::Python::initialize();
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_splmm_windowed_prepare_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("case");
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F1 I1 0 0 1 1\nF1 I2 0 0 1 1\nF1 I3 0 0 1 1\nF1 I4 0 0 1 1\n",
+        )
+        .unwrap();
+        std::fs::write(prefix.with_extension("bed"), [0x6c, 0x1b, 0x01, 0x00]).unwrap();
+
+        let prepared = prepare_prefix_input(
+            &prefix.to_string_lossy(),
+            4,
+            None,
+            None,
+            None,
+            Some(1),
+            false,
+        )
+        .unwrap();
+        assert!(prepared.payload.is_none());
+        assert_eq!(prepared.n_rows(), 1);
+        assert_eq!(prepared.row_source_indices.as_deref(), Some(&[0usize][..]));
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6087,10 +6787,11 @@ mod tests {
 
         let mut input = unified_input_from_splmm_prepared(&prepared, None).unwrap();
         let mut core = vec![0.0_f64; prepared.n_rows() * 3];
-        let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-            core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
-            Ok(())
-        };
+        let mut sink =
+            |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+                core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+                Ok(())
+            };
         grammar_scan_blocks_core(
             &mut input,
             &x_design,
@@ -6155,10 +6856,11 @@ mod tests {
 
         let mut input = unified_input_from_splmm_prepared(&prepared, None).unwrap();
         let mut core = vec![0.0_f64; prepared.n_rows() * 3];
-        let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-            core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
-            Ok(())
-        };
+        let mut sink =
+            |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+                core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+                Ok(())
+            };
         grammar_scan_blocks_core(
             &mut input,
             &x_design,
@@ -6207,10 +6909,11 @@ mod tests {
 
         let mut workspace_core = factor.make_solve_workspace(2).unwrap();
         let mut core = vec![0.0_f64; prepared.n_rows() * 3];
-        let mut sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-            core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
-            Ok(())
-        };
+        let mut sink =
+            |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+                core[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+                Ok(())
+            };
         let mut input = unified_input_from_splmm_prepared(&prepared, None).unwrap();
         exact_scan_blocks_core(
             &factor,
@@ -6322,10 +7025,11 @@ mod tests {
 
         let mut workspace_full = factor.make_solve_workspace(2).unwrap();
         let mut full = vec![0.0_f64; prepared.n_rows() * 3];
-        let mut full_sink = |row_start: usize, rows_here: usize, block: &[f64]| {
-            full[row_start * 3..][..rows_here * 3].copy_from_slice(block);
-            Ok(())
-        };
+        let mut full_sink =
+            |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+                full[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+                Ok(())
+            };
         let mut input = unified_input_from_splmm_prepared(&prepared, None).unwrap();
         exact_scan_blocks_core(
             &factor,

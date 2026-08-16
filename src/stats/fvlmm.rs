@@ -16,6 +16,8 @@ use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
+use std::fmt::Write as FmtWrite;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
@@ -40,6 +42,7 @@ use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_with_excluded, is_simple_snp_allele,
 };
 use crate::gload::WindowedBedMatrix;
+use crate::kmer::KfileAssocSource;
 use crate::linalg::{
     chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
 };
@@ -3200,6 +3203,215 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
         .map_err(PyRuntimeError::new_err)?;
 
     Ok((rows_written, pve, log_det_v))
+}
+
+/// Stream a binary-presence k-file through the fixed-lambda FvLMM kernel.
+///
+/// The k-file contract deliberately omits site metadata and writes only
+/// `maf`, `beta`, `se`, and `pwald`.  The source supplies centered 0/2 f32
+/// rows, so no Python/NumPy dosage chunk is created during the scan.
+#[pyfunction]
+#[pyo3(signature = (
+    kfile_prefix, out_tsv, s, xcov, y_rot, u_t, sample_indices, log10_lbd,
+    threads=0, nullml=None, rotate_block_rows=512,
+    progress_callback=None, progress_every=0, genetic_model="add"
+))]
+pub fn fvlmm_assoc_kfile_to_tsv_f32<'py>(
+    py: Python<'py>,
+    kfile_prefix: String,
+    out_tsv: String,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    sample_indices: Vec<i64>,
+    log10_lbd: f64,
+    threads: usize,
+    nullml: Option<f64>,
+    rotate_block_rows: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    genetic_model: &str,
+) -> PyResult<usize> {
+    let gm = PackedGeneticModel::parse(genetic_model)?;
+    if !matches!(gm, PackedGeneticModel::Add) {
+        return Err(PyRuntimeError::new_err(
+            "k-file FvLMM native scanner supports additive model only",
+        ));
+    }
+    let y_owned = y_rot.as_slice()?.to_vec();
+    let s_owned = s.as_slice()?.to_vec();
+    let xcov_arr = xcov.as_array();
+    let ut_arr = u_t.as_array();
+    let n = y_owned.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y_rot must not be empty"));
+    }
+    if xcov_arr.shape()[0] != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s_owned.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("u_t must be (n, n) row-major U^T"));
+    }
+    let xcov_owned = xcov
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?
+        .to_vec();
+    let ut_owned = u_t
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("u_t must be contiguous (C-order)"))?
+        .to_vec();
+    let sample_idx = sample_indices
+        .iter()
+        .enumerate()
+        .map(|(pos, &raw)| {
+            if raw < 0 {
+                Err(PyRuntimeError::new_err(format!(
+                    "sample_indices[{pos}] must be non-negative, got {raw}"
+                )))
+            } else {
+                Ok(raw as usize)
+            }
+        })
+        .collect::<PyResult<Vec<usize>>>()?;
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "sample_indices length {} != len(y_rot) {n}",
+            sample_idx.len()
+        )));
+    }
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return Err(PyRuntimeError::new_err("invalid log10_lbd"));
+    }
+    let _ = nullml;
+    let kfile_prefix_owned = kfile_prefix;
+    let out_tsv_owned = out_tsv.clone();
+    let progress_cb = progress_callback;
+    let rows_written = py.detach(move || -> Result<usize, String> {
+        let source = KfileAssocSource::open(Path::new(&kfile_prefix_owned), &sample_idx)
+            .map_err(|e| e.to_string())?;
+        if source.n_samples() != n {
+            return Err(format!(
+                "k-file sample count {} != FvLMM sample count {n}",
+                source.n_samples()
+            ));
+        }
+        let marker_count = source.n_kmers();
+        let p = xcov_owned.len() / n.max(1);
+        if n <= p + 1 {
+            return Err(format!("n must be > p+1, got n={n}, p={p}"));
+        }
+        let cache =
+            prepare_fixed_lambda_assoc_cache_f32(&s_owned, &xcov_owned, &y_owned, n, p, lbd)
+                .map_err(|e| e.to_string())?;
+        let block_rows = rotate_block_rows.max(1).min(marker_count.max(1));
+        let block_values = block_rows
+            .checked_mul(n)
+            .ok_or_else(|| "k-file FvLMM block size overflow".to_string())?;
+        let mut rot_block = vec![0.0_f32; block_values];
+        let mut out_block = vec![0.0_f64; block_rows * 3];
+        let proj_threads = stage_proj_threads_or(threads.max(1));
+        let assoc_threads = stage_assoc_threads_or(threads.max(1), proj_threads);
+        let proj_pool = get_cached_pool(proj_threads).map_err(|e| e.to_string())?;
+        let assoc_pool = get_cached_pool(assoc_threads).map_err(|e| e.to_string())?;
+        let writer = AsyncTsvWriter::with_config(
+            &out_tsv_owned,
+            b"maf\tbeta\tse\tpwald\n",
+            64 * 1024 * 1024,
+            16,
+        )?;
+        let progress_step = if progress_every == 0 {
+            block_rows.max(1)
+        } else {
+            progress_every.max(1)
+        };
+        let mut next_progress = progress_step.min(marker_count).max(1);
+        let mut done = 0usize;
+        let mut text_buf = String::with_capacity(block_rows.saturating_mul(64));
+        let overlap = proj_threads > 1 || assoc_threads > 1;
+        let rows_written = source.for_each_centered_block(
+            block_rows,
+            overlap,
+            |row_start, rows, raw_block, maf| {
+                if row_start != done {
+                    return Err(format!(
+                        "k-file FvLMM source returned non-sequential row_start={row_start}, expected={done}"
+                    ));
+                }
+            rotate_snp_block_with_ut_blas(
+                raw_block,
+                rows,
+                n,
+                &ut_owned,
+                &mut rot_block[..rows * n],
+                proj_threads,
+                proj_pool.as_ref(),
+            );
+            assoc_fixed_lambda_rot_block_blas_f32(
+                &rot_block[..rows * n],
+                rows,
+                n,
+                p,
+                &cache,
+                &mut out_block[..rows * 3],
+                3,
+                assoc_threads,
+                assoc_pool.as_ref(),
+                None,
+            );
+            text_buf.clear();
+            for row in 0..rows {
+                let result = &out_block[row * 3..(row + 1) * 3];
+                writeln!(
+                    &mut text_buf,
+                    "{:.4}\t{:.4}\t{:.4}\t{:.4e}",
+                    maf[row], result[0], result[1], result[2]
+                )
+                .map_err(|e| format!("format k-file FvLMM result: {e}"))?;
+            }
+            writer.send(text_buf.as_bytes().to_vec())?;
+            done = row_start.saturating_add(rows);
+            if let Some(cb) = progress_cb.as_ref() {
+                if done >= next_progress || done >= marker_count {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (done.min(marker_count), marker_count))?;
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                    while next_progress <= done {
+                        next_progress = next_progress.saturating_add(progress_step);
+                    }
+                }
+            }
+                Ok(())
+            },
+        )?;
+        done = rows_written;
+        if let Some(cb) = progress_cb.as_ref() {
+            if done >= marker_count {
+                Python::attach(|py2| -> PyResult<()> {
+                    py2.check_signals()?;
+                    cb.call1(py2, (marker_count, marker_count))?;
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        writer.finish()?;
+        Ok(done)
+    });
+    match rows_written {
+        Ok(rows) => Ok(rows),
+        Err(err) => {
+            let _ = std::fs::remove_file(&out_tsv);
+            Err(PyRuntimeError::new_err(err))
+        }
+    }
 }
 
 /// Resolve SNP name: use the bim name if non-empty and not ".", else chrom_pos.

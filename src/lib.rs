@@ -216,7 +216,8 @@ use fvlmm::{
     fastlmm_reml_null_f32, fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32,
     fvlmm_assoc_chunk_from_snp_f32, fvlmm_assoc_chunk_from_snp_to_tsv_f32,
     fvlmm_assoc_chunk_from_snp_with_cache_f32, fvlmm_assoc_chunk_with_cache_f32,
-    fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32, FvLmmAssocCache,
+    fvlmm_assoc_kfile_to_tsv_f32, fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32,
+    FvLmmAssocCache,
 };
 use fvlmm2::fvlmm2_assoc_chunk_f32;
 use garfield::{
@@ -245,8 +246,8 @@ use gfreader::{
     VcfChunkReader,
 };
 use glm::{
-    lm_block_assoc_f32, lm_block_assoc_packed, lm_block_assoc_packed_to_tsv,
-    lm_stream_bed_segments_compact_to_tsv, lm_stream_bed_to_tsv,
+    lm_assoc_kfile_to_tsv_f32, lm_block_assoc_f32, lm_block_assoc_packed,
+    lm_block_assoc_packed_to_tsv, lm_stream_bed_segments_compact_to_tsv, lm_stream_bed_to_tsv,
 };
 use glm2::lm2_stream_bed_to_tsv;
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
@@ -283,8 +284,8 @@ use ld::{
 use lm_trait::{lm_trait_assoc_bed_matrix_to_tsv, lm_trait_assoc_bed_to_tsv};
 use lmm::{
     lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32, lmm_reml_assoc_bed_to_tsv_f32,
-    lmm_reml_assoc_packed_f32, lmm_reml_assoc_packed_f32_to_tsv, lmm_reml_chunk_f32,
-    lmm_reml_chunk_from_snp_f32, lmm_reml_lmm2_assoc_bed_to_tsv_f32,
+    lmm_reml_assoc_kfile_to_tsv_f32, lmm_reml_assoc_packed_f32, lmm_reml_assoc_packed_f32_to_tsv,
+    lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_lmm2_assoc_bed_to_tsv_f32,
     lmm_reml_lmm2_chunk_from_snp_f32,
 };
 use logreg::fit_best_and_not_py;
@@ -324,7 +325,8 @@ use spgrm::{
 };
 use splmm::{
     splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_assoc_pcg_dense_f32,
-    splmm_load_sparse_grm_subset_dense, splmm_residualized_approx_null_fit_from_jxgrm,
+    splmm_assoc_pcg_kfile_to_tsv, splmm_load_sparse_grm_subset_dense,
+    splmm_residualized_approx_null_fit_from_jxgrm,
     splmm_residualized_approx_sample_state_from_jxgrm,
     splmm_residualized_approx_sample_state_from_jxgrm_lambda, splmm_scan_exact_packed,
     splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats, splmm_sparse_null_model_debug,
@@ -803,6 +805,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lm_block_assoc_f32, m)?)?;
     m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(lm_assoc_kfile_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lm_trait_assoc_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_trait_assoc_bed_matrix_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm2_stream_bed_to_tsv, m)?)?;
@@ -850,6 +853,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_dense_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(splmm_assoc_pcg_kfile_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_scan_grammar_packed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_scan_exact_packed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_load_sparse_grm_subset_dense, m)?)?;
@@ -952,6 +956,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_chunk_from_snp_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_bed_to_tsv_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fvlmm_assoc_kfile_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_prepare_cache_f32, m)?)?;
     m.add_function(wrap_pyfunction!(
         fvlmm_assoc_chunk_from_snp_with_cache_f32,
@@ -961,6 +966,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_rotate_x_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_rotate_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_bed_to_tsv_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(lmm_reml_assoc_kfile_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_lmm2_assoc_bed_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32_to_tsv, m)?)?;

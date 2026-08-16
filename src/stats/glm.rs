@@ -19,9 +19,11 @@ use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -51,6 +53,7 @@ use crate::gfreader::{
 };
 use crate::gload::WindowedBedMatrix;
 use crate::he::{row_major_block_mul_mat_f32, row_major_block_mul_mat_f32_small_rhs};
+use crate::kmer::KfileAssocSource;
 use crate::linalg::sanitize_assoc_pvalue;
 use crate::stats_common::{check_ctrlc, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
@@ -4301,6 +4304,200 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
 
         writer.finish().map_err(PyRuntimeError::new_err)?;
         Ok((kept_total, m))
+    })
+}
+
+/// Native streaming LM scan over a k-file bitset.
+///
+/// The k-file source is decoded directly into a bounded centered dosage block
+/// and the same QR/projection arithmetic used by `lm_stream_bed_to_tsv` is
+/// applied.  The output intentionally keeps the historical k-file four-column
+/// contract (`maf`, `beta`, `se`, `pwald`).
+#[pyfunction]
+#[pyo3(signature = (
+    kfile_prefix,
+    y,
+    x,
+    out_tsv,
+    sample_indices,
+    chunk_size=10000,
+    threads=0,
+    progress_callback=None,
+    progress_every=0,
+    genetic_model="add",
+))]
+pub fn lm_assoc_kfile_to_tsv_f32<'py>(
+    py: Python<'py>,
+    kfile_prefix: String,
+    y: PyReadonlyArray1<'py, f64>,
+    x: PyReadonlyArray2<'py, f64>,
+    out_tsv: String,
+    sample_indices: PyReadonlyArray1<'py, i64>,
+    chunk_size: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    genetic_model: &str,
+) -> PyResult<usize> {
+    if chunk_size == 0 {
+        return Err(PyValueError::new_err("chunk_size must be > 0"));
+    }
+    if !genetic_model.trim().eq_ignore_ascii_case("add") {
+        return Err(PyValueError::new_err(
+            "k-file native LM currently supports only genetic_model='add'",
+        ));
+    }
+    let y_slice = y.as_slice()?;
+    let x_arr = x.as_array();
+    let n = y_slice.len();
+    if x_arr.ndim() != 2 || x_arr.shape()[0] != n {
+        return Err(PyRuntimeError::new_err(
+            "X must be a 2D array with X.n_rows == len(y)",
+        ));
+    }
+    let q0 = x_arr.shape()[1];
+    if n <= q0 + 1 {
+        return Err(PyRuntimeError::new_err(format!(
+            "n too small: require n > q0+1, got n={n}, q0={q0}"
+        )));
+    }
+    let sample_indices_vec: Vec<usize> = sample_indices
+        .as_slice()?
+        .iter()
+        .map(|&v| {
+            usize::try_from(v)
+                .map_err(|_| PyValueError::new_err("sample_indices must be non-negative"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    if sample_indices_vec.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "sample_indices length {} does not match len(y) {n}",
+            sample_indices_vec.len()
+        )));
+    }
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(values) => Cow::Borrowed(values),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let qr_ctx = LmQrProjection::from_design(x_flat.as_ref(), y_slice, n, q0)
+        .map_err(PyRuntimeError::new_err)?;
+    let rhs_cols = qr_ctx.rank.saturating_add(1);
+    let rhs_f32 = pack_lm_scan_rhs_f32(
+        y_slice,
+        if qr_ctx.rank > 0 {
+            Some(qr_ctx.q_f32.as_slice())
+        } else {
+            None
+        },
+        qr_ctx.rank,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    let out_tsv_owned = out_tsv;
+    let prefix_owned = kfile_prefix;
+    let progress_callback = progress_callback;
+    let progress_block = if progress_every == 0 {
+        chunk_size.max(1)
+    } else {
+        progress_every.max(1)
+    };
+
+    py.detach(move || -> PyResult<usize> {
+        let source = KfileAssocSource::open(Path::new(&prefix_owned), &sample_indices_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let total_rows = source.n_kmers();
+        let pool = get_cached_pool(threads).map_err(PyRuntimeError::new_err)?;
+        let writer = AsyncTsvWriter::with_config(
+            &out_tsv_owned,
+            b"maf\tbeta\tse\tpwald\n",
+            64 * 1024 * 1024,
+            16,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        let block_rows = chunk_size.max(1);
+        let mut rhs_products = vec![0.0_f32; block_rows.saturating_mul(rhs_cols.max(1))];
+        let mut gy = vec![0.0_f64; block_rows];
+        let mut ss = vec![0.0_f64; block_rows];
+        let mut qg = vec![0.0_f64; block_rows.saturating_mul(qr_ctx.rank)];
+        let mut text = String::with_capacity(block_rows.saturating_mul(96));
+        let mut done = 0usize;
+        let mut next_progress = progress_block.min(total_rows).max(1);
+        let overlap = pool
+            .as_ref()
+            .map(|pool| pool.current_num_threads() > 1)
+            .unwrap_or(false);
+        let scan_done = source
+            .for_each_centered_block(block_rows, overlap, |row_start, rows, g_block, maf| {
+                if row_start != done {
+                    return Err(format!(
+                        "k-file LM source returned non-sequential row_start={row_start}, expected={done}"
+                    ));
+                }
+            let rhs_block = &mut rhs_products[..rows * rhs_cols.max(1)];
+            row_major_block_mul_mat_f32_lm(
+                g_block,
+                rows,
+                n,
+                &rhs_f32,
+                rhs_cols,
+                rhs_block,
+                pool.as_ref(),
+            );
+            row_major_block_first_col_f32_to_f64(
+                rhs_block,
+                rows,
+                rhs_cols,
+                &mut gy[..rows],
+                pool.as_ref(),
+            );
+            row_major_block_sumsq_f64(g_block, rows, n, &mut ss[..rows], pool.as_ref());
+            for row in 0..rows {
+                let qg_row = &mut qg[row * qr_ctx.rank..(row + 1) * qr_ctx.rank];
+                for col in 0..qr_ctx.rank {
+                    qg_row[col] = rhs_block[row * rhs_cols + 1 + col] as f64;
+                }
+                let stats = lm_assoc_from_qr_projection_raw(qg_row, gy[row], ss[row], &qr_ctx);
+                let _ = writeln!(
+                    text,
+                    "{:.4}\t{:.4}\t{:.4}\t{:.4e}",
+                    maf[row], stats[0], stats[1], stats[3],
+                );
+            }
+            writer
+                .send(text.as_bytes().to_vec())
+                .map_err(|error| error.to_string())?;
+            text.clear();
+            done = row_start.saturating_add(rows);
+            if let Some(cb) = progress_callback.as_ref() {
+                if done >= next_progress || done == total_rows {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (done.min(total_rows), total_rows))?;
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())?;
+                    while next_progress <= done {
+                        next_progress = next_progress.saturating_add(progress_block);
+                        if next_progress == 0 {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                Python::attach(|py2| py2.check_signals()).map_err(|error| error.to_string())?;
+            }
+                Ok(())
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        done = scan_done;
+        if let Some(cb) = progress_callback.as_ref() {
+            Python::attach(|py2| -> PyResult<()> {
+                py2.check_signals()?;
+                cb.call1(py2, (total_rows, total_rows))?;
+                Ok(())
+            })?;
+        }
+        writer.finish().map_err(PyRuntimeError::new_err)?;
+        Ok(done)
     })
 }
 

@@ -72,34 +72,6 @@ _WARNED_BED_MMAP_LIMIT_LEGACY = False
 _WARNED_BED_PREPARED_SNPS_ONLY_LEGACY = False
 
 
-def _format_kfile_assoc_text(
-    *,
-    maf: object,
-    results: object,
-    include_header: bool = True,
-) -> str:
-    """Format the k-file contract output without site metadata or filtering."""
-    maf_arr = np.asarray(maf, dtype=np.float64).reshape(-1)
-    result_arr = np.asarray(results, dtype=np.float64)
-    if result_arr.ndim != 2 or int(result_arr.shape[1]) < 3:
-        raise ValueError("k-file association results must have at least 3 columns.")
-    if int(result_arr.shape[0]) != int(maf_arr.shape[0]):
-        raise ValueError("k-file MAF and association result row counts differ.")
-    out = np.column_stack(
-        [
-            np.char.mod("%.8g", maf_arr),
-            np.char.mod("%.8g", result_arr[:, 0]),
-            np.char.mod("%.8g", result_arr[:, 1]),
-            np.char.mod("%.6e", result_arr[:, 2]),
-        ]
-    )
-    buf = io.StringIO()
-    if bool(include_header):
-        buf.write("maf\tbeta\tse\tpwald\n")
-    np.savetxt(buf, out, fmt="%s", delimiter="\t")
-    return buf.getvalue()
-
-
 def _current_bed_memory_mb() -> float:
     try:
         mb = float(os.environ.get("JX_BED_BLOCK_TARGET_MB", "512"))
@@ -542,9 +514,44 @@ def _filter_snps_only_chunk_python_fallback(
     maf_chunk: np.ndarray,
     sites: list[object],
 ) -> tuple[np.ndarray, np.ndarray, list[object]]:
+    """Reject the obsolete BED-side Python filtering compatibility path."""
     raise RuntimeError(
         "Rust-only GWAS mode disables Python snps_only chunk fallback."
     )
+
+
+_KFILE_NATIVE_SCAN_SYMBOLS = {
+    "lm": "lm_assoc_kfile_to_tsv_f32",
+    "lmm": "lmm_reml_assoc_kfile_to_tsv_f32",
+    "fvlmm": "fvlmm_assoc_kfile_to_tsv_f32",
+    "splmm": "splmm_assoc_pcg_kfile_to_tsv",
+    "splmm2": "splmm_assoc_pcg_kfile_to_tsv",
+}
+
+
+def _require_kfile_native_request(
+    requested: list[str],
+    genetic_model: str,
+) -> None:
+    """Reject k-file requests that cannot use the native single-scan route."""
+    if len(requested) != 1:
+        raise RuntimeError(
+            "k-file GWAS requires exactly one model so the native Rust scanner "
+            "can be used; Python fallback has been removed."
+        )
+    if str(genetic_model).strip().lower() != "add":
+        raise RuntimeError(
+            "k-file GWAS native scanners currently support only the additive model; "
+            "Python fallback has been removed."
+        )
+    model_key = str(requested[0]).strip().lower()
+    symbol = _KFILE_NATIVE_SCAN_SYMBOLS.get(model_key)
+    if symbol is None or not hasattr(jxrs, symbol):
+        raise RuntimeError(
+            f"Rust extension missing native k-file scanner for {model_key!r} "
+            f"({symbol or 'unknown symbol'}); rebuild/reinstall JanusX. "
+            "Python fallback has been removed."
+        )
 
 
 def run_chunked_gwas_kfile(
@@ -562,19 +569,23 @@ def run_chunked_gwas_kfile(
     cov_all: Union[np.ndarray, None],
     threads: int,
     logger: logging.Logger,
+    genetic_model: str = "add",
     sparse_grm: Optional[str] = None,
     summary_rows: Optional[list[dict[str, object]]] = None,
     saved_paths: Optional[list[str]] = None,
     use_spinner: bool = False,
 ) -> None:
-    """Run the four-column streaming GWAS contract directly on a k-file."""
+    """Run the four-column streaming GWAS contract through native Rust only."""
     requested = []
     for raw in model_names:
         key = str(raw).strip().lower()
-        if key in {"lm", "lmm", "fvlmm", "splmm"} and key not in requested:
+        if key == "splmm-exact":
+            key = "splmm2"
+        if key in {"lm", "lmm", "fvlmm", "splmm", "splmm2"} and key not in requested:
             requested.append(key)
     if not requested:
         return
+    _require_kfile_native_request(requested, genetic_model)
     if summary_rows is None:
         summary_rows = []
     if saved_paths is None:
@@ -637,7 +648,7 @@ def run_chunked_gwas_kfile(
                     models.append(
                         (model_key, FvLMM(y=y_vec, X=x_cov, kinship=grm_trait))
                     )
-            elif model_key == "splmm":
+            elif model_key in {"splmm", "splmm2"}:
                 from .api import ASSOC
 
                 sparse_kinship = sparse_grm if sparse_grm is not None else grm_trait
@@ -648,6 +659,9 @@ def run_chunked_gwas_kfile(
                     model_args={
                         "threads": max(1, int(threads)),
                         "chunk_size": max(1, int(chunk_size)),
+                        "sparse_null_objective": (
+                            "raw" if model_key == "splmm2" else "fastgwa"
+                        ),
                     },
                 )
                 if isinstance(sparse_kinship, str):
@@ -662,10 +676,7 @@ def run_chunked_gwas_kfile(
                     sparse_model.fit(y_vec, X=x_cov, k=sparse_kinship)
                 models.append((model_key, sparse_model))
 
-        out_handles: dict[str, tuple[object, str, str, int]] = {}
-        model_labels = [
-            "FvLMM" if key == "fvlmm" else key.upper() for key in requested
-        ]
+        model_labels = ["FvLMM" if key == "fvlmm" else key.upper() for key in requested]
         progress_desc = "K-file GWAS"
         if len(model_labels) == 1:
             progress_desc = f"K-file {model_labels[0]}"
@@ -675,114 +686,269 @@ def run_chunked_gwas_kfile(
             force_animate=True,
             logger=logger,
         )
-        pbar_done = 0
-        reader = None
-        try:
-            for model_key, _model in models:
-                safe_trait = _safe_trait_file_label(trait_name)
-                out_tsv = f"{outprefix}.{safe_trait}.{model_key}.tsv"
-                tmp_tsv = _gwas_result_tmp_path(out_tsv)
-                out_handles[model_key] = (
-                    open(tmp_tsv, "w", encoding="utf-8", newline=""),
-                    tmp_tsv,
-                    out_tsv,
-                    0,
-                )
+        # The native scanner is deliberately selected only for the single
+        # additive request validated above.  There is no Python decode path.
+        native_model_key: Optional[str] = None
+        if len(requested) == 1 and str(genetic_model).strip().lower() == "add":
+            candidate = requested[0]
+            try:
+                fvlmm_lbd_native = float(getattr(models[0][1], "lbd_null", np.nan))
+            except Exception:
+                fvlmm_lbd_native = float("nan")
+            if candidate == "lm" and hasattr(jxrs, "lm_assoc_kfile_to_tsv_f32"):
+                native_model_key = candidate
+            elif (
+                candidate == "lmm"
+                and hasattr(jxrs, "lmm_reml_assoc_kfile_to_tsv_f32")
+                and not bool(getattr(models[0][1], "lowrank", False))
+            ):
+                native_model_key = candidate
+            elif (
+                candidate == "fvlmm"
+                and hasattr(jxrs, "fvlmm_assoc_kfile_to_tsv_f32")
+                and not bool(getattr(models[0][1], "lowrank", False))
+                and getattr(models[0][1], "Dh", None) is not None
+                and np.isfinite(fvlmm_lbd_native)
+                and fvlmm_lbd_native > 0.0
+            ):
+                native_model_key = candidate
+            elif (
+                candidate in {"splmm", "splmm2"}
+                and hasattr(jxrs, "splmm_assoc_pcg_kfile_to_tsv")
+                and isinstance(getattr(models[0][1], "sparse_grm_path_", None), str)
+            ):
+                native_model_key = candidate
 
-            reader = jxrs.KfileChunkReader(
-                str(kfile),
-                sample_indices=sample_indices.tolist(),
-            )
-            while True:
-                item = reader.next_chunk(max(1, int(chunk_size)))
-                if item is None:
-                    break
-                dosage_raw, maf_raw, _row_idx = item
-                dosage = np.ascontiguousarray(np.asarray(dosage_raw, dtype=np.float32))
-                maf = np.asarray(maf_raw, dtype=np.float32).reshape(-1)
-                if dosage.ndim != 2 or dosage.shape[1] != int(y_vec.shape[0]):
-                    raise RuntimeError("k-file dosage chunk is not aligned to the trait samples.")
-                if int(dosage.shape[0]) != int(maf.shape[0]):
-                    raise RuntimeError("k-file dosage/MAF chunk row counts differ.")
-                for model_key, model in models:
-                    if model_key == "splmm":
-                        results = model._assoc_backend_splmm(
-                            dosage,
-                            threads=max(1, int(threads)),
-                            chunk_size=max(1, int(chunk_size)),
-                        )
-                    else:
-                        results = model.gwas(dosage, threads=max(1, int(threads)))
-                    text = _format_kfile_assoc_text(
-                        maf=maf,
-                        results=results,
-                        include_header=(
-                            int(out_handles[model_key][3]) == 0
-                        ),
-                    )
-                    handle, tmp_tsv, out_tsv, count = out_handles[model_key]
-                    handle.write(text)
-                    out_handles[model_key] = (handle, tmp_tsv, out_tsv, count + int(maf.shape[0]))
-                chunk_rows = int(maf.shape[0])
-                if chunk_rows > 0:
-                    pbar.update(chunk_rows)
-                    pbar_done += chunk_rows
-
-            # The metadata count is the expected scan total.  Keep the bar
-            # honest if a truncated/filtered source yields a different count.
-            if pbar_done != int(n_kmers) and pbar_done > 0:
-                pbar.set_total(int(pbar_done))
-            pbar.finish()
-
-            for model_key, _model in models:
-                handle, tmp_tsv, out_tsv, count = out_handles[model_key]
-                handle.flush()
-                handle.close()
-                if count <= 0:
-                    _cleanup_gwas_result_tmp(tmp_tsv)
-                    continue
-                _finalize_gwas_result_tsv(tmp_tsv, out_tsv, kfile, logger=logger)
-                saved_paths.append(str(out_tsv))
-                summary_rows.append(
-                    {
-                        "phenotype": str(trait_name),
-                        "model": str(model_key).upper() if model_key != "fvlmm" else "FvLMM",
-                        "nidv": int(keep_idx.shape[0]),
-                        "eff_snp": int(count),
-                        "pve": (
-                            float(getattr(_model, "pve"))
-                            if model_key in {"lmm", "fvlmm"}
-                            and np.isfinite(float(getattr(_model, "pve", np.nan)))
-                            else None
-                        ),
-                        "avg_cpu": 0.0,
-                        "peak_rss_gb": 0.0,
-                        "gwas_time_s": 0.0,
-                        "viz_time_s": 0.0,
-                        "result_file": str(out_tsv),
-                    }
-                )
-                _log_model_line(
-                    logger,
-                    "FvLMM" if model_key == "fvlmm" else model_key.upper(),
-                    f"Results saved to {_display_path(str(out_tsv))}",
-                    use_spinner=bool(use_spinner),
-                )
-        except Exception:
-            for handle, tmp_tsv, _out_tsv, _count in out_handles.values():
-                try:
-                    handle.close()
-                except Exception:
-                    pass
-                _cleanup_gwas_result_tmp(tmp_tsv)
-            raise
-        finally:
-            if reader is not None:
-                try:
-                    reader.close()
-                except Exception:
-                    pass
+        if native_model_key is None:
             pbar.close(show_done=False)
+            raise RuntimeError(
+                f"Native Rust k-file scanner cannot serve model {requested[0]!r} "
+                "for the fitted model state; Python fallback has been removed."
+            )
+
+        if native_model_key is not None:
+            model = models[0][1]
+            safe_trait = _safe_trait_file_label(trait_name)
+            out_tsv = f"{outprefix}.{safe_trait}.{native_model_key}.tsv"
+            tmp_tsv = _gwas_result_tmp_path(out_tsv)
+            progress_last = 0
+
+            def _native_progress(done: int, total: int) -> None:
+                nonlocal progress_last
+                try:
+                    d = max(0, int(done))
+                    t = max(1, int(total))
+                except Exception:
+                    return
+                if int(pbar.total) != t:
+                    pbar.set_total(t)
+                d = min(d, int(pbar.total))
+                delta = d - progress_last
+                if delta > 0:
+                    pbar.update(delta)
+                    progress_last = d
+
+            scan_t0 = time.monotonic()
+            try:
+                progress_every_native = max(
+                    1,
+                    min(
+                        max(1, int(chunk_size)),
+                        _progress_callback_step(max(1, int(n_kmers))),
+                    ),
+                )
+                if native_model_key == "lm":
+                    x_design = np.ascontiguousarray(
+                        np.concatenate(
+                            [
+                                np.ones((int(y_vec.shape[0]), 1), dtype=np.float64),
+                                x_cov,
+                            ],
+                            axis=1,
+                        ),
+                        dtype=np.float64,
+                    )
+                    count = int(
+                        jxrs.lm_assoc_kfile_to_tsv_f32(
+                            kfile_prefix=str(kfile),
+                            y=np.ascontiguousarray(y_vec, dtype=np.float64),
+                            x=x_design,
+                            out_tsv=str(tmp_tsv),
+                            sample_indices=np.ascontiguousarray(
+                                sample_indices, dtype=np.int64
+                            ),
+                            chunk_size=max(1, int(chunk_size)),
+                            threads=max(1, int(threads)),
+                            progress_callback=_native_progress,
+                            progress_every=int(progress_every_native),
+                            genetic_model=str(genetic_model),
+                        )
+                    )
+                elif native_model_key == "lmm":
+                    try:
+                        bounds = tuple(getattr(model, "bounds"))
+                        lmm_low = float(bounds[0])
+                        lmm_high = float(bounds[1])
+                        if not (
+                            np.isfinite(lmm_low)
+                            and np.isfinite(lmm_high)
+                            and lmm_low < lmm_high
+                        ):
+                            raise ValueError
+                    except Exception:
+                        lmm_low, lmm_high = -5.0, 5.0
+                    try:
+                        init_lbd = float(getattr(model, "lbd_null"))
+                        init_log10_lbd = (
+                            float(np.log10(init_lbd))
+                            if np.isfinite(init_lbd) and init_lbd > 0.0
+                            else None
+                        )
+                    except Exception:
+                        init_log10_lbd = None
+                    count = int(
+                        jxrs.lmm_reml_assoc_kfile_to_tsv_f32(
+                            kfile_prefix=str(kfile),
+                            out_tsv=str(tmp_tsv),
+                            s=np.ascontiguousarray(
+                                np.asarray(model.S, dtype=np.float64).reshape(-1)
+                            ),
+                            xcov=np.ascontiguousarray(
+                                np.asarray(model.Xcov, dtype=np.float64)
+                            ),
+                            y_rot=np.ascontiguousarray(
+                                np.asarray(model.y, dtype=np.float64).reshape(-1)
+                            ),
+                            u_t=np.ascontiguousarray(
+                                np.asarray(model.Dh, dtype=np.float32)
+                            ),
+                            sample_indices=np.ascontiguousarray(
+                                sample_indices, dtype=np.int64
+                            ),
+                            low=float(lmm_low),
+                            high=float(lmm_high),
+                            max_iter=30,
+                            tol=1e-2,
+                            threads=max(1, int(threads)),
+                            init_log10_lbd=init_log10_lbd,
+                            rotate_block_rows=max(1, int(chunk_size)),
+                            progress_callback=_native_progress,
+                            progress_every=int(progress_every_native),
+                            genetic_model=str(genetic_model),
+                        )
+                    )
+                elif native_model_key == "fvlmm":
+                    count = int(
+                        jxrs.fvlmm_assoc_kfile_to_tsv_f32(
+                            kfile_prefix=str(kfile),
+                            out_tsv=str(tmp_tsv),
+                            s=np.ascontiguousarray(
+                                np.asarray(model.S, dtype=np.float64).reshape(-1)
+                            ),
+                            xcov=np.ascontiguousarray(
+                                np.asarray(model.Xcov, dtype=np.float64)
+                            ),
+                            y_rot=np.ascontiguousarray(
+                                np.asarray(model.y, dtype=np.float64).reshape(-1)
+                            ),
+                            u_t=np.ascontiguousarray(
+                                np.asarray(model.Dh, dtype=np.float32)
+                            ),
+                            sample_indices=sample_indices.tolist(),
+                            log10_lbd=float(np.log10(float(model.lbd_null))),
+                            threads=max(1, int(threads)),
+                            rotate_block_rows=max(1, int(chunk_size)),
+                            progress_callback=_native_progress,
+                            progress_every=int(progress_every_native),
+                            genetic_model=str(genetic_model),
+                        )
+                    )
+                else:
+                    sparse_fit = getattr(model, "null_fit_", None) or {}
+                    sparse_lbd = float(sparse_fit.get("lambda", np.nan))
+                    sparse_path = str(getattr(model, "sparse_grm_path_", ""))
+                    if not np.isfinite(sparse_lbd) or sparse_lbd < 0.0:
+                        raise RuntimeError(
+                            f"SparseLMM null fit returned invalid lambda: {sparse_lbd}"
+                        )
+
+                    def _native_splmm_progress(stage: int, done: int, total: int) -> None:
+                        _native_progress(done, total)
+
+                    splmm_out = jxrs.splmm_assoc_pcg_kfile_to_tsv(
+                        kfile_prefix=str(kfile),
+                        out_tsv=str(tmp_tsv),
+                        y=np.ascontiguousarray(y_vec, dtype=np.float64),
+                        lbd=sparse_lbd,
+                        sparse_jxgrm_path=sparse_path,
+                        x_cov=(
+                            None
+                            if getattr(model, "X_", None) is None
+                            else np.ascontiguousarray(
+                                np.asarray(model.X_, dtype=np.float64)
+                            )
+                        ),
+                        sample_indices=sample_indices.tolist(),
+                        sparse_sample_indices=(
+                            None
+                            if getattr(model, "sparse_sample_idx_", None) is None
+                            else np.asarray(
+                                model.sparse_sample_idx_, dtype=np.int64
+                            ).reshape(-1).tolist()
+                        ),
+                        threads=max(1, int(threads)),
+                        block_rows=max(1, int(chunk_size)),
+                        model="add",
+                        scan_mode=("approx" if native_model_key == "splmm" else "exact"),
+                        rhat_markers=30,
+                        rhat_seed=20260527,
+                        tol=1e-3,
+                        max_iter=200,
+                        progress_callback=_native_splmm_progress,
+                        progress_every=int(progress_every_native),
+                    )
+                    count = int(tuple(splmm_out)[9])
+            except Exception:
+                _cleanup_gwas_result_tmp(tmp_tsv)
+                pbar.close(show_done=False)
+                raise
+
+            if progress_last < count:
+                pbar.update(int(count - progress_last))
+            pbar.finish()
+            _finalize_gwas_result_tsv(tmp_tsv, out_tsv, kfile, logger=logger)
+            saved_paths.append(str(out_tsv))
+            summary_rows.append(
+                {
+                    "phenotype": str(trait_name),
+                    "model": (
+                        "FvLMM"
+                        if native_model_key == "fvlmm"
+                        else native_model_key.upper()
+                    ),
+                    "nidv": int(keep_idx.shape[0]),
+                    "eff_snp": int(count),
+                    "pve": (
+                        float(getattr(model, "pve"))
+                        if native_model_key in {"lmm", "fvlmm"}
+                        and np.isfinite(float(getattr(model, "pve", np.nan)))
+                        else None
+                    ),
+                    "avg_cpu": 0.0,
+                    "peak_rss_gb": 0.0,
+                    "gwas_time_s": float(max(time.monotonic() - scan_t0, 0.0)),
+                    "viz_time_s": 0.0,
+                    "result_file": str(out_tsv),
+                }
+            )
+            _log_model_line(
+                logger,
+                "FvLMM" if native_model_key == "fvlmm" else native_model_key.upper(),
+                f"Results saved to {_display_path(str(out_tsv))}",
+                use_spinner=bool(use_spinner),
+            )
+            pbar.close(show_done=False)
+            continue
 
 
 def run_chunked_gwas_lmm_lm(

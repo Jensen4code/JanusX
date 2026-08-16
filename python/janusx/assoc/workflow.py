@@ -4655,21 +4655,6 @@ def _inspect_kfile_source(prefix: str) -> tuple[np.ndarray, int, dict[str, objec
     return ids, n_kmers, info
 
 
-def _new_kfile_reader(
-    prefix: str,
-    *,
-    sample_indices: Optional[np.ndarray] = None,
-) -> object:
-    if not hasattr(jxrs, "KfileChunkReader"):
-        raise RuntimeError(
-            "Rust extension missing KfileChunkReader; rebuild/reinstall JanusX."
-        )
-    idx = None
-    if sample_indices is not None:
-        idx = np.asarray(sample_indices, dtype=np.int64).reshape(-1).tolist()
-    return jxrs.KfileChunkReader(str(prefix), sample_indices=idx)
-
-
 def _build_kfile_grm_streaming(
     prefix: str,
     *,
@@ -7933,7 +7918,7 @@ def _run_gwas_pipeline(
         unsupported_kfile_models = [
             str(model)
             for model in requested_stream_models
-            if str(model).strip().lower() not in {"lm", "lmm", "fvlmm", "splmm"}
+            if str(model).strip().lower() not in {"lm", "lmm", "fvlmm", "splmm", "splmm2"}
         ]
         if len(unsupported_kfile_models) > 0 or bool(args.farmcpu) or bool(args.algwas):
             unsupported_kfile_models.extend(
@@ -7942,8 +7927,19 @@ def _run_gwas_pipeline(
                 if bool(enabled) and model not in unsupported_kfile_models
             )
             raise ValueError(
-                "-kfile currently supports only -lm, -lmm, -fvlmm and -splmm; "
+                "-kfile currently supports only -lm, -lmm, -fvlmm, -splmm and -splmm-exact; "
                 f"unsupported model(s): {', '.join(unsupported_kfile_models)}"
+            )
+        if len(requested_stream_models) != 1:
+            raise ValueError(
+                "-kfile native GWAS requires exactly one model "
+                "(-lm, -lmm, -fvlmm, -splmm, or -splmm-exact); "
+                "the Python fallback has been removed."
+            )
+        if str(args.model).strip().lower() != "add":
+            raise ValueError(
+                "-kfile native GWAS currently supports only the additive model "
+                "(-model add); the Python fallback has been removed."
             )
     qcov_requested = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     qcov_needs_grm = False
@@ -8660,6 +8656,7 @@ def _run_gwas_pipeline(
                     cov_all=(None if cov_all is None else np.asarray(cov_all, dtype=np.float32)),
                     threads=max(1, int(args.thread)),
                     logger=logger,
+                    genetic_model=str(args.model),
                     summary_rows=gwas_summary_rows,
                     saved_paths=saved_result_paths,
                     use_spinner=bool(use_spinner),

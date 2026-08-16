@@ -13,7 +13,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -419,7 +421,7 @@ fn bitset_dosage_lut() -> &'static [[f32; 8]; 256] {
 }
 
 #[inline]
-fn full_bitset_presence(row: &[u8], n_samples: usize) -> usize {
+fn full_bitset_presence_scalar(row: &[u8], n_samples: usize) -> usize {
     let full_bytes = n_samples / 8;
     let mut count = 0u32;
     let whole_bytes = full_bytes - (full_bytes % 8);
@@ -436,6 +438,139 @@ fn full_bitset_presence(row: &[u8], n_samples: usize) -> usize {
         count += (row[full_bytes] & ((1u8 << tail) - 1)).count_ones();
     }
     count as usize
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn full_bitset_presence_neon(row: &[u8], n_samples: usize) -> usize {
+    use std::arch::aarch64::*;
+
+    let full_bytes = n_samples / 8;
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while offset + 16 <= full_bytes {
+        let values = vld1q_u8(row.as_ptr().add(offset));
+        let bits = vcntq_u8(values);
+        let sum16 = vpaddlq_u8(bits);
+        let sum32 = vpaddlq_u16(sum16);
+        let sum64 = vpaddlq_u32(sum32);
+        count += vgetq_lane_u64(sum64, 0) as usize;
+        count += vgetq_lane_u64(sum64, 1) as usize;
+        offset += 16;
+    }
+    count += row[offset..full_bytes]
+        .iter()
+        .map(|value| value.count_ones() as usize)
+        .sum::<usize>();
+    let tail = n_samples % 8;
+    if tail != 0 {
+        count += (row[full_bytes] & ((1u8 << tail) - 1)).count_ones() as usize;
+    }
+    count
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn full_bitset_presence_avx2(row: &[u8], n_samples: usize) -> usize {
+    use std::arch::x86_64::*;
+
+    let full_bytes = n_samples / 8;
+    let lut4 = _mm256_setr_epi8(
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3,
+        3, 4,
+    );
+    let low_mask = _mm256_set1_epi8(0x0f_i8);
+    let zero = _mm256_setzero_si256();
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while offset + 32 <= full_bytes {
+        let values = _mm256_loadu_si256(row.as_ptr().add(offset) as *const __m256i);
+        let low = _mm256_and_si256(values, low_mask);
+        let high = _mm256_and_si256(_mm256_srli_epi16(values, 4), low_mask);
+        let bits = _mm256_add_epi8(
+            _mm256_shuffle_epi8(lut4, low),
+            _mm256_shuffle_epi8(lut4, high),
+        );
+        let sums = _mm256_sad_epu8(bits, zero);
+        let mut lanes = [0u64; 4];
+        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, sums);
+        count += lanes.iter().map(|value| *value as usize).sum::<usize>();
+        offset += 32;
+    }
+    count += row[offset..full_bytes]
+        .iter()
+        .map(|value| value.count_ones() as usize)
+        .sum::<usize>();
+    let tail = n_samples % 8;
+    if tail != 0 {
+        count += (row[full_bytes] & ((1u8 << tail) - 1)).count_ones() as usize;
+    }
+    count
+}
+
+/// Count full-sample presence bits using a runtime-dispatched SIMD popcount.
+///
+/// The bitset format is little-bit ordered, so the population count is
+/// independent of the dosage expansion.  NEON/AVX2 is used only when the
+/// platform advertises it; short rows and non-SIMD targets use the scalar
+/// fallback.  The caller still gets exactly the same count for a tail byte.
+#[inline]
+fn full_bitset_presence(row: &[u8], n_samples: usize) -> usize {
+    let full_bytes = n_samples / 8;
+    #[cfg(target_arch = "aarch64")]
+    if full_bytes >= 16 && std::arch::is_aarch64_feature_detected!("neon") {
+        return unsafe { full_bitset_presence_neon(row, n_samples) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if full_bytes >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { full_bitset_presence_avx2(row, n_samples) };
+    }
+    full_bitset_presence_scalar(row, n_samples)
+}
+
+/// Decode one full-identity bitset row to centered 0/2 dosage.
+///
+/// The hot path uses SIMD population count and a byte-to-eight-dosage LUT;
+/// arbitrary sample subsets continue to use the grouped scalar decoder.  The
+/// function is kept separate so tests and the GRM decoder can verify the fast
+/// path against the scalar reference directly.
+pub(crate) fn decode_centered_row_full_identity_simd(
+    packed_row: &[u8],
+    n_samples: usize,
+    out_row: &mut [f32],
+) -> Result<f32> {
+    if n_samples == 0 {
+        bail!("full-identity k-file row has zero samples");
+    }
+    if out_row.len() != n_samples {
+        bail!(
+            "full-identity k-file row buffer has wrong length: got {}, expected {}",
+            out_row.len(),
+            n_samples
+        );
+    }
+    let bytes_per_col = n_samples.div_ceil(8);
+    if packed_row.len() < bytes_per_col {
+        bail!(
+            "full-identity k-file row is too short: got {}, expected at least {}",
+            packed_row.len(),
+            bytes_per_col
+        );
+    }
+    let presence = full_bitset_presence(packed_row, n_samples);
+    let p = presence as f32 / n_samples as f32;
+    let lut = bitset_dosage_lut();
+    for byte_idx in 0..bytes_per_col {
+        let start = byte_idx * 8;
+        let width = (n_samples - start).min(8);
+        let expanded = &lut[packed_row[byte_idx] as usize];
+        out_row[start..start + width].copy_from_slice(&expanded[..width]);
+    }
+    let center = 2.0 * p;
+    for value in out_row.iter_mut() {
+        *value -= center;
+    }
+    Ok(p.min(1.0 - p))
 }
 
 impl KfileGrmPreparedBlock {
@@ -653,6 +788,480 @@ pub(crate) struct KfileGrmSource {
     denominator: f64,
     stage_timing: KfileGrmStageTiming,
     full_decode_plan: KfileBitsetDecodePlan,
+}
+
+/// Native streaming source for association scans over a k-file bitset.
+///
+/// Unlike [`KfileChunkReader`], this source writes directly into caller-owned
+/// buffers and centers each 0/2 dosage row on the selected-sample mean.  The
+/// association kernels can therefore consume one bounded block without a
+/// Python allocation or a second k-file pass.
+pub(crate) struct KfileAssocSource {
+    layout: KfileLayout,
+    bsite: File,
+    sample_indices: Vec<usize>,
+    decode_plan: KfileBitsetDecodePlan,
+    packed_block: Vec<u8>,
+    next_row: u64,
+}
+
+/// A reusable decoded block exchanged by the persistent k-file prefetcher.
+///
+/// The consumer returns ordinary blocks with [`KfileAssocPrefetch::recycle`]
+/// after copying/using their contents.  Keeping ownership of the two buffers
+/// in the channel avoids a per-block allocation while the producer reads and
+/// decodes the next block in parallel with the sparse solve.
+pub(crate) struct KfileAssocPrefetchBlock {
+    dosage: Vec<f32>,
+    maf: Vec<f32>,
+    n_samples: usize,
+    row_start: usize,
+    rows: usize,
+    error: Option<String>,
+}
+
+impl KfileAssocPrefetchBlock {
+    fn new(values_len: usize, block_rows: usize, n_samples: usize) -> Self {
+        Self {
+            dosage: vec![0.0; values_len],
+            maf: vec![0.0; block_rows],
+            n_samples,
+            row_start: 0,
+            rows: 0,
+            error: None,
+        }
+    }
+
+    pub(crate) fn row_start(&self) -> usize {
+        self.row_start
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) fn dosage(&self) -> &[f32] {
+        &self.dosage[..self.rows.saturating_mul(self.n_samples)]
+    }
+
+    pub(crate) fn maf(&self) -> &[f32] {
+        &self.maf[..self.rows]
+    }
+}
+
+/// Persistent two-buffer decoder for consumers whose scan loop owns its
+/// output slice (for example the generic SparseLMM `GenotypeMatrix` trait).
+pub(crate) struct KfileAssocPrefetch {
+    ready_rx: Option<Mutex<Receiver<KfileAssocPrefetchBlock>>>,
+    free_tx: Option<SyncSender<KfileAssocPrefetchBlock>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl KfileAssocPrefetch {
+    fn new(source: KfileAssocSource, block_rows: usize) -> Result<Self> {
+        if block_rows == 0 {
+            bail!("k-file association prefetch block_rows must be > 0");
+        }
+        let n_samples = source.n_samples();
+        let values_len = block_rows
+            .checked_mul(n_samples)
+            .ok_or_else(|| anyhow::anyhow!("k-file association prefetch buffer overflow"))?;
+        let (free_tx, free_rx) = sync_channel::<KfileAssocPrefetchBlock>(2);
+        let (ready_tx, ready_rx) = sync_channel::<KfileAssocPrefetchBlock>(2);
+        for _ in 0..2 {
+            free_tx
+                .send(KfileAssocPrefetchBlock::new(
+                    values_len, block_rows, n_samples,
+                ))
+                .expect("k-file prefetch seed free channel");
+        }
+        let marker_count = source.n_kmers();
+        let join = std::thread::spawn(move || {
+            let mut source = source;
+            while let Ok(mut block) = free_rx.recv() {
+                let row_start = source.next_row as usize;
+                match source.next_centered_block(
+                    block_rows,
+                    block.dosage.as_mut_slice(),
+                    block.maf.as_mut_slice(),
+                ) {
+                    Ok(Some(rows)) => {
+                        block.row_start = row_start;
+                        block.rows = rows;
+                        let more = source.next_row < source.layout.meta.n_kmers;
+                        if ready_tx.send(block).is_err() || !more {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        block.row_start = marker_count;
+                        block.rows = 0;
+                        let _ = ready_tx.send(block);
+                        break;
+                    }
+                    Err(error) => {
+                        block.row_start = usize::MAX;
+                        block.rows = 0;
+                        block.error = Some(error.to_string());
+                        let _ = ready_tx.send(block);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            ready_rx: Some(Mutex::new(ready_rx)),
+            free_tx: Some(free_tx),
+            join: Some(join),
+        })
+    }
+
+    pub(crate) fn next(&mut self) -> Result<Option<KfileAssocPrefetchBlock>, String> {
+        let receiver = self
+            .ready_rx
+            .as_ref()
+            .ok_or_else(|| "k-file association prefetch has been closed".to_string())?;
+        let block = receiver
+            .lock()
+            .map_err(|_| "k-file association prefetch receiver lock poisoned".to_string())?
+            .recv()
+            .map_err(|_| "k-file association prefetch producer stopped unexpectedly".to_string())?;
+        if let Some(error) = block.error {
+            return Err(error);
+        }
+        if block.rows == 0 {
+            return Ok(None);
+        }
+        Ok(Some(block))
+    }
+
+    pub(crate) fn recycle(&self, block: KfileAssocPrefetchBlock) -> Result<(), String> {
+        if let Some(sender) = self.free_tx.as_ref() {
+            // The producer intentionally exits after sending the final block,
+            // so its receive end may already be gone when the consumer
+            // recycles that last buffer.  The buffer is no longer needed in
+            // that case; treat the failed recycle as a normal EOF condition.
+            let _ = sender.send(block);
+            Ok(())
+        } else {
+            Err("k-file association prefetch has been closed".to_string())
+        }
+    }
+}
+
+impl Drop for KfileAssocPrefetch {
+    fn drop(&mut self) {
+        self.ready_rx.take();
+        self.free_tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl KfileAssocSource {
+    pub(crate) fn open(prefix: &Path, sample_indices: &[usize]) -> Result<Self> {
+        let layout = load_layout(prefix)?;
+        validate_grm_value_type(&layout.meta, &layout.meta_path)?;
+        let (selected, _) = build_sample_selection(&layout.samples, Some(sample_indices.to_vec()))?;
+        let n_samples_full =
+            usize::try_from(layout.meta.n_samples).context("n_samples does not fit usize")?;
+        let decode_plan = KfileBitsetDecodePlan::new(&selected, n_samples_full)?;
+        let bsite = File::open(&layout.bsite_path).with_context(|| {
+            format!("failed to open bsite file: {}", layout.bsite_path.display())
+        })?;
+        Ok(Self {
+            layout,
+            bsite,
+            sample_indices: selected,
+            decode_plan,
+            packed_block: Vec::new(),
+            next_row: 0,
+        })
+    }
+
+    pub(crate) fn n_samples(&self) -> usize {
+        self.sample_indices.len()
+    }
+
+    pub(crate) fn n_samples_full(&self) -> usize {
+        self.layout.meta.n_samples as usize
+    }
+
+    pub(crate) fn n_kmers(&self) -> usize {
+        self.layout.meta.n_kmers as usize
+    }
+
+    pub(crate) fn into_prefetch(self, block_rows: usize) -> Result<KfileAssocPrefetch> {
+        KfileAssocPrefetch::new(self, block_rows)
+    }
+
+    /// Read a small set of rows without changing the sequential cursor.
+    ///
+    /// Approximate SparseLMM uses this only for its r-hat marker sample.  The
+    /// main association scan remains a single sequential pass over `bsite`.
+    pub(crate) fn read_centered_rows_at(
+        &self,
+        row_indices: &[usize],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let n_selected = self.sample_indices.len();
+        if row_indices.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let bytes_per_col = usize::try_from(self.layout.meta.bytes_per_col)
+            .context("bytes_per_col does not fit usize")?;
+        let mut bsite = self
+            .bsite
+            .try_clone()
+            .with_context(|| format!("failed to clone {}", self.layout.bsite_path.display()))?;
+        let mut packed = vec![0u8; bytes_per_col];
+        let mut dosage = vec![0.0_f32; row_indices.len().saturating_mul(n_selected)];
+        let mut maf = vec![0.0_f32; row_indices.len()];
+        for (out_row_idx, &row_idx) in row_indices.iter().enumerate() {
+            if row_idx >= self.n_kmers() {
+                bail!("k-file association row index out of range: {row_idx}");
+            }
+            let offset = (BSITE_HEADER_SIZE as u64)
+                .checked_add(
+                    (row_idx as u64)
+                        .checked_mul(self.layout.meta.bytes_per_col)
+                        .ok_or_else(|| anyhow::anyhow!("k-file association offset overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("k-file association offset overflow"))?;
+            bsite
+                .seek(SeekFrom::Start(offset))
+                .with_context(|| format!("failed to seek {}", self.layout.bsite_path.display()))?;
+            bsite
+                .read_exact(&mut packed)
+                .with_context(|| format!("failed to read {}", self.layout.bsite_path.display()))?;
+            let out = &mut dosage[out_row_idx * n_selected..(out_row_idx + 1) * n_selected];
+            maf[out_row_idx] = self.decode_centered_row(&packed, out)?;
+        }
+        Ok((dosage, maf))
+    }
+
+    fn decode_centered_row(&self, packed_row: &[u8], out_row: &mut [f32]) -> Result<f32> {
+        let n_selected = self.sample_indices.len();
+        if out_row.len() != n_selected {
+            bail!("k-file association row buffer has the wrong number of samples");
+        }
+        let n_samples_full = self.n_samples_full();
+        let full_identity = self.decode_plan.full_identity;
+        if full_identity {
+            return decode_centered_row_full_identity_simd(packed_row, n_samples_full, out_row);
+        }
+        let lut = bitset_dosage_lut();
+        let mut presence = 0usize;
+        for group in &self.decode_plan.groups {
+            let expanded = &lut[packed_row[group.byte] as usize];
+            for entry in &group.entries {
+                let value = expanded[entry.bit];
+                out_row[entry.column] = value;
+                if value > 0.0 {
+                    presence += 1;
+                }
+            }
+        }
+        let p = presence as f32 / n_selected as f32;
+        let center = 2.0 * p;
+        for value in out_row.iter_mut() {
+            *value -= center;
+        }
+        Ok(p.min(1.0 - p))
+    }
+
+    /// Decode at most `max_rows` rows into centered 0/2 dosage values.
+    ///
+    /// `dosage` must have room for `max_rows * n_samples()` values and `maf`
+    /// for `max_rows` values.  The returned count is the number of rows
+    /// decoded; `None` means the source is exhausted.
+    pub(crate) fn next_centered_block(
+        &mut self,
+        max_rows: usize,
+        dosage: &mut [f32],
+        maf: &mut [f32],
+    ) -> Result<Option<usize>> {
+        if max_rows == 0 {
+            bail!("k-file association block_rows must be > 0");
+        }
+        let n_selected = self.sample_indices.len();
+        if dosage.len() < max_rows.saturating_mul(n_selected) {
+            bail!("k-file association dosage buffer is too small");
+        }
+        if maf.len() < max_rows {
+            bail!("k-file association MAF buffer is too small");
+        }
+        if self.next_row >= self.layout.meta.n_kmers {
+            return Ok(None);
+        }
+
+        let rows_left = self.layout.meta.n_kmers - self.next_row;
+        let rows = usize::try_from(rows_left.min(max_rows as u64))
+            .context("k-file association row count does not fit usize")?;
+        let bytes_per_col = usize::try_from(self.layout.meta.bytes_per_col)
+            .context("bytes_per_col does not fit usize")?;
+        let byte_len = rows
+            .checked_mul(bytes_per_col)
+            .ok_or_else(|| anyhow::anyhow!("k-file association block size overflow"))?;
+        let offset = (BSITE_HEADER_SIZE as u64)
+            .checked_add(
+                self.next_row
+                    .checked_mul(self.layout.meta.bytes_per_col)
+                    .ok_or_else(|| anyhow::anyhow!("k-file association offset overflow"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("k-file association offset overflow"))?;
+        self.bsite
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed to seek {}", self.layout.bsite_path.display()))?;
+        // Reuse the bounded packed-byte buffer across sequential blocks.  A
+        // k-file scan can contain millions of blocks; allocating a fresh
+        // Vec for every block otherwise becomes visible in profiles even
+        // though the resident memory remains bounded.
+        self.packed_block.resize(byte_len, 0);
+        self.bsite
+            .read_exact(&mut self.packed_block)
+            .with_context(|| format!("failed to read {}", self.layout.bsite_path.display()))?;
+
+        for row in 0..rows {
+            let packed_row = &self.packed_block[row * bytes_per_col..(row + 1) * bytes_per_col];
+            let out_row = &mut dosage[row * n_selected..(row + 1) * n_selected];
+            maf[row] = self.decode_centered_row(packed_row, out_row)?;
+        }
+        self.next_row += rows as u64;
+        Ok(Some(rows))
+    }
+
+    /// Consume the sequential source with a bounded two-buffer pipeline.
+    ///
+    /// The producer owns the file cursor and fills two reusable centered
+    /// dosage/MAF buffers while the caller performs projection, association,
+    /// or output work in `consume`.  No marker-sized allocation is made and
+    /// the source is scanned exactly once.  The sequential method remains
+    /// available for adapters that require a caller-owned output slice.
+    pub(crate) fn for_each_centered_block<F>(
+        self,
+        block_rows: usize,
+        overlap: bool,
+        mut consume: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(usize, usize, &[f32], &[f32]) -> Result<(), String>,
+    {
+        if block_rows == 0 {
+            return Err("k-file association block_rows must be > 0".to_string());
+        }
+        let n = self.n_samples();
+        let marker_count = self.n_kmers();
+        let block_values = block_rows
+            .checked_mul(n)
+            .ok_or_else(|| "k-file association double-buffer size overflow".to_string())?;
+
+        struct AssocChunk {
+            dosage: Vec<f32>,
+            maf: Vec<f32>,
+            row_start: usize,
+            rows: usize,
+            producer_failed: bool,
+        }
+
+        impl AssocChunk {
+            fn new(block_values: usize, block_rows: usize) -> Self {
+                Self {
+                    dosage: vec![0.0; block_values],
+                    maf: vec![0.0; block_rows],
+                    row_start: 0,
+                    rows: 0,
+                    producer_failed: false,
+                }
+            }
+        }
+
+        if !overlap || marker_count <= block_rows {
+            let mut source = self;
+            let mut dosage = vec![0.0_f32; block_values];
+            let mut maf = vec![0.0_f32; block_rows];
+            let mut done = 0usize;
+            while let Some(rows) = source
+                .next_centered_block(block_rows, dosage.as_mut_slice(), maf.as_mut_slice())
+                .map_err(|error| error.to_string())?
+            {
+                consume(done, rows, &dosage[..rows * n], &maf[..rows])?;
+                done = done.saturating_add(rows);
+            }
+            return Ok(done);
+        }
+
+        let producer_error = Arc::new(Mutex::new(None::<String>));
+        let producer_error_slot = Arc::clone(&producer_error);
+        let mut source = self;
+        let producer = move |chunk: &mut AssocChunk| -> bool {
+            let row_start = source.next_row as usize;
+            match source.next_centered_block(
+                block_rows,
+                chunk.dosage.as_mut_slice(),
+                chunk.maf.as_mut_slice(),
+            ) {
+                Ok(Some(rows)) => {
+                    chunk.row_start = row_start;
+                    chunk.rows = rows;
+                    chunk.producer_failed = false;
+                    source.next_row < source.layout.meta.n_kmers
+                }
+                Ok(None) => {
+                    chunk.row_start = marker_count;
+                    chunk.rows = 0;
+                    chunk.producer_failed = false;
+                    false
+                }
+                Err(error) => {
+                    if let Ok(mut slot) = producer_error_slot.lock() {
+                        *slot = Some(error.to_string());
+                    }
+                    chunk.row_start = usize::MAX;
+                    chunk.rows = 0;
+                    chunk.producer_failed = true;
+                    false
+                }
+            }
+        };
+        let consumer_error = Arc::clone(&producer_error);
+        let mut done = 0usize;
+        let consumer = |chunk: &mut AssocChunk| -> Result<(), String> {
+            if chunk.producer_failed || chunk.row_start == usize::MAX {
+                return Err(consumer_error
+                    .lock()
+                    .map_err(|_| "k-file association producer error lock poisoned".to_string())?
+                    .take()
+                    .unwrap_or_else(|| "k-file association producer failed".to_string()));
+            }
+            if chunk.rows == 0 {
+                return Ok(());
+            }
+            consume(
+                chunk.row_start,
+                chunk.rows,
+                &chunk.dosage[..chunk.rows * n],
+                &chunk.maf[..chunk.rows],
+            )?;
+            done = chunk.row_start.saturating_add(chunk.rows);
+            Ok(())
+        };
+
+        crate::pipeline::run_double_buffer(
+            2,
+            || AssocChunk::new(block_values, block_rows),
+            producer,
+            consumer,
+        )?;
+        if let Some(error) = producer_error
+            .lock()
+            .map_err(|_| "k-file association producer error lock poisoned".to_string())?
+            .take()
+        {
+            return Err(error);
+        }
+        Ok(done)
+    }
 }
 
 #[allow(dead_code)]
@@ -995,9 +1604,9 @@ pub fn kfile_inspect_py<'py>(py: Python<'py>, prefix: String) -> PyResult<Bound<
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_bsite_chunk, decode_grm_prepared_block_into,
+        decode_bsite_chunk, decode_centered_row_full_identity_simd, decode_grm_prepared_block_into,
         decode_grm_prepared_block_into_with_plan, maf_from_presence, prepare_grm_bsite_block,
-        KfileBitsetDecodePlan, KfileChunkReader, KfileGrmSource,
+        KfileAssocSource, KfileBitsetDecodePlan, KfileChunkReader, KfileGrmSource,
     };
     use crate::kmer::format::{BsiteHeader, KmergeMeta};
     use std::fs::{self, File};
@@ -1140,6 +1749,113 @@ mod tests {
     }
 
     #[test]
+    fn full_identity_simd_decode_matches_scalar_reference() {
+        let n_samples = 137usize;
+        let bytes_per_col = n_samples.div_ceil(8);
+        let mut packed = vec![0u8; bytes_per_col];
+        for (idx, byte) in packed.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(37).rotate_left(1);
+        }
+        packed[bytes_per_col - 1] &= (1u8 << (n_samples % 8)) - 1;
+        let mut got = vec![0.0_f32; n_samples];
+        let maf = decode_centered_row_full_identity_simd(
+            packed.as_slice(),
+            n_samples,
+            got.as_mut_slice(),
+        )
+        .expect("SIMD full-identity decode");
+
+        let presence = packed
+            .iter()
+            .enumerate()
+            .map(|(byte_idx, value)| {
+                let valid_bits = if byte_idx + 1 == bytes_per_col {
+                    n_samples - byte_idx * 8
+                } else {
+                    8
+                };
+                (value
+                    & if valid_bits == 8 {
+                        u8::MAX
+                    } else {
+                        (1u8 << valid_bits) - 1
+                    })
+                .count_ones() as usize
+            })
+            .sum::<usize>();
+        let p = presence as f32 / n_samples as f32;
+        assert!((maf - p.min(1.0 - p)).abs() < 1e-7);
+        for (sample, value) in got.iter().enumerate() {
+            let raw = if ((packed[sample >> 3] >> (sample & 7)) & 1) != 0 {
+                2.0_f32
+            } else {
+                0.0_f32
+            };
+            assert!((*value - (raw - 2.0 * p)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn assoc_double_buffer_preserves_order_and_values() {
+        let dir = grm_fixture_dir();
+        let meta = valid_grm_meta();
+        write_grm_fixture(
+            &dir,
+            &meta,
+            VALID_IDV,
+            &[0b0000_0011, 0b0000_1111, 0b0000_0001],
+        );
+        let prefix = dir.join("fixture");
+        let source = KfileAssocSource::open(&prefix, &[0, 1, 2, 3]).unwrap();
+        let mut observed = Vec::<(usize, Vec<f32>, f32)>::new();
+        let rows = source
+            .for_each_centered_block(1, true, |row_start, rows, dosage, maf| {
+                observed.push((row_start, dosage[..rows * 4].to_vec(), maf[0]));
+                Ok::<(), String>(())
+            })
+            .expect("double-buffered association scan");
+        assert_eq!(rows, 3);
+        assert_eq!(observed.len(), 3);
+        assert_eq!(
+            observed.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(observed[0].1, vec![1.0, 1.0, -1.0, -1.0]);
+        assert_eq!(observed[1].1, vec![0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(observed[2].1, vec![1.5, -0.5, -0.5, -0.5]);
+        fs::remove_dir_all(dir).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn assoc_prefetch_reuses_two_buffers_without_reordering() {
+        let dir = grm_fixture_dir();
+        let meta = valid_grm_meta();
+        write_grm_fixture(
+            &dir,
+            &meta,
+            VALID_IDV,
+            &[0b0000_0011, 0b0000_1111, 0b0000_0001],
+        );
+        let prefix = dir.join("fixture");
+        let source = KfileAssocSource::open(&prefix, &[0, 1, 2, 3]).unwrap();
+        let mut prefetch = source.into_prefetch(1).expect("start k-file prefetch");
+        let mut starts = Vec::new();
+        for _ in 0..3 {
+            let block = prefetch
+                .next()
+                .expect("receive prefetch block")
+                .expect("prefetch block present");
+            starts.push(block.row_start());
+            assert_eq!(block.rows(), 1);
+            assert_eq!(block.dosage().len(), 4);
+            prefetch.recycle(block).expect("recycle prefetch buffer");
+        }
+        assert_eq!(starts, vec![0, 1, 2]);
+        drop(prefetch);
+        fs::remove_dir_all(dir).expect("remove fixture directory");
+    }
+
+    #[test]
     fn decodes_little_endian_presence_bits_to_dosage() {
         let (dosage, presence) =
             decode_bsite_chunk(&[0b0101_0011], 6, 1, 0, &[]).expect("decode chunk");
@@ -1154,6 +1870,91 @@ mod tests {
                 .expect("decode selected chunk");
         assert_eq!(dosage, vec![0.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
         assert_eq!(presence, vec![1, 1]);
+    }
+
+    #[test]
+    fn assoc_source_decodes_centered_zero_two_rows_in_selected_order() {
+        let dir = grm_fixture_dir();
+        let meta = valid_grm_meta();
+        write_grm_fixture(
+            &dir,
+            &meta,
+            VALID_IDV,
+            &[0b0000_0011, 0b0000_1111, 0b0000_0001],
+        );
+        let prefix = dir.join("fixture");
+        let mut source = KfileAssocSource::open(&prefix, &[3, 1, 0]).unwrap();
+        let mut dosage = vec![0.0_f32; 2 * 3];
+        let mut maf = vec![0.0_f32; 2];
+        let rows = source
+            .next_centered_block(2, &mut dosage, &mut maf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert!((maf[0] - (1.0 / 3.0)).abs() < 1e-6);
+        assert_eq!(maf[1], 0.0);
+        let expected = [-4.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 0.0, 0.0, 0.0];
+        for (got, want) in dosage.iter().zip(expected) {
+            assert!((*got as f64 - want).abs() < 1e-6, "got={got} want={want}");
+        }
+
+        let mut dosage_tail = vec![0.0_f32; 3];
+        let mut maf_tail = vec![0.0_f32; 1];
+        assert_eq!(
+            source
+                .next_centered_block(1, &mut dosage_tail, &mut maf_tail)
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert!((maf_tail[0] - (1.0 / 3.0)).abs() < 1e-6);
+        let expected_tail = [-2.0 / 3.0, -2.0 / 3.0, 4.0 / 3.0];
+        for (got, want) in dosage_tail.iter().zip(expected_tail) {
+            assert!((*got as f64 - want).abs() < 1e-6, "got={got} want={want}");
+        }
+        assert!(source
+            .next_centered_block(1, &mut dosage_tail, &mut maf_tail)
+            .unwrap()
+            .is_none());
+        fs::remove_dir_all(dir).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn assoc_source_random_rows_do_not_advance_sequential_cursor() {
+        let dir = grm_fixture_dir();
+        let meta = valid_grm_meta();
+        write_grm_fixture(
+            &dir,
+            &meta,
+            VALID_IDV,
+            &[0b0000_0011, 0b0000_1111, 0b0000_0001],
+        );
+        let prefix = dir.join("fixture");
+        let mut source = KfileAssocSource::open(&prefix, &[3, 1, 0, 2]).unwrap();
+        let (random, random_maf) = source.read_centered_rows_at(&[2, 0]).unwrap();
+        assert_eq!(random.len(), 8);
+        assert_eq!(random_maf.len(), 2);
+        let expected_random = [-0.5_f32, -0.5, 1.5, -0.5, -1.0, 1.0, 1.0, -1.0];
+        for (got, want) in random.iter().zip(expected_random) {
+            assert!((*got - want).abs() < 1e-6, "got={got} want={want}");
+        }
+        assert!((random_maf[0] - 0.25).abs() < 1e-6);
+        assert_eq!(random_maf[1], 0.5);
+        assert_eq!(source.next_row, 0);
+
+        let mut dosage = vec![0.0_f32; 4];
+        let mut maf = vec![0.0_f32; 1];
+        assert_eq!(
+            source
+                .next_centered_block(1, &mut dosage, &mut maf)
+                .unwrap(),
+            Some(1)
+        );
+        let expected_first = [-1.0_f32, 1.0, 1.0, -1.0];
+        for (got, want) in dosage.iter().zip(expected_first) {
+            assert!((*got - want).abs() < 1e-6, "got={got} want={want}");
+        }
+        fs::remove_dir_all(dir).expect("remove fixture directory");
     }
 
     #[test]

@@ -290,7 +290,11 @@ pub struct GlobalStats {
 impl GlobalStats {
     #[inline]
     pub fn n_markers(&self) -> usize {
-        self.maf.len()
+        if self.maf.is_empty() {
+            self.n_markers_total
+        } else {
+            self.maf.len()
+        }
     }
 
     /// Row-source slice for a block of kept markers, suitable for
@@ -330,6 +334,14 @@ pub trait GenotypeMatrix: Send + Sync {
     /// Raw packed bytes at a specific source SNP index (original BIM row).
     /// This is the primitive accessor for mmap matrices.
     fn source_row_bytes(&self, source_idx: usize) -> &[u8];
+
+    /// MAF values produced by a streaming decoder for the most recent block.
+    /// Resident BED backends return `None` because their metadata is already
+    /// available in `GlobalStats`; k-file adapters use this bounded slice for
+    /// direct TSV output without allocating one vector per marker.
+    fn block_maf(&self, _rows_here: usize) -> Option<&[f32]> {
+        None
+    }
 
     /// Decode a block of kept markers via `decode_mean_imputed_additive_packed_block_rows_f32`.
     /// Default impl uses `packed_flat()` with absolute source offsets.

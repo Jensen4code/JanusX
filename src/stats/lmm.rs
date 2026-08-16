@@ -11,13 +11,15 @@
 
 use matrixmultiply::sgemm;
 use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::Bound;
 use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
+use std::fmt::Write as FmtWrite;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -41,6 +43,7 @@ use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_with_excluded, is_simple_snp_allele,
 };
 use crate::gload::WindowedBedMatrix;
+use crate::kmer::KfileAssocSource;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into, normal_sf};
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 use memmap2::Mmap;
@@ -2743,6 +2746,222 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
         Ok(summary.total_rows)
     })
     .map_err(PyRuntimeError::new_err)
+}
+
+/// Native streaming LMM scan over a k-file bitset.
+///
+/// This keeps the same rotated REML kernel, warm-start policy and projection
+/// path as the unified BED scanner.  Only the genotype source and the compact
+/// four-column k-file writer differ.
+#[pyfunction]
+#[pyo3(signature = (
+    kfile_prefix,
+    out_tsv,
+    s,
+    xcov,
+    y_rot,
+    u_t,
+    sample_indices,
+    low=-5.0,
+    high=5.0,
+    max_iter=30,
+    tol=1e-2,
+    threads=0,
+    init_log10_lbd=None,
+    rotate_block_rows=512,
+    progress_callback=None,
+    progress_every=0,
+    genetic_model="add",
+))]
+pub fn lmm_reml_assoc_kfile_to_tsv_f32<'py>(
+    py: Python<'py>,
+    kfile_prefix: String,
+    out_tsv: String,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    sample_indices: PyReadonlyArray1<'py, i64>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    init_log10_lbd: Option<f64>,
+    rotate_block_rows: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    genetic_model: &str,
+) -> PyResult<usize> {
+    if low >= high {
+        return Err(PyRuntimeError::new_err("low must be < high"));
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyRuntimeError::new_err("tol must be positive and finite"));
+    }
+    if !genetic_model.trim().eq_ignore_ascii_case("add") {
+        return Err(PyRuntimeError::new_err(
+            "k-file native LMM currently supports only genetic_model='add'",
+        ));
+    }
+    let s_slice = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+    let ut_arr = u_t.as_array();
+    let n = y.len();
+    if s_slice.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if xcov_arr.ndim() != 2 || xcov_arr.shape()[0] != n {
+        return Err(PyRuntimeError::new_err(
+            "Xcov must be a 2D array with Xcov.n_rows == len(y_rot)",
+        ));
+    }
+    let p = xcov_arr.shape()[1];
+    if n <= p + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p+1"));
+    }
+    if ut_arr.ndim() != 2 || ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("u_t must be (n, n) row-major U^T"));
+    }
+    let sample_indices_vec: Vec<usize> = sample_indices
+        .as_slice()?
+        .iter()
+        .map(|&v| {
+            usize::try_from(v)
+                .map_err(|_| PyValueError::new_err("sample_indices must be non-negative"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    if sample_indices_vec.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "sample_indices length {} does not match len(y_rot) {n}",
+            sample_indices_vec.len()
+        )));
+    }
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(values) => Cow::Borrowed(values),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(values) => Cow::Borrowed(values),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+    let init_log10_lbd = init_log10_lbd
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(low, high));
+    let prefix_owned = kfile_prefix;
+    let out_tsv_owned = out_tsv;
+    let block_rows = rotate_block_rows.max(1);
+    let progress_block = if progress_every == 0 {
+        block_rows
+    } else {
+        progress_every.max(1)
+    };
+
+    py.detach(move || -> PyResult<usize> {
+        let source = KfileAssocSource::open(Path::new(&prefix_owned), &sample_indices_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let total_rows = source.n_kmers();
+        let pool = get_cached_pool(threads).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let writer = AsyncTsvWriter::with_config(
+            &out_tsv_owned,
+            b"maf\tbeta\tse\tpwald\n",
+            64 * 1024 * 1024,
+            16,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        let mut rot_block = vec![0.0_f32; block_rows.saturating_mul(n)];
+        let mut out_block = vec![0.0_f64; block_rows.saturating_mul(3)];
+        let mut text = String::with_capacity(block_rows.saturating_mul(96));
+        let mut done = 0usize;
+        let mut next_progress = progress_block.min(total_rows).max(1);
+        let overlap = pool
+            .as_ref()
+            .map(|pool| pool.current_num_threads() > 1)
+            .unwrap_or(false);
+        let scan_done = source
+            .for_each_centered_block(block_rows, overlap, |row_start, rows, snp_sub, maf| {
+                if row_start != done {
+                    return Err(format!(
+                        "k-file LMM source returned non-sequential row_start={row_start}, expected={done}"
+                    ));
+                }
+            let rot_sub = &mut rot_block[..rows * n];
+            rotate_snp_block_with_ut_blas(
+                snp_sub,
+                rows,
+                n,
+                ut_flat.as_ref(),
+                rot_sub,
+                threads.max(1),
+                pool.as_ref(),
+            );
+            let out_sub = &mut out_block[..rows * 3];
+            run_rotated_reml_assoc_block_f32(
+                rot_sub,
+                rows,
+                n,
+                s_slice,
+                &xcov_flat,
+                y,
+                p,
+                low,
+                high,
+                tol,
+                max_iter,
+                init_log10_lbd,
+                true,
+                true,
+                None,
+                out_sub,
+                3,
+                pool.as_ref(),
+            );
+            for row in 0..rows {
+                let out_row = &out_sub[row * 3..(row + 1) * 3];
+                let _ = writeln!(
+                    text,
+                    "{:.4}\t{:.4}\t{:.4}\t{:.4e}",
+                    maf[row], out_row[0], out_row[1], out_row[2],
+                );
+            }
+            writer
+                .send(text.as_bytes().to_vec())
+                .map_err(|error| error.to_string())?;
+            text.clear();
+            done = row_start.saturating_add(rows);
+            if let Some(cb) = progress_callback.as_ref() {
+                if done >= next_progress || done == total_rows {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (done.min(total_rows), total_rows))?;
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())?;
+                    while next_progress <= done {
+                        next_progress = next_progress.saturating_add(progress_block);
+                        if next_progress == 0 {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                Python::attach(|py2| py2.check_signals()).map_err(|error| error.to_string())?;
+            }
+                Ok(())
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        done = scan_done;
+        if let Some(cb) = progress_callback.as_ref() {
+            Python::attach(|py2| -> PyResult<()> {
+                py2.check_signals()?;
+                cb.call1(py2, (total_rows, total_rows))?;
+                Ok(())
+            })?;
+        }
+        writer.finish().map_err(PyRuntimeError::new_err)?;
+        Ok(done)
+    })
 }
 
 /// Single-entry Rust BED -> TSV path for exact LMM2 association.
