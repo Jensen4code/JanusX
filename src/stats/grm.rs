@@ -9,8 +9,9 @@ use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -28,8 +29,10 @@ use crate::gfcore::{
     block_rows_from_memory_target_mb, parse_positive_env_f64, parse_positive_env_usize, read_fam,
     BedSnpIter,
 };
+use crate::kmer::KfileGrmSource;
 use crate::stats_common::{
-    check_ctrlc, env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
+    check_ctrlc, env_truthy, get_cached_pool, interrupt_requested, map_err_string_to_py,
+    parse_index_vec_i64, INTERRUPTED_MSG,
 };
 
 #[inline]
@@ -2000,6 +2003,518 @@ fn write_npy_f32_matrix(path: &str, data: &[f32], rows: usize, cols: usize) -> R
     w.flush()
         .map_err(|e| format!("flush npy file failed: {e}"))?;
     Ok(())
+}
+
+struct NpyTemporaryPath {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl NpyTemporaryPath {
+    fn beside(output: &Path) -> Result<Self, String> {
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        let basename = output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("invalid NPY output path: {}", output.display()))?;
+        let path = parent.join(format!(".{basename}.tmp.{}", std::process::id()));
+        if path.exists() {
+            return Err(format!(
+                "temporary NPY output already exists: {}; remove it before retrying",
+                path.display()
+            ));
+        }
+        Ok(Self { path, keep: false })
+    }
+
+    fn commit(mut self, output: &Path) -> Result<(), String> {
+        fs::rename(&self.path, output).map_err(|error| {
+            format!(
+                "rename temporary NPY output {} -> {} failed: {error}",
+                self.path.display(),
+                output.display()
+            )
+        })?;
+        self.keep = true;
+        Ok(())
+    }
+}
+
+impl Drop for NpyTemporaryPath {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct KfileDenseChunk {
+    values: Vec<f32>,
+    retained_rows: usize,
+    scanned_end: usize,
+}
+
+impl KfileDenseChunk {
+    fn new(values_len: usize) -> Self {
+        Self {
+            values: vec![0.0; values_len],
+            retained_rows: 0,
+            scanned_end: 0,
+        }
+    }
+
+    fn set_data(&mut self, retained_rows: usize, scanned_end: usize) {
+        self.retained_rows = retained_rows;
+        self.scanned_end = scanned_end;
+    }
+}
+
+fn accumulate_f32_block_into_f64_upper_with_scratch(
+    values: &[f32],
+    rows: usize,
+    n: usize,
+    accum: &mut [f64],
+    first_block: bool,
+    scratch: &mut [f32],
+) -> Result<(), String> {
+    let values_len = rows
+        .checked_mul(n)
+        .ok_or_else(|| "kfile GRM block size overflow".to_string())?;
+    let matrix_len = n
+        .checked_mul(n)
+        .ok_or_else(|| "kfile GRM matrix size overflow".to_string())?;
+    if values.len() < values_len {
+        return Err(format!(
+            "kfile GRM block is too small: got {}, expected at least {values_len}",
+            values.len()
+        ));
+    }
+    if accum.len() != matrix_len || scratch.len() < matrix_len {
+        return Err("kfile GRM accumulator buffer size mismatch".to_string());
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let (cblas_copy_rhs, cblas_force_tmp_accum) = grm_packed_cblas_flags();
+    grm_rankk_update_raw_mixed_f32_to_f64(
+        accum.as_mut_ptr(),
+        &values[..values_len],
+        rows,
+        n,
+        GrmAccumMode::Syrk,
+        cblas_copy_rhs,
+        first_block,
+        cblas_force_tmp_accum,
+        adaptive_packed_local_xxt_rows(n),
+        scratch,
+    )
+}
+
+fn accumulate_f32_block_into_f64_upper(
+    values: &[f32],
+    rows: usize,
+    n: usize,
+    accum: &mut [f64],
+    first_block: bool,
+) -> Result<(), String> {
+    let scratch_len = n
+        .checked_mul(n)
+        .ok_or_else(|| "kfile GRM temporary matrix size overflow".to_string())?;
+    let mut scratch = vec![0.0_f32; scratch_len];
+    accumulate_f32_block_into_f64_upper_with_scratch(
+        values,
+        rows,
+        n,
+        accum,
+        first_block,
+        scratch.as_mut_slice(),
+    )
+}
+
+fn finalize_grm_f32(mut accum: Vec<f64>, n: usize, denominator: f64) -> Result<Vec<f32>, String> {
+    let expected_len = n
+        .checked_mul(n)
+        .ok_or_else(|| "kfile GRM matrix size overflow".to_string())?;
+    if accum.len() != expected_len {
+        return Err("kfile GRM accumulator buffer size mismatch".to_string());
+    }
+    if !(denominator.is_finite() && denominator > 0.0) {
+        return Err("no polymorphic k-mers remain after kfile GRM filtering".to_string());
+    }
+    let inv_denominator = 1.0 / denominator;
+    for col in 0..n {
+        for row in 0..=col {
+            // The BLAS accumulator is column-major upper-triangular.
+            let index = col * n + row;
+            let value = accum[index] * inv_denominator;
+            if !value.is_finite() {
+                return Err("kfile GRM contains a non-finite matrix value".to_string());
+            }
+            accum[index] = value;
+            accum[row * n + col] = value;
+        }
+    }
+    Ok(accum.into_iter().map(|value| value as f32).collect())
+}
+
+fn parse_kfile_sample_indices(
+    sample_indices: Option<PyReadonlyArray1<'_, i64>>,
+) -> PyResult<Option<Vec<usize>>> {
+    sample_indices
+        .map(|indices| {
+            indices
+                .as_slice()?
+                .iter()
+                .map(|&index| {
+                    usize::try_from(index).map_err(|_| {
+                        PyRuntimeError::new_err(format!(
+                            "sample_indices contains a negative or overflowing value: {index}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grm_kfile_f32_core<P>(
+    prefix: &Path,
+    sample_indices: Option<&[usize]>,
+    method: usize,
+    maf_threshold: f32,
+    block_rows: usize,
+    threads: usize,
+    stage_timing: bool,
+    mut progress: Option<P>,
+) -> Result<(Vec<f32>, usize, usize, Vec<String>), String>
+where
+    P: FnMut(usize, usize) -> Result<(), String>,
+{
+    let total_started = Instant::now();
+    let mut source = KfileGrmSource::open(prefix, sample_indices, method, maf_threshold)
+        .map_err(|error| error.to_string())?;
+    let n_kmers = usize::try_from(source.n_kmers())
+        .map_err(|_| "kfile GRM n_kmers does not fit usize for progress reporting".to_string())?;
+    let n = source.n_samples();
+    let matrix_len = n
+        .checked_mul(n)
+        .ok_or_else(|| "kfile GRM matrix size overflow".to_string())?;
+    let row_step = grm_stream_block_rows(block_rows.max(1), n_kmers, n, std::mem::size_of::<f32>());
+    let chunk_values_len = row_step
+        .checked_mul(n)
+        .ok_or_else(|| "kfile GRM decoded block size overflow".to_string())?;
+    let notify_step = if block_rows == 0 {
+        row_step
+    } else {
+        block_rows.max(1)
+    };
+    let total_threads = effective_threads(threads);
+    let use_pipeline = grm_overlap_enabled_default() && total_threads > 1 && n_kmers > row_step;
+    let decode_threads = if use_pipeline {
+        grm_decode_threads(total_threads, true)
+    } else {
+        1
+    };
+    let blas_threads = if use_pipeline {
+        grm_blas_threads(total_threads, decode_threads, true)
+    } else {
+        total_threads.max(1)
+    };
+    let mut accum = vec![0.0_f64; matrix_len];
+    let mut scratch = vec![0.0_f32; matrix_len];
+    let mut first_block = true;
+    let mut last_notified = 0usize;
+    let mut blas_seconds = 0.0_f64;
+
+    let mut notify_progress = |done: usize, force: bool| -> Result<(), String> {
+        let done = done.min(n_kmers);
+        if !force && done < last_notified.saturating_add(notify_step) {
+            return Ok(());
+        }
+        last_notified = done;
+        if let Some(callback) = progress.as_mut() {
+            callback(done, n_kmers)
+        } else if interrupt_requested() {
+            Err(INTERRUPTED_MSG.to_string())
+        } else {
+            Ok(())
+        }
+    };
+    notify_progress(0, true)?;
+
+    let _blas_guard = BlasThreadGuard::enter(blas_threads);
+    if use_pipeline {
+        let decode_error = Arc::new(Mutex::new(None::<String>));
+        let producer_error = Arc::clone(&decode_error);
+        let make_chunk = || KfileDenseChunk::new(chunk_values_len);
+        let producer = |chunk: &mut KfileDenseChunk| -> bool {
+            match source.next_prepared_block(row_step) {
+                Ok(Some(block)) => {
+                    match source.decode_block_into(&block, 0..n, &mut chunk.values) {
+                        Ok(()) => {
+                            chunk.set_data(block.retained_rows(), source.scanned_rows());
+                            source.scanned_rows() < n_kmers
+                        }
+                        Err(error) => {
+                            if let Ok(mut error_slot) = producer_error.lock() {
+                                *error_slot = Some(error.to_string());
+                            }
+                            chunk.retained_rows = 0;
+                            chunk.scanned_end = usize::MAX;
+                            false
+                        }
+                    }
+                }
+                Ok(None) => {
+                    chunk.set_data(0, n_kmers);
+                    false
+                }
+                Err(error) => {
+                    if let Ok(mut error_slot) = producer_error.lock() {
+                        *error_slot = Some(error.to_string());
+                    }
+                    chunk.retained_rows = 0;
+                    chunk.scanned_end = usize::MAX;
+                    false
+                }
+            }
+        };
+        let consumer = |chunk: &mut KfileDenseChunk| -> Result<(), String> {
+            if chunk.scanned_end == usize::MAX {
+                return Err(decode_error
+                    .lock()
+                    .map_err(|_| "kfile GRM error lock poisoned".to_string())?
+                    .take()
+                    .unwrap_or_else(|| "kfile GRM producer failed".to_string()));
+            }
+            if chunk.retained_rows > 0 {
+                let started = Instant::now();
+                accumulate_f32_block_into_f64_upper_with_scratch(
+                    &chunk.values,
+                    chunk.retained_rows,
+                    n,
+                    accum.as_mut_slice(),
+                    first_block,
+                    scratch.as_mut_slice(),
+                )?;
+                blas_seconds += started.elapsed().as_secs_f64();
+                first_block = false;
+            }
+            notify_progress(chunk.scanned_end, chunk.scanned_end == n_kmers)
+        };
+        crate::pipeline::run_double_buffer(2, make_chunk, producer, consumer)?;
+    } else {
+        let mut chunk = KfileDenseChunk::new(chunk_values_len);
+        while let Some(block) = source
+            .next_prepared_block(row_step)
+            .map_err(|error| error.to_string())?
+        {
+            source
+                .decode_block_into(&block, 0..n, &mut chunk.values)
+                .map_err(|error| error.to_string())?;
+            chunk.set_data(block.retained_rows(), source.scanned_rows());
+            if chunk.retained_rows > 0 {
+                let started = Instant::now();
+                accumulate_f32_block_into_f64_upper_with_scratch(
+                    &chunk.values,
+                    chunk.retained_rows,
+                    n,
+                    accum.as_mut_slice(),
+                    first_block,
+                    scratch.as_mut_slice(),
+                )?;
+                blas_seconds += started.elapsed().as_secs_f64();
+                first_block = false;
+            }
+            notify_progress(chunk.scanned_end, chunk.scanned_end == n_kmers)?;
+        }
+    }
+    notify_progress(n_kmers, true)?;
+
+    let effective_rows = source.effective_rows();
+    let sample_ids = source.sample_ids().to_vec();
+    let denominator = source.denominator();
+    if effective_rows == 0 {
+        return Err("no polymorphic k-mers remain after kfile GRM filtering".to_string());
+    }
+    let output = finalize_grm_f32(accum, n, denominator)?;
+    if stage_timing {
+        let source_timing = source.stage_timing();
+        let read_seconds = source_timing.read_ns as f64 / 1e9;
+        let filter_seconds = source_timing.filter_ns as f64 / 1e9;
+        let decode_seconds = source_timing.decode_ns as f64 / 1e9;
+        let total_seconds = total_started.elapsed().as_secs_f64();
+        let staged_seconds = read_seconds + filter_seconds + decode_seconds + blas_seconds;
+        let overlap_seconds = (staged_seconds - total_seconds).max(0.0);
+        let other_seconds = (total_seconds - staged_seconds).max(0.0);
+        let percent = |seconds: f64| {
+            if total_seconds > 0.0 {
+                seconds * 100.0 / total_seconds
+            } else {
+                0.0
+            }
+        };
+        eprintln!(
+            "Kfile GRM stage timing: read={read_seconds:.3}s ({:.1}%), filter/popcount={filter_seconds:.3}s ({:.1}%), decode={decode_seconds:.3}s ({:.1}%), BLAS={blas_seconds:.3}s ({:.1}%), other={other_seconds:.3}s ({:.1}%), overlap={overlap_seconds:.3}s ({:.1}%), total={total_seconds:.3}s, row_step={row_step}, n_samples={n}, effective_kmers={effective_rows}, threads_total={total_threads}, decode_threads={decode_threads}, blas_threads={blas_threads}, overlap={}",
+            percent(read_seconds),
+            percent(filter_seconds),
+            percent(decode_seconds),
+            percent(blas_seconds),
+            percent(other_seconds),
+            percent(overlap_seconds),
+            if use_pipeline { "on" } else { "off" },
+        );
+    }
+    Ok((output, effective_rows, n, sample_ids))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    sample_indices=None,
+    method=1,
+    maf_threshold=0.02,
+    block_rows=0,
+    threads=0,
+    stage_timing=false,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_kfile_f32<'py>(
+    py: Python<'py>,
+    prefix: String,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    maf_threshold: f32,
+    block_rows: usize,
+    threads: usize,
+    stage_timing: bool,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, usize, Vec<String>)> {
+    let sample_indices = parse_kfile_sample_indices(sample_indices)?;
+    let prefix = PathBuf::from(prefix);
+    let (matrix, effective_rows, n, sample_ids) = py
+        .detach(move || {
+            let mut last_callback = 0usize;
+            let callback = move |done: usize, total: usize| -> Result<(), String> {
+                let force = done == 0 || done == total;
+                if !force
+                    && progress_every > 0
+                    && done < last_callback.saturating_add(progress_every)
+                {
+                    return Ok(());
+                }
+                last_callback = done;
+                if let Some(callback) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        callback.call1(py2, (done, total))?;
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())
+                } else {
+                    Python::attach(|py2| py2.check_signals()).map_err(|error| error.to_string())
+                }
+            };
+            grm_kfile_f32_core(
+                prefix.as_path(),
+                sample_indices.as_deref(),
+                method,
+                maf_threshold,
+                if block_rows == 0 { 65_536 } else { block_rows },
+                threads,
+                stage_timing,
+                Some(callback),
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+    let array = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n, n), matrix)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+    )
+    .into_bound();
+    Ok((array, effective_rows, sample_ids))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    out_npy_path,
+    sample_indices=None,
+    method=1,
+    maf_threshold=0.02,
+    block_rows=0,
+    threads=0,
+    stage_timing=false,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_kfile_f32_to_npy<'py>(
+    py: Python<'py>,
+    prefix: String,
+    out_npy_path: String,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    maf_threshold: f32,
+    block_rows: usize,
+    threads: usize,
+    stage_timing: bool,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(usize, usize, Vec<String>)> {
+    let sample_indices = parse_kfile_sample_indices(sample_indices)?;
+    let prefix = PathBuf::from(prefix);
+    let output_path = PathBuf::from(out_npy_path);
+    let (matrix, effective_rows, n, sample_ids) = py
+        .detach(move || {
+            let mut last_callback = 0usize;
+            let callback = move |done: usize, total: usize| -> Result<(), String> {
+                let force = done == 0 || done == total;
+                if !force
+                    && progress_every > 0
+                    && done < last_callback.saturating_add(progress_every)
+                {
+                    return Ok(());
+                }
+                last_callback = done;
+                if let Some(callback) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        callback.call1(py2, (done, total))?;
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())
+                } else {
+                    Python::attach(|py2| py2.check_signals()).map_err(|error| error.to_string())
+                }
+            };
+            let (matrix, effective_rows, n, sample_ids) = grm_kfile_f32_core(
+                prefix.as_path(),
+                sample_indices.as_deref(),
+                method,
+                maf_threshold,
+                if block_rows == 0 { 65_536 } else { block_rows },
+                threads,
+                stage_timing,
+                Some(callback),
+            )?;
+            let temporary = NpyTemporaryPath::beside(output_path.as_path())?;
+            write_npy_f32_matrix(
+                temporary.path.to_string_lossy().as_ref(),
+                matrix.as_slice(),
+                n,
+                n,
+            )?;
+            temporary.commit(output_path.as_path())?;
+            Ok((matrix, effective_rows, n, sample_ids))
+        })
+        .map_err(map_err_string_to_py)?;
+    let _ = matrix;
+    Ok((effective_rows, n, sample_ids))
 }
 
 fn write_npy_f64_matrix(path: &str, data: &[f64], rows: usize, cols: usize) -> Result<(), String> {
@@ -5941,8 +6456,261 @@ pub fn grm_sim_bench_f32(
 #[cfg(test)]
 mod tests {
     use super::{grm_decode_threads_default_for_backend, open_grm_bed_iter};
-    use std::fs;
+    use crate::kmer::format::{BsiteHeader, KmergeMeta};
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static KFILE_FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct KfileFixture {
+        dir: PathBuf,
+        prefix: PathBuf,
+        rows: Vec<u8>,
+    }
+
+    impl KfileFixture {
+        fn new(rows: &[u8]) -> Self {
+            let unique = KFILE_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "janusx-grm-kfile-{}-{}-{unique}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos(),
+            ));
+            fs::create_dir(&dir).expect("create kfile fixture directory");
+            let prefix = dir.join("fixture");
+            let meta = KmergeMeta {
+                format: "janusx-kmer-bitmatrix-v1".to_string(),
+                k: 31,
+                n_samples: 4,
+                n_kmers: rows.len() as u64,
+                bytes_per_col: 1,
+                encoding: "acgt_2bit".to_string(),
+                canonical: true,
+                matrix_layout: "column_major_bitset".to_string(),
+                value_type: "binary_presence".to_string(),
+                bit_order: "little_bit_order".to_string(),
+                bkmer_file: "fixture.bkmer".to_string(),
+                bsite_file: "fixture.bsite".to_string(),
+                idv_file: "fixture.idv".to_string(),
+                min_count: 1,
+                min_presence_rate: 0.0,
+                max_presence_rate: 1.0,
+                bucket_bits: 0,
+                compression: "none".to_string(),
+            };
+            fs::write(
+                PathBuf::from(format!("{}.meta.json", prefix.display())),
+                serde_json::to_vec(&meta).expect("serialize kfile metadata"),
+            )
+            .expect("write kfile metadata");
+            fs::write(
+                dir.join("fixture.idv"),
+                "#idx\tsample_id\tkmc_prefix\n0\ts1\tp1\n1\ts2\tp2\n2\ts3\tp3\n3\ts4\tp4\n",
+            )
+            .expect("write kfile sample IDs");
+            let mut bsite = File::create(dir.join("fixture.bsite")).expect("create bsite");
+            BsiteHeader {
+                n_samples: 4,
+                n_kmers: rows.len() as u64,
+                bytes_per_col: 1,
+            }
+            .write_to(&mut bsite)
+            .expect("write bsite header");
+            bsite.write_all(rows).expect("write bsite rows");
+            Self {
+                dir,
+                prefix,
+                rows: rows.to_vec(),
+            }
+        }
+
+        fn prefix(&self) -> &Path {
+            &self.prefix
+        }
+    }
+
+    impl Drop for KfileFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn scalar_kfile_grm(rows: &[u8], sample_indices: &[usize], method: usize) -> (Vec<f32>, usize) {
+        let n = sample_indices.len();
+        let mut out = vec![0.0_f64; n * n];
+        let mut denominator = 0.0_f64;
+        let mut effective_rows = 0usize;
+        for &row in rows {
+            let presence = sample_indices
+                .iter()
+                .filter(|&&sample| ((row >> sample) & 1) != 0)
+                .count();
+            let p = presence as f64 / n as f64;
+            let variance = 2.0 * p * (1.0 - p);
+            if variance <= 1e-12 {
+                continue;
+            }
+            effective_rows += 1;
+            denominator += if method == 1 { variance } else { 1.0 };
+            for (i, &sample_i) in sample_indices.iter().enumerate() {
+                let gi = if ((row >> sample_i) & 1) != 0 {
+                    2.0
+                } else {
+                    0.0
+                };
+                let xi = (gi - 2.0 * p)
+                    * if method == 1 {
+                        1.0
+                    } else {
+                        1.0 / variance.sqrt()
+                    };
+                for (j, &sample_j) in sample_indices.iter().enumerate() {
+                    let gj = if ((row >> sample_j) & 1) != 0 {
+                        2.0
+                    } else {
+                        0.0
+                    };
+                    let xj = (gj - 2.0 * p)
+                        * if method == 1 {
+                            1.0
+                        } else {
+                            1.0 / variance.sqrt()
+                        };
+                    out[i * n + j] += xi * xj;
+                }
+            }
+        }
+        assert!(denominator > 0.0, "fixture needs polymorphic rows");
+        (
+            out.into_iter()
+                .map(|value| (value / denominator) as f32)
+                .collect(),
+            effective_rows,
+        )
+    }
+
+    fn assert_matrix_close(got: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(got.len(), expected.len());
+        for (index, (&actual, &wanted)) in got.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - wanted).abs() <= tolerance,
+                "matrix entry {index}: actual={actual}, expected={wanted}"
+            );
+        }
+    }
+
+    #[test]
+    fn kfile_dense_core_matches_scalar_reference_for_blocks_threads_and_selection() {
+        // Presence rows over s1..s4: 0011, 0101, 1110, 1111, 0000.
+        let fixture = KfileFixture::new(&[0b0000_0011, 0b0000_0101, 0b0000_1110, 0b1111, 0]);
+        let selected = [3usize, 1, 0];
+        for method in [1usize, 2usize] {
+            let (expected, expected_effective_rows) =
+                scalar_kfile_grm(&fixture.rows, &selected, method);
+            for block_rows in [1usize, 3usize] {
+                for threads in [1usize, 2usize] {
+                    let (got, effective_rows, n, ids) = super::grm_kfile_f32_core(
+                        fixture.prefix(),
+                        Some(&selected),
+                        method,
+                        0.0,
+                        block_rows,
+                        threads,
+                        false,
+                        None::<fn(usize, usize) -> Result<(), String>>,
+                    )
+                    .expect("dense kfile GRM");
+                    assert_eq!(n, 3);
+                    assert_eq!(ids, vec!["s4", "s2", "s1"]);
+                    assert_eq!(effective_rows, expected_effective_rows);
+                    assert_matrix_close(&got, &expected, 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kfile_dense_core_reports_monotonic_complete_progress() {
+        let fixture = KfileFixture::new(&[0b0011, 0b0101, 0b1110, 0b1111, 0]);
+        let mut events = Vec::new();
+        super::grm_kfile_f32_core(
+            fixture.prefix(),
+            None,
+            1,
+            0.0,
+            1,
+            2,
+            false,
+            Some(|done, total| {
+                events.push((done, total));
+                Ok(())
+            }),
+        )
+        .expect("dense kfile GRM progress");
+        assert_eq!(events.first(), Some(&(0, 5)));
+        assert_eq!(events.last(), Some(&(5, 5)));
+        assert!(events.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        assert!(events
+            .iter()
+            .all(|&(done, total)| done <= total && total == 5));
+    }
+
+    #[test]
+    fn kfile_dense_core_rejects_empty_retained_set() {
+        let fixture = KfileFixture::new(&[0, 0b1111]);
+        let error = super::grm_kfile_f32_core(
+            fixture.prefix(),
+            None,
+            1,
+            0.0,
+            1,
+            1,
+            false,
+            None::<fn(usize, usize) -> Result<(), String>>,
+        )
+        .expect_err("monomorphic kfile rows must be rejected");
+        assert!(error.contains("no polymorphic k-mers"), "{error}");
+    }
+
+    #[test]
+    fn kfile_dense_npy_writer_commits_only_complete_output_and_cleans_failed_temporary() {
+        let fixture = KfileFixture::new(&[0b0011]);
+        let output = fixture.dir.join("dense.npy");
+        let temporary = super::NpyTemporaryPath::beside(&output).expect("temporary output");
+        let committed_temporary_path = temporary.path.clone();
+        super::write_npy_f32_matrix(
+            temporary.path.to_string_lossy().as_ref(),
+            &[1.0, 2.0, 3.0, 4.0],
+            2,
+            2,
+        )
+        .expect("write temporary NPY");
+        temporary.commit(&output).expect("commit NPY output");
+        assert!(output.is_file());
+        assert!(!committed_temporary_path.exists());
+
+        let failed_output = fixture.dir.join("failed.npy");
+        let failed_temporary =
+            super::NpyTemporaryPath::beside(&failed_output).expect("failed temporary output");
+        let failed_path = failed_temporary.path.clone();
+        let error = super::write_npy_f32_matrix(
+            failed_temporary.path.to_string_lossy().as_ref(),
+            &[1.0],
+            2,
+            2,
+        )
+        .expect_err("mismatched matrix must fail before output is committed");
+        assert!(error.contains("data length mismatch"), "{error}");
+        drop(failed_temporary);
+        assert!(!failed_path.exists());
+        assert!(!failed_output.exists());
+    }
 
     #[test]
     fn grm_decode_threads_accelerate_keeps_legacy_defaults() {
