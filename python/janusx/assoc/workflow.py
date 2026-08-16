@@ -4679,52 +4679,43 @@ def _build_kfile_grm_streaming(
     method: int,
     logger: Optional[logging.Logger] = None,
 ) -> tuple[np.ndarray, int]:
-    """Build a bounded-memory centered/standardized GRM from kfile dosage chunks."""
+    """Build a kfile GRM through the shared native kernel.
+
+    The native implementation owns block decoding, filtering, and mixed-
+    precision accumulation so GWAS and ``jx grm`` use identical formulas.
+    ``maf_threshold=0`` preserves the historical GWAS wrapper's no-MAF-filter
+    behavior while still excluding monomorphic rows required for a valid GRM.
+    """
     if int(method) not in {1, 2}:
         raise ValueError("k-file GRM method must be 1 (centered) or 2 (standardized).")
     idx = np.asarray(sample_indices, dtype=np.int64).reshape(-1)
-    n = int(idx.shape[0])
-    if n == 0:
+    if idx.size == 0:
         raise ValueError("k-file GRM sample selection is empty.")
-    reader = _new_kfile_reader(prefix, sample_indices=idx)
-    grm = np.zeros((n, n), dtype=np.float64)
-    denom = 0.0
-    eff_m = 0
-    while True:
-        item = reader.next_chunk(max(1, int(chunk_size)))
-        if item is None:
-            break
-        dosage, _maf_chunk, _row_idx = item
-        block = np.ascontiguousarray(np.asarray(dosage, dtype=np.float64))
-        if block.ndim != 2 or block.shape[1] != n:
-            raise ValueError("k-file GRM chunk sample dimension mismatch.")
-        # This is the same centered/standardized convention as the BED GRM
-        # path, but the whole chunk is accumulated with one BLAS-friendly
-        # matrix product.  The reader's MAF is deliberately not used here:
-        # centering needs the presence frequency p, not min(p, 1-p).
-        p = np.mean(block, axis=1) * 0.5
-        variance = np.maximum(2.0 * p * (1.0 - p), 0.0)
-        centered = block - (2.0 * p)[:, None]
-        if int(method) == 2:
-            keep = variance > 1e-12
-            if np.any(keep):
-                standardized = centered[keep] / np.sqrt(variance[keep])[:, None]
-                grm += standardized.T @ standardized
-                denom += float(np.count_nonzero(keep))
-            eff_m += int(np.count_nonzero(keep))
-        else:
-            grm += centered.T @ centered
-            denom += float(np.sum(variance, dtype=np.float64))
-            eff_m += int(block.shape[0])
-    if eff_m == 0 or denom <= 0.0:
-        return np.zeros((n, n), dtype=np.float32), 0
-    out = np.asarray(grm / denom, dtype=np.float32)
-    out = np.asarray((out + out.T) * 0.5, dtype=np.float32)
+    if not hasattr(jxrs, "grm_kfile_f32"):
+        raise RuntimeError(
+            "Rust extension missing grm_kfile_f32; rebuild/reinstall JanusX."
+        )
+    matrix, eff_m, native_ids = jxrs.grm_kfile_f32(
+        str(prefix),
+        sample_indices=np.ascontiguousarray(idx, dtype=np.int64),
+        method=int(method),
+        maf_threshold=0.0,
+        block_rows=max(1, int(chunk_size)),
+        threads=0,
+    )
+    out = np.ascontiguousarray(np.asarray(matrix, dtype=np.float32))
+    n = int(idx.shape[0])
+    if out.shape != (n, n):
+        raise ValueError(
+            f"native k-file GRM shape mismatch: got {out.shape}, expected {(n, n)}"
+        )
+    if len(np.asarray(native_ids, dtype=str).reshape(-1)) != n:
+        raise ValueError("native k-file GRM sample ID count mismatch.")
     if logger is not None and bool(getattr(logger, "_janusx_gwas_verbose", False)):
         _log_file_only(
             logger,
             logging.INFO,
-            f"k-file GRM stream: retained {int(eff_m)} of {int(n_kmers)} rows.",
+            f"k-file native GRM: retained {int(eff_m)} of {int(n_kmers)} rows.",
         )
     return out, int(eff_m)
 
