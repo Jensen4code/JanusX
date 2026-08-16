@@ -21,6 +21,8 @@ pub use count::kmer_count_run_py;
 pub use inputs::kmer_resolve_inputs_py;
 pub use kfile::{kfile_inspect_py, KfileChunkReader};
 #[allow(unused_imports)]
-pub(crate) use kfile::{KfileGrmPreparedBlock, KfileGrmSource, KfileGrmStageTiming};
+pub(crate) use kfile::{
+    KfileBitsetDecodePlan, KfileGrmPreparedBlock, KfileGrmSource, KfileGrmStageTiming,
+};
 pub use kformat::kformat_run_py;
 pub use stats::kstats_run_py;

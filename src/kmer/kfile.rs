@@ -7,11 +7,13 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::BoundObject;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -316,6 +318,7 @@ impl KfileGrmStageTiming {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub(crate) struct KfileGrmPreparedBlock {
     packed: Vec<u8>,
     retained_row_offsets: Vec<usize>,
@@ -325,9 +328,123 @@ pub(crate) struct KfileGrmPreparedBlock {
     pub denominator: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct KfileBitsetDecodeEntry {
+    bit: usize,
+    column: usize,
+}
+
+#[derive(Clone, Debug)]
+struct KfileBitsetDecodeGroup {
+    byte: usize,
+    mask: u8,
+    entries: Vec<KfileBitsetDecodeEntry>,
+}
+
+/// Precomputed bit positions for one decoded sample stripe.
+///
+/// The plan groups requested samples by source byte. This removes repeated
+/// division/masking from the hot row loop while retaining the caller's sample
+/// order in the output columns.
+#[derive(Clone, Debug)]
+pub(crate) struct KfileBitsetDecodePlan {
+    width: usize,
+    full_identity: bool,
+    groups: Vec<KfileBitsetDecodeGroup>,
+}
+
+impl KfileBitsetDecodePlan {
+    pub(crate) fn new(sample_indices: &[usize], n_samples_full: usize) -> Result<Self> {
+        validate_grm_selection(sample_indices, n_samples_full)?;
+        let bytes_per_col = n_samples_full
+            .checked_add(7)
+            .ok_or_else(|| anyhow::anyhow!("sample count overflow"))?
+            / 8;
+        let mut grouped = (0..bytes_per_col)
+            .map(|_| Vec::<KfileBitsetDecodeEntry>::new())
+            .collect::<Vec<_>>();
+        for (column, &sample_index) in sample_indices.iter().enumerate() {
+            grouped[sample_index >> 3].push(KfileBitsetDecodeEntry {
+                bit: sample_index & 7,
+                column,
+            });
+        }
+        let groups = grouped
+            .into_iter()
+            .enumerate()
+            .filter_map(|(byte, entries)| {
+                if entries.is_empty() {
+                    return None;
+                }
+                let mask = entries
+                    .iter()
+                    .fold(0u8, |mask, entry| mask | (1u8 << entry.bit));
+                Some(KfileBitsetDecodeGroup {
+                    byte,
+                    mask,
+                    entries,
+                })
+            })
+            .collect::<Vec<_>>();
+        let full_identity = sample_indices.len() == n_samples_full
+            && sample_indices
+                .iter()
+                .enumerate()
+                .all(|(expected, &actual)| expected == actual);
+        Ok(Self {
+            width: sample_indices.len(),
+            full_identity,
+            groups,
+        })
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.width
+    }
+}
+
+fn bitset_dosage_lut() -> &'static [[f32; 8]; 256] {
+    static LUT: OnceLock<[[f32; 8]; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [[0.0_f32; 8]; 256];
+        for (value, row) in table.iter_mut().enumerate() {
+            for (bit, dosage) in row.iter_mut().enumerate() {
+                if (value & (1usize << bit)) != 0 {
+                    *dosage = 2.0;
+                }
+            }
+        }
+        table
+    })
+}
+
+#[inline]
+fn full_bitset_presence(row: &[u8], n_samples: usize) -> usize {
+    let full_bytes = n_samples / 8;
+    let mut count = 0u32;
+    let whole_bytes = full_bytes - (full_bytes % 8);
+    for chunk in row[..whole_bytes].chunks_exact(8) {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(chunk);
+        count += u64::from_le_bytes(bytes).count_ones();
+    }
+    for &value in &row[whole_bytes..full_bytes] {
+        count += value.count_ones();
+    }
+    let tail = n_samples % 8;
+    if tail != 0 {
+        count += (row[full_bytes] & ((1u8 << tail) - 1)).count_ones();
+    }
+    count as usize
+}
+
 impl KfileGrmPreparedBlock {
     pub(crate) fn retained_rows(&self) -> usize {
         self.retained_row_offsets.len()
+    }
+
+    pub(crate) fn packed_len(&self) -> usize {
+        self.packed.len()
     }
 }
 
@@ -394,16 +511,23 @@ pub(crate) fn prepare_grm_bsite_block(
     }
 
     let selected_n = sample_indices.len();
+    let decode_plan = KfileBitsetDecodePlan::new(sample_indices, n_samples_full)?;
     let mut retained_row_offsets = Vec::new();
     let mut row_center = Vec::new();
     let mut row_scale = Vec::new();
     let mut denominator = 0.0f64;
+    let full_identity = decode_plan.full_identity;
     for row in 0..n_rows {
         let packed_row = &bytes[row * bytes_per_col..(row + 1) * bytes_per_col];
-        let presence = sample_indices
-            .iter()
-            .filter(|&&index| ((packed_row[index >> 3] >> (index & 7)) & 1) != 0)
-            .count();
+        let presence = if full_identity {
+            full_bitset_presence(packed_row, n_samples_full)
+        } else {
+            decode_plan
+                .groups
+                .iter()
+                .map(|group| (packed_row[group.byte] & group.mask).count_ones() as usize)
+                .sum()
+        };
         let p = presence as f64 / selected_n as f64;
         let maf = p.min(1.0 - p);
         let variance = 2.0 * p * (1.0 - p);
@@ -434,9 +558,27 @@ pub(crate) fn decode_grm_prepared_block_into(
     sample_indices: &[usize],
     out: &mut [f32],
 ) -> Result<()> {
+    if sample_indices.is_empty() {
+        return Ok(());
+    }
+    let n_samples_full = sample_indices
+        .iter()
+        .copied()
+        .max()
+        .and_then(|index| index.checked_add(1))
+        .unwrap_or(0);
+    let plan = KfileBitsetDecodePlan::new(sample_indices, n_samples_full)?;
+    decode_grm_prepared_block_into_with_plan(block, &plan, out)
+}
+
+pub(crate) fn decode_grm_prepared_block_into_with_plan(
+    block: &KfileGrmPreparedBlock,
+    plan: &KfileBitsetDecodePlan,
+    out: &mut [f32],
+) -> Result<()> {
     let required_len = block
         .retained_rows()
-        .checked_mul(sample_indices.len())
+        .checked_mul(plan.width())
         .ok_or_else(|| anyhow::anyhow!("GRM decoded output size overflow"))?;
     if out.len() < required_len {
         bail!(
@@ -455,22 +597,45 @@ pub(crate) fn decode_grm_prepared_block_into(
         bail!("GRM prepared block has an invalid packed layout");
     }
     let bytes_per_col = block.packed.len() / block.scanned_rows;
+    let lut = bitset_dosage_lut();
     for (decoded_row, &packed_row) in block.retained_row_offsets.iter().enumerate() {
         if packed_row >= block.scanned_rows {
             bail!("GRM prepared block has an invalid retained row offset");
         }
         let row_bytes = &block.packed[packed_row * bytes_per_col..(packed_row + 1) * bytes_per_col];
-        for (column, &sample_index) in sample_indices.iter().enumerate() {
-            if sample_index / 8 >= bytes_per_col {
-                bail!("sample index out of range for GRM prepared block: {sample_index}");
+        let output_row = &mut out[decoded_row * plan.width()..(decoded_row + 1) * plan.width()];
+        if plan.full_identity {
+            for group in &plan.groups {
+                if group.byte >= bytes_per_col {
+                    bail!(
+                        "bitset decode plan byte out of range: {} >= {}",
+                        group.byte,
+                        bytes_per_col
+                    );
+                }
+                let expanded = &lut[row_bytes[group.byte] as usize];
+                let output_start = group.byte * 8;
+                for (offset, &genotype) in expanded.iter().take(group.entries.len()).enumerate() {
+                    output_row[output_start + offset] =
+                        (genotype - block.row_center[decoded_row]) * block.row_scale[decoded_row];
+                }
             }
-            let genotype = if ((row_bytes[sample_index >> 3] >> (sample_index & 7)) & 1) != 0 {
-                2.0
-            } else {
-                0.0
-            };
-            out[decoded_row * sample_indices.len() + column] =
-                (genotype - block.row_center[decoded_row]) * block.row_scale[decoded_row];
+        } else {
+            for group in &plan.groups {
+                if group.byte >= bytes_per_col {
+                    bail!(
+                        "bitset decode plan byte out of range: {} >= {}",
+                        group.byte,
+                        bytes_per_col
+                    );
+                }
+                let expanded = &lut[row_bytes[group.byte] as usize];
+                for entry in &group.entries {
+                    output_row[entry.column] = (expanded[entry.bit]
+                        - block.row_center[decoded_row])
+                        * block.row_scale[decoded_row];
+                }
+            }
         }
     }
     Ok(())
@@ -487,6 +652,7 @@ pub(crate) struct KfileGrmSource {
     effective_rows: usize,
     denominator: f64,
     stage_timing: KfileGrmStageTiming,
+    full_decode_plan: KfileBitsetDecodePlan,
 }
 
 #[allow(dead_code)]
@@ -503,6 +669,9 @@ impl KfileGrmSource {
         let requested_indices = sample_indices.map(|indices| indices.to_vec());
         let (sample_indices, sample_ids) =
             build_sample_selection(&layout.samples, requested_indices)?;
+        let n_samples_full =
+            usize::try_from(layout.meta.n_samples).context("n_samples does not fit usize")?;
+        let full_decode_plan = KfileBitsetDecodePlan::new(&sample_indices, n_samples_full)?;
         let bsite = File::open(&layout.bsite_path).with_context(|| {
             format!("failed to open bsite file: {}", layout.bsite_path.display())
         })?;
@@ -517,6 +686,7 @@ impl KfileGrmSource {
             effective_rows: 0,
             denominator: 0.0,
             stage_timing: KfileGrmStageTiming::default(),
+            full_decode_plan,
         })
     }
 
@@ -586,7 +756,25 @@ impl KfileGrmSource {
             bail!("GRM selected sample positions are out of range");
         }
         let decode_started = Instant::now();
-        decode_grm_prepared_block_into(block, &self.sample_indices[selected_positions], out)?;
+        if selected_positions.start == 0 && selected_positions.end == self.sample_indices.len() {
+            decode_grm_prepared_block_into_with_plan(block, &self.full_decode_plan, out)?;
+        } else {
+            let selected = &self.sample_indices[selected_positions.clone()];
+            let plan = KfileBitsetDecodePlan::new(selected, self.n_samples_full())?;
+            decode_grm_prepared_block_into_with_plan(block, &plan, out)?;
+        }
+        self.stage_timing.add_decode(decode_started.elapsed());
+        Ok(())
+    }
+
+    pub(crate) fn decode_block_into_with_plan(
+        &mut self,
+        block: &KfileGrmPreparedBlock,
+        plan: &KfileBitsetDecodePlan,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let decode_started = Instant::now();
+        decode_grm_prepared_block_into_with_plan(block, plan, out)?;
         self.stage_timing.add_decode(decode_started.elapsed());
         Ok(())
     }
@@ -807,8 +995,9 @@ pub fn kfile_inspect_py<'py>(py: Python<'py>, prefix: String) -> PyResult<Bound<
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_bsite_chunk, decode_grm_prepared_block_into, maf_from_presence,
-        prepare_grm_bsite_block, KfileChunkReader, KfileGrmSource,
+        decode_bsite_chunk, decode_grm_prepared_block_into,
+        decode_grm_prepared_block_into_with_plan, maf_from_presence, prepare_grm_bsite_block,
+        KfileBitsetDecodePlan, KfileChunkReader, KfileGrmSource,
     };
     use crate::kmer::format::{BsiteHeader, KmergeMeta};
     use std::fs::{self, File};
@@ -901,6 +1090,53 @@ mod tests {
         assert_eq!(block.denominator, 1.0);
         assert_eq!(values.len(), 4);
         assert!((values.iter().map(|x| x * x).sum::<f32>() - 8.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn grm_bitset_lut_plan_matches_scalar_for_all_bytes_and_reordered_subset() {
+        let n_samples = 13usize;
+        let bytes_per_col = n_samples.div_ceil(8);
+        let mut bytes = Vec::<u8>::new();
+        for value in 1u8..=254u8 {
+            bytes.push(value);
+            bytes.push((!value) & 0x1f);
+        }
+        let n_rows = bytes.len() / bytes_per_col;
+        let selections = vec![
+            (0..n_samples).collect::<Vec<_>>(),
+            vec![12usize, 0, 7, 3, 10],
+        ];
+        for selected in selections {
+            let block = prepare_grm_bsite_block(
+                bytes.as_slice(),
+                n_samples,
+                n_rows,
+                selected.as_slice(),
+                1,
+                0.0,
+            )
+            .expect("prepare bitset block");
+            let plan = KfileBitsetDecodePlan::new(selected.as_slice(), n_samples)
+                .expect("build bitset decode plan");
+            let mut got = vec![0.0_f32; block.retained_rows() * selected.len()];
+            decode_grm_prepared_block_into_with_plan(&block, &plan, &mut got)
+                .expect("decode with bitset plan");
+            let mut expected = vec![0.0_f32; got.len()];
+            for (decoded_row, &raw_row) in block.retained_row_offsets.iter().enumerate() {
+                let row_bytes = &bytes[raw_row * bytes_per_col..(raw_row + 1) * bytes_per_col];
+                for (column, &sample_index) in selected.iter().enumerate() {
+                    let genotype =
+                        if ((row_bytes[sample_index >> 3] >> (sample_index & 7)) & 1) != 0 {
+                            2.0_f32
+                        } else {
+                            0.0_f32
+                        };
+                    expected[decoded_row * selected.len() + column] =
+                        genotype - block.row_center[decoded_row];
+                }
+            }
+            assert_eq!(got, expected);
+        }
     }
 
     #[test]

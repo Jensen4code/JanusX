@@ -94,7 +94,9 @@ use crate::gfreader::{
 };
 use crate::gload::WindowedBedMatrix;
 use crate::grm::decode_grm_block;
-use crate::kmer::{KfileGrmPreparedBlock, KfileGrmSource, KfileGrmStageTiming};
+use crate::kmer::{
+    KfileBitsetDecodePlan, KfileGrmPreparedBlock, KfileGrmSource, KfileGrmStageTiming,
+};
 use crate::pipeline::run_double_buffer;
 use crate::stats_common::{
     check_ctrlc, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
@@ -114,6 +116,11 @@ const SPGRM_JXGRM_VALUE_ALIGN_BYTES: usize = std::mem::size_of::<f64>();
 const SPGRM_DEFAULT_STREAMING_MERGE_MIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const SPGRM_DECODE_STRIPE_ESTIMATE: usize = 2;
 const SPGRM_GCTA_IMPORT_SUFFIX: &str = ".gcta.spgrm";
+const KFILE_PREPARED_CACHE_MAGIC: &[u8; 8] = b"JXKPC01\0";
+const KFILE_PREPARED_CACHE_VERSION: u32 = 1;
+const KFILE_PREPARED_CACHE_BLOCK_COUNT_OFFSET: u64 = 36;
+
+static KFILE_PREPARED_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpgrmNpyFloatDtype {
@@ -232,6 +239,7 @@ struct SpgrmStreamStripeScratch {
     stripe: SpgrmStripe,
     full_sample_fast: bool,
     subset_plan: Option<SubsetDecodePlan>,
+    kfile_decode_plan: Option<KfileBitsetDecodePlan>,
     decoded: Vec<f32>,
 }
 
@@ -241,6 +249,7 @@ impl Clone for SpgrmStreamStripeScratch {
             stripe: self.stripe,
             full_sample_fast: self.full_sample_fast,
             subset_plan: self.subset_plan.clone(),
+            kfile_decode_plan: self.kfile_decode_plan.clone(),
             decoded: vec![0.0_f32; self.decoded.len()],
         }
     }
@@ -263,10 +272,12 @@ impl SpgrmStreamStripeScratch {
                 n_samples_full,
             ))
         };
+        let kfile_decode_plan = KfileBitsetDecodePlan::new(stripe_idx, n_samples_full).ok();
         Self {
             stripe,
             full_sample_fast,
             subset_plan,
+            kfile_decode_plan,
             decoded: vec![0.0_f32; row_step.saturating_mul(stripe.end - stripe.start)],
         }
     }
@@ -2647,13 +2658,19 @@ fn spgrm_decode_kfile_batch_block(
         let output_len = retained_rows
             .checked_mul(width)
             .ok_or_else(|| "kfile sparse GRM decoded stripe size overflow".to_string())?;
-        source
-            .decode_block_into(
-                block,
-                stripe.stripe.start..stripe.stripe.end,
-                &mut stripe.decoded[..output_len],
-            )
-            .map_err(|error| error.to_string())?;
+        if let Some(plan) = stripe.kfile_decode_plan.as_ref() {
+            source
+                .decode_block_into_with_plan(block, plan, &mut stripe.decoded[..output_len])
+                .map_err(|error| error.to_string())?;
+        } else {
+            source
+                .decode_block_into(
+                    block,
+                    stripe.stripe.start..stripe.stripe.end,
+                    &mut stripe.decoded[..output_len],
+                )
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -4423,6 +4440,248 @@ fn spgrm_stream_bed_to_jxgrm_core(
     Ok((out_path, n_samples, nnz))
 }
 
+struct KfilePreparedBlockCache {
+    path: PathBuf,
+    n_samples_full: usize,
+    n_kmers: usize,
+    bytes_per_col: usize,
+    n_blocks: usize,
+}
+
+struct KfilePreparedBlockCacheReader {
+    reader: BufReader<File>,
+    n_kmers: usize,
+    bytes_per_col: usize,
+    remaining_blocks: usize,
+    scanned_rows: usize,
+}
+
+fn kfile_cache_write_header<W: Write>(
+    writer: &mut W,
+    n_samples_full: usize,
+    n_kmers: usize,
+    bytes_per_col: usize,
+    n_blocks: usize,
+) -> Result<(), String> {
+    writer
+        .write_all(KFILE_PREPARED_CACHE_MAGIC)
+        .and_then(|_| writer.write_all(&KFILE_PREPARED_CACHE_VERSION.to_le_bytes()))
+        .and_then(|_| writer.write_all(&(n_samples_full as u64).to_le_bytes()))
+        .and_then(|_| writer.write_all(&(n_kmers as u64).to_le_bytes()))
+        .and_then(|_| writer.write_all(&(bytes_per_col as u64).to_le_bytes()))
+        .and_then(|_| writer.write_all(&(n_blocks as u64).to_le_bytes()))
+        .map_err(|error| format!("write kfile prepared cache header failed: {error}"))
+}
+
+fn kfile_cache_read_u64<R: Read>(reader: &mut R, name: &str) -> Result<u64, String> {
+    let mut bytes = [0u8; 8];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| format!("read kfile prepared cache {name} failed: {error}"))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn kfile_cache_read_header<R: Read>(
+    reader: &mut R,
+) -> Result<(usize, usize, usize, usize), String> {
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|error| format!("read kfile prepared cache magic failed: {error}"))?;
+    if &magic != KFILE_PREPARED_CACHE_MAGIC {
+        return Err("invalid kfile prepared cache magic".to_string());
+    }
+    let version = {
+        let mut bytes = [0u8; 4];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|error| format!("read kfile prepared cache version failed: {error}"))?;
+        u32::from_le_bytes(bytes)
+    };
+    if version != KFILE_PREPARED_CACHE_VERSION {
+        return Err(format!(
+            "unsupported kfile prepared cache version: {version}"
+        ));
+    }
+    let n_samples_full = usize::try_from(kfile_cache_read_u64(reader, "sample count")?)
+        .map_err(|_| "kfile prepared cache sample count does not fit usize".to_string())?;
+    let n_kmers = usize::try_from(kfile_cache_read_u64(reader, "k-mer count")?)
+        .map_err(|_| "kfile prepared cache k-mer count does not fit usize".to_string())?;
+    let bytes_per_col = usize::try_from(kfile_cache_read_u64(reader, "bytes per column")?)
+        .map_err(|_| "kfile prepared cache bytes per column does not fit usize".to_string())?;
+    let n_blocks = usize::try_from(kfile_cache_read_u64(reader, "block count")?)
+        .map_err(|_| "kfile prepared cache block count does not fit usize".to_string())?;
+    Ok((n_samples_full, n_kmers, bytes_per_col, n_blocks))
+}
+
+impl KfilePreparedBlockCache {
+    fn build_with_progress<F>(
+        source: &mut KfileGrmSource,
+        row_step: usize,
+        mut progress: F,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(usize) -> Result<(), String>,
+    {
+        if row_step == 0 {
+            return Err("kfile prepared cache row_step must be > 0".to_string());
+        }
+        let n_samples_full = source.n_samples_full();
+        let n_kmers = usize::try_from(source.n_kmers())
+            .map_err(|_| "kfile prepared cache k-mer count does not fit usize".to_string())?;
+        let bytes_per_col = n_samples_full.div_ceil(8);
+        let unique = KFILE_PREPARED_CACHE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "janusx-kfile-prepared-{}-{unique}.cache",
+            std::process::id()
+        ));
+        let result = (|| -> Result<Self, String> {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|error| {
+                    format!(
+                        "create kfile prepared cache {} failed: {error}",
+                        path.display()
+                    )
+                })?;
+            let mut writer = BufWriter::new(file);
+            kfile_cache_write_header(&mut writer, n_samples_full, n_kmers, bytes_per_col, 0)?;
+            let mut n_blocks = 0usize;
+            while let Some(block) = source
+                .next_prepared_block(row_step)
+                .map_err(|error| error.to_string())?
+            {
+                let encoded_len = bincode::serialized_size(&block)
+                    .map_err(|error| format!("size kfile prepared block failed: {error}"))?;
+                writer
+                    .write_all(&encoded_len.to_le_bytes())
+                    .map_err(|error| {
+                        format!("write kfile prepared block length failed: {error}")
+                    })?;
+                bincode::serialize_into(&mut writer, &block)
+                    .map_err(|error| format!("write kfile prepared block failed: {error}"))?;
+                n_blocks = n_blocks
+                    .checked_add(1)
+                    .ok_or_else(|| "kfile prepared cache block count overflow".to_string())?;
+                progress(source.scanned_rows())?;
+            }
+            writer
+                .flush()
+                .map_err(|error| format!("flush kfile prepared cache failed: {error}"))?;
+            let mut file = writer
+                .into_inner()
+                .map_err(|error| format!("finalize kfile prepared cache failed: {error}"))?;
+            file.seek(SeekFrom::Start(KFILE_PREPARED_CACHE_BLOCK_COUNT_OFFSET))
+                .map_err(|error| format!("seek kfile prepared cache header failed: {error}"))?;
+            file.write_all(&(n_blocks as u64).to_le_bytes())
+                .and_then(|_| file.flush())
+                .map_err(|error| {
+                    format!("write kfile prepared cache block count failed: {error}")
+                })?;
+            Ok(Self {
+                path: path.clone(),
+                n_samples_full,
+                n_kmers,
+                bytes_per_col,
+                n_blocks,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&path);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn reader(&self) -> Result<KfilePreparedBlockCacheReader, String> {
+        let file = File::open(&self.path).map_err(|error| {
+            format!(
+                "open kfile prepared cache {} failed: {error}",
+                self.path.display()
+            )
+        })?;
+        let mut reader = BufReader::new(file);
+        let (n_samples_full, n_kmers, bytes_per_col, n_blocks) =
+            kfile_cache_read_header(&mut reader)?;
+        if n_samples_full != self.n_samples_full
+            || n_kmers != self.n_kmers
+            || bytes_per_col != self.bytes_per_col
+            || n_blocks != self.n_blocks
+        {
+            return Err("kfile prepared cache header does not match source".to_string());
+        }
+        Ok(KfilePreparedBlockCacheReader {
+            reader,
+            n_kmers,
+            bytes_per_col,
+            remaining_blocks: n_blocks,
+            scanned_rows: 0,
+        })
+    }
+
+    #[cfg(test)]
+    fn replay<F>(&self, mut callback: F) -> Result<(), String>
+    where
+        F: FnMut(KfileGrmPreparedBlock, usize) -> Result<(), String>,
+    {
+        let mut reader = self.reader()?;
+        while let Some((block, scanned_end)) = reader.next_block()? {
+            callback(block, scanned_end)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for KfilePreparedBlockCache {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl KfilePreparedBlockCacheReader {
+    fn next_block(&mut self) -> Result<Option<(KfileGrmPreparedBlock, usize)>, String> {
+        if self.remaining_blocks == 0 {
+            return Ok(None);
+        }
+        let encoded_len = usize::try_from(kfile_cache_read_u64(
+            &mut self.reader,
+            "prepared block length",
+        )?)
+        .map_err(|_| "kfile prepared block length does not fit usize".to_string())?;
+        let mut encoded = vec![0u8; encoded_len];
+        self.reader
+            .read_exact(&mut encoded)
+            .map_err(|error| format!("read kfile prepared block failed: {error}"))?;
+        let block: KfileGrmPreparedBlock = bincode::deserialize(&encoded)
+            .map_err(|error| format!("deserialize kfile prepared block failed: {error}"))?;
+        if block.scanned_rows == 0
+            || block.retained_rows() > block.scanned_rows
+            || block.packed_len() % block.scanned_rows != 0
+            || block.packed_len() / block.scanned_rows != self.bytes_per_col
+        {
+            return Err("invalid kfile prepared block in cache".to_string());
+        }
+        self.scanned_rows = self
+            .scanned_rows
+            .checked_add(block.scanned_rows)
+            .ok_or_else(|| "kfile prepared cache scanned-row overflow".to_string())?;
+        if self.scanned_rows > self.n_kmers {
+            return Err("kfile prepared cache scanned rows exceed source rows".to_string());
+        }
+        self.remaining_blocks -= 1;
+        if self.remaining_blocks == 0 && self.scanned_rows != self.n_kmers {
+            return Err("kfile prepared cache does not cover all source rows".to_string());
+        }
+        Ok(Some((block, self.scanned_rows)))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn grm_stream_bed_row_band_f32_fill_core(
     bed_prefix: &str,
@@ -5159,18 +5418,61 @@ pub(crate) fn spgrm_kfile_to_jxgrm_core(
     if task_batches.is_empty() {
         return Err("kfile sparse GRM resolved no sample-tile tasks".to_string());
     }
+    let out_path = normalize_spgrm_path(out_prefix);
+    if out_path.is_empty() {
+        return Err("Sparse GRM output prefix must not be empty".to_string());
+    }
+    let cache_enabled = task_batches.len() > 1;
+    let progress_batch_count = task_batches
+        .len()
+        .checked_add(usize::from(cache_enabled))
+        .ok_or_else(|| "kfile sparse GRM progress batch count overflow".to_string())?;
     let total_progress = n_kmers
-        .checked_mul(task_batches.len())
+        .checked_mul(progress_batch_count)
         .ok_or_else(|| "kfile sparse GRM progress total overflow".to_string())?;
     let notify_step = if progress_every == 0 {
         row_step
     } else {
         progress_every.max(1)
     };
-    let out_path = normalize_spgrm_path(out_prefix);
-    if out_path.is_empty() {
-        return Err("Sparse GRM output prefix must not be empty".to_string());
-    }
+    let progress_batch_offset = usize::from(cache_enabled);
+    let progress_compute_offset = progress_batch_offset.saturating_mul(n_kmers);
+    let mut progress_last_notified = 0usize;
+    spgrm_progress_notify(
+        progress_callback,
+        0,
+        total_progress,
+        notify_step,
+        &mut progress_last_notified,
+        true,
+    )?;
+    // When several sample-tile batches are required, prepare the raw kfile once
+    // and replay filtered prepared blocks for each batch. A single batch keeps
+    // the direct streaming path and avoids an unnecessary temporary file.
+    let prepared_cache = if cache_enabled {
+        let cache =
+            KfilePreparedBlockCache::build_with_progress(&mut source, row_step, |scanned_rows| {
+                spgrm_progress_notify(
+                    progress_callback,
+                    scanned_rows,
+                    total_progress,
+                    notify_step,
+                    &mut progress_last_notified,
+                    false,
+                )
+            })?;
+        spgrm_progress_notify(
+            progress_callback,
+            n_kmers,
+            total_progress,
+            notify_step,
+            &mut progress_last_notified,
+            true,
+        )?;
+        Some(cache)
+    } else {
+        None
+    };
     let spill_nnz_limit = spgrm_spill_nnz_limit().max(n_use.max(1));
     let timing = if spgrm_stage_timing_enabled() {
         Some(Arc::new(SpgrmStageTiming::default()))
@@ -5191,7 +5493,7 @@ pub(crate) fn spgrm_kfile_to_jxgrm_core(
     let use_double_buffer = stream_double_buffer && n_kmers > row_step;
     let mut chunk_paths = Vec::<PathBuf>::new();
     let write_result = (|| -> Result<(usize, usize, usize), String> {
-        let mut last_notified = 0usize;
+        let mut last_notified = progress_last_notified;
         let mut chunk_idx = 0usize;
         let mut nnz_total = 0usize;
         let mut sparse_buffer = Vec::<SpgrmEntry>::new();
@@ -5199,7 +5501,7 @@ pub(crate) fn spgrm_kfile_to_jxgrm_core(
 
         spgrm_progress_notify(
             progress_callback,
-            0,
+            progress_compute_offset,
             total_progress,
             notify_step,
             &mut last_notified,
@@ -5207,7 +5509,13 @@ pub(crate) fn spgrm_kfile_to_jxgrm_core(
         )?;
 
         for (batch_idx, batch) in task_batches.iter().enumerate() {
-            source.reset_scan().map_err(|error| error.to_string())?;
+            if prepared_cache.is_none() {
+                source.reset_scan().map_err(|error| error.to_string())?;
+            }
+            let mut cache_reader = prepared_cache
+                .as_ref()
+                .map(KfilePreparedBlockCache::reader)
+                .transpose()?;
             let task_slice = &tasks[batch.start..batch.end];
             let (stripe_template, mut accumulators) = spgrm_build_stream_batch(
                 task_slice,
@@ -5223,15 +5531,28 @@ pub(crate) fn spgrm_kfile_to_jxgrm_core(
                 let producer_error = Arc::clone(&decode_error);
                 let make_chunk = || KfileSpgrmChunk::new(stripe_template.clone());
                 let producer = |chunk: &mut KfileSpgrmChunk| -> bool {
-                    match source.next_prepared_block(row_step) {
-                        Ok(Some(block)) => match spgrm_decode_kfile_batch_block(
+                    let next = if let Some(reader) = cache_reader.as_mut() {
+                        reader.next_block()
+                    } else {
+                        source
+                            .next_prepared_block(row_step)
+                            .map(|maybe| {
+                                maybe.map(|block| {
+                                    let scanned_end = source.scanned_rows();
+                                    (block, scanned_end)
+                                })
+                            })
+                            .map_err(|error| error.to_string())
+                    };
+                    match next {
+                        Ok(Some((block, scanned_end))) => match spgrm_decode_kfile_batch_block(
                             &mut source,
                             &block,
                             chunk.decoded.stripe_scratch.as_mut_slice(),
                         ) {
                             Ok(()) => {
-                                chunk.set_data(block.retained_rows(), source.scanned_rows());
-                                source.scanned_rows() < n_kmers
+                                chunk.set_data(block.retained_rows(), scanned_end);
+                                scanned_end < n_kmers
                             }
                             Err(error) => {
                                 if let Ok(mut slot) = producer_error.lock() {
@@ -5258,9 +5579,9 @@ pub(crate) fn spgrm_kfile_to_jxgrm_core(
                 let consumer = |chunk: &mut KfileSpgrmChunk| -> Result<(), String> {
                     consume_kfile_spgrm_chunk(
                         chunk,
-                        batch_idx,
+                        batch_idx + progress_batch_offset,
                         n_kmers,
-                        task_batches.len(),
+                        progress_batch_count,
                         accumulators.as_mut_slice(),
                         progress_callback,
                         notify_step,
@@ -5282,21 +5603,34 @@ pub(crate) fn spgrm_kfile_to_jxgrm_core(
                 }
             } else {
                 let mut chunk = KfileSpgrmChunk::new(stripe_template);
-                while let Some(block) = source
-                    .next_prepared_block(row_step)
-                    .map_err(|error| error.to_string())?
-                {
+                loop {
+                    let next = if let Some(reader) = cache_reader.as_mut() {
+                        reader.next_block()
+                    } else {
+                        source
+                            .next_prepared_block(row_step)
+                            .map(|maybe| {
+                                maybe.map(|block| {
+                                    let scanned_end = source.scanned_rows();
+                                    (block, scanned_end)
+                                })
+                            })
+                            .map_err(|error| error.to_string())
+                    }?;
+                    let Some((block, scanned_end)) = next else {
+                        break;
+                    };
                     spgrm_decode_kfile_batch_block(
                         &mut source,
                         &block,
                         chunk.decoded.stripe_scratch.as_mut_slice(),
                     )?;
-                    chunk.set_data(block.retained_rows(), source.scanned_rows());
+                    chunk.set_data(block.retained_rows(), scanned_end);
                     consume_kfile_spgrm_chunk(
                         &chunk,
-                        batch_idx,
+                        batch_idx + progress_batch_offset,
                         n_kmers,
-                        task_batches.len(),
+                        progress_batch_count,
                         accumulators.as_mut_slice(),
                         progress_callback,
                         notify_step,
@@ -6772,6 +7106,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn kfile_prepared_cache_replays_blocks_and_removes_temp_file() {
+        let fixture = KfileFixture::new(&[0b0011, 0b0101, 0b1110, 0b1010, 0b1111, 0]);
+        let mut direct_source = KfileGrmSource::open(fixture.prefix(), None, 1, 0.0).unwrap();
+        let mut direct_values = Vec::<f32>::new();
+        while let Some(block) = direct_source.next_prepared_block(2).unwrap() {
+            let mut values = vec![0.0_f32; block.retained_rows() * 4];
+            direct_source
+                .decode_block_into(&block, 0..4, &mut values)
+                .unwrap();
+            direct_values.extend(values);
+        }
+
+        let mut cache_source = KfileGrmSource::open(fixture.prefix(), None, 1, 0.0).unwrap();
+        let mut progress = Vec::new();
+        let cache =
+            KfilePreparedBlockCache::build_with_progress(&mut cache_source, 2, |scanned_rows| {
+                progress.push(scanned_rows);
+                Ok(())
+            })
+            .unwrap();
+        let cache_path = cache.path().to_path_buf();
+        assert!(cache_path.is_file());
+        assert_eq!(progress, vec![2, 4, 6]);
+        assert_eq!(
+            cache_source.effective_rows(),
+            direct_source.effective_rows()
+        );
+        assert!((cache_source.denominator() - direct_source.denominator()).abs() < 1e-12);
+        let mut replay_values = Vec::<f32>::new();
+        cache
+            .replay(|block, _scanned_end| {
+                let mut values = vec![0.0_f32; block.retained_rows() * 4];
+                crate::kmer::kfile::decode_grm_prepared_block_into(
+                    &block,
+                    &[0, 1, 2, 3],
+                    &mut values,
+                )
+                .map_err(|error| error.to_string())?;
+                replay_values.extend(values);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(replay_values, direct_values);
+        drop(cache);
+        assert!(!cache_path.exists());
     }
 
     #[test]

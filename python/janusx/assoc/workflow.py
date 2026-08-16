@@ -4678,6 +4678,7 @@ def _build_kfile_grm_streaming(
     chunk_size: int,
     method: int,
     logger: Optional[logging.Logger] = None,
+    use_spinner: bool = False,
 ) -> tuple[np.ndarray, int]:
     """Build a kfile GRM through the shared native kernel.
 
@@ -4695,14 +4696,45 @@ def _build_kfile_grm_streaming(
         raise RuntimeError(
             "Rust extension missing grm_kfile_f32; rebuild/reinstall JanusX."
         )
-    matrix, eff_m, native_ids = jxrs.grm_kfile_f32(
-        str(prefix),
-        sample_indices=np.ascontiguousarray(idx, dtype=np.int64),
-        method=int(method),
-        maf_threshold=0.0,
-        block_rows=max(1, int(chunk_size)),
-        threads=0,
+    progress_total = max(1, int(n_kmers))
+    progress_done = 0
+    pbar = _ProgressAdapter(
+        total=progress_total,
+        desc="K-file GRM",
+        force_animate=True,
+        logger=logger,
     )
+
+    def _progress_callback(done: int, total: int) -> None:
+        nonlocal progress_total, progress_done
+        try:
+            total_use = max(1, int(total))
+            done_use = max(0, int(done))
+        except Exception:
+            return
+        if total_use != progress_total:
+            pbar.set_total(total_use)
+            progress_total = total_use
+        done_use = min(done_use, progress_total)
+        step = done_use - progress_done
+        if step > 0:
+            pbar.update(step)
+            progress_done = done_use
+
+    try:
+        matrix, eff_m, native_ids = jxrs.grm_kfile_f32(
+            str(prefix),
+            sample_indices=np.ascontiguousarray(idx, dtype=np.int64),
+            method=int(method),
+            maf_threshold=0.0,
+            block_rows=max(1, int(chunk_size)),
+            threads=0,
+            progress_callback=_progress_callback,
+            progress_every=_progress_callback_step(progress_total),
+        )
+        pbar.finish()
+    finally:
+        pbar.close(show_done=False)
     out = np.ascontiguousarray(np.asarray(matrix, dtype=np.float32))
     n = int(idx.shape[0])
     if out.shape != (n, n):
@@ -4819,6 +4851,7 @@ def _prepare_kfile_stream_context(
             chunk_size=max(1, int(chunk_size)),
             method=int(str(grm_option).strip()),
             logger=logger,
+            use_spinner=use_spinner,
         )
     qmatrix = np.zeros((len(ids), 0), dtype=np.float32)
     if qdim > 0:

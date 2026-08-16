@@ -663,6 +663,20 @@ def run_chunked_gwas_kfile(
                 models.append((model_key, sparse_model))
 
         out_handles: dict[str, tuple[object, str, str, int]] = {}
+        model_labels = [
+            "FvLMM" if key == "fvlmm" else key.upper() for key in requested
+        ]
+        progress_desc = "K-file GWAS"
+        if len(model_labels) == 1:
+            progress_desc = f"K-file {model_labels[0]}"
+        pbar = _ProgressAdapter(
+            total=max(1, int(n_kmers)),
+            desc=progress_desc,
+            force_animate=True,
+            logger=logger,
+        )
+        pbar_done = 0
+        reader = None
         try:
             for model_key, _model in models:
                 safe_trait = _safe_trait_file_label(trait_name)
@@ -709,6 +723,16 @@ def run_chunked_gwas_kfile(
                     handle, tmp_tsv, out_tsv, count = out_handles[model_key]
                     handle.write(text)
                     out_handles[model_key] = (handle, tmp_tsv, out_tsv, count + int(maf.shape[0]))
+                chunk_rows = int(maf.shape[0])
+                if chunk_rows > 0:
+                    pbar.update(chunk_rows)
+                    pbar_done += chunk_rows
+
+            # The metadata count is the expected scan total.  Keep the bar
+            # honest if a truncated/filtered source yields a different count.
+            if pbar_done != int(n_kmers) and pbar_done > 0:
+                pbar.set_total(int(pbar_done))
+            pbar.finish()
 
             for model_key, _model in models:
                 handle, tmp_tsv, out_tsv, count = out_handles[model_key]
@@ -752,6 +776,13 @@ def run_chunked_gwas_kfile(
                     pass
                 _cleanup_gwas_result_tmp(tmp_tsv)
             raise
+        finally:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+            pbar.close(show_done=False)
 
 
 def run_chunked_gwas_lmm_lm(
