@@ -94,6 +94,7 @@ use crate::gfreader::{
 };
 use crate::gload::WindowedBedMatrix;
 use crate::grm::decode_grm_block;
+use crate::kmer::{KfileGrmPreparedBlock, KfileGrmSource, KfileGrmStageTiming};
 use crate::pipeline::run_double_buffer;
 use crate::stats_common::{
     check_ctrlc, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
@@ -288,6 +289,41 @@ struct SpgrmDecodedBatchBuffer {
     stripe_scratch: Vec<SpgrmStreamStripeScratch>,
     row_start: usize,
     cur_rows: usize,
+}
+
+/// A decoded kfile block for one sparse-GRM task batch.
+///
+/// `decoded.row_start == usize::MAX` is the producer-error sentinel used by
+/// the double-buffer pipeline.  The producer retains the source's scan end so
+/// progress reflects raw k-mer rows even when filtering leaves this block
+/// empty.
+struct KfileSpgrmChunk {
+    decoded: SpgrmDecodedBatchBuffer,
+    scanned_end: usize,
+}
+
+impl KfileSpgrmChunk {
+    fn new(stripe_scratch: Vec<SpgrmStreamStripeScratch>) -> Self {
+        Self {
+            decoded: SpgrmDecodedBatchBuffer {
+                stripe_scratch,
+                row_start: 0,
+                cur_rows: 0,
+            },
+            scanned_end: 0,
+        }
+    }
+
+    fn set_data(&mut self, retained_rows: usize, scanned_end: usize) {
+        self.decoded.row_start = 0;
+        self.decoded.cur_rows = retained_rows;
+        self.scanned_end = scanned_end;
+    }
+
+    fn set_producer_error(&mut self) {
+        self.decoded.row_start = usize::MAX;
+        self.decoded.cur_rows = 0;
+    }
 }
 
 #[inline]
@@ -2598,6 +2634,131 @@ fn spgrm_consume_stream_batch_buffer(
         last_notified,
         false,
     )
+}
+
+fn spgrm_decode_kfile_batch_block(
+    source: &mut KfileGrmSource,
+    block: &KfileGrmPreparedBlock,
+    stripes: &mut [SpgrmStreamStripeScratch],
+) -> Result<(), String> {
+    let retained_rows = block.retained_rows();
+    for stripe in stripes {
+        let width = stripe.width();
+        let output_len = retained_rows
+            .checked_mul(width)
+            .ok_or_else(|| "kfile sparse GRM decoded stripe size overflow".to_string())?;
+        source
+            .decode_block_into(
+                block,
+                stripe.stripe.start..stripe.stripe.end,
+                &mut stripe.decoded[..output_len],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn spgrm_accumulate_kfile_batch(
+    stripes: &[SpgrmStreamStripeScratch],
+    retained_rows: usize,
+    first_block: bool,
+    accumulators: &mut [SpgrmBatchTaskAccum],
+    threads: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    timing: Option<&SpgrmStageTiming>,
+) -> Result<(), String> {
+    if retained_rows == 0 {
+        return Ok(());
+    }
+    if threads > 1 && accumulators.len() > 1 {
+        let mut work = || {
+            accumulators.par_iter_mut().for_each(|task_acc| {
+                spgrm_accumulate_task_gemm(task_acc, stripes, retained_rows, first_block, timing);
+            });
+        };
+        if let Some(pool) = pool {
+            pool.install(&mut work);
+        } else {
+            work();
+        }
+    } else {
+        for task_acc in accumulators {
+            spgrm_accumulate_task_gemm(task_acc, stripes, retained_rows, first_block, timing);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_kfile_spgrm_chunk(
+    chunk: &KfileSpgrmChunk,
+    batch_idx: usize,
+    n_kmers: usize,
+    n_batches: usize,
+    accumulators: &mut [SpgrmBatchTaskAccum],
+    progress_callback: Option<&Py<PyAny>>,
+    notify_step: usize,
+    last_notified: &mut usize,
+    threads: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    timing: Option<&SpgrmStageTiming>,
+    first_block: &mut bool,
+    producer_error: &Arc<Mutex<Option<String>>>,
+) -> Result<(), String> {
+    if chunk.decoded.row_start == usize::MAX {
+        return Err(producer_error
+            .lock()
+            .map_err(|_| "kfile sparse GRM error lock poisoned".to_string())?
+            .take()
+            .unwrap_or_else(|| "kfile sparse GRM producer failed".to_string()));
+    }
+    if chunk.decoded.cur_rows > 0 {
+        spgrm_accumulate_kfile_batch(
+            chunk.decoded.stripe_scratch.as_slice(),
+            chunk.decoded.cur_rows,
+            *first_block,
+            accumulators,
+            threads,
+            pool,
+            timing,
+        )?;
+        *first_block = false;
+    }
+    let batch_done = batch_idx
+        .checked_mul(n_kmers)
+        .and_then(|offset| offset.checked_add(chunk.scanned_end))
+        .ok_or_else(|| "kfile sparse GRM progress overflow".to_string())?;
+    let total = n_kmers
+        .checked_mul(n_batches)
+        .ok_or_else(|| "kfile sparse GRM progress overflow".to_string())?;
+    spgrm_progress_notify(
+        progress_callback,
+        batch_done,
+        total,
+        notify_step,
+        last_notified,
+        false,
+    )
+}
+
+fn verify_kfile_rescan_totals(
+    reference: Option<(usize, f64)>,
+    observed: (usize, f64),
+) -> Result<(usize, f64), String> {
+    if !observed.1.is_finite() || observed.1 < 0.0 {
+        return Err("kfile sparse GRM produced an invalid denominator".to_string());
+    }
+    if let Some((expected_rows, expected_denominator)) = reference {
+        let scale = expected_denominator.abs().max(observed.1.abs()).max(1.0);
+        if expected_rows != observed.0 || (expected_denominator - observed.1).abs() > 1e-12 * scale
+        {
+            return Err(format!(
+                "kfile sparse GRM rescan totals changed: effective rows {} -> {}, denominator {} -> {}",
+                expected_rows, observed.0, expected_denominator, observed.1,
+            ));
+        }
+    }
+    Ok(observed)
 }
 
 fn spgrm_open_bed_payload_mmap(
@@ -4934,6 +5095,378 @@ fn grm_stream_bed_full_f32_to_npy_core(
     Ok((m, n_use))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spgrm_kfile_to_jxgrm_core(
+    prefix: &Path,
+    sample_indices: Option<&[usize]>,
+    out_prefix: &str,
+    method: usize,
+    threshold: f64,
+    abs_threshold: bool,
+    maf_threshold: f32,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    progress_callback: Option<&Py<PyAny>>,
+    progress_every: usize,
+) -> Result<(String, usize, usize, usize), String> {
+    if !threshold.is_finite() {
+        return Err("Sparse GRM threshold must be finite".to_string());
+    }
+    let mut source = KfileGrmSource::open(prefix, sample_indices, method, maf_threshold)
+        .map_err(|e| e.to_string())?;
+    let n_kmers = usize::try_from(source.n_kmers()).map_err(|_| {
+        "kfile sparse GRM n_kmers does not fit usize for progress reporting".to_string()
+    })?;
+    if n_kmers == 0 {
+        return Err("Sparse GRM requires at least one k-mer row".to_string());
+    }
+    let n_use = source.n_samples();
+    let n_samples_full = source.n_samples_full();
+    if n_use == 0 || n_samples_full == 0 {
+        return Err("Sparse GRM requires n_samples > 0".to_string());
+    }
+    if n_samples_full > u32::MAX as usize {
+        return Err(format!(
+            "Sparse GRM row indices are stored as u32; got n_samples={n_samples_full} > {}",
+            u32::MAX
+        ));
+    }
+    let stream_double_buffer = spgrm_stream_double_buffer_requested(threads);
+    let decode_buffers = if stream_double_buffer { 2usize } else { 1usize };
+    let memory_plan = spgrm_resolve_stream_memory_plan(
+        n_kmers,
+        n_use,
+        n_samples_full,
+        block_rows,
+        sample_block,
+        threads,
+        decode_buffers,
+    );
+    let sample_step = memory_plan.sample_step;
+    let row_step = memory_plan.row_step.min(n_kmers).max(1);
+    let tasks = build_spgrm_tasks(n_use, sample_step);
+    let task_batches = build_spgrm_task_batches(
+        tasks.as_slice(),
+        row_step,
+        spgrm_batch_limits(
+            row_step,
+            sample_step,
+            memory_plan.max_decoded_bytes,
+            threads,
+        ),
+    );
+    if task_batches.is_empty() {
+        return Err("kfile sparse GRM resolved no sample-tile tasks".to_string());
+    }
+    let total_progress = n_kmers
+        .checked_mul(task_batches.len())
+        .ok_or_else(|| "kfile sparse GRM progress total overflow".to_string())?;
+    let notify_step = if progress_every == 0 {
+        row_step
+    } else {
+        progress_every.max(1)
+    };
+    let out_path = normalize_spgrm_path(out_prefix);
+    if out_path.is_empty() {
+        return Err("Sparse GRM output prefix must not be empty".to_string());
+    }
+    let spill_nnz_limit = spgrm_spill_nnz_limit().max(n_use.max(1));
+    let timing = if spgrm_stage_timing_enabled() {
+        Some(Arc::new(SpgrmStageTiming::default()))
+    } else {
+        None
+    };
+    let pool = get_cached_pool(threads).map_err(|error| error.to_string())?;
+    let split_single_task =
+        spgrm_single_diag_task_subtile_step(tasks.as_slice(), threads).is_some();
+    let blas_threads = if threads <= 1 {
+        None
+    } else if tasks.len() > 1 || split_single_task {
+        Some(1usize)
+    } else {
+        Some(threads.max(1))
+    };
+    let _blas_guard = blas_threads.map(BlasThreadGuard::enter);
+    let use_double_buffer = stream_double_buffer && n_kmers > row_step;
+    let mut chunk_paths = Vec::<PathBuf>::new();
+    let write_result = (|| -> Result<(usize, usize, usize), String> {
+        let mut last_notified = 0usize;
+        let mut chunk_idx = 0usize;
+        let mut nnz_total = 0usize;
+        let mut sparse_buffer = Vec::<SpgrmEntry>::new();
+        let mut reference_totals = None::<(usize, f64)>;
+
+        spgrm_progress_notify(
+            progress_callback,
+            0,
+            total_progress,
+            notify_step,
+            &mut last_notified,
+            true,
+        )?;
+
+        for (batch_idx, batch) in task_batches.iter().enumerate() {
+            source.reset_scan().map_err(|error| error.to_string())?;
+            let task_slice = &tasks[batch.start..batch.end];
+            let (stripe_template, mut accumulators) = spgrm_build_stream_batch(
+                task_slice,
+                row_step,
+                source.sample_indices(),
+                source.n_samples_full(),
+                threads,
+            );
+            let decode_error = Arc::new(Mutex::new(None::<String>));
+            let mut first_block = true;
+
+            if use_double_buffer {
+                let producer_error = Arc::clone(&decode_error);
+                let make_chunk = || KfileSpgrmChunk::new(stripe_template.clone());
+                let producer = |chunk: &mut KfileSpgrmChunk| -> bool {
+                    match source.next_prepared_block(row_step) {
+                        Ok(Some(block)) => match spgrm_decode_kfile_batch_block(
+                            &mut source,
+                            &block,
+                            chunk.decoded.stripe_scratch.as_mut_slice(),
+                        ) {
+                            Ok(()) => {
+                                chunk.set_data(block.retained_rows(), source.scanned_rows());
+                                source.scanned_rows() < n_kmers
+                            }
+                            Err(error) => {
+                                if let Ok(mut slot) = producer_error.lock() {
+                                    *slot = Some(error);
+                                }
+                                chunk.set_producer_error();
+                                false
+                            }
+                        },
+                        Ok(None) => {
+                            chunk.set_data(0, n_kmers);
+                            false
+                        }
+                        Err(error) => {
+                            if let Ok(mut slot) = producer_error.lock() {
+                                *slot = Some(error.to_string());
+                            }
+                            chunk.set_producer_error();
+                            false
+                        }
+                    }
+                };
+                let consumer_error = Arc::clone(&decode_error);
+                let consumer = |chunk: &mut KfileSpgrmChunk| -> Result<(), String> {
+                    consume_kfile_spgrm_chunk(
+                        chunk,
+                        batch_idx,
+                        n_kmers,
+                        task_batches.len(),
+                        accumulators.as_mut_slice(),
+                        progress_callback,
+                        notify_step,
+                        &mut last_notified,
+                        threads,
+                        pool.as_ref(),
+                        timing.as_deref(),
+                        &mut first_block,
+                        &consumer_error,
+                    )
+                };
+                run_double_buffer(2usize, make_chunk, producer, consumer)?;
+                if let Some(error) = decode_error
+                    .lock()
+                    .map_err(|_| "kfile sparse GRM error lock poisoned".to_string())?
+                    .take()
+                {
+                    return Err(error);
+                }
+            } else {
+                let mut chunk = KfileSpgrmChunk::new(stripe_template);
+                while let Some(block) = source
+                    .next_prepared_block(row_step)
+                    .map_err(|error| error.to_string())?
+                {
+                    spgrm_decode_kfile_batch_block(
+                        &mut source,
+                        &block,
+                        chunk.decoded.stripe_scratch.as_mut_slice(),
+                    )?;
+                    chunk.set_data(block.retained_rows(), source.scanned_rows());
+                    consume_kfile_spgrm_chunk(
+                        &chunk,
+                        batch_idx,
+                        n_kmers,
+                        task_batches.len(),
+                        accumulators.as_mut_slice(),
+                        progress_callback,
+                        notify_step,
+                        &mut last_notified,
+                        threads,
+                        pool.as_ref(),
+                        timing.as_deref(),
+                        &mut first_block,
+                        &decode_error,
+                    )?;
+                }
+            }
+
+            let totals = verify_kfile_rescan_totals(
+                reference_totals,
+                (source.effective_rows(), source.denominator()),
+            )?;
+            reference_totals = Some(totals);
+            let t_threshold = Instant::now();
+            let mut entries = spgrm_collect_batch_entries(
+                accumulators.as_slice(),
+                1.0_f64 / totals.1,
+                threshold,
+                abs_threshold,
+            )?;
+            if let Some(timing) = timing.as_deref() {
+                timing.add_threshold_ns(spgrm_elapsed_ns(t_threshold));
+            }
+            nnz_total = nnz_total.saturating_add(entries.len());
+            sparse_buffer.append(&mut entries);
+            if sparse_buffer.len() >= spill_nnz_limit {
+                let chunk_path = spgrm_chunk_path(&out_path, chunk_idx);
+                let t_spill = Instant::now();
+                spill_sorted_entries_to_chunk(&chunk_path, &mut sparse_buffer)?;
+                if let Some(timing) = timing.as_deref() {
+                    timing.add_spill_ns(spgrm_elapsed_ns(t_spill));
+                }
+                chunk_paths.push(chunk_path);
+                chunk_idx = chunk_idx.saturating_add(1);
+            }
+        }
+
+        let (effective_rows, denominator) = reference_totals
+            .ok_or_else(|| "kfile sparse GRM completed no task batches".to_string())?;
+        if effective_rows == 0 || !(denominator.is_finite() && denominator > 0.0) {
+            return Err("no polymorphic k-mers remain after kfile GRM filtering".to_string());
+        }
+        let (n_samples, nnz) = if chunk_paths.is_empty() {
+            let t_spill = Instant::now();
+            let out = write_sorted_entries_to_jxgrm(&out_path, n_use, &mut sparse_buffer);
+            if let Some(timing) = timing.as_deref() {
+                timing.add_spill_ns(spgrm_elapsed_ns(t_spill));
+            }
+            out?
+        } else {
+            if !sparse_buffer.is_empty() {
+                let chunk_path = spgrm_chunk_path(&out_path, chunk_idx);
+                let t_spill = Instant::now();
+                spill_sorted_entries_to_chunk(&chunk_path, &mut sparse_buffer)?;
+                if let Some(timing) = timing.as_deref() {
+                    timing.add_spill_ns(spgrm_elapsed_ns(t_spill));
+                }
+                chunk_paths.push(chunk_path);
+            }
+            let t_spill = Instant::now();
+            let out =
+                merge_chunked_entries_to_jxgrm(&out_path, n_use, chunk_paths.as_slice(), nnz_total);
+            if let Some(timing) = timing.as_deref() {
+                timing.add_spill_ns(spgrm_elapsed_ns(t_spill));
+            }
+            out?
+        };
+        spgrm_progress_notify(
+            progress_callback,
+            total_progress,
+            total_progress,
+            notify_step,
+            &mut last_notified,
+            true,
+        )?;
+        Ok((n_samples, nnz, effective_rows))
+    })();
+    for chunk_path in chunk_paths {
+        let _ = fs::remove_file(chunk_path);
+    }
+    if write_result.is_err() {
+        let _ = fs::remove_file(&out_path);
+    }
+    let (n_samples, nnz, effective_rows) = write_result?;
+    if let Some(timing) = timing.as_deref() {
+        let source_timing: KfileGrmStageTiming = source.stage_timing();
+        eprintln!(
+            "spgrm timing [kfile] n_use={n_use} m={n_kmers} sample_step={sample_step} row_step={row_step} read_sum={:.3}s filter_sum={:.3}s decode_sum={:.3}s gemm_sum={:.3}s threshold_sum={:.3}s spill={:.3}s",
+            spgrm_stage_secs(source_timing.read_ns),
+            spgrm_stage_secs(source_timing.filter_ns),
+            spgrm_stage_secs(source_timing.decode_ns),
+            spgrm_stage_secs(timing.gemm_ns()),
+            spgrm_stage_secs(timing.threshold_ns()),
+            spgrm_stage_secs(timing.spill_ns()),
+        );
+    }
+    Ok((out_path, n_samples, nnz, effective_rows))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    out_prefix=None,
+    sample_indices=None,
+    method=1,
+    threshold=0.05_f64,
+    abs_threshold=false,
+    maf_threshold=0.02_f32,
+    block_rows=0,
+    sample_block=0,
+    threads=0,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn spgrm_kfile_to_jxgrm<'py>(
+    py: Python<'py>,
+    prefix: String,
+    out_prefix: Option<String>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    threshold: f64,
+    abs_threshold: bool,
+    maf_threshold: f32,
+    block_rows: usize,
+    sample_block: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(String, usize, usize, usize)> {
+    let sample_indices = sample_indices
+        .map(|values| {
+            values
+                .as_slice()?
+                .iter()
+                .map(|&value| {
+                    usize::try_from(value).map_err(|_| {
+                        PyRuntimeError::new_err(format!(
+                            "sample_indices contains a negative or overflowing value: {value}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()?;
+    let output = out_prefix.unwrap_or_else(|| prefix.clone());
+    let prefix = PathBuf::from(prefix);
+    py.detach(move || {
+        spgrm_kfile_to_jxgrm_core(
+            prefix.as_path(),
+            sample_indices.as_deref(),
+            &output,
+            method,
+            threshold,
+            abs_threshold,
+            maf_threshold,
+            block_rows,
+            sample_block,
+            threads,
+            progress_callback.as_ref(),
+            progress_every,
+        )
+    })
+    .map_err(map_err_string_to_py)
+}
+
 pub fn spgrm_bed_to_jxgrm_core(
     prefix: &str,
     sample_idx: Option<&[usize]>,
@@ -6003,7 +6536,348 @@ pub fn spgrm_dense_npy_to_jxgrm<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kmer::format::{BsiteHeader, KmergeMeta};
     use pyo3::types::{PyCFunction, PyDict, PyTuple};
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicUsizeOrdering};
+
+    static KFILE_FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct KfileFixture {
+        dir: PathBuf,
+        prefix: PathBuf,
+        rows: Vec<u8>,
+    }
+
+    impl KfileFixture {
+        fn new(rows: &[u8]) -> Self {
+            let unique = KFILE_FIXTURE_COUNTER.fetch_add(1, AtomicUsizeOrdering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "janusx-spgrm-kfile-{}-{}-{unique}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos(),
+            ));
+            fs::create_dir(&dir).expect("create kfile fixture directory");
+            let prefix = dir.join("fixture");
+            let meta = KmergeMeta {
+                format: "janusx-kmer-bitmatrix-v1".to_string(),
+                k: 31,
+                n_samples: 4,
+                n_kmers: rows.len() as u64,
+                bytes_per_col: 1,
+                encoding: "acgt_2bit".to_string(),
+                canonical: true,
+                matrix_layout: "column_major_bitset".to_string(),
+                value_type: "binary_presence".to_string(),
+                bit_order: "little_bit_order".to_string(),
+                bkmer_file: "fixture.bkmer".to_string(),
+                bsite_file: "fixture.bsite".to_string(),
+                idv_file: "fixture.idv".to_string(),
+                min_count: 1,
+                min_presence_rate: 0.0,
+                max_presence_rate: 1.0,
+                bucket_bits: 0,
+                compression: "none".to_string(),
+            };
+            fs::write(
+                PathBuf::from(format!("{}.meta.json", prefix.display())),
+                serde_json::to_vec(&meta).expect("serialize kfile metadata"),
+            )
+            .expect("write kfile metadata");
+            fs::write(
+                dir.join("fixture.idv"),
+                "#idx\tsample_id\tkmc_prefix\n0\ts1\tp1\n1\ts2\tp2\n2\ts3\tp3\n3\ts4\tp4\n",
+            )
+            .expect("write kfile sample IDs");
+            let mut bsite = File::create(dir.join("fixture.bsite")).expect("create bsite");
+            BsiteHeader {
+                n_samples: 4,
+                n_kmers: rows.len() as u64,
+                bytes_per_col: 1,
+            }
+            .write_to(&mut bsite)
+            .expect("write bsite header");
+            bsite.write_all(rows).expect("write bsite rows");
+            Self {
+                dir,
+                prefix,
+                rows: rows.to_vec(),
+            }
+        }
+
+        fn prefix(&self) -> &Path {
+            &self.prefix
+        }
+
+        fn out_prefix(&self) -> String {
+            self.dir.join("sparse").to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for KfileFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn scalar_kfile_grm(rows: &[u8], method: usize) -> Vec<f64> {
+        let n = 4usize;
+        let mut out = vec![0.0_f64; n * n];
+        let mut denominator = 0.0_f64;
+        for &row in rows {
+            let presence = (0..n).filter(|&sample| (row >> sample) & 1 != 0).count();
+            let p = presence as f64 / n as f64;
+            let variance = 2.0_f64 * p * (1.0_f64 - p);
+            if variance <= 1e-12_f64 {
+                continue;
+            }
+            denominator += if method == 1 { variance } else { 1.0 };
+            for i in 0..n {
+                let gi = if (row >> i) & 1 != 0 { 2.0 } else { 0.0 };
+                let xi = (gi - 2.0 * p)
+                    * if method == 1 {
+                        1.0
+                    } else {
+                        1.0 / variance.sqrt()
+                    };
+                for j in 0..n {
+                    let gj = if (row >> j) & 1 != 0 { 2.0 } else { 0.0 };
+                    let xj = (gj - 2.0 * p)
+                        * if method == 1 {
+                            1.0
+                        } else {
+                            1.0 / variance.sqrt()
+                        };
+                    out[i * n + j] += xi * xj;
+                }
+            }
+        }
+        assert!(denominator > 0.0, "fixture needs polymorphic rows");
+        out.iter_mut().for_each(|value| *value /= denominator);
+        out
+    }
+
+    fn assert_sparse_matches_dense(
+        csc: &SparseGrmCsc,
+        dense: &[f64],
+        threshold: f64,
+        tolerance: f64,
+    ) {
+        let n = csc.n_samples;
+        let mut expected = Vec::<(usize, usize, f64)>::new();
+        for col in 0..n {
+            for row in col..n {
+                let value = dense[row * n + col];
+                if row == col || spgrm_keep_value(value, threshold, false) {
+                    expected.push((col, row, value));
+                }
+            }
+        }
+        let mut observed = Vec::<(usize, usize, f64)>::new();
+        for col in 0..n {
+            for idx in csc.col_ptr[col] as usize..csc.col_ptr[col + 1] as usize {
+                observed.push((col, csc.row_indices[idx] as usize, csc.values[idx]));
+            }
+        }
+        assert_eq!(observed.len(), expected.len());
+        for ((actual_col, actual_row, actual), (wanted_col, wanted_row, wanted)) in
+            observed.into_iter().zip(expected)
+        {
+            assert_eq!((actual_col, actual_row), (wanted_col, wanted_row));
+            assert!(
+                (actual - wanted).abs() <= tolerance,
+                "sparse value ({actual_row}, {actual_col}): actual={actual}, expected={wanted}"
+            );
+        }
+    }
+
+    #[test]
+    fn kfile_sparse_core_matches_dense_reference_across_methods_and_thresholds() {
+        Python::initialize();
+        let fixture = KfileFixture::new(&[0b0011, 0b0101, 0b1110, 0b1111, 0]);
+        for method in [1usize, 2usize] {
+            let dense = scalar_kfile_grm(fixture.rows.as_slice(), method);
+            for threshold in [0.05_f64, 0.0_f64, -1.0_f64] {
+                let (path, n, _, effective_kmers) = spgrm_kfile_to_jxgrm_core(
+                    fixture.prefix(),
+                    None,
+                    fixture.out_prefix().as_str(),
+                    method,
+                    threshold,
+                    false,
+                    0.0,
+                    2,
+                    2,
+                    2,
+                    None,
+                    0,
+                )
+                .expect("sparse kfile GRM");
+                assert_eq!(n, 4);
+                assert!(effective_kmers > 0);
+                let csc = crate::cholesky::read_sparse_grm_csc(path.as_str()).expect("read sparse");
+                assert_sparse_matches_dense(&csc, dense.as_slice(), threshold, 1e-5_f64);
+                fs::remove_file(path).expect("remove sparse output");
+            }
+        }
+    }
+
+    #[test]
+    fn kfile_sparse_core_is_deterministic_across_block_batch_and_thread_choices() {
+        Python::initialize();
+        let fixture = KfileFixture::new(&[0b0011, 0b0101, 0b1110, 0b1010, 0b1111, 0]);
+        let mut reference = None::<SparseGrmCsc>;
+        for block_rows in [1usize, 4usize] {
+            for sample_block in [1usize, 2usize, 4usize] {
+                for threads in [1usize, 2usize] {
+                    let out_prefix = fixture
+                        .dir
+                        .join(format!("sparse-{block_rows}-{sample_block}-{threads}"))
+                        .to_string_lossy()
+                        .into_owned();
+                    let (path, _, _, _) = spgrm_kfile_to_jxgrm_core(
+                        fixture.prefix(),
+                        None,
+                        &out_prefix,
+                        1,
+                        -1.0,
+                        false,
+                        0.0,
+                        block_rows,
+                        sample_block,
+                        threads,
+                        None,
+                        0,
+                    )
+                    .expect("sparse kfile GRM");
+                    let csc =
+                        crate::cholesky::read_sparse_grm_csc(path.as_str()).expect("read sparse");
+                    if let Some(expected) = reference.as_ref() {
+                        assert_eq!(csc.n_samples, expected.n_samples);
+                        assert_eq!(csc.nnz, expected.nnz);
+                        assert_eq!(csc.col_ptr, expected.col_ptr);
+                        assert_eq!(csc.row_indices, expected.row_indices);
+                        for (actual, wanted) in csc.values.iter().zip(expected.values.iter()) {
+                            assert!((actual - wanted).abs() <= 1e-5);
+                        }
+                    } else {
+                        reference = Some(csc);
+                    }
+                    fs::remove_file(path).expect("remove sparse output");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kfile_sparse_core_reports_complete_progress_and_cleans_callback_failure() {
+        Python::initialize();
+        let fixture = KfileFixture::new(&[0b0011, 0b0101, 0b1110, 0b1010]);
+        let progress = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        let progress_capture = Arc::clone(&progress);
+        let successful_prefix = fixture.dir.join("progress").to_string_lossy().into_owned();
+        let (successful_path, _, _, _) = Python::attach(|py| -> PyResult<_> {
+            let callback = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+                    progress_capture
+                        .lock()
+                        .unwrap()
+                        .push(args.extract::<(usize, usize)>()?);
+                    Ok::<(), PyErr>(())
+                },
+            )?
+            .unbind()
+            .into_any();
+            spgrm_kfile_to_jxgrm_core(
+                fixture.prefix(),
+                None,
+                &successful_prefix,
+                1,
+                -1.0,
+                false,
+                0.0,
+                1,
+                1,
+                1,
+                Some(&callback),
+                1,
+            )
+            .map_err(map_err_string_to_py)
+        })
+        .expect("sparse kfile GRM progress");
+        let events = progress.lock().unwrap().clone();
+        let n_kmers = fixture.rows.len();
+        let memory_plan = spgrm_resolve_stream_memory_plan(n_kmers, 4, 4, 1, 1, 1, 1);
+        let tasks = build_spgrm_tasks(4, memory_plan.sample_step);
+        let expected_total = n_kmers
+            * build_spgrm_task_batches(
+                tasks.as_slice(),
+                memory_plan.row_step,
+                spgrm_batch_limits(
+                    memory_plan.row_step,
+                    memory_plan.sample_step,
+                    memory_plan.max_decoded_bytes,
+                    1,
+                ),
+            )
+            .len();
+        assert_eq!(events.first().copied(), Some((0, expected_total)));
+        assert_eq!(
+            events.last().copied(),
+            Some((expected_total, expected_total))
+        );
+        assert!(events.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        assert!(events
+            .iter()
+            .all(|&(done, total)| done <= total && total == expected_total));
+        fs::remove_file(successful_path).expect("remove successful sparse output");
+
+        let failed_prefix = fixture.dir.join("failed").to_string_lossy().into_owned();
+        let error = Python::attach(|py| -> PyResult<String> {
+            let callback = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+                    let (done, _total) = args.extract::<(usize, usize)>()?;
+                    if done > 0 {
+                        Err(PyRuntimeError::new_err("intentional callback failure"))
+                    } else {
+                        Ok::<(), PyErr>(())
+                    }
+                },
+            )?
+            .unbind()
+            .into_any();
+            let error = spgrm_kfile_to_jxgrm_core(
+                fixture.prefix(),
+                None,
+                &failed_prefix,
+                1,
+                -1.0,
+                false,
+                0.0,
+                1,
+                1,
+                1,
+                Some(&callback),
+                1,
+            )
+            .expect_err("callback failure must stop sparse kfile GRM");
+            Ok(error)
+        })
+        .expect("capture sparse kfile error");
+        assert!(error.contains("intentional callback failure"), "{error}");
+        assert!(!Path::new(&format!("{failed_prefix}.spgrm")).exists());
+    }
 
     fn pack_site_major_dosages(sample_major: &[Vec<Option<u8>>]) -> Vec<u8> {
         let n_samples = sample_major.len();
