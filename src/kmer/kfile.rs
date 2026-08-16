@@ -49,13 +49,6 @@ fn validate_meta(meta: &KmergeMeta, meta_path: &Path) -> Result<()> {
             meta.matrix_layout
         );
     }
-    if meta.value_type.trim() != "binary_presence" {
-        bail!(
-            "unsupported value type in {}: {}",
-            meta_path.display(),
-            meta.value_type
-        );
-    }
     if meta.bit_order.trim() != "little_bit_order" {
         bail!(
             "unsupported bit order in {}: {}",
@@ -348,6 +341,17 @@ fn validate_grm_parameters(method: usize, maf_threshold: f32) -> Result<()> {
     Ok(())
 }
 
+fn validate_grm_value_type(meta: &KmergeMeta, meta_path: &Path) -> Result<()> {
+    if meta.value_type.trim() != "binary_presence" {
+        bail!(
+            "unsupported GRM value type in {}: {}",
+            meta_path.display(),
+            meta.value_type
+        );
+    }
+    Ok(())
+}
+
 fn validate_grm_selection(sample_indices: &[usize], n_samples_full: usize) -> Result<()> {
     if sample_indices.is_empty() {
         bail!("sample selection is empty");
@@ -495,6 +499,7 @@ impl KfileGrmSource {
     ) -> Result<Self> {
         validate_grm_parameters(method, maf_threshold)?;
         let layout = load_layout(prefix)?;
+        validate_grm_value_type(&layout.meta, &layout.meta_path)?;
         let requested_indices = sample_indices.map(|indices| indices.to_vec());
         let (sample_indices, sample_ids) =
             build_sample_selection(&layout.samples, requested_indices)?;
@@ -803,7 +808,7 @@ pub fn kfile_inspect_py<'py>(py: Python<'py>, prefix: String) -> PyResult<Bound<
 mod tests {
     use super::{
         decode_bsite_chunk, decode_grm_prepared_block_into, maf_from_presence,
-        prepare_grm_bsite_block, KfileGrmSource,
+        prepare_grm_bsite_block, KfileChunkReader, KfileGrmSource,
     };
     use crate::kmer::format::{BsiteHeader, KmergeMeta};
     use std::fs::{self, File};
@@ -995,6 +1000,18 @@ mod tests {
             combined[row * 4 + 2..row * 4 + 4].copy_from_slice(&right[row * 2..row * 2 + 2]);
         }
         assert_eq!(combined, full);
+        fs::remove_dir_all(dir).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn grm_source_requires_binary_presence_without_changing_chunk_reader() {
+        let dir = grm_fixture_dir();
+        let mut meta = valid_grm_meta();
+        meta.value_type = "dosage".to_string();
+        write_grm_fixture(&dir, &meta, VALID_IDV, &[3, 15, 1]);
+        let prefix = dir.join("fixture");
+        assert!(KfileChunkReader::new(prefix.to_string_lossy().into_owned(), None, None).is_ok());
+        assert!(KfileGrmSource::open(&prefix, None, 1, 0.0).is_err());
         fs::remove_dir_all(dir).expect("remove fixture directory");
     }
 
