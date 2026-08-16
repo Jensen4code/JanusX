@@ -10,7 +10,9 @@ use pyo3::BoundObject;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Clone, Debug)]
 struct KfileLayout {
@@ -45,6 +47,13 @@ fn validate_meta(meta: &KmergeMeta, meta_path: &Path) -> Result<()> {
             "unsupported matrix layout in {}: {}",
             meta_path.display(),
             meta.matrix_layout
+        );
+    }
+    if meta.value_type.trim() != "binary_presence" {
+        bail!(
+            "unsupported value type in {}: {}",
+            meta_path.display(),
+            meta.value_type
         );
     }
     if meta.bit_order.trim() != "little_bit_order" {
@@ -287,6 +296,347 @@ fn maf_from_presence(presence: u64, n_samples: usize) -> f32 {
     p.min(1.0 - p)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KfileGrmStageTiming {
+    pub read_ns: u64,
+    pub filter_ns: u64,
+    pub decode_ns: u64,
+}
+
+impl KfileGrmStageTiming {
+    fn add_read(&mut self, elapsed: std::time::Duration) {
+        self.read_ns = self
+            .read_ns
+            .saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+    }
+
+    fn add_filter(&mut self, elapsed: std::time::Duration) {
+        self.filter_ns = self
+            .filter_ns
+            .saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+    }
+
+    fn add_decode(&mut self, elapsed: std::time::Duration) {
+        self.decode_ns = self
+            .decode_ns
+            .saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+    }
+}
+
+pub(crate) struct KfileGrmPreparedBlock {
+    packed: Vec<u8>,
+    retained_row_offsets: Vec<usize>,
+    row_center: Vec<f32>,
+    row_scale: Vec<f32>,
+    pub scanned_rows: usize,
+    pub denominator: f64,
+}
+
+impl KfileGrmPreparedBlock {
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.retained_row_offsets.len()
+    }
+}
+
+fn validate_grm_parameters(method: usize, maf_threshold: f32) -> Result<()> {
+    if method != 1 && method != 2 {
+        bail!("GRM method must be 1 or 2, got {method}");
+    }
+    if !maf_threshold.is_finite() || !(0.0..=0.5).contains(&maf_threshold) {
+        bail!("GRM MAF threshold must be finite and within 0..=0.5, got {maf_threshold}");
+    }
+    Ok(())
+}
+
+fn validate_grm_selection(sample_indices: &[usize], n_samples_full: usize) -> Result<()> {
+    if sample_indices.is_empty() {
+        bail!("sample selection is empty");
+    }
+    let mut seen = HashSet::with_capacity(sample_indices.len());
+    for &index in sample_indices {
+        if index >= n_samples_full {
+            bail!("sample index out of range: {index}");
+        }
+        if !seen.insert(index) {
+            bail!("duplicate sample index: {index}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_grm_bsite_block(
+    bytes: &[u8],
+    n_samples_full: usize,
+    n_rows: usize,
+    sample_indices: &[usize],
+    method: usize,
+    maf_threshold: f32,
+) -> Result<KfileGrmPreparedBlock> {
+    validate_grm_parameters(method, maf_threshold)?;
+    validate_grm_selection(sample_indices, n_samples_full)?;
+    let bytes_per_col = n_samples_full
+        .checked_add(7)
+        .ok_or_else(|| anyhow::anyhow!("sample count overflow"))?
+        / 8;
+    let expected_len = n_rows
+        .checked_mul(bytes_per_col)
+        .ok_or_else(|| anyhow::anyhow!("GRM block payload size overflow"))?;
+    if bytes.len() != expected_len {
+        bail!(
+            "GRM block length mismatch: actual={} expected={}",
+            bytes.len(),
+            expected_len
+        );
+    }
+
+    let selected_n = sample_indices.len();
+    let mut retained_row_offsets = Vec::new();
+    let mut row_center = Vec::new();
+    let mut row_scale = Vec::new();
+    let mut denominator = 0.0f64;
+    for row in 0..n_rows {
+        let packed_row = &bytes[row * bytes_per_col..(row + 1) * bytes_per_col];
+        let presence = sample_indices
+            .iter()
+            .filter(|&&index| ((packed_row[index >> 3] >> (index & 7)) & 1) != 0)
+            .count();
+        let p = presence as f64 / selected_n as f64;
+        let maf = p.min(1.0 - p);
+        let variance = 2.0 * p * (1.0 - p);
+        if maf >= maf_threshold as f64 && variance > 1e-12 {
+            retained_row_offsets.push(row);
+            row_center.push((2.0 * p) as f32);
+            if method == 1 {
+                row_scale.push(1.0);
+                denominator += variance;
+            } else {
+                row_scale.push((1.0 / variance.sqrt()) as f32);
+                denominator += 1.0;
+            }
+        }
+    }
+    Ok(KfileGrmPreparedBlock {
+        packed: bytes.to_vec(),
+        retained_row_offsets,
+        row_center,
+        row_scale,
+        scanned_rows: n_rows,
+        denominator,
+    })
+}
+
+pub(crate) fn decode_grm_prepared_block_into(
+    block: &KfileGrmPreparedBlock,
+    sample_indices: &[usize],
+    out: &mut [f32],
+) -> Result<()> {
+    let required_len = block
+        .retained_rows()
+        .checked_mul(sample_indices.len())
+        .ok_or_else(|| anyhow::anyhow!("GRM decoded output size overflow"))?;
+    if out.len() < required_len {
+        bail!(
+            "GRM decode output is too small: actual={} required={}",
+            out.len(),
+            required_len
+        );
+    }
+    if block.scanned_rows == 0 {
+        if !block.packed.is_empty() {
+            bail!("GRM prepared block has bytes but zero scanned rows");
+        }
+        return Ok(());
+    }
+    if block.packed.len() % block.scanned_rows != 0 {
+        bail!("GRM prepared block has an invalid packed layout");
+    }
+    let bytes_per_col = block.packed.len() / block.scanned_rows;
+    for (decoded_row, &packed_row) in block.retained_row_offsets.iter().enumerate() {
+        if packed_row >= block.scanned_rows {
+            bail!("GRM prepared block has an invalid retained row offset");
+        }
+        let row_bytes = &block.packed[packed_row * bytes_per_col..(packed_row + 1) * bytes_per_col];
+        for (column, &sample_index) in sample_indices.iter().enumerate() {
+            if sample_index / 8 >= bytes_per_col {
+                bail!("sample index out of range for GRM prepared block: {sample_index}");
+            }
+            let genotype = if ((row_bytes[sample_index >> 3] >> (sample_index & 7)) & 1) != 0 {
+                2.0
+            } else {
+                0.0
+            };
+            out[decoded_row * sample_indices.len() + column] =
+                (genotype - block.row_center[decoded_row]) * block.row_scale[decoded_row];
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct KfileGrmSource {
+    layout: KfileLayout,
+    bsite: File,
+    sample_indices: Vec<usize>,
+    sample_ids: Vec<String>,
+    method: usize,
+    maf_threshold: f32,
+    next_row: u64,
+    effective_rows: usize,
+    denominator: f64,
+    stage_timing: KfileGrmStageTiming,
+}
+
+#[allow(dead_code)]
+impl KfileGrmSource {
+    pub(crate) fn open(
+        prefix: &Path,
+        sample_indices: Option<&[usize]>,
+        method: usize,
+        maf_threshold: f32,
+    ) -> Result<Self> {
+        validate_grm_parameters(method, maf_threshold)?;
+        let layout = load_layout(prefix)?;
+        let requested_indices = sample_indices.map(|indices| indices.to_vec());
+        let (sample_indices, sample_ids) =
+            build_sample_selection(&layout.samples, requested_indices)?;
+        let bsite = File::open(&layout.bsite_path).with_context(|| {
+            format!("failed to open bsite file: {}", layout.bsite_path.display())
+        })?;
+        Ok(Self {
+            layout,
+            bsite,
+            sample_indices,
+            sample_ids,
+            method,
+            maf_threshold,
+            next_row: 0,
+            effective_rows: 0,
+            denominator: 0.0,
+            stage_timing: KfileGrmStageTiming::default(),
+        })
+    }
+
+    pub(crate) fn next_prepared_block(
+        &mut self,
+        block_rows: usize,
+    ) -> Result<Option<KfileGrmPreparedBlock>> {
+        if block_rows == 0 {
+            bail!("GRM block_rows must be > 0");
+        }
+        if self.next_row >= self.layout.meta.n_kmers {
+            return Ok(None);
+        }
+        let rows_left = self.layout.meta.n_kmers - self.next_row;
+        let n_rows = usize::try_from(rows_left.min(block_rows as u64))
+            .context("GRM block row count does not fit usize")?;
+        let bytes_per_col = usize::try_from(self.layout.meta.bytes_per_col)
+            .context("bytes_per_col does not fit usize")?;
+        let byte_len = n_rows
+            .checked_mul(bytes_per_col)
+            .ok_or_else(|| anyhow::anyhow!("GRM block payload size overflow"))?;
+        let offset = (BSITE_HEADER_SIZE as u64)
+            .checked_add(
+                self.next_row
+                    .checked_mul(self.layout.meta.bytes_per_col)
+                    .ok_or_else(|| anyhow::anyhow!("GRM bsite offset overflow"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("GRM bsite offset overflow"))?;
+        self.bsite
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed to seek {}", self.layout.bsite_path.display()))?;
+        let mut bytes = vec![0u8; byte_len];
+        let read_started = Instant::now();
+        self.bsite
+            .read_exact(&mut bytes)
+            .with_context(|| format!("failed to read {}", self.layout.bsite_path.display()))?;
+        self.stage_timing.add_read(read_started.elapsed());
+
+        let filter_started = Instant::now();
+        let block = prepare_grm_bsite_block(
+            &bytes,
+            self.n_samples_full(),
+            n_rows,
+            &self.sample_indices,
+            self.method,
+            self.maf_threshold,
+        )?;
+        self.stage_timing.add_filter(filter_started.elapsed());
+        self.next_row += n_rows as u64;
+        self.effective_rows = self
+            .effective_rows
+            .checked_add(block.retained_rows())
+            .ok_or_else(|| anyhow::anyhow!("effective GRM row count overflow"))?;
+        self.denominator += block.denominator;
+        Ok(Some(block))
+    }
+
+    pub(crate) fn decode_block_into(
+        &mut self,
+        block: &KfileGrmPreparedBlock,
+        selected_positions: Range<usize>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        if selected_positions.start > selected_positions.end
+            || selected_positions.end > self.sample_indices.len()
+        {
+            bail!("GRM selected sample positions are out of range");
+        }
+        let decode_started = Instant::now();
+        decode_grm_prepared_block_into(block, &self.sample_indices[selected_positions], out)?;
+        self.stage_timing.add_decode(decode_started.elapsed());
+        Ok(())
+    }
+
+    pub(crate) fn reset_scan(&mut self) -> Result<()> {
+        self.bsite
+            .seek(SeekFrom::Start(BSITE_HEADER_SIZE as u64))
+            .with_context(|| format!("failed to reset {}", self.layout.bsite_path.display()))?;
+        self.next_row = 0;
+        self.effective_rows = 0;
+        self.denominator = 0.0;
+        Ok(())
+    }
+
+    pub(crate) fn reset_timing(&mut self) {
+        self.stage_timing = KfileGrmStageTiming::default();
+    }
+
+    pub(crate) fn n_samples(&self) -> usize {
+        self.sample_indices.len()
+    }
+
+    pub(crate) fn n_samples_full(&self) -> usize {
+        self.layout.meta.n_samples as usize
+    }
+
+    pub(crate) fn n_kmers(&self) -> u64 {
+        self.layout.meta.n_kmers
+    }
+
+    pub(crate) fn sample_indices(&self) -> &[usize] {
+        &self.sample_indices
+    }
+
+    pub(crate) fn sample_ids(&self) -> &[String] {
+        &self.sample_ids
+    }
+
+    pub(crate) fn scanned_rows(&self) -> usize {
+        self.next_row as usize
+    }
+
+    pub(crate) fn effective_rows(&self) -> usize {
+        self.effective_rows
+    }
+
+    pub(crate) fn denominator(&self) -> f64 {
+        self.denominator
+    }
+
+    pub(crate) fn stage_timing(&self) -> KfileGrmStageTiming {
+        self.stage_timing
+    }
+}
+
 #[pyclass]
 pub struct KfileChunkReader {
     bsite: File,
@@ -451,7 +801,102 @@ pub fn kfile_inspect_py<'py>(py: Python<'py>, prefix: String) -> PyResult<Bound<
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_bsite_chunk, maf_from_presence};
+    use super::{
+        decode_bsite_chunk, decode_grm_prepared_block_into, maf_from_presence,
+        prepare_grm_bsite_block, KfileGrmSource,
+    };
+    use crate::kmer::format::{BsiteHeader, KmergeMeta};
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn grm_fixture_dir() -> PathBuf {
+        let unique = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "janusx-kfile-grm-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos(),
+            unique
+        ));
+        fs::create_dir(&path).expect("create fixture directory");
+        path
+    }
+
+    fn write_grm_fixture(dir: &Path, meta: &KmergeMeta, idv_rows: &str, payload: &[u8]) {
+        let prefix = dir.join("fixture");
+        fs::write(
+            PathBuf::from(format!("{}.meta.json", prefix.display())),
+            serde_json::to_vec(meta).expect("serialize metadata"),
+        )
+        .expect("write metadata");
+        fs::write(dir.join(&meta.idv_file), idv_rows).expect("write idv");
+        let mut bsite = File::create(dir.join(&meta.bsite_file)).expect("create bsite");
+        BsiteHeader {
+            n_samples: meta.n_samples,
+            n_kmers: meta.n_kmers,
+            bytes_per_col: meta.bytes_per_col,
+        }
+        .write_to(&mut bsite)
+        .expect("write bsite header");
+        bsite.write_all(payload).expect("write bsite payload");
+    }
+
+    fn valid_grm_meta() -> KmergeMeta {
+        KmergeMeta {
+            format: "janusx-kmer-bitmatrix-v1".to_string(),
+            k: 31,
+            n_samples: 4,
+            n_kmers: 3,
+            bytes_per_col: 1,
+            encoding: "acgt_2bit".to_string(),
+            canonical: true,
+            matrix_layout: "column_major_bitset".to_string(),
+            value_type: "binary_presence".to_string(),
+            bit_order: "little_bit_order".to_string(),
+            bkmer_file: "fixture.bkmer".to_string(),
+            bsite_file: "fixture.bsite".to_string(),
+            idv_file: "fixture.idv".to_string(),
+            min_count: 1,
+            min_presence_rate: 0.0,
+            max_presence_rate: 1.0,
+            bucket_bits: 8,
+            compression: "none".to_string(),
+        }
+    }
+
+    const VALID_IDV: &str =
+        "#idx\tsample_id\tkmc_prefix\n0\ts0\tp0\n1\ts1\tp1\n2\ts2\tp2\n3\ts3\tp3\n";
+
+    #[test]
+    fn grm_block_filters_on_selected_sample_maf_and_centers_zero_two_dosage() {
+        // rows: 0011, 1111, 0001 over four selected samples
+        let bytes = [0b0000_0011, 0b0000_1111, 0b0000_0001];
+        let block = prepare_grm_bsite_block(&bytes, 4, 3, &[0, 1, 2, 3], 1, 0.25).unwrap();
+        let mut values = vec![0.0; block.retained_rows() * 4];
+        decode_grm_prepared_block_into(&block, &[0, 1, 2, 3], &mut values).unwrap();
+        assert_eq!(block.retained_rows(), 2);
+        assert_eq!(block.scanned_rows, 3);
+        assert_eq!(values, vec![1.0, 1.0, -1.0, -1.0, 1.5, -0.5, -0.5, -0.5]);
+        assert!((block.denominator - 0.875).abs() < 1e-12);
+    }
+
+    #[test]
+    fn grm_block_method_two_excludes_monomorphic_rows_and_standardizes() {
+        let bytes = [0b0000_0011, 0b0000_1111];
+        let block = prepare_grm_bsite_block(&bytes, 4, 2, &[3, 1, 0, 2], 2, 0.0).unwrap();
+        let mut values = vec![0.0; block.retained_rows() * 4];
+        decode_grm_prepared_block_into(&block, &[3, 1, 0, 2], &mut values).unwrap();
+        assert_eq!(block.retained_rows(), 1);
+        assert_eq!(block.denominator, 1.0);
+        assert_eq!(values.len(), 4);
+        assert!((values.iter().map(|x| x * x).sum::<f32>() - 8.0).abs() < 1e-5);
+    }
 
     #[test]
     fn decodes_little_endian_presence_bits_to_dosage() {
@@ -484,5 +929,128 @@ mod tests {
             decode_bsite_chunk(&[0b0000_0001, 0b0000_0010], 2, 2, 7, &[]).expect("decode rows");
         assert_eq!(dosage, vec![2.0, 0.0, 0.0, 2.0]);
         assert_eq!(presence, vec![1, 1]);
+    }
+
+    #[test]
+    fn grm_source_accepts_prefix_or_metadata_and_resets_scan_without_resetting_timing() {
+        let dir = grm_fixture_dir();
+        let meta = valid_grm_meta();
+        write_grm_fixture(
+            &dir,
+            &meta,
+            VALID_IDV,
+            &[0b0000_0011, 0b0000_1111, 0b0000_0001],
+        );
+        let prefix = dir.join("fixture");
+        let meta_path = PathBuf::from(format!("{}.meta.json", prefix.display()));
+        let mut from_prefix = KfileGrmSource::open(&prefix, None, 1, 0.25).unwrap();
+        let from_meta = KfileGrmSource::open(&meta_path, None, 1, 0.25).unwrap();
+        assert_eq!(from_prefix.sample_ids(), from_meta.sample_ids());
+        assert_eq!(from_prefix.n_samples(), from_meta.n_samples());
+
+        let first = from_prefix.next_prepared_block(3).unwrap().unwrap();
+        let mut first_values = vec![0.0; first.retained_rows() * 4];
+        from_prefix
+            .decode_block_into(&first, 0..4, &mut first_values)
+            .unwrap();
+        let timing_before_reset = from_prefix.stage_timing();
+        from_prefix.reset_scan().unwrap();
+        assert_eq!(from_prefix.stage_timing(), timing_before_reset);
+        assert_eq!(from_prefix.scanned_rows(), 0);
+        assert_eq!(from_prefix.effective_rows(), 0);
+        assert_eq!(from_prefix.denominator(), 0.0);
+        let repeated = from_prefix.next_prepared_block(3).unwrap().unwrap();
+        let mut repeated_values = vec![0.0; repeated.retained_rows() * 4];
+        from_prefix
+            .decode_block_into(&repeated, 0..4, &mut repeated_values)
+            .unwrap();
+        assert_eq!(first_values, repeated_values);
+        assert_eq!(first.denominator, repeated.denominator);
+        fs::remove_dir_all(dir).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn grm_source_decodes_selected_position_stripes_in_grm_sample_order() {
+        let dir = grm_fixture_dir();
+        let meta = valid_grm_meta();
+        write_grm_fixture(
+            &dir,
+            &meta,
+            VALID_IDV,
+            &[0b0000_0011, 0b0000_0001, 0b0000_1110],
+        );
+        let prefix = dir.join("fixture");
+        let mut source = KfileGrmSource::open(&prefix, Some(&[3, 1, 0, 2]), 1, 0.0).unwrap();
+        let block = source.next_prepared_block(3).unwrap().unwrap();
+        let rows = block.retained_rows();
+        let mut full = vec![0.0; rows * 4];
+        let mut left = vec![0.0; rows * 2];
+        let mut right = vec![0.0; rows * 2];
+        source.decode_block_into(&block, 0..4, &mut full).unwrap();
+        source.decode_block_into(&block, 0..2, &mut left).unwrap();
+        source.decode_block_into(&block, 2..4, &mut right).unwrap();
+        let mut combined = vec![0.0; rows * 4];
+        for row in 0..rows {
+            combined[row * 4..row * 4 + 2].copy_from_slice(&left[row * 2..row * 2 + 2]);
+            combined[row * 4 + 2..row * 4 + 4].copy_from_slice(&right[row * 2..row * 2 + 2]);
+        }
+        assert_eq!(combined, full);
+        fs::remove_dir_all(dir).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn grm_source_rejects_invalid_metadata_and_selection() {
+        let idv_cases = [
+            (
+                "duplicate idv sample",
+                "#idx\tsample_id\tkmc_prefix\n0\ts0\tp0\n1\ts0\tp1\n2\ts2\tp2\n3\ts3\tp3\n",
+            ),
+            (
+                "non-contiguous idv index",
+                "#idx\tsample_id\tkmc_prefix\n0\ts0\tp0\n2\ts1\tp1\n3\ts2\tp2\n4\ts3\tp3\n",
+            ),
+        ];
+        for (_name, idv_rows) in idv_cases {
+            let dir = grm_fixture_dir();
+            let meta = valid_grm_meta();
+            write_grm_fixture(&dir, &meta, idv_rows, &[3, 15, 1]);
+            assert!(KfileGrmSource::open(&dir.join("fixture"), None, 1, 0.0).is_err());
+            fs::remove_dir_all(dir).expect("remove fixture directory");
+        }
+
+        for (name, field, value) in [
+            ("non-binary value type", "value_type", "dosage"),
+            ("unsupported bit order", "bit_order", "big_bit_order"),
+            ("unsupported compression", "compression", "zstd"),
+        ] {
+            let dir = grm_fixture_dir();
+            let mut meta = valid_grm_meta();
+            match field {
+                "value_type" => meta.value_type = value.to_string(),
+                "bit_order" => meta.bit_order = value.to_string(),
+                "compression" => meta.compression = value.to_string(),
+                _ => unreachable!("unknown metadata field"),
+            }
+            write_grm_fixture(&dir, &meta, VALID_IDV, &[3, 15, 1]);
+            assert!(
+                KfileGrmSource::open(&dir.join("fixture"), None, 1, 0.0).is_err(),
+                "{name} must fail"
+            );
+            fs::remove_dir_all(dir).expect("remove fixture directory");
+        }
+
+        let dir = grm_fixture_dir();
+        let meta = valid_grm_meta();
+        write_grm_fixture(&dir, &meta, VALID_IDV, &[3, 15, 1]);
+        let prefix = dir.join("fixture");
+        assert!(KfileGrmSource::open(&prefix, None, 3, 0.0).is_err());
+        assert!(KfileGrmSource::open(&prefix, None, 1, -0.01).is_err());
+        assert!(KfileGrmSource::open(&prefix, None, 1, 0.51).is_err());
+        assert!(KfileGrmSource::open(&prefix, Some(&[0, 0]), 1, 0.0).is_err());
+        assert!(KfileGrmSource::open(&prefix, Some(&[4]), 1, 0.0).is_err());
+        fs::remove_file(dir.join("fixture.bsite")).expect("remove bsite");
+        write_grm_fixture(&dir, &meta, VALID_IDV, &[3, 15]);
+        assert!(KfileGrmSource::open(&prefix, None, 1, 0.0).is_err());
+        fs::remove_dir_all(dir).expect("remove fixture directory");
     }
 }
