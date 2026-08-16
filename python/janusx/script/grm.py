@@ -122,6 +122,22 @@ except Exception:
     _spgrm_dense_f32_to_jxgrm = None
     _spgrm_dense_npy_to_jxgrm = None
 
+try:
+    from janusx.janusx import (
+        grm_kfile_f32 as _grm_kfile_f32,
+        grm_kfile_f32_to_npy as _grm_kfile_f32_to_npy,
+        kfile_inspect as _kfile_inspect,
+    )
+except Exception:
+    _grm_kfile_f32 = None
+    _grm_kfile_f32_to_npy = None
+    _kfile_inspect = None
+
+try:
+    from janusx.janusx import spgrm_kfile_to_jxgrm as _spgrm_kfile_to_jxgrm
+except Exception:
+    _spgrm_kfile_to_jxgrm = None
+
 
 DEFAULT_BED_MEMORY_GB = 1.0
 _GRM_AUTO_MEM_DENSE_BLOCK_ROWS = 4096
@@ -1053,6 +1069,7 @@ def _write_sparse_grm_meta(
     het_threshold: Union[float, None],
     snps_only: bool,
     dense_grm_path: Union[str, None] = None,
+    extra_meta: dict[str, object] | None = None,
 ) -> None:
     meta = {
         "abs_threshold": False,
@@ -1077,8 +1094,219 @@ def _write_sparse_grm_meta(
         "snps_only": bool(snps_only),
         "source": str(source),
     }
+    if extra_meta:
+        collisions = sorted(set(meta).intersection(extra_meta))
+        if collisions:
+            raise ValueError(
+                "Sparse GRM metadata extension collides with reserved keys: "
+                + ", ".join(collisions)
+            )
+        meta.update(dict(extra_meta))
     with open(f"{sparse_path}.meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, ensure_ascii=True, sort_keys=True)
+
+
+def _resolve_kfile_grm_prefix(path: str) -> str:
+    value = str(path).strip()
+    if value.lower().endswith(".meta.json"):
+        return value[: -len(".meta.json")]
+    return value
+
+
+def _remove_kfile_grm_outputs(paths: list[str]) -> None:
+    for raw_path in paths:
+        path = str(raw_path)
+        for candidate in (path, f"{path}.id", f"{path}.meta.json"):
+            try:
+                if os.path.isfile(candidate):
+                    os.remove(candidate)
+            except OSError:
+                pass
+
+
+def _kfile_progress_adapter(total: int, desc: str):
+    pbar = ProgressAdapter(
+        total=max(1, int(total)),
+        desc=str(desc),
+        emit_done=False,
+        force_animate=True,
+    )
+    state = {"done": 0, "total": max(1, int(total))}
+
+    def callback(done: int, callback_total: int) -> None:
+        new_total = max(1, int(callback_total))
+        if new_total != state["total"]:
+            pbar.set_total(new_total)
+            state["total"] = new_total
+        current = min(max(0, int(done)), new_total)
+        if current > state["done"]:
+            pbar.update(current - state["done"])
+            state["done"] = current
+
+    return pbar, callback
+
+
+def _build_grm_from_kfile(
+    *,
+    kfile: str,
+    outprefix: str,
+    method: int,
+    maf_threshold: float,
+    sparse_cutoff: float | None,
+    txt: bool,
+    block_rows: int,
+    threads: int,
+    stage_timing: bool,
+    logger,
+) -> tuple[str, np.ndarray, int, int | None]:
+    """Build a dense or sparse GRM directly from a native JanusX kfile."""
+    prefix = _resolve_kfile_grm_prefix(kfile)
+    if _kfile_inspect is None:
+        raise RuntimeError(
+            "Native kfile inspection is unavailable. Rebuild/reinstall JanusX."
+        )
+    info = dict(_kfile_inspect(prefix))
+    sample_ids = np.asarray(info.get("sample_ids", []), dtype=str).reshape(-1)
+    n_kmers = int(info.get("n_kmers", 0))
+    if sample_ids.size <= 0:
+        raise RuntimeError("kfile contains no samples")
+    if n_kmers <= 0:
+        raise RuntimeError("kfile contains no k-mer rows")
+    if int(method) not in (1, 2):
+        raise ValueError(f"GRM method must be 1 or 2, got {method}")
+    if not np.isfinite(float(maf_threshold)) or not (0.0 <= float(maf_threshold) <= 0.5):
+        raise ValueError(
+            f"GRM MAF threshold must be finite and within 0..=0.5, got {maf_threshold}"
+        )
+
+    method_tag = _grm_method_tag(int(method))
+    output_base = f"{outprefix}.{method_tag}"
+    output_paths = [
+        output_base,
+        f"{output_base}.spgrm",
+        f"{output_base}.npy",
+        f"{output_base}.txt",
+    ]
+
+    if sparse_cutoff is not None:
+        if not np.isfinite(float(sparse_cutoff)):
+            raise ValueError(f"Sparse GRM cutoff must be finite, got {sparse_cutoff}")
+        if _spgrm_kfile_to_jxgrm is None:
+            raise RuntimeError(
+                "Native kfile sparse GRM is unavailable. Rebuild/reinstall JanusX."
+            )
+        pbar, progress_cb = _kfile_progress_adapter(n_kmers, "Sparse GRM (kfile)")
+        started = time.monotonic()
+        try:
+            with _spgrm_timing_env(bool(stage_timing)):
+                written_path, sparse_n, sparse_nnz, effective_kmers = _spgrm_kfile_to_jxgrm(
+                    prefix,
+                    out_prefix=output_base,
+                    method=int(method),
+                    threshold=float(sparse_cutoff),
+                    maf_threshold=float(maf_threshold),
+                    block_rows=max(1, int(block_rows)),
+                    sample_block=0,
+                    threads=max(1, int(threads)),
+                    progress_callback=progress_cb,
+                    progress_every=max(1, int(block_rows)),
+                )
+            written_path = str(written_path)
+            if int(sparse_n) != int(sample_ids.size):
+                raise RuntimeError(
+                    f"Sparse GRM sample count mismatch: sparse={int(sparse_n)}, "
+                    f"expected={int(sample_ids.size)}"
+                )
+            _write_sparse_grm_meta(
+                written_path,
+                cutoff=float(sparse_cutoff),
+                source="kfile",
+                method=int(method),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=None,
+                het_threshold=None,
+                snps_only=False,
+                extra_meta={
+                    "source_path": str(kfile),
+                    "dosage_encoding": "0/2",
+                    "input_kmers": int(n_kmers),
+                    "effective_kmers": int(effective_kmers),
+                    "selected_samples": int(sample_ids.size),
+                },
+            )
+            np.savetxt(f"{written_path}.id", sample_ids, fmt="%s")
+            log_success(
+                logger,
+                f"Sparse GRM (kfile, NNZ: {int(sparse_nnz)}) ...Finished "
+                f"[{format_elapsed(max(0.0, time.monotonic() - started))}]",
+                force_color=True,
+            )
+            return written_path, sample_ids, int(effective_kmers), int(sparse_nnz)
+        except Exception:
+            _remove_kfile_grm_outputs(output_paths)
+            raise
+        finally:
+            pbar.finish()
+            pbar.close()
+
+    if _grm_kfile_f32 is None or _grm_kfile_f32_to_npy is None:
+        raise RuntimeError(
+            "Native kfile dense GRM is unavailable. Rebuild/reinstall JanusX."
+        )
+    pbar, progress_cb = _kfile_progress_adapter(n_kmers, "GRM (kfile)")
+    started = time.monotonic()
+    try:
+        if bool(txt):
+            matrix, effective_kmers, native_ids = _grm_kfile_f32(
+                prefix,
+                method=int(method),
+                maf_threshold=float(maf_threshold),
+                block_rows=max(1, int(block_rows)),
+                threads=max(1, int(threads)),
+                stage_timing=bool(stage_timing),
+                progress_callback=progress_cb,
+                progress_every=max(1, int(block_rows)),
+            )
+            matrix_path = f"{output_base}.txt"
+            matrix_array = np.ascontiguousarray(np.asarray(matrix, dtype=np.float32))
+            n_samples = int(matrix_array.shape[0]) if matrix_array.ndim == 2 else 0
+            if matrix_array.shape != (n_samples, n_samples):
+                raise RuntimeError(
+                    f"kfile dense GRM shape mismatch: got {matrix_array.shape}, "
+                    f"expected {(int(n_samples), int(n_samples))}"
+                )
+            np.savetxt(matrix_path, matrix_array, fmt="%.6f")
+        else:
+            matrix_path = f"{output_base}.npy"
+            effective_kmers, n_samples, native_ids = _grm_kfile_f32_to_npy(
+                prefix,
+                matrix_path,
+                method=int(method),
+                maf_threshold=float(maf_threshold),
+                block_rows=max(1, int(block_rows)),
+                threads=max(1, int(threads)),
+                stage_timing=bool(stage_timing),
+                progress_callback=progress_cb,
+                progress_every=max(1, int(block_rows)),
+            )
+    except Exception:
+        _remove_kfile_grm_outputs(output_paths)
+        raise
+    finally:
+        pbar.finish()
+        pbar.close()
+    native_ids = np.asarray(native_ids, dtype=str).reshape(-1)
+    if int(n_samples) != int(sample_ids.size) or native_ids.tolist() != sample_ids.tolist():
+        _remove_kfile_grm_outputs(output_paths)
+        raise RuntimeError("kfile dense GRM sample IDs do not match kfile inspection")
+    np.savetxt(f"{matrix_path}.id", sample_ids, fmt="%s")
+    log_success(
+        logger,
+        f"GRM (kfile, Effective k-mers: {int(effective_kmers)}) ...Finished "
+        f"[{format_elapsed(max(0.0, time.monotonic() - started))}]",
+        force_color=True,
+    )
+    return str(matrix_path), sample_ids, int(effective_kmers), None
 
 
 def _select_cli_grm_backend() -> tuple[str, str]:
@@ -1896,6 +2124,10 @@ def main(log: bool = True):
             "Requires sibling `<grm>.id` and must be used with `-sparse` to emit `.spgrm`."
         ),
     )
+    geno_group.add_argument(
+        "-kfile", "--kfile", type=str,
+        help="Input JanusX kfile prefix (.meta.json/.bkmer/.bsite/.idv).",
+    )
 
     # ------------------------------------------------------------------
     # Optional arguments
@@ -2005,6 +2237,7 @@ def main(log: bool = True):
             hmp=getattr(args, "hmp", None),
             file=getattr(args, "file", None),
             bfile=getattr(args, "bfile", None),
+            kfile=getattr(args, "kfile", None),
             prefix=None,
         )
     out_dir, outprefix, out_stem = apply_output_prefix_compat(args, auto_prefix)
@@ -2012,6 +2245,8 @@ def main(log: bool = True):
     if args.part is not None or args.part_group is not None:
         if getattr(args, "dense_grm", None):
             raise RuntimeError("`-part`/`-part-group` is only supported for genotype-driven GRM builds, not `-k/--dense-grm` input.")
+        if getattr(args, "kfile", None):
+            raise RuntimeError("`-part`/`-part-group` is not supported with `-kfile/--kfile`.")
         if args.sparse is not None:
             raise RuntimeError("`-part`/`-part-group` cannot be combined with `-sparse/--sparse`.")
         if bool(args.txt):
@@ -2093,6 +2328,10 @@ def main(log: bool = True):
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
+    elif getattr(args, "kfile", None):
+        # Native kfile inspection validates the complete prefix and gives a
+        # precise error for missing sidecars; the prefix itself is not a file.
+        checks.append(True)
     else:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     if not ensure_all_true(checks):
@@ -2163,6 +2402,86 @@ def main(log: bool = True):
             f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
         )
         log_success(logger, endinfo)
+        return
+
+    # ------------------------------------------------------------------
+    # Native kfile GRM route (no BED materialization or Python fallback)
+    # ------------------------------------------------------------------
+    if getattr(args, "kfile", None):
+        if int(args.method) not in (1, 2):
+            raise RuntimeError(f"GRM method must be 1 or 2, got {args.method}")
+        if not np.isfinite(float(args.maf)) or not (0.0 <= float(args.maf) <= 0.5):
+            raise RuntimeError(
+                f"GRM MAF threshold must be finite and within 0..=0.5, got {args.maf}"
+            )
+        kfile_prefix = _resolve_kfile_grm_prefix(str(gfile))
+        kfile_info = dict(_kfile_inspect(kfile_prefix)) if _kfile_inspect is not None else None
+        if kfile_info is None:
+            raise RuntimeError(
+                "Native kfile inspection is unavailable. Rebuild/reinstall JanusX."
+            )
+        n_kmers = int(kfile_info.get("n_kmers", 0))
+        n_samples_kfile = int(kfile_info.get("n_samples", 0))
+        if n_kmers <= 0 or n_samples_kfile <= 0:
+            raise RuntimeError("kfile metadata contains no k-mer rows or samples")
+        if args.memory is None:
+            auto_memory_gb, auto_memory_reason = _resolve_grm_auto_decode_memory_gb(
+                n_samples_total=n_samples_kfile,
+                n_markers_total=n_kmers,
+                sparse=(args.sparse is not None),
+            )
+            args.memory = float(auto_memory_gb)
+            if defer_config_emit:
+                _emit_grm_configuration(
+                    logger=logger,
+                    gfile=gfile,
+                    args=args,
+                    requested_threads=int(requested_threads),
+                    detected_threads=int(detected_threads),
+                    outprefix=outprefix,
+                    auto_memory_requested=bool(memory_auto_requested),
+                    memory_resolved=True,
+                )
+            _log_verbose_or_file_only(
+                logger,
+                verbose=bool(getattr(args, "verbose", False)),
+                msg=(
+                    "Kfile GRM decode memory auto: "
+                    f"{float(args.memory):.2f} GB (reason: {str(auto_memory_reason).strip() or 'route-aware default'})."
+                ),
+            )
+        args.memory = _normalize_memory_gb(args.memory)
+        memory_mb = _memory_gb_to_mb(args.memory)
+        kfile_block_rows = _decode_block_rows_from_memory_mb(
+            n_samples_kfile,
+            n_kmers,
+            memory_mb,
+            streaming=(args.sparse is not None),
+        )
+        _log_verbose_or_file_only(
+            logger,
+            verbose=bool(getattr(args, "verbose", False)),
+            msg="Resolved kfile GRM decode plan: block_rows=%s, n_samples=%s, n_kmers=%s.",
+            args=(int(kfile_block_rows), int(n_samples_kfile), int(n_kmers)),
+        )
+        _build_grm_from_kfile(
+            kfile=str(gfile),
+            outprefix=str(outprefix),
+            method=int(args.method),
+            maf_threshold=float(args.maf),
+            sparse_cutoff=(None if args.sparse is None else float(args.sparse)),
+            txt=bool(args.txt),
+            block_rows=int(kfile_block_rows),
+            threads=int(args.thread),
+            stage_timing=bool(args.stage_timing),
+            logger=logger,
+        )
+        lt = time.localtime()
+        log_success(
+            logger,
+            f"\nFinished GRM calculation. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
+            f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}",
+        )
         return
 
     # ------------------------------------------------------------------
