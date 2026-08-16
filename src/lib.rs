@@ -251,9 +251,10 @@ use glm::{
 use glm2::lm2_stream_bed_to_tsv;
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
-    grm_bed_f64_from_meta, grm_packed_bed_f32, grm_packed_bed_f64, grm_packed_f32,
-    grm_packed_f32_with_stats, grm_packed_f64, grm_packed_f64_with_stats, grm_sim_bench_f32,
-    grm_stream_bed_f32, grm_stream_bed_f32_to_npy, grm_stream_bed_f64, grm_stream_bed_f64_to_npy,
+    grm_bed_f64_from_meta, grm_kfile_f32, grm_kfile_f32_to_npy, grm_packed_bed_f32,
+    grm_packed_bed_f64, grm_packed_f32, grm_packed_f32_with_stats, grm_packed_f64,
+    grm_packed_f64_with_stats, grm_sim_bench_f32, grm_stream_bed_f32, grm_stream_bed_f32_to_npy,
+    grm_stream_bed_f64, grm_stream_bed_f64_to_npy,
 };
 use gstats::{
     gstats_bed_individual_stats, gstats_bed_joint_stats, gstats_bed_ldscore, gstats_bed_site_stats,
@@ -318,7 +319,8 @@ use sim_g2p::g2p_simulate_py;
 use spgrm::{
     grm_bed_f32_row_band_from_meta, grm_bed_f32_row_band_from_meta_to_npy,
     grm_bed_f32_tiled_from_meta_to_npy, spgrm_bed_to_jxgrm, spgrm_bed_to_jxgrm_from_meta,
-    spgrm_dense_f32_to_jxgrm, spgrm_dense_npy_to_jxgrm, spgrm_packed_to_jxgrm,
+    spgrm_dense_f32_to_jxgrm, spgrm_dense_npy_to_jxgrm, spgrm_kfile_to_jxgrm,
+    spgrm_packed_to_jxgrm,
 };
 use splmm::{
     splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_assoc_pcg_dense_f32,
@@ -743,11 +745,14 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(spgrm_packed_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm_from_meta, m)?)?;
+    m.add_function(wrap_pyfunction!(spgrm_kfile_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(grm_bed_f32_row_band_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(grm_bed_f32_row_band_from_meta_to_npy, m)?)?;
     m.add_function(wrap_pyfunction!(grm_bed_f32_tiled_from_meta_to_npy, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_dense_f32_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_dense_npy_to_jxgrm, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_kfile_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_kfile_f32_to_npy, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_corr_py, m)?)?;
     m.add_function(wrap_pyfunction!(score_cont_mean_diff_corr_batch_py, m)?)?;
