@@ -56,6 +56,7 @@ import warnings
 import multiprocessing as mp
 import concurrent.futures as cf
 import textwrap
+import json
 from dataclasses import dataclass
 from shutil import get_terminal_size
 from datetime import datetime
@@ -1360,6 +1361,34 @@ def _align_pheno_to_sample_order(
     if pheno.index.equals(sid_index):
         return pheno, ids
     return pheno.reindex(sid_index), ids
+
+
+def _align_kfile_pheno_to_sample_order(
+    pheno: pd.DataFrame,
+    sample_ids: np.ndarray,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Align k-file phenotype rows by intersection, like the BED workflow.
+
+    Unlike the generic model helpers, k-file preparation happens before a
+    trait mask is available.  Reindexing to every k-file ID would therefore
+    manufacture all-NaN rows for samples absent from the phenotype table and
+    report an incorrect ``common`` count.  Keep only IDs present in both
+    inputs, preserving k-file order; per-trait finite-value filtering remains
+    the responsibility of the scan stage.
+    """
+    ids = np.asarray(sample_ids, dtype=str).reshape(-1)
+    pheno_use = pheno.copy()
+    pheno_use.index = pheno_use.index.astype(str)
+    pheno_pos = {sid: idx for idx, sid in enumerate(pheno_use.index.tolist())}
+    common_ids = [sid for sid in ids.tolist() if sid in pheno_pos]
+    if len(common_ids) == 0:
+        return pheno_use.iloc[0:0].copy(), np.asarray([], dtype=str)
+    # ``pheno_pos`` is unique after load_phenotype's duplicate-ID handling,
+    # but use positional selection to avoid any accidental label coercion.
+    take = np.asarray([pheno_pos[sid] for sid in common_ids], dtype=np.int64)
+    aligned = pheno_use.iloc[take].copy()
+    aligned.index = pd.Index(common_ids, dtype=str)
+    return aligned, np.asarray(common_ids, dtype=str)
 
 
 def _looks_sample_header_token(token: object) -> bool:
@@ -4762,6 +4791,194 @@ def _load_kfile_external_grm(
     return np.ascontiguousarray(matrix[np.ix_(order, order)]), np.asarray(ids, dtype=str)
 
 
+def _kfile_sparse_sample_hash(sample_ids: np.ndarray) -> str:
+    """Return a stable, order-sensitive cache key for k-file sample IDs."""
+    ids = np.asarray(sample_ids, dtype=str).reshape(-1)
+    digest = hashlib.blake2b(digest_size=12)
+    for sid in ids.tolist():
+        encoded = str(sid).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little", signed=False))
+        digest.update(encoded)
+    digest.update(int(ids.shape[0]).to_bytes(8, "little", signed=False))
+    return digest.hexdigest()
+
+
+def _ensure_kfile_sparse_grm(
+    *,
+    dense_grm: np.ndarray,
+    sample_ids: np.ndarray,
+    out_prefix: str,
+    cutoff: float,
+    method: int = 1,
+    dense_grm_path: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    use_spinner: bool = False,
+) -> str:
+    """Persist one cropped dense GRM as a reusable SparseLMM GRM.
+
+    The k-file route has no BED prefix that can be handed to the shared BED
+    sparse-GRM builder.  More importantly, the phenotype/covariate alignment
+    may leave only a subset of the k-file samples.  This helper therefore
+    receives the already aligned dense matrix, writes the exact subset once,
+    and stores an ID sidecar so every trait can select its finite phenotype
+    subset without rebuilding the sparse matrix.
+    """
+    ids = np.asarray(sample_ids, dtype=str).reshape(-1)
+    matrix = np.asarray(dense_grm, dtype=np.float32)
+    if matrix.ndim != 2 or int(matrix.shape[0]) != int(matrix.shape[1]):
+        raise ValueError(f"k-file dense GRM must be square, got shape={matrix.shape}")
+    if int(matrix.shape[0]) != int(ids.shape[0]):
+        raise ValueError(
+            "k-file dense GRM/sample ID mismatch: "
+            f"matrix_n={int(matrix.shape[0])}, ids_n={int(ids.shape[0])}"
+        )
+    if ids.shape[0] == 0:
+        raise ValueError("k-file sparse GRM requires at least one aligned sample")
+    cutoff_f = float(cutoff)
+    if not np.isfinite(cutoff_f):
+        raise ValueError(f"SparseLMM cutoff must be finite, got {cutoff}")
+    if not hasattr(jxrs, "spgrm_dense_f32_to_jxgrm"):
+        raise RuntimeError(
+            "Rust extension missing spgrm_dense_f32_to_jxgrm required for k-file SparseLMM. "
+            "Rebuild/reinstall JanusX."
+        )
+
+    out_prefix_use = str(out_prefix).strip()
+    if out_prefix_use == "":
+        raise ValueError("k-file sparse GRM output prefix must not be empty")
+    sparse_path = _splmm_normalize_sparse_grm_path(out_prefix_use)
+    meta_path = f"{sparse_path}.meta.json"
+    id_path = f"{sparse_path}.id"
+    parent = os.path.dirname(os.path.abspath(sparse_path))
+    if parent != "":
+        os.makedirs(parent, exist_ok=True)
+
+    source_path = str(dense_grm_path or "").strip()
+    source_stat: dict[str, object] = {}
+    if source_path != "":
+        try:
+            stat = os.stat(source_path)
+            source_stat = {
+                "source_path": os.path.normpath(source_path),
+                "source_mtime_ns": int(stat.st_mtime_ns),
+                "source_size": int(stat.st_size),
+            }
+        except OSError:
+            source_stat = {"source_path": os.path.normpath(source_path)}
+    ids_hash = _kfile_sparse_sample_hash(ids)
+    matrix_digest = hashlib.blake2b(
+        np.ascontiguousarray(matrix, dtype=np.float32).tobytes(order="C"),
+        digest_size=16,
+    ).hexdigest()
+    spec: dict[str, object] = {
+        "builder_revision": "kfile_dense_crop_v1",
+        "source": "dense_grm_kfile_cropped",
+        "cutoff": cutoff_f,
+        "abs_threshold": False,
+        "sample_n": int(ids.shape[0]),
+        "sample_hash": ids_hash,
+        "matrix_shape": [int(matrix.shape[0]), int(matrix.shape[1])],
+        "matrix_digest": matrix_digest,
+        **source_stat,
+    }
+
+    if os.path.isfile(sparse_path) and os.path.isfile(meta_path) and os.path.isfile(id_path):
+        existing_spec: object = None
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                existing_spec = json.load(fh)
+        except Exception:
+            existing_spec = None
+        existing_ids: list[str] = []
+        try:
+            existing_ids = [str(x).strip() for x in np.loadtxt(id_path, dtype=str, ndmin=1).tolist()]
+        except Exception:
+            existing_ids = []
+        if existing_spec == spec and existing_ids == ids.tolist() and os.path.getsize(sparse_path) >= 16:
+            if logger is not None:
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"SparseLMM sparse GRM reused (k-file cropped): {_display_path(sparse_path)}",
+                )
+            return sparse_path
+
+    for stale_path in (sparse_path, id_path, meta_path):
+        try:
+            os.remove(stale_path)
+        except OSError:
+            pass
+
+    progress_total = max(1, int(matrix.shape[0]))
+    progress_done = 0
+    pbar = _ProgressAdapter(
+        total=progress_total,
+        desc="Sparse GRM (k-file cropped)",
+        force_animate=True,
+        logger=logger,
+    )
+
+    def _progress_callback(done: int, total: int) -> None:
+        nonlocal progress_total, progress_done
+        try:
+            total_use = max(1, int(total))
+            done_use = max(0, int(done))
+        except Exception:
+            return
+        if total_use != progress_total:
+            pbar.set_total(total_use)
+            progress_total = total_use
+        done_use = min(done_use, progress_total)
+        if done_use > progress_done:
+            pbar.update(done_use - progress_done)
+            progress_done = done_use
+
+    build_ok = False
+    build_t0 = time.monotonic()
+    try:
+        result = jxrs.spgrm_dense_f32_to_jxgrm(
+            np.ascontiguousarray(matrix, dtype=np.float32),
+            out_prefix_use,
+            threshold=cutoff_f,
+            abs_threshold=False,
+            progress_callback=_progress_callback,
+            progress_every=1,
+        )
+        build_ok = True
+    finally:
+        if build_ok and progress_done < progress_total:
+            pbar.update(progress_total - progress_done)
+        if build_ok:
+            pbar.finish()
+        pbar.close(show_done=False)
+
+    built_path = sparse_path
+    if isinstance(result, (tuple, list)) and len(result) > 0:
+        candidate = _splmm_normalize_sparse_grm_path(str(result[0]))
+        if candidate != "":
+            built_path = candidate
+    if not os.path.isfile(built_path):
+        raise RuntimeError(
+            "k-file sparse GRM builder returned without creating the output: "
+            f"{_display_path(built_path)}"
+        )
+    sparse_path = built_path
+    id_path = f"{sparse_path}.id"
+    meta_path = f"{sparse_path}.meta.json"
+    np.savetxt(id_path, ids, fmt="%s")
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(spec, fh, ensure_ascii=True, sort_keys=True)
+    if logger is not None:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "SparseLMM sparse GRM ready (k-file cropped): "
+            f"{_display_path(sparse_path)} (n={int(ids.shape[0])}, "
+            f"time={format_elapsed(max(0.0, time.monotonic() - build_t0))})",
+        )
+    return sparse_path
+
+
 def _prepare_kfile_stream_context(
     *,
     prefix: str,
@@ -4785,7 +5002,8 @@ def _prepare_kfile_stream_context(
         id_col=0,
         use_spinner=use_spinner,
     )
-    pheno, ids = _align_pheno_to_sample_order(pheno, k_ids)
+    pheno_n_input = int(pheno.shape[0])
+    pheno, ids = _align_kfile_pheno_to_sample_order(pheno, k_ids)
     any_finite = False
     for col in pheno.columns:
         values = pd.to_numeric(pheno[col], errors="coerce").to_numpy(dtype=np.float64)
@@ -4814,6 +5032,14 @@ def _prepare_kfile_stream_context(
             cov_all[[cov_pos[sid] for sid in ids]],
             dtype=np.float32,
         )
+    _set_pending_gwas_overlap_line(
+        logger,
+        (
+            f"Sample overlap: geno={int(k_ids.shape[0])}, pheno={pheno_n_input}, "
+            f"cov={(int(len(cov_ids)) if cov_ids is not None else 'NA')}, "
+            f"common={int(ids.shape[0])}"
+        ),
+    )
     if bool(inverse_normal):
         pheno = inverse_normal_transform(pheno, logger=logger)
         logger.info(
@@ -4823,21 +5049,42 @@ def _prepare_kfile_stream_context(
     qdim = _parse_qcov_dim(qcov)
     grm = None
     eff_m = int(n_kmers)
-    if (
-        (bool(require_grm) or qdim > 0)
-        and str(grm_option).strip() not in {"", "1", "2"}
-    ):
-        grm, _grm_ids = _load_kfile_external_grm(grm_option, ids=ids)
-    elif str(grm_option).strip() in {"1", "2"} and (bool(require_grm) or qdim > 0):
+    grm_option_text = str(grm_option).strip()
+    if (bool(require_grm) or qdim > 0) and grm_option_text not in {"", "1", "2"}:
+        grm_t0 = time.monotonic()
+        with CliStatus(
+            grm_load_status_open(grm_option_text),
+            enabled=bool(use_spinner),
+        ) as task:
+            try:
+                grm, _grm_ids = _load_kfile_external_grm(grm_option_text, ids=ids)
+            except Exception:
+                task.fail(grm_load_status_fail(grm_option_text))
+                raise
+            task.complete(grm_load_status_done(grm_option_text, int(grm.shape[0])))
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"Loading GRM from {_basename_only(grm_option_text)} "
+            f"(n={int(grm.shape[0])}) [{format_elapsed(time.monotonic() - grm_t0)}]",
+        )
+    elif grm_option_text in {"1", "2"} and (bool(require_grm) or qdim > 0):
+        grm_t0 = time.monotonic()
         grm, eff_m = _build_kfile_grm_streaming(
             prefix,
             sample_indices=sample_indices,
             n_kmers=n_kmers,
             chunk_size=max(1, int(chunk_size)),
-            method=int(str(grm_option).strip()),
+            method=int(grm_option_text),
             logger=logger,
             use_spinner=use_spinner,
         )
+        grm_msg = (
+            f"Calculating GRM from k-file (n={int(grm.shape[0])}) "
+            f"...Finished [{format_elapsed(time.monotonic() - grm_t0)}]"
+        )
+        _log_file_only(logger, logging.INFO, grm_msg)
+        print_success(grm_msg, force_color=bool(use_spinner))
     qmatrix = np.zeros((len(ids), 0), dtype=np.float32)
     if qdim > 0:
         if grm is None:
@@ -4850,6 +5097,12 @@ def _prepare_kfile_stream_context(
             require_rust=True,
         )
         qmatrix = np.asarray(eigvec[:, -int(qdim):], dtype=np.float32)
+    else:
+        _emit_warning_line(
+            logger,
+            "PC dimension set to 0; using empty Q matrix.",
+            use_spinner=bool(use_spinner),
+        )
     return (
         pheno,
         np.asarray(ids, dtype=str),
@@ -5482,6 +5735,131 @@ def _iter_bim_named_sites(bim_path: str) -> Iterator[tuple[str, int, str]]:
             yield chrom, pos, _normalize_snp_name(raw_name, chrom, pos)
 
 
+def _iter_bim_assoc_sites(
+    bim_path: str,
+) -> Iterator[tuple[str, int, str, str, str]]:
+    """Stream PLINK BIM rows for compact k-file GWAS publication.
+
+    The native k-file scanners intentionally write only ``maf/beta/se/pwald``
+    to keep the scan writer small.  A sibling BIM is the authoritative marker
+    header for kfiles produced by ``gformat -fmt kfile``; stream it one row at
+    a time so expanding the result never materializes millions of sites.
+    """
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+        for line_no, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if line == "":
+                continue
+            toks = line.split()
+            if len(toks) < 6:
+                raise ValueError(f"Malformed BIM line at {bim_path}:{line_no}")
+            chrom = str(toks[0]).strip()
+            pos = _coerce_site_pos(toks[3])
+            snp = _normalize_snp_name(toks[1], chrom, pos)
+            yield chrom, pos, snp, str(toks[4]), str(toks[5])
+
+
+def _expand_compact_kfile_gwas_tsv(
+    tmp_tsv: str,
+    out_tsv: str,
+    genofile: str,
+    *,
+    logger: Union[logging.Logger, None] = None,
+) -> bool:
+    """Publish compact native kfile results with the standard BIM schema.
+
+    Native kfile scanners emit four columns (``maf``, ``beta``, ``se``,
+    ``pwald``).  When a sibling BIM is available, merge its marker identity
+    and alleles into the result using the same eleven-column schema used by
+    bfile SparseLMM output.  The kfile conversion has already filtered and
+    imputed the stored 0/2 calls, therefore its published missing-rate column
+    is ``0.0000``.
+    """
+    source_path = str(tmp_tsv)
+    bim_path = _resolve_gwas_snp_bim_path(str(genofile))
+    if bim_path is None:
+        return False
+    if not os.path.isfile(source_path):
+        return False
+
+    with open(source_path, "r", encoding="utf-8", errors="replace") as fin:
+        header_raw = fin.readline()
+    header = header_raw.rstrip("\r\n")
+    if header.split("\t") != ["maf", "beta", "se", "pwald"]:
+        return False
+
+    expanded_tmp = f"{str(out_tsv)}.bim.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    rows_written = 0
+    try:
+        bim_iter = _iter_bim_assoc_sites(str(bim_path))
+        with open(source_path, "r", encoding="utf-8", errors="replace") as fin, open(
+            expanded_tmp, "w", encoding="utf-8", newline=""
+        ) as fout:
+            source_header = fin.readline()
+            if source_header == "":
+                raise ValueError(f"Empty compact kfile GWAS result: {source_path}")
+            fout.write(
+                "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\t"
+                "beta\tse\tchisq\tpwald\n"
+            )
+            for source_line_no, raw in enumerate(fin, start=2):
+                line = raw.rstrip("\r\n")
+                if line == "":
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 4:
+                    raise ValueError(
+                        f"Malformed compact kfile GWAS row at {source_path}:{source_line_no}: "
+                        f"expected 4 columns, got {len(parts)}"
+                    )
+                site = next(bim_iter, None)
+                if site is None:
+                    raise ValueError(
+                        "kfile GWAS result has more rows than its sibling BIM: "
+                        f"result_row={rows_written + 1}, bim={bim_path}"
+                    )
+                chrom, pos, snp, allele0, allele1 = site
+                try:
+                    maf = float(parts[0])
+                    beta = float(parts[1])
+                    se = float(parts[2])
+                    pwald = float(parts[3])
+                except ValueError as ex:
+                    raise ValueError(
+                        f"Non-numeric compact kfile GWAS row at "
+                        f"{source_path}:{source_line_no}"
+                    ) from ex
+                chisq = float("nan")
+                if np.isfinite(beta) and np.isfinite(se) and se > 0.0:
+                    chisq = float((beta / se) ** 2)
+                fout.write(
+                    f"{chrom}\t{int(pos)}\t{snp}\t{allele0}\t{allele1}\t"
+                    f"{maf:.4f}\t0.0000\t{beta:.4f}\t{se:.4f}\t"
+                    f"{chisq:.6g}\t{pwald:.4e}\n"
+                )
+                rows_written += 1
+
+            if next(bim_iter, None) is not None:
+                raise ValueError(
+                    "sibling BIM has more rows than the compact kfile GWAS result: "
+                    f"result_rows={rows_written}, bim={bim_path}"
+                )
+
+        _replace_file_with_retry(expanded_tmp, str(out_tsv))
+        _cleanup_gwas_result_tmp(source_path)
+        if logger is not None:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "Expanded kfile GWAS result with BIM metadata: "
+                f"{_display_path(str(out_tsv))} (rows={rows_written})",
+            )
+        return True
+    except Exception:
+        _cleanup_gwas_result_tmp(expanded_tmp)
+        raise
+
+
 def _augment_gwas_tsv_with_snp_names(
     out_tsv: str,
     genofile: str,
@@ -5577,6 +5955,13 @@ def _finalize_gwas_result_tsv(
     *,
     logger: Union[logging.Logger, None] = None,
 ) -> None:
+    if _expand_compact_kfile_gwas_tsv(
+        str(tmp_tsv),
+        str(out_tsv),
+        str(genofile),
+        logger=logger,
+    ):
+        return
     _replace_file_with_retry(str(tmp_tsv), str(out_tsv))
 
 
@@ -7739,7 +8124,10 @@ def _run_gwas_pipeline(
         args = parse_args(argv)
     # Plotting is enabled by default for GWAS CLI, but benchmarks can disable
     # it to keep visualization out of end-to-end runtime comparisons.
-    args.plot = False if getattr(args, "kfile", None) else _gwas_plot_enabled()
+    # Keep kfile plotting on the same default path as BED GWAS.  The kfile
+    # finalizer now expands sibling BIM metadata before invoking the shared
+    # fastplot reader, so it no longer needs a special plot-disabled route.
+    args.plot = _gwas_plot_enabled()
     args.cov = _normalize_cov_inputs(args.cov)
     args._lm2_cov_idx = None
     args._lm2_fallback_to_lm = False
@@ -7767,12 +8155,12 @@ def _run_gwas_pipeline(
     if kfile_mode:
         gfile = _resolve_kfile_prefix(args.kfile)
         prefix = os.path.basename(gfile.rstrip("/\\"))
-        # The k-file contract deliberately scans every bsite row.  Keep the
-        # regular GWAS filter options from leaking into GRM/scan helpers if a
-        # future route is added below, and make the effective policy explicit.
-        args.maf = 0.0
-        args.geno = 1.0
-        args.het = 1.0
+        # Keep the public filter values unchanged so the configuration and
+        # genotype status are rendered exactly like the BED route.  Kfile
+        # conversion has already recoded dosage 1 to missing, applied its
+        # post-recoding MAF/missingness filters, and imputed the remaining
+        # calls to binary 0/2; the scan itself therefore consumes the stored
+        # marker set without re-running BED-side QC.
 
     out_dir, outprefix = _resolve_gwas_output_prefix(
         getattr(args, "out", None),
@@ -8009,8 +8397,13 @@ def _run_gwas_pipeline(
                 args.qcov,
                 int(len(preinspect_ids)),
             )
+            kfile_status = genotype_load_status_done(
+                preinspect_src_for_merge,
+                n_samples=len(preinspect_ids),
+                n_snps=int(preinspect_n_snps),
+            )
             _queue_preconfig_success(
-                f"k-file metadata loaded ({len(preinspect_ids)} samples, {int(preinspect_n_snps)} k-mers) "
+                f"{kfile_status} "
                 f"[{format_elapsed(preinspect_elapsed_secs)}]"
             )
             auto_memory_gb, auto_memory_reason = _resolve_gwas_auto_decode_memory_gb(
@@ -8083,6 +8476,15 @@ def _run_gwas_pipeline(
         qcov_needs_grm = _gwas_qcov_prefers_grm_route(
             args.qcov,
             int(len(preinspect_ids)),
+        )
+        kfile_status = genotype_load_status_done(
+            preinspect_src_for_merge,
+            n_samples=len(preinspect_ids),
+            n_snps=int(preinspect_n_snps),
+        )
+        _queue_preconfig_success(
+            f"{kfile_status} "
+            f"[{format_elapsed(preinspect_elapsed_secs)}]"
         )
     elif preinspect_ids is not None:
         qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
@@ -8205,6 +8607,11 @@ def _run_gwas_pipeline(
             ),
         )
         _emit_report_kv(report_logger, "Models Executed", _format_gwas_models_executed(args))
+        # Keep the parsed PC/Q setting visible in the regular configuration
+        # block as well as the optional advanced block.  In non-interactive
+        # runs the rich terminal configuration is not rendered, so this is
+        # the only early confirmation that ``-q 10`` was accepted.
+        _emit_report_kv(report_logger, "Q Option", args.qcov)
         _emit_report_kv(
             report_logger,
             "Thresholds",
@@ -8603,7 +9010,7 @@ def _run_gwas_pipeline(
                 post_grm_hook = _capture_sidecar_grm_path
             if kfile_mode:
                 if terminal_rich:
-                    _section(terminal_logger, "k-file GWAS")
+                    _section(terminal_logger, "GWAS task")
                 if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
                     _flush_preconfig_successes()
                 kfile_sparse_grm = None
@@ -8650,6 +9057,101 @@ def _run_gwas_pipeline(
                     ),
                     inverse_normal=bool(getattr(args, "intrans", False)),
                 )
+
+                # The BED route prepares SparseLMM through post_grm_hook.  A
+                # k-file has no BED prefix, so that hook is intentionally not
+                # involved here.  Materialize one persistent sparse GRM from
+                # the already aligned/cropped dense GRM instead.  The ID
+                # sidecar lets each trait select its finite phenotype subset
+                # without another dense->sparse conversion.
+                if _gwas_splmm_requested(args) and (
+                    kfile_sparse_grm is None or str(kfile_sparse_grm).strip() == ""
+                ):
+                    if grm is None:
+                        raise ValueError(
+                            "k-file SparseLMM requires a dense GRM when -spk is not a precomputed sparse path."
+                        )
+                    sparse_cfg = next(iter(splmm_prepared_run_cfgs.values()), None)
+                    if sparse_cfg is None:
+                        raise RuntimeError("Missing SparseLMM run configuration for k-file GWAS.")
+                    sparse_cutoff = float(sparse_cfg.get("sparse_cutoff", 0.05))
+                    sparse_cache_prefix = (
+                        f"{str(outprefix)}.kfile.splmm.n{int(len(ids))}."
+                        f"{_kfile_sparse_sample_hash(np.asarray(ids, dtype=str))}"
+                    )
+                    kfile_sparse_grm = _ensure_kfile_sparse_grm(
+                        dense_grm=np.asarray(grm),
+                        sample_ids=np.asarray(ids, dtype=str),
+                        out_prefix=sparse_cache_prefix,
+                        cutoff=sparse_cutoff,
+                        method=int(prepared_splmm_sparse_method),
+                        dense_grm_path=(
+                            None
+                            if str(getattr(args, "grm", "")).strip() in {"", "1", "2"}
+                            else str(getattr(args, "grm"))
+                        ),
+                        logger=logger,
+                        use_spinner=bool(use_spinner),
+                    )
+                    for run_cfg in splmm_prepared_run_cfgs.values():
+                        run_cfg["sparse_jxgrm_path"] = str(kfile_sparse_grm)
+
+                if kfile_sparse_grm is not None and str(kfile_sparse_grm).strip() != "":
+                    sparse_display = os.path.basename(str(kfile_sparse_grm))
+                    with CliStatus(
+                        f"Loading sparse GRM from {sparse_display}...",
+                        enabled=bool(use_spinner),
+                    ) as task:
+                        task.complete(f"Loading sparse GRM from {sparse_display}")
+
+                # Publish the prepared context before entering the native
+                # scan, matching the BED workflow's Data preparation -> GWAS
+                # hand-off and ensuring trait headers include these rows.
+                genofile_stream = str(_resolve_kfile_prefix(genofile_stream))
+                kfile_bim_path = _resolve_gwas_snp_bim_path(genofile_stream)
+                kfile_plot_enabled = bool(args.plot) and kfile_bim_path is not None
+                if bool(args.plot) and not kfile_plot_enabled:
+                    _emit_warning_line(
+                        logger,
+                        "kfile plotting requires a sibling .bim site header; "
+                        "plot skipped for this run.",
+                        use_spinner=bool(use_spinner),
+                    )
+                _flush_pending_gwas_overlap_line(
+                    logger,
+                    use_spinner=bool(use_spinner),
+                )
+                setattr(
+                    logger,
+                    "_janusx_gwas_task_context_rows",
+                    [
+                        ("Data Loaded", f"{int(len(ids))} Samples | {int(n_snps)} k-mers"),
+                        ("Genotype Cache", _display_path(str(genofile_stream))),
+                        ("GWAS Stats", str(gwas_row_stat_mode)),
+                        ("GRM Status", _format_gwas_grm_status(grm, args.grm)),
+                        ("Q Matrix", _format_gwas_q_status(qmatrix)),
+                        ("Covariates", _format_gwas_cov_status(cov_all)),
+                        (
+                            "Sparse GRM",
+                            _format_gwas_sparse_status_multi(
+                                list(splmm_prepared_run_cfgs.values()),
+                                sparse_source=getattr(args, "grm_sparse", "1"),
+                            ),
+                        ) if _gwas_splmm_requested(args) else ("Sparse GRM", "Not requested"),
+                        (
+                            "Output",
+                            (
+                                "chrom/pos/snp/alleles/af/miss/beta/se/chisq/pwald; "
+                                f"plot {'enabled' if kfile_plot_enabled else 'disabled'}"
+                                if kfile_bim_path is not None
+                                else "maf/beta/se/pwald; plot disabled (no BIM)"
+                            ),
+                        ),
+                    ],
+                )
+                if terminal_rich:
+                    _phase_split(terminal_logger)
+                kfile_summary_start = len(gwas_summary_rows)
                 run_chunked_gwas_kfile(
                     model_names=list(stream_models),
                     kfile=str(genofile_stream),
@@ -8669,24 +9171,39 @@ def _run_gwas_pipeline(
                     summary_rows=gwas_summary_rows,
                     saved_paths=saved_result_paths,
                     use_spinner=bool(use_spinner),
+                    plot=bool(kfile_plot_enabled),
                 )
+                # The k-file route completes its native scan in one call, so
+                # it does not pass through the regular per-task dispatcher
+                # that emits the BED trait summary.  Publish the same summary
+                # table here, grouped by phenotype for multi-trait runs.
+                kfile_rows = gwas_summary_rows[kfile_summary_start:]
+                emitted_kfile_rows: set[int] = set()
+                for kfile_trait in list(getattr(pheno, "columns", [])):
+                    trait_indices = [
+                        idx
+                        for idx, row in enumerate(kfile_rows)
+                        if idx not in emitted_kfile_rows
+                        and str(row.get("phenotype", "")) == str(kfile_trait)
+                    ]
+                    if len(trait_indices) == 0:
+                        continue
+                    emitted_kfile_rows.update(trait_indices)
+                    trait_rows = [kfile_rows[idx] for idx in trait_indices]
+                    _emit_gwas_trait_summary(logger, trait_rows)
+                if len(emitted_kfile_rows) < len(kfile_rows):
+                    _emit_gwas_trait_summary(
+                        logger,
+                        [
+                            row
+                            for idx, row in enumerate(kfile_rows)
+                            if idx not in emitted_kfile_rows
+                        ],
+                    )
                 preloaded_packed = None
-                genofile_stream = str(_resolve_kfile_prefix(genofile_stream))
                 stream_models = []
                 has_farmcpu = False
                 farmcpu_handled_in_trait_loop = True
-                setattr(
-                    logger,
-                    "_janusx_gwas_task_context_rows",
-                    [
-                        ("Data Loaded", f"{int(len(ids))} Samples | {int(n_snps)} k-mers"),
-                        ("Genotype Cache", _display_path(str(genofile_stream))),
-                        ("GRM Status", _format_gwas_grm_status(grm, args.grm)),
-                        ("Q Matrix", _format_gwas_q_status(qmatrix)),
-                        ("Covariates", _format_gwas_cov_status(cov_all)),
-                        ("Output", "maf/beta/se/pwald; plot disabled"),
-                    ],
-                )
             elif shared_context_needed:
                 if terminal_rich:
                     _section(terminal_logger, "GWAS task")

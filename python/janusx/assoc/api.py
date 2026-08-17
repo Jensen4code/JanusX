@@ -661,6 +661,38 @@ class ASSOC:
         assert self._tmpdir_path is not None
         return self._tmpdir_path
 
+    def close(self) -> None:
+        """Release temporary files owned by this fitted association object.
+
+        SparseLMM may materialize a dense/scipy GRM into a temporary sparse
+        GRM before fitting.  ``TemporaryDirectory`` emits a ``ResourceWarning``
+        when it is left to its finalizer, so the public estimator owns an
+        explicit, idempotent cleanup hook.  Calling ``close`` does not alter
+        fitted statistics; it only removes the temporary on-disk artifacts.
+        """
+        tmpdir = self._tmpdir_obj
+        self._tmpdir_obj = None
+        self._tmpdir_path = None
+        if tmpdir is not None:
+            try:
+                tmpdir.cleanup()
+            except Exception:
+                # Cleanup is best effort during exception handling and object
+                # finalization.  The fitted result must remain usable.
+                pass
+
+    def __enter__(self) -> "ASSOC":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - exercised by interpreter GC
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _finalize_fit_result(self, *, kinship_kind: str) -> None:
         backend_name = None
         if self.backend_model_ is not None:

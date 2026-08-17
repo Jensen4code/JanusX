@@ -72,6 +72,35 @@ _WARNED_BED_MMAP_LIMIT_LEGACY = False
 _WARNED_BED_PREPARED_SNPS_ONLY_LEGACY = False
 
 
+_GWAS_STREAM_MODEL_LABELS = {
+    "lm": "LM",
+    "lmm": "LMM",
+    "lmm2": "LMM2",
+    "fvlmm": "FvLMM",
+    "splmm": "SparseLMM",
+    "splmm2": "SparseLMM2",
+}
+
+
+def _gwas_stream_model_label(model_key: object) -> str:
+    """Return the public model label shared by BED and kfile routes."""
+    key = str(model_key).strip().lower()
+    return str(_GWAS_STREAM_MODEL_LABELS.get(key, key.upper()))
+
+
+def _close_assoc_models(models: list[tuple[str, object]]) -> None:
+    """Close API-backed null models without making cleanup part of the scan."""
+    for _model_key, model in models:
+        close = getattr(model, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # A cleanup failure must not mask a completed GWAS result or
+                # the original scan exception.
+                pass
+
+
 def _current_bed_memory_mb() -> float:
     try:
         mb = float(os.environ.get("JX_BED_BLOCK_TARGET_MB", "512"))
@@ -574,8 +603,13 @@ def run_chunked_gwas_kfile(
     summary_rows: Optional[list[dict[str, object]]] = None,
     saved_paths: Optional[list[str]] = None,
     use_spinner: bool = False,
+    plot: bool = False,
 ) -> None:
-    """Run the four-column streaming GWAS contract through native Rust only."""
+    """Run the streaming kfile GWAS route through native Rust only.
+
+    The native scanner remains compact while the finalizer expands sibling
+    BIM metadata to the standard bfile TSV schema before optional plotting.
+    """
     requested = []
     for raw in model_names:
         key = str(raw).strip().lower()
@@ -590,6 +624,8 @@ def run_chunked_gwas_kfile(
         summary_rows = []
     if saved_paths is None:
         saved_paths = []
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
     source_ids = np.asarray(kfile_ids, dtype=str).reshape(-1)
     target_ids = np.asarray(ids, dtype=str).reshape(-1)
     source_pos = {sid: i for i, sid in enumerate(source_ids.tolist())}
@@ -598,11 +634,22 @@ def run_chunked_gwas_kfile(
         raise ValueError(f"k-file sample alignment failed: {missing[:5]}")
 
     for trait_name in list(pheno.columns):
+        cpu_t0 = process.cpu_times()
+        trait_t0 = time.monotonic()
+        peak_rss = int(process.memory_info().rss)
         y_full, sameidx = _trait_values_and_mask(pheno, trait_name)
         keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
         if int(keep_idx.shape[0]) == 0:
             logger.warning(f"{trait_name}: no overlapping samples, skipped.")
             continue
+        _emit_trait_header(
+            logger,
+            trait_name,
+            int(keep_idx.shape[0]),
+            pve=None,
+            use_spinner=bool(use_spinner),
+            width=60,
+        )
         trait_ids = np.asarray(target_ids[keep_idx], dtype=str)
         sample_indices = np.asarray(
             [source_pos[sid] for sid in trait_ids.tolist()],
@@ -629,6 +676,7 @@ def run_chunked_gwas_kfile(
             else:
                 raise ValueError("k-file GRM sample dimension does not match phenotype IDs.")
 
+        model_init_t0 = time.monotonic()
         models: list[tuple[str, object]] = []
         shared_lmm = None
         for model_key in requested:
@@ -675,11 +723,14 @@ def run_chunked_gwas_kfile(
                 else:
                     sparse_model.fit(y_vec, X=x_cov, k=sparse_kinship)
                 models.append((model_key, sparse_model))
+        peak_rss = max(peak_rss, int(process.memory_info().rss))
 
-        model_labels = ["FvLMM" if key == "fvlmm" else key.upper() for key in requested]
-        progress_desc = "K-file GWAS"
-        if len(model_labels) == 1:
-            progress_desc = f"K-file {model_labels[0]}"
+        model_labels = [_gwas_stream_model_label(key) for key in requested]
+        # Keep the progress task name identical to the BED route.  The input
+        # source is already visible in the genotype status line; adding a
+        # kfile-specific prefix here made otherwise equivalent runs look like
+        # different models in logs and terminal output.
+        progress_desc = model_labels[0] if len(model_labels) == 1 else "GWAS"
         pbar = _ProgressAdapter(
             total=max(1, int(n_kmers)),
             desc=progress_desc,
@@ -749,6 +800,7 @@ def run_chunked_gwas_kfile(
                     progress_last = d
 
             scan_t0 = time.monotonic()
+            init_secs = max(scan_t0 - model_init_t0, 0.0)
             try:
                 progress_every_native = max(
                     1,
@@ -911,43 +963,99 @@ def run_chunked_gwas_kfile(
             except Exception:
                 _cleanup_gwas_result_tmp(tmp_tsv)
                 pbar.close(show_done=False)
+                _close_assoc_models(models)
                 raise
 
             if progress_last < count:
                 pbar.update(int(count - progress_last))
             pbar.finish()
+            scan_secs = max(time.monotonic() - scan_t0, 0.0)
+            cpu_t1 = process.cpu_times()
+            peak_rss = max(peak_rss, int(process.memory_info().rss))
+            wall_model = max(time.monotonic() - trait_t0, 1e-12)
+            cpu_used = float(
+                (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+            )
+            avg_cpu_pct = (
+                100.0 * cpu_used / wall_model / max(1, int(n_cores))
+                if wall_model > 0.0
+                else 0.0
+            )
+            peak_rss_gb = float(peak_rss / 1024**3)
+            # Stop the scan renderer before BIM publication and plotting.  A
+            # kfile plot can take a noticeable amount of time; leaving this
+            # bar open made the terminal appear frozen at 100% while the
+            # visualizer was working.
+            pbar.close(show_done=False)
             _finalize_gwas_result_tsv(tmp_tsv, out_tsv, kfile, logger=logger)
             saved_paths.append(str(out_tsv))
+            viz_secs = 0.0
+            if bool(plot):
+                viz_secs = _run_fastplot_from_tsv_with_status(
+                    out_tsv,
+                    y_vec,
+                    xlabel=str(trait_name),
+                    outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
+                    use_spinner=bool(use_spinner),
+                    emit_done_line=False,
+                )
+            pve_now: Optional[float] = None
+            if native_model_key in {"lmm", "fvlmm"}:
+                try:
+                    pve_tmp = float(getattr(model, "pve", np.nan))
+                    if np.isfinite(pve_tmp):
+                        pve_now = pve_tmp
+                except Exception:
+                    pve_now = None
             summary_rows.append(
                 {
                     "phenotype": str(trait_name),
-                    "model": (
-                        "FvLMM"
-                        if native_model_key == "fvlmm"
-                        else native_model_key.upper()
-                    ),
+                    "model": _gwas_stream_model_label(native_model_key),
                     "nidv": int(keep_idx.shape[0]),
                     "eff_snp": int(count),
-                    "pve": (
-                        float(getattr(model, "pve"))
-                        if native_model_key in {"lmm", "fvlmm"}
-                        and np.isfinite(float(getattr(model, "pve", np.nan)))
-                        else None
-                    ),
-                    "avg_cpu": 0.0,
-                    "peak_rss_gb": 0.0,
-                    "gwas_time_s": float(max(time.monotonic() - scan_t0, 0.0)),
-                    "viz_time_s": 0.0,
+                    "pve": pve_now,
+                    "avg_cpu": float(avg_cpu_pct),
+                    "peak_rss_gb": float(peak_rss_gb),
+                    "gwas_time_s": float(init_secs + scan_secs),
+                    "viz_time_s": float(viz_secs),
                     "result_file": str(out_tsv),
                 }
             )
+            time_parts: list[str] = []
+            if init_secs > 0.0:
+                time_parts.append(format_elapsed(init_secs))
+            time_parts.append(format_elapsed(scan_secs))
+            if bool(plot):
+                time_parts.append(format_elapsed(viz_secs))
+            if (
+                pve_now is not None
+                and np.isfinite(float(pve_now))
+                and str(native_model_key).lower() in {"lmm", "lmm2", "fvlmm"}
+            ):
+                done_msg = (
+                    f"{_gwas_stream_model_label(native_model_key)} ...pve(pheno) "
+                    f"{float(pve_now):.3f} [{'/'.join(time_parts)}]"
+                )
+            else:
+                done_msg = (
+                    f"{_gwas_stream_model_label(native_model_key)} ...Finished "
+                    f"[{'/'.join(time_parts)}]"
+                )
             _log_model_line(
                 logger,
-                "FvLMM" if native_model_key == "fvlmm" else native_model_key.upper(),
+                _gwas_stream_model_label(native_model_key),
+                f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} c, "
+                f"peak RSS ~ {peak_rss_gb:.2f} G",
+                use_spinner=bool(use_spinner),
+            )
+            _log_model_line(
+                logger,
+                _gwas_stream_model_label(native_model_key),
                 f"Results saved to {_display_path(str(out_tsv))}",
                 use_spinner=bool(use_spinner),
             )
-            pbar.close(show_done=False)
+            _rich_success(logger, done_msg, use_spinner=bool(use_spinner))
+            _close_assoc_models(models)
             continue
 
 
