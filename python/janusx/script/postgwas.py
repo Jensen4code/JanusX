@@ -10686,6 +10686,54 @@ def _format_bimrange_summary(
     return f"{_format_bimrange_tuple(bimranges[0])},...({len(bimranges)} ranges)"
 
 
+def _postgwas_highlight_rows(
+    plotmodel: GWASPLOT,
+    path: str,
+) -> tuple[np.ndarray, dict[tuple[str, int], str], list[object]]:
+    """Resolve highlight coordinates against every matching plotted row.
+
+    GARFIELD tables can contain several rows at the same endpoint (for
+    example, a singleton and one or more logical-rule endpoints).  Matching
+    by a boolean coordinate mask keeps all of those rows visible while using
+    one label per requested coordinate.
+    """
+    raw = pd.read_csv(path, sep="\t", header=None, comment="#")
+    if raw.shape[1] < 2:
+        raise ValueError(
+            "Highlight file must contain at least chromosome and position columns."
+        )
+
+    labels: dict[tuple[str, int], str] = {}
+    for row in raw.itertuples(index=False, name=None):
+        try:
+            key = (_normalize_chr(row[0]), int(float(row[1])))
+        except (TypeError, ValueError):
+            continue
+        label = ""
+        if len(row) >= 4 and row[3] is not None and not pd.isna(row[3]):
+            label = str(row[3]).strip()
+        if label == "":
+            label = f"{key[0]}_{key[1]}"
+        labels.setdefault(key, label)
+
+    chr_by_id = getattr(plotmodel, "_chr_label_by_id", {})
+    keep = np.zeros(len(plotmodel.df.index), dtype=bool)
+    for i, index in enumerate(plotmodel.df.index):
+        try:
+            raw_chrom = index[0]
+            try:
+                chrom = chr_by_id.get(int(raw_chrom), raw_chrom)
+            except (TypeError, ValueError):
+                chrom = raw_chrom
+            key = (_normalize_chr(chrom), int(index[1]))
+        except (TypeError, ValueError, IndexError):
+            key = ("", -1)
+        keep[i] = key in labels
+
+    highlight_index = [index for index, is_keep in zip(plotmodel.df.index, keep) if is_keep]
+    return keep, labels, highlight_index
+
+
 def _overlay_manhattan_threshold_points(
     ax: plt.Axes,
     plotmodel: GWASPLOT,
@@ -11429,6 +11477,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         getattr(args, "_postgwas_single_scatter_size", _DEFAULT_SCATTER_SIZE)
     )
     single_alpha = getattr(args, "_postgwas_single_alpha", None)
+    highlight_color = str(getattr(args, "highlight_color", "red"))
+    highlight_marker = str(getattr(args, "highlight_marker", "D"))
 
     if not status_enabled:
         logger.info(f"Loading GWAS results from {src}... [{format_elapsed(0.0)}]")
@@ -11702,19 +11752,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
 
             if args.highlight:
-                # Highlight specific SNPs (bed-like file: chr, start, end, gene, desc)
-                df_hl = pd.read_csv(args.highlight, sep="\t", header=None)
-                gene_mask = df_hl[3].isna()
-                df_hl.loc[gene_mask, 3] = (
-                    df_hl.loc[gene_mask, 0].astype(str)
-                    + "_"
-                    + df_hl.loc[gene_mask, 1].astype(str)
+                # Match by coordinate, not by unique MultiIndex lookup:
+                # GARFIELD may have multiple rows at one endpoint.
+                hl_mask, hl_labels, hl_index = _postgwas_highlight_rows(
+                    plotmodel,
+                    str(args.highlight),
                 )
-                df_hl = df_hl.set_index([0, 1])
-
-                # Intersect highlight positions with SNPs in the plot model
-                df_hl_idx = df_hl.index[df_hl.index.isin(plotmodel.df.index)]
-                if len(df_hl_idx) == 0:
+                if not bool(np.any(hl_mask)):
                     logger.warning("Nothing to highlight. Check the BED file.")
                     plotmodel.manhattan(
                         None,
@@ -11745,37 +11789,52 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         max_logp=manh_max_logp,
                     )
                 else:
+                    hl_rows = plotmodel.df.iloc[np.flatnonzero(hl_mask)].copy()
                     y_hl = _postgwas_plot_logp_values(
-                        plotmodel.df.loc[df_hl_idx, "y"],
+                        hl_rows["y"],
                         no_logtrans=no_logtrans,
                     )
                     keep_hl = np.isfinite(y_hl) & (y_hl >= float(manh_min_logp))
                     if manh_max_logp is not None:
                         keep_hl = keep_hl & (y_hl <= float(manh_max_logp))
-                    draw_hl_idx = df_hl_idx[keep_hl]
-                    draw_hl_y = y_hl[keep_hl]
-                    ax.scatter(
-                        plotmodel.df.loc[draw_hl_idx, "x"],
-                        draw_hl_y,
-                        marker="D",
-                        color="red",
-                        alpha=(float(single_alpha) if single_alpha is not None else 0.85),
-                        zorder=10,
-                        s=single_scatter_size,
-                        rasterized=rasterized,
-                        **_marker_scatter_style("D"),
-                    )
-                    for idx in draw_hl_idx:
-                        text = _sanitize_plot_text(df_hl.loc[idx, 3])
-                        ax.text(
-                            plotmodel.df.loc[idx, "x"],
-                            float(
-                                _postgwas_plot_logp_values(
-                                    plotmodel.df.loc[idx, "y"],
-                                    no_logtrans=no_logtrans,
-                                )[0]
+                    if bool(np.any(keep_hl)):
+                        ax.scatter(
+                            hl_rows.loc[keep_hl, "x"],
+                            y_hl[keep_hl],
+                            marker=highlight_marker,
+                            color=highlight_color,
+                            alpha=(float(single_alpha) if single_alpha is not None else 0.85),
+                            zorder=10,
+                            s=single_scatter_size,
+                            rasterized=rasterized,
+                            **_marker_scatter_style(highlight_marker),
+                        )
+
+                    # Put one label at the highest plotted row per coordinate,
+                    # while preserving every endpoint row in the highlighted layer.
+                    chr_by_id = getattr(plotmodel, "_chr_label_by_id", {})
+                    hl_keys = [
+                        (
+                            _normalize_chr(
+                                chr_by_id.get(int(index[0]), index[0])
                             ),
-                            s=text,
+                            int(index[1]),
+                        )
+                        for index in hl_rows.index
+                    ]
+                    for key, text in hl_labels.items():
+                        row_mask = np.asarray(
+                            [item == key for item in hl_keys],
+                            dtype=bool,
+                        ) & keep_hl
+                        if not bool(np.any(row_mask)):
+                            continue
+                        row_pos = np.flatnonzero(row_mask)
+                        best_pos = int(row_pos[np.argmax(y_hl[row_pos])])
+                        ax.text(
+                            float(hl_rows.iloc[best_pos]["x"]),
+                            float(y_hl[best_pos]),
+                            s=_sanitize_plot_text(text),
                             ha="center",
                             zorder=11,
                         )
@@ -11794,7 +11853,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ),
                         s=single_scatter_size,
                         alpha=(float(single_alpha) if single_alpha is not None else 0.78),
-                        ignore=df_hl_idx,
+                        ignore=hl_index,
                         rasterized=rasterized,
                     )
                     _overlay_postgwas_manhattan_hits(
@@ -11808,7 +11867,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         alpha_override=(float(single_alpha) if single_alpha is not None else None),
                         min_logp=manh_min_logp,
                         max_logp=manh_max_logp,
-                        ignore=list(df_hl_idx),
+                        ignore=hl_index,
                     )
             else:
                 plotmodel.manhattan(
@@ -14894,6 +14953,27 @@ def main(argv: Optional[list[str]] = None):
             "and draw all points (no fast optimization; no 0.5 cut)."
         ),
     )
+    common_group.add_argument(
+        "-highlight", "--highlight",
+        dest="highlight",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    common_group.add_argument(
+        "-highlight-color", "--highlight-color",
+        dest="highlight_color",
+        type=str,
+        default="red",
+        help=argparse.SUPPRESS,
+    )
+    common_group.add_argument(
+        "-highlight-marker", "--highlight-marker",
+        dest="highlight_marker",
+        type=str,
+        default="D",
+        help=argparse.SUPPRESS,
+    )
     _add_postgwas_annotation_source_args(common_group)
     common_group.add_argument(
         "-fmt", "--fmt", dest="format", type=str, default="png",
@@ -14924,9 +15004,6 @@ def main(argv: Optional[list[str]] = None):
     if int(args.thread) > int(detected_threads):
         thread_capped = True
         args.thread = int(detected_threads)
-    # `--highlight` was removed from CLI; keep a disabled attribute for
-    # internal legacy branches that still check it.
-    args.highlight = None
     args.gwasfile = (
         [str(x) for x in list(args.gwasfile)]
         if args.gwasfile is not None

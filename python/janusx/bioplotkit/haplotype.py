@@ -1279,6 +1279,7 @@ def plot_haplotype(
     advantage_sites: Optional[Sequence[Tuple[str, int]]] = None,
     palette: Optional[Union[str, dict]] = "default",
     min_haplotype_n: int = 30,
+    exclude_heterozygous: bool = False,
     ascending: bool = False,
     mode: Literal["continuous", "binomial"] = "continuous",
     alpha: float = 0.05,
@@ -1313,8 +1314,10 @@ def plot_haplotype(
         Either:
           1) DataFrame with columns like [chr, pos, ref, alt, sample...]
              (or MultiIndex index=(chr,pos) + REF/A0 ALT/A1 columns),
-          2) chunks iterator from `load_genotype_chunks`,
-          3) (chunks, sample_ids) tuple.
+          2) sample-by-site DataFrame whose columns are ``(chrom, pos)``
+             tuples and whose cells contain normalized allele labels,
+          3) chunks iterator from `load_genotype_chunks`,
+          4) (chunks, sample_ids) tuple.
         Optional when `bfile` + `snp_sites` are provided.
     draw_letters
         Draw annotations:
@@ -1337,6 +1340,10 @@ def plot_haplotype(
     min_haplotype_n
         Minimum sample count per haplotype group to keep for statistics and plotting.
         Groups with n < min_haplotype_n are removed (default: 30).
+    exclude_heterozygous
+        Exclude samples carrying a heterozygous call at any selected haplotype
+        site before grouping. This is useful when comparing homozygous haplotypes
+        only (default: False).
     ascending
         Sort haplotype plotting order by phenotype mean.
         False: high-to-low (default), True: low-to-high.
@@ -1473,7 +1480,16 @@ def plot_haplotype(
             force_kind=genotype_force_kind,
         )
     elif isinstance(genotype, pd.DataFrame):
-        geno_sample_site = _genotype_dataframe_to_sample_site(genotype, phenotype_samples)
+        is_sample_site = all(
+            isinstance(col, tuple) and len(col) >= 2 for col in genotype.columns
+        )
+        if is_sample_site:
+            geno_sample_site = genotype.copy()
+            geno_sample_site.index = geno_sample_site.index.map(str)
+        else:
+            geno_sample_site = _genotype_dataframe_to_sample_site(
+                genotype, phenotype_samples
+            )
     elif isinstance(genotype, tuple) and len(genotype) == 2:
         geno_sample_site = _chunks_to_sample_site(
             genotype[0], phenotype_samples, genotype[1]
@@ -1508,6 +1524,30 @@ def plot_haplotype(
         merged = merged.loc[~missing_site_mask].copy()
     if merged.empty:
         raise ValueError("No valid samples after merging phenotype and genotype.")
+
+    removed_heterozygous_n = 0
+    if bool(exclude_heterozygous) and site_cols:
+        heterozygous_mask = np.zeros(int(merged.shape[0]), dtype=bool)
+        for col in site_cols:
+            heterozygous_mask |= merged[col].map(_is_heterozygote_label).to_numpy(
+                dtype=bool,
+                copy=False,
+            )
+        removed_heterozygous_n = int(np.count_nonzero(heterozygous_mask))
+        if removed_heterozygous_n > 0:
+            warnings.warn(
+                (
+                    "Filtered out samples with heterozygous genotype in selected "
+                    f"haplotype sites: n={removed_heterozygous_n}"
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            merged = merged.loc[~heterozygous_mask].copy()
+        if merged.empty:
+            raise ValueError(
+                "No valid samples remain after excluding heterozygous haplotypes."
+            )
 
     if len(site_cols) == 1:
         merged["_hap_key"] = merged[site_cols[0]]
@@ -1570,6 +1610,9 @@ def plot_haplotype(
 
     summary.attrs["min_haplotype_n"] = int(min_haplotype_n)
     summary.attrs["removed_missing_site_samples"] = int(removed_missing_site_n)
+    summary.attrs["exclude_heterozygous"] = bool(exclude_heterozygous)
+    summary.attrs["removed_heterozygous_samples"] = int(removed_heterozygous_n)
+    summary.attrs["n_samples_after_site_filters"] = int(merged.shape[0])
     summary.attrs["removed_haplotype_groups"] = int(removed_counts.shape[0])
     summary.attrs["removed_haplotype_samples"] = int(removed_counts.sum())
     summary.attrs["removed_haplotype_detail"] = removed_counts.to_dict()
