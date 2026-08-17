@@ -1,6 +1,7 @@
 use crate::breader::{open_bkmer_mmap, open_bsite_mmap, typed_body_view, TypedBodyView};
 use crate::kmer::format::{KmergeMeta, SampleEntry};
 use crate::kmer::progress::ProgressFn;
+use crate::kmer::writer::read_idv_file;
 use anyhow::{bail, Context, Result};
 #[cfg(unix)]
 use memmap2::Advice;
@@ -470,58 +471,6 @@ fn validate_meta(meta: &KmergeMeta, meta_path: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn read_idv_file(path: &Path) -> Result<Vec<SampleEntry>> {
-    let mut rows = Vec::new();
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
-        .from_path(path)
-        .with_context(|| format!("failed to open idv file: {}", path.display()))?;
-    let headers = reader
-        .headers()
-        .with_context(|| format!("failed to read idv header: {}", path.display()))?
-        .clone();
-    if headers.len() < 3
-        || headers.get(0) != Some("#idx")
-        || headers.get(1) != Some("sample_id")
-        || headers.get(2) != Some("kmc_prefix")
-    {
-        bail!("invalid idv header in {}", path.display());
-    }
-    for rec in reader.records() {
-        let rec = rec.with_context(|| format!("failed to parse idv row: {}", path.display()))?;
-        let index = rec
-            .get(0)
-            .ok_or_else(|| anyhow::anyhow!("missing idx in {}", path.display()))?
-            .parse::<u32>()
-            .with_context(|| format!("invalid idx in {}", path.display()))?;
-        let sample_id = rec
-            .get(1)
-            .ok_or_else(|| anyhow::anyhow!("missing sample_id in {}", path.display()))?
-            .to_string();
-        let kmc_prefix = rec
-            .get(2)
-            .ok_or_else(|| anyhow::anyhow!("missing kmc_prefix in {}", path.display()))?
-            .to_string();
-        rows.push(SampleEntry {
-            index,
-            sample_id,
-            kmc_prefix,
-        });
-    }
-    rows.sort_by_key(|row| row.index);
-    for (expected, row) in rows.iter().enumerate() {
-        if row.index as usize != expected {
-            bail!(
-                "idv indices must be contiguous from 0 in {} (saw {} at row {})",
-                path.display(),
-                row.index,
-                expected
-            );
-        }
-    }
-    Ok(rows)
 }
 
 fn parse_compare_groups(

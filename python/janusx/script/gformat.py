@@ -16,6 +16,7 @@ Supported outputs
 - `-fmt hmp`   : HapMap text (.hmp)
 - `-fmt txt`   : `prefix.txt` + `prefix.id` + `prefix.site`
 - `-fmt npy`   : `prefix.npy` + `prefix.id` + `prefix.site`
+- `-fmt kfile` : `prefix.bsite` + `prefix.idv` + `prefix.bim` + `prefix.meta.json`
 
 Default output format is PLINK (`-fmt plink`) when `-fmt` is omitted.
 
@@ -25,6 +26,8 @@ Notes
 - `-file -> vcf/hmp/plink` requires real site metadata via `prefix.bsite`/`prefix.site` or `prefix.bim`.
 - `txt/npy` outputs always write headerless `prefix.site` as four columns:
   `CHR POS REF ALT`.
+- `kfile` output treats genotype `1` as missing, filters with `--geno`,
+  imputes with the mode of `{0,2}`, and writes dosage `2` as a presence bit.
 """
 
 from __future__ import annotations
@@ -113,7 +116,7 @@ from ._common.genoio import (
     determine_genotype_source_from_args as determine_genotype_source,
     discover_id_sidecar_path,
     discover_site_path,
-    write_gfd_output,
+    write_kfile_output,
     write_npy_output,
     write_text_output,
 )
@@ -1268,11 +1271,11 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
         return fmt, base, f"{base}.txt"
     if fmt == "npy":
         return fmt, base, f"{base}.npy"
-    if fmt == "gfd":
-        return fmt, base, f"{base}.bin"
+    if fmt == "kfile":
+        return fmt, base, base
     if fmt == "plink":
         return fmt, base, base
-    raise ValueError("Unsupported output format. Use one of: plink, vcf, hmp, txt, npy, gfd.")
+    raise ValueError("Unsupported output format. Use one of: plink, vcf, hmp, txt, npy, kfile.")
 
 def _iter_filtered_chunks(
     chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
@@ -1330,75 +1333,6 @@ def _iter_counted_chunks(
     for block, sites in chunks:
         counter[0] += int(np.asarray(block).shape[0])
         yield block, sites
-
-
-def _mode_impute_012(geno: np.ndarray) -> np.ndarray:
-    x = np.asarray(geno, dtype=np.float32)
-    if x.ndim != 2:
-        raise ValueError(f"Genotype block must be 2D, got {x.shape}")
-    if x.shape[0] == 0 or x.shape[1] == 0:
-        return np.empty_like(x, dtype=np.int8)
-
-    g = np.full(x.shape, -9, dtype=np.int8)
-    valid = np.isfinite(x) & (x >= 0.0)
-    if np.any(valid):
-        vals = np.rint(x[valid]).astype(np.int16, copy=False)
-        vals = np.clip(vals, 0, 2).astype(np.int8, copy=False)
-        g[valid] = vals
-
-    c0 = np.sum(g == 0, axis=1, dtype=np.int64)
-    c1 = np.sum(g == 1, axis=1, dtype=np.int64)
-    c2 = np.sum(g == 2, axis=1, dtype=np.int64)
-    modes = np.argmax(np.stack([c0, c1, c2], axis=1), axis=1).astype(np.int8, copy=False)
-
-    miss = g < 0
-    if np.any(miss):
-        rows, cols = np.where(miss)
-        g[rows, cols] = modes[rows]
-    return g
-
-
-def _transform_gfd_block(
-    geno: np.ndarray,
-    sites: Sequence[SiteInfo],
-) -> tuple[np.ndarray, list[SiteInfo]]:
-    x = np.asarray(geno, dtype=np.float32)
-    if x.ndim != 2:
-        raise ValueError(f"Genotype block must be 2D, got {x.shape}")
-    m, n = x.shape
-    if m != len(sites):
-        raise ValueError(f"Genotype/sites mismatch: rows={m}, sites={len(sites)}")
-    if m == 0:
-        return np.empty((0, n), dtype=np.uint8), []
-
-    g = _mode_impute_012(x)
-    left = (g != 0).astype(np.uint8, copy=False)
-    right = (g != 2).astype(np.uint8, copy=False)
-
-    out = np.empty((m * 2, n), dtype=np.uint8)
-    out[0::2, :] = left
-    out[1::2, :] = right
-
-    out_sites: list[SiteInfo] = []
-    for s in sites:
-        chrom0 = str(s.chrom)
-        try:
-            pos0 = int(s.pos)
-        except Exception:
-            pos0 = 0
-        out_sites.append(SiteInfo(f"{chrom0}_1", pos0, "0", "1"))
-        out_sites.append(SiteInfo(f"{chrom0}_2", pos0, "0", "1"))
-    return out, out_sites
-
-
-def _iter_gfd_chunks(
-    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
-) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
-    for geno, sites in chunks:
-        arr, gfd_sites = _transform_gfd_block(np.asarray(geno, dtype=np.float32), list(sites))
-        if arr.shape[0] == 0:
-            continue
-        yield arr, gfd_sites
 
 
 def _stack_chunks(
@@ -2473,9 +2407,9 @@ def build_parser() -> CliArgumentParser:
         "-fmt",
         "--fmt",
         dest="format",
-        choices=["plink", "vcf", "hmp", "txt", "npy", "gfd"],
+        choices=["plink", "vcf", "hmp", "txt", "npy", "kfile"],
         default="plink",
-        help="Output genotype format: plink, vcf, hmp, txt, npy, gfd (default: plink).",
+        help="Output genotype format: plink, vcf, hmp, txt, npy, kfile (default: plink).",
     )
     add_common_out_arg(opt, default=".", help_profile="converted_results")
     add_common_prefix_arg(opt, default=None, help_profile="input_basename")
@@ -2742,7 +2676,7 @@ def main() -> None:
             f"{out_fmt.upper()} output from -file input requires real site metadata. "
             "Please provide a matching prefix.bsite/prefix.site or prefix.bim sidecar."
         )
-    if snp_name_template is not None and out_fmt in {"txt", "npy", "gfd"}:
+    if snp_name_template is not None and out_fmt in {"txt", "npy"}:
         logger.warning(
             "--snp-name only affects outputs carrying SNP IDs (PLINK/VCF/HMP); "
             "it has no effect for %s output.",
@@ -2799,6 +2733,13 @@ def main() -> None:
 
     reader_model = "add"
     reader_het = float(args.het)
+    kfile_output = out_fmt == "kfile"
+    # Kfile has a different QC contract: heterozygotes are recoded as
+    # missing before --geno/--maf are evaluated.  Disable reader-side
+    # filtering so the streaming kfile writer can apply that contract once.
+    reader_maf = 0.0 if kfile_output else float(args.maf)
+    reader_missing = 1.0 if kfile_output else float(args.geno)
+    reader_het_for_input = 1.0 if kfile_output else reader_het
     site_type_snps_only = _simple_snp_only_requested(
         snps_only=bool(args.snps_only),
         biallelic_only=bool(args.biallelic_only),
@@ -3111,10 +3052,10 @@ def main() -> None:
                 str(source_path),
                 chunk_size=50_000,
                 sample_ids=keep_sample_ids,
-                maf_threshold=float(args.maf),
-                max_missing_rate=float(args.geno),
+                maf_threshold=reader_maf,
+                max_missing_rate=reader_missing,
                 model=reader_model,
-                het_threshold=reader_het,
+                het_threshold=reader_het_for_input,
                 snp_sites=push_snp_sites,
                 bim_range=push_bim_range,
                 chr_keys=post_filter.chr_keys,
@@ -3129,10 +3070,10 @@ def main() -> None:
                 str(source_path),
                 chunk_size=50_000,
                 sample_ids=keep_sample_ids,
-                maf_threshold=float(args.maf),
-                max_missing_rate=float(args.geno),
+                maf_threshold=reader_maf,
+                max_missing_rate=reader_missing,
                 model=reader_model,
-                het_threshold=reader_het,
+                het_threshold=reader_het_for_input,
                 snp_sites=push_snp_sites,
                 bim_range=push_bim_range,
                 chr_keys=post_filter.chr_keys,
@@ -3149,10 +3090,10 @@ def main() -> None:
                 site_path=txt_site_path,
                 chunk_size=50_000,
                 sample_ids=keep_sample_ids,
-                maf_threshold=float(args.maf),
-                max_missing_rate=float(args.geno),
+                maf_threshold=reader_maf,
+                max_missing_rate=reader_missing,
                 model=reader_model,
-                het_threshold=reader_het,
+                het_threshold=reader_het_for_input,
                 snp_sites=push_snp_sites,
                 bim_range=push_bim_range,
                 chr_keys=post_filter.chr_keys,
@@ -3164,11 +3105,11 @@ def main() -> None:
             c = load_genotype_chunks(
                 gfile,
                 chunk_size=50_000,
-                maf=float(args.maf),
-                missing_rate=float(args.geno),
+                maf=reader_maf,
+                missing_rate=reader_missing,
                 impute=False,
                 model=reader_model,
-                het=reader_het,
+                het=reader_het_for_input,
                 snps_only=bool(site_type_snps_only),
                 sample_ids=keep_sample_ids,
                 snp_sites=push_snp_sites,
@@ -3764,6 +3705,11 @@ def main() -> None:
         # Single-pass mode: write and count simultaneously, then backfill site count.
         selected_n_sites = None
 
+    # The kfile writer applies its own post-decode QC after recoding dosage 1
+    # to missing, so the reader's pre-filtered site count is not usable.
+    if kfile_output:
+        selected_n_sites = None
+
     out_sample_ids = keep_sample_ids if keep_sample_ids is not None else [str(s) for s in sample_ids]
     print(f"Genotype source: {format_path_for_display(gfile)}")
     if selected_n_sites is not None:
@@ -3778,6 +3724,21 @@ def main() -> None:
                 snp_name_template,
             )
         return _iter_snp_named_chunks(_make_chunks(), snp_name_template)
+
+    if out_fmt == "kfile":
+        t0 = time.time()
+        written = write_kfile_output(
+            str(out_prefix),
+            out_sample_ids,
+            _make_output_chunks(),
+            total_sites=None,
+            max_missing_rate=float(args.geno),
+            maf_threshold=float(args.maf),
+        )
+        print(f"Samples: {len(out_sample_ids)}, sites: {int(written)}")
+        log_success(logger, f"Format conversion completed in {time.time() - t0:.2f} s")
+        log_success(logger, f"Output written: {output_display}")
+        return
 
     if rust_prune_direct_done:
         _rewrite_plink_bim_snp_names(str(out_prefix), snp_name_template)
@@ -3852,14 +3813,6 @@ def main() -> None:
             out_sample_ids,
             output_chunks,
             total_sites=(int(selected_n_sites) if selected_n_sites is not None else None),
-        )
-    elif out_fmt == "gfd":
-        write_gfd_output(
-            out_path,
-            out_sample_ids,
-            output_chunks,
-            total_sites=(int(selected_n_sites) * 2 if selected_n_sites is not None else None),
-            source_is_dosage012=True,
         )
     else:
         if selected_n_sites is None:

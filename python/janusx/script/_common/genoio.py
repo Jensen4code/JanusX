@@ -4,6 +4,8 @@ import json
 import os
 import struct
 import sys
+import tempfile
+import shutil
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -40,11 +42,6 @@ from .progress import (
     should_animate_status,
     stdout_is_tty,
 )
-
-try:
-    from janusx.janusx import gfd_packbits_from_dosage_block as _gfd_packbits_from_dosage_block
-except Exception:
-    _gfd_packbits_from_dosage_block = None
 
 try:
     from janusx.janusx import Bin01StreamWriter as _Bin01StreamWriter
@@ -1684,6 +1681,82 @@ def write_bim_file(path: str, sites: Sequence[SiteInfo]) -> None:
             alt = str(site.alt_allele)
             fbim.write(f"{chrom}\t{sid}\t0\t{pos}\t{ref}\t{alt}\n")
 
+
+def transform_kfile_block(
+    geno: np.ndarray,
+    sites: Sequence[SiteInfo],
+    *,
+    max_missing_rate: float = 1.0,
+    maf_threshold: float = 0.0,
+) -> tuple[np.ndarray, list[SiteInfo]]:
+    """Convert a dosage block to a binary-presence kfile block.
+
+    Kfile genotype conversion deliberately treats heterozygous dosage ``1``
+    as missing.  Filtering is therefore performed after that recoding, and
+    the remaining missing calls are imputed by the per-site mode of ``{0, 2}``
+    (ties choose ``0``).  The returned rows are little-endian bit-packed with
+    dosage ``0`` encoded as bit 0 and dosage ``2`` as bit 1.
+    """
+    x = np.asarray(geno, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"kfile genotype block must be 2D, got {x.shape}")
+    n_rows, n_samples = (int(x.shape[0]), int(x.shape[1]))
+    sites_list = list(sites)
+    if n_rows != len(sites_list):
+        raise ValueError(
+            f"kfile genotype/sites mismatch: rows={n_rows}, sites={len(sites_list)}"
+        )
+    if n_samples <= 0:
+        raise ValueError("kfile conversion requires at least one sample")
+    miss_limit = float(max_missing_rate)
+    maf_limit = float(maf_threshold)
+    if not (0.0 <= miss_limit <= 1.0):
+        raise ValueError("kfile max_missing_rate must be within [0, 1]")
+    if not (0.0 <= maf_limit <= 0.5):
+        raise ValueError("kfile maf_threshold must be within [0, 0.5]")
+    if n_rows == 0:
+        return np.empty((0, (n_samples + 7) // 8), dtype=np.uint8), []
+
+    # Reader dosage is expected to be the exact 0/1/2 coding.  Do not round
+    # arbitrary floating point values here: rounding would silently turn an
+    # invalid call such as 0.6 into a homozygous reference call.
+    rounded = x
+    valid = np.isfinite(x) & ((rounded == 0.0) | (rounded == 2.0))
+    observed = np.sum(valid, axis=1, dtype=np.int64)
+    missing_rate = 1.0 - (observed.astype(np.float64) / float(n_samples))
+    keep = missing_rate <= (miss_limit + 1e-12)
+
+    # MAF is computed from observed 0/2 calls after heterozygotes become NA.
+    # Sites with no observed calls are retained only when no MAF threshold was
+    # requested; they are deterministically imputed to dosage 0.
+    alt_count = np.sum(valid & (rounded == 2.0), axis=1, dtype=np.int64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # Each dosage-2 individual contributes two alternate alleles.  The
+        # factor of two cancels against the diploid denominator, leaving the
+        # fraction of observed 0/2 calls carrying dosage 2.
+        alt_freq = alt_count.astype(np.float64) / observed.astype(np.float64)
+    maf = np.minimum(alt_freq, 1.0 - alt_freq)
+    if maf_limit > 0.0:
+        keep &= np.isfinite(maf) & (maf + 1e-12 >= maf_limit)
+
+    keep_idx = np.flatnonzero(keep).astype(np.int64, copy=False)
+    if keep_idx.size == 0:
+        return np.empty((0, (n_samples + 7) // 8), dtype=np.uint8), []
+
+    valid_keep = valid[keep_idx, :]
+    rounded_keep = rounded[keep_idx, :]
+    c0 = np.sum(valid_keep & (rounded_keep == 0.0), axis=1, dtype=np.int64)
+    c2 = np.sum(valid_keep & (rounded_keep == 2.0), axis=1, dtype=np.int64)
+    # Tie order intentionally matches argmax([count_0, count_2]).
+    mode_is_two = c2 > c0
+    present = valid_keep & (rounded_keep == 2.0)
+    missing = ~valid_keep
+    if np.any(missing):
+        present[missing] = np.broadcast_to(mode_is_two[:, None], present.shape)[missing]
+
+    packed = np.packbits(present.astype(np.uint8, copy=False), axis=1, bitorder="little")
+    return np.ascontiguousarray(packed, dtype=np.uint8), [sites_list[int(i)] for i in keep_idx]
+
 def _require_bin01_writer():
     if _Bin01StreamWriter is None:
         raise RuntimeError(
@@ -1890,144 +1963,175 @@ def write_bin01_output(
         )
 
 
-def write_gfd_output(
+_KFILE_BSITE_MAGIC = b"JXBSIT1\0"
+_KFILE_BSITE_VERSION = 1
+_KFILE_BSITE_HEADER_SIZE = 80
+
+
+def _write_kfile_bsite_header(
+    handle,
+    *,
+    n_samples: int,
+    n_sites: int,
+    bytes_per_col: int,
+) -> None:
+    """Write the standard 80-byte kfile bitset header."""
+    handle.seek(0)
+    handle.write(
+        struct.pack(
+            "<8sIIQQQIII28s",
+            _KFILE_BSITE_MAGIC,
+            int(_KFILE_BSITE_VERSION),
+            1,  # column-major bitset layout
+            int(n_samples),
+            int(n_sites),
+            int(bytes_per_col),
+            0,  # little-bit order
+            0,  # no compression
+            0,
+            b"\0" * 28,
+        )
+    )
+
+
+def _kfile_bim_row(site: SiteInfo) -> str:
+    chrom = str(getattr(site, "chrom", "")).strip()
+    try:
+        pos = int(getattr(site, "pos", 0))
+    except Exception:
+        pos = 0
+    snp = str(getattr(site, "snp", "")).strip()
+    if snp == "" or snp == ".":
+        snp = f"{chrom}_{pos}"
+    ref = str(getattr(site, "ref_allele", "N"))
+    alt = str(getattr(site, "alt_allele", "N"))
+    return f"{chrom}\t{snp}\t0\t{pos}\t{ref}\t{alt}\n"
+
+
+def _write_kfile_idv_file(path: Path, sample_ids: Sequence[str]) -> None:
+    """Write one sample ID per line in the compact kfile sidecar."""
+    with open(path, "w", encoding="utf-8") as handle:
+        for sample_id in sample_ids:
+            handle.write(f"{sample_id}\n")
+
+
+def write_kfile_output(
     out_path: str,
     sample_ids: Sequence[str],
     chunks: Iterable[tuple[np.ndarray, Sequence[SiteInfo]]],
     *,
-    total_sites: int | None,
-    source_is_dosage012: bool = False,
-) -> None:
-    """
-    Write Garfield dedicated binary matrix output:
-      - {prefix}.bin : header + packed 0/1 rows (JXBIN001)
-      - {prefix}.id  : sample IDs (text)
-      - {prefix}.bsite: binary site metadata
-        (chrom-code, strand[0='-',1='+'], cM, bp, allele0, allele1)
-    """
-    sample_ids = [str(x) for x in sample_ids]
-    n_samples = len(sample_ids)
+    total_sites: int | None = None,
+    max_missing_rate: float = 1.0,
+    maf_threshold: float = 0.0,
+) -> int:
+    """Stream dosage blocks into a BIM-headed binary-presence kfile."""
+    ids = [str(x).strip() for x in sample_ids]
+    n_samples = len(ids)
     if n_samples <= 0:
-        raise ValueError("sample_ids is empty")
+        raise ValueError("kfile output requires at least one sample")
+    if any(not sample_id for sample_id in ids):
+        raise ValueError("kfile output sample IDs must be non-empty")
+    if any(any(char.isspace() for char in sample_id) for sample_id in ids):
+        raise ValueError("kfile output sample IDs must not contain whitespace")
+    if len(set(ids)) != n_samples:
+        raise ValueError("kfile output sample IDs must be unique")
+    miss_limit = float(max_missing_rate)
+    maf_limit = float(maf_threshold)
+    if not (0.0 <= miss_limit <= 1.0):
+        raise ValueError("kfile max_missing_rate must be within [0, 1]")
+    if not (0.0 <= maf_limit <= 0.5):
+        raise ValueError("kfile maf_threshold must be within [0, 0.5]")
 
-    prefix = output_prefix_from_path(out_path)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    write_id_file(f"{prefix}.id", sample_ids)
-
+    prefix = Path(str(out_path))
+    if prefix.name.endswith(".meta.json"):
+        prefix = Path(str(prefix)[: -len(".meta.json")])
+    parent = prefix.parent if str(prefix.parent) else Path(".")
+    parent.mkdir(parents=True, exist_ok=True)
+    name = prefix.name
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f".{name}.kfile.", dir=str(parent)))
+    tmp_prefix = tmp_dir / name
+    suffixes = (".bsite", ".bim", ".idv", ".meta.json")
+    final_paths = {suffix: Path(f"{prefix}{suffix}") for suffix in suffixes}
+    temp_paths = {suffix: Path(f"{tmp_prefix}{suffix}") for suffix in suffixes}
+    bytes_per_col = (n_samples + 7) // 8
     written = 0
-    packed_cols = (n_samples + 7) // 8
-    writer_cls = _require_bin01_writer()
-    progress, task_id, pbar = _open_site_progress("Writing GFD", total_sites)
-    writer = writer_cls(str(out_path), n_samples, "none")
-    with open(f"{prefix}.bsite", "wb") as fsite:
-        try:
-            _write_bsite_header(
-                fsite,
+    progress, task_id, pbar = _open_site_progress("Writing kfile", total_sites)
+    try:
+        _write_kfile_idv_file(temp_paths[".idv"], ids)
+        with (
+            open(temp_paths[".bsite"], "wb") as bsite,
+            open(temp_paths[".bim"], "w", encoding="utf-8") as bim,
+        ):
+            _write_kfile_bsite_header(
+                bsite,
+                n_samples=n_samples,
                 n_sites=0,
-                n_chrom=0,
-                chrom_dict_offset=LEGACY_BSITE_HEADER_SIZE,
-                flags=0,
+                bytes_per_col=bytes_per_col,
             )
-            chrom_codes: dict[str, int] = {}
-            chrom_names: list[str] = []
             for block, sites in chunks:
-                arr = np.asarray(block)
-                if arr.ndim != 2:
-                    raise ValueError("GFD chunk must be 2D (n_sites, n_samples)")
-                if int(arr.shape[1]) != n_samples:
+                packed, kept_sites = transform_kfile_block(
+                    np.asarray(block, dtype=np.float32),
+                    list(sites),
+                    max_missing_rate=miss_limit,
+                    maf_threshold=maf_limit,
+                )
+                if packed.shape[0] == 0:
+                    continue
+                if int(packed.shape[1]) != bytes_per_col:
                     raise ValueError(
-                        f"GFD chunk sample mismatch: got {arr.shape[1]}, expected {n_samples}"
+                        f"kfile packed width mismatch: got {packed.shape[1]}, expected {bytes_per_col}"
                     )
-                sites_list = list(sites)
-                n_rows_in = int(arr.shape[0])
-                if n_rows_in != len(sites_list):
-                    raise ValueError(
-                        f"GFD chunk rows/sites mismatch: rows={n_rows_in}, sites={len(sites_list)}"
-                    )
+                bsite.write(np.asarray(packed, dtype=np.uint8).tobytes(order="C"))
+                for site in kept_sites:
+                    bim.write(_kfile_bim_row(site))
+                written += int(packed.shape[0])
+                _advance_site_progress(progress, task_id, pbar, int(packed.shape[0]))
 
-                if source_is_dosage012:
-                    if _gfd_packbits_from_dosage_block is not None:
-                        packed = np.asarray(
-                            _gfd_packbits_from_dosage_block(np.asarray(arr, dtype=np.float32))
-                        )
-                    else:
-                        x = np.asarray(arr, dtype=np.float32)
-                        g = np.full(x.shape, -9, dtype=np.int8)
-                        valid = np.isfinite(x) & (x >= 0.0)
-                        if np.any(valid):
-                            vals = np.rint(x[valid]).astype(np.int16, copy=False)
-                            vals = np.clip(vals, 0, 2).astype(np.int8, copy=False)
-                            g[valid] = vals
-                        c0 = np.sum(g == 0, axis=1, dtype=np.int64)
-                        c1 = np.sum(g == 1, axis=1, dtype=np.int64)
-                        c2 = np.sum(g == 2, axis=1, dtype=np.int64)
-                        modes = np.argmax(np.stack([c0, c1, c2], axis=1), axis=1).astype(
-                            np.int8, copy=False
-                        )
-                        miss = g < 0
-                        if np.any(miss):
-                            rows, cols = np.where(miss)
-                            g[rows, cols] = modes[rows]
-                        out = np.empty((n_rows_in * 2, n_samples), dtype=np.uint8)
-                        out[0::2, :] = (g != 0).astype(np.uint8, copy=False)
-                        out[1::2, :] = (g != 2).astype(np.uint8, copy=False)
-                        packed = np.packbits(out, axis=1, bitorder="little")
-
-                    if int(packed.shape[1]) != packed_cols:
-                        raise ValueError(
-                            f"GFD packbits column mismatch: got {packed.shape[1]}, expected {packed_cols}"
-                        )
-                    writer.write_chunk_packed(np.asarray(packed, dtype=np.uint8))
-
-                    out_sites: list[SiteInfo] = []
-                    for s in sites_list:
-                        chrom0 = str(getattr(s, "chrom", ""))
-                        try:
-                            pos0 = int(getattr(s, "pos", 0))
-                        except Exception:
-                            pos0 = 0
-                        out_sites.append(SiteInfo(f"{chrom0}_1", pos0, "0", "1"))
-                        out_sites.append(SiteInfo(f"{chrom0}_2", pos0, "0", "1"))
-                    write_bsite_records(
-                        fsite,
-                        out_sites,
-                        chrom_codes=chrom_codes,
-                        chrom_names=chrom_names,
-                    )
-                    n_rows_out = int(packed.shape[0])
-                    written += n_rows_out
-                    _advance_site_progress(progress, task_id, pbar, n_rows_out)
-                else:
-                    writer.write_chunk_f32(np.asarray(arr, dtype=np.float32))
-                    write_bsite_records(
-                        fsite,
-                        sites_list,
-                        chrom_codes=chrom_codes,
-                        chrom_names=chrom_names,
-                    )
-                    n_rows_out = int(arr.shape[0])
-                    written += n_rows_out
-                    _advance_site_progress(progress, task_id, pbar, n_rows_out)
-
-            chrom_dict_offset = write_bsite_chrom_dict(fsite, chrom_names)
-            _write_bsite_header(
-                fsite,
+            if written <= 0:
+                raise ValueError("All variants were filtered out for kfile output")
+            _write_kfile_bsite_header(
+                bsite,
+                n_samples=n_samples,
                 n_sites=written,
-                n_chrom=len(chrom_names),
-                chrom_dict_offset=chrom_dict_offset,
-                flags=0,
+                bytes_per_col=bytes_per_col,
             )
-            fsite.flush()
-        finally:
-            writer.close()
-            _close_site_progress(progress, pbar)
+            bsite.flush()
 
-    if total_sites is not None and written != int(total_sites):
-        print(
-            f"! Warning: Written site count mismatch for GFD output: {written} vs {total_sites}. "
-            f"Header was written with n_sites={written}.",
-            file=sys.stderr,
-        )
+        meta = {
+            "format": "janusx-kmer-bitmatrix-v1",
+            "k": 0,
+            "n_samples": n_samples,
+            "n_kmers": written,
+            "bytes_per_col": bytes_per_col,
+            "encoding": "DOSAGE_0_2_BINARY_PRESENCE",
+            "canonical": False,
+            "matrix_layout": "column_major_bitset",
+            "value_type": "binary_presence",
+            "bit_order": "little_bit_order",
+            "bkmer_file": "",
+            "bsite_file": f"{name}.bsite",
+            "idv_file": f"{name}.idv",
+            "min_count": 0,
+            "min_presence_rate": float(maf_limit),
+            "max_presence_rate": 1.0,
+            "bucket_bits": 0,
+            "compression": "none",
+        }
+        with open(temp_paths[".meta.json"], "w", encoding="utf-8") as meta_file:
+            json.dump(meta, meta_file, indent=2)
+            meta_file.write("\n")
+
+        for suffix in (".idv", ".bim", ".bsite", ".meta.json"):
+            os.replace(temp_paths[suffix], final_paths[suffix])
+        if total_sites is not None and written != int(total_sites):
+            print(
+                f"! Warning: Written kfile site count mismatch: {written} vs {total_sites}.",
+                file=sys.stderr,
+            )
+        return written
+    finally:
+        _close_site_progress(progress, pbar)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _open_site_progress(desc: str, total_sites: int | None):

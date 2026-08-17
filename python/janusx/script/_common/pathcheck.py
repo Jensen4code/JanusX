@@ -37,10 +37,10 @@ def format_output_display(
         return f"{prefix_disp} (.npy/.site/.id)"
     if fmt == "txt":
         return f"{prefix_disp} (.txt/.site/.id)"
+    if fmt == "kfile":
+        return f"{prefix_disp} (.bsite/.bim/.idv/.meta.json)"
     if fmt == "bin":
         return f"{prefix_disp} (.bin/.bin.site/.bin.id or .bim/.fam)"
-    if fmt == "gfd":
-        return f"{prefix_disp} (.bin/.site/.id)"
     return f"{path_disp} ({fmt})"
 
 

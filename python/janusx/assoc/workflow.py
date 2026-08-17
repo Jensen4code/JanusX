@@ -5443,6 +5443,15 @@ def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
     if path.lower().endswith(".bim") and os.path.isfile(path):
         return path
 
+    # Marker-oriented kfiles produced by ``gformat -fmt kfile`` intentionally
+    # have no ``.bkmer`` payload.  Their sibling BIM is the site header, so
+    # check the logical prefix before falling back to PLINK/FILE resolution.
+    if path.lower().endswith(".meta.json"):
+        path = path[: -len(".meta.json")]
+    bim_from_prefix = f"{path}.bim"
+    if os.path.isfile(bim_from_prefix):
+        return bim_from_prefix
+
     plink_prefix = _as_plink_prefix(path)
     if plink_prefix is not None:
         bim_path = f"{plink_prefix}.bim"

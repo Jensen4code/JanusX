@@ -3,7 +3,7 @@ use crate::kmer::encode::{canonical_code, decode_kmer_u64, encode_kmer_u64, ENCO
 use crate::kmer::format::{
     BkmerHeader, BsiteHeader, KmergeMeta, SampleEntry, BKMER_HEADER_SIZE, BSITE_HEADER_SIZE,
 };
-use crate::kmer::writer::{write_idv_file, write_meta_json};
+use crate::kmer::writer::{read_idv_file, write_idv_file, write_meta_json};
 use anyhow::{bail, Context, Result};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -262,53 +262,6 @@ fn validate_meta(meta: &KmergeMeta, meta_path: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn read_idv_file(path: &Path) -> Result<Vec<SampleEntry>> {
-    let mut rows = Vec::new();
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
-        .from_path(path)
-        .with_context(|| format!("failed to open idv file: {}", path.display()))?;
-    let headers = reader.headers()?.clone();
-    if headers.len() < 3
-        || headers.get(0) != Some("#idx")
-        || headers.get(1) != Some("sample_id")
-        || headers.get(2) != Some("kmc_prefix")
-    {
-        bail!("invalid idv header in {}", path.display());
-    }
-    for rec in reader.records() {
-        let rec = rec?;
-        let index = rec
-            .get(0)
-            .ok_or_else(|| anyhow::anyhow!("missing idv index"))?
-            .parse::<u32>()?;
-        let sample_id = rec
-            .get(1)
-            .ok_or_else(|| anyhow::anyhow!("missing sample_id"))?
-            .trim()
-            .to_string();
-        if sample_id.is_empty() {
-            bail!("empty sample_id in {}", path.display());
-        }
-        rows.push(SampleEntry {
-            index,
-            sample_id,
-            kmc_prefix: rec.get(2).unwrap_or_default().to_string(),
-        });
-    }
-    rows.sort_by_key(|row| row.index);
-    let mut seen = HashSet::with_capacity(rows.len());
-    for (expected, row) in rows.iter().enumerate() {
-        if row.index as usize != expected || !seen.insert(row.sample_id.clone()) {
-            bail!(
-                "idv indices must be contiguous and sample IDs unique: {}",
-                path.display()
-            );
-        }
-    }
-    Ok(rows)
 }
 
 fn load_layout(prefix_or_meta: &Path) -> Result<KformatLayout> {
