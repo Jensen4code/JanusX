@@ -1144,7 +1144,7 @@ def _fit_janusx_packed(
         common["shape0"] = float(shape0)
         common["min_abs_beta"] = 1e-9
         ret = _jxrs.bayesa_packed(**common)
-        beta_raw, alpha_raw, varb_raw, vare, h2_mean, var_h2 = ret
+        beta_raw, alpha_raw, varb_raw, vare, h2_mean, var_h2, *diag_tail = ret
         prob_in_mean = float("nan")
         n_active_mean = float("nan")
     elif method == "BayesB":
@@ -1156,14 +1156,14 @@ def _fit_janusx_packed(
         common["prob_in"] = float(prob_in)
         common["counts"] = float(counts)
         ret = _jxrs.bayesb_packed(**common)
-        beta_raw, alpha_raw, varb_raw, vare, h2_mean, var_h2, prob_in_mean, n_active_mean = ret
+        beta_raw, alpha_raw, varb_raw, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, *diag_tail = ret
     elif method == "BayesCpi":
         if s0_b is not None:
             common["s0_b"] = float(s0_b)
         common["prob_in"] = float(prob_in)
         common["counts"] = float(counts)
         ret = _jxrs.bayescpi_packed(**common)
-        beta_raw, alpha_raw, varb_raw, vare, h2_mean, var_h2, prob_in_mean, n_active_mean = ret
+        beta_raw, alpha_raw, varb_raw, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, *diag_tail = ret
     else:
         raise ValueError(f"Unsupported method: {method}")
     beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
@@ -1178,6 +1178,14 @@ def _fit_janusx_packed(
         "var_h2": float(var_h2),
         "prob_in_mean": _safe_float(prob_in_mean),
         "n_active_mean": _safe_float(n_active_mean),
+        # A/B/C non-trace kernels append R-hat after the legacy fields.  Old
+        # B/C kernels ended at PIP, which is ambiguous when p == 1; require
+        # the new extra scalar before interpreting the tail as R-hat.
+        "rhat_h2": _safe_float(
+            diag_tail[-1]
+            if ((method == "BayesA" and len(diag_tail) >= 1) or (method != "BayesA" and len(diag_tail) >= 2))
+            else float("nan")
+        ),
         "seed": int(seed),
     }
 

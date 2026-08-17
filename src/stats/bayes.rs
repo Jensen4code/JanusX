@@ -117,6 +117,112 @@ fn posterior_keep_iters(n_iter: usize, burnin: usize, thin: usize) -> Vec<i64> {
     out
 }
 
+// A single MCMC chain does not support the classical multi-chain Gelman--Rubin
+// diagnostic.  We therefore report the standard split-chain R-hat calculated
+// from the retained posterior h2 samples.  The two consecutive halves are
+// treated as two chains; this is useful for detecting a persistent drift in the
+// scalar variance component while keeping the production kernels streaming.
+const BAYES_RHAT_THRESHOLD: f64 = 1.20;
+const BAYES_RHAT_MIN_KEEP: usize = 100;
+const BAYES_RHAT_CHECK_EVERY: usize = 25;
+const BAYES_RHAT_STABLE_CHECKS: usize = 3;
+
+#[derive(Debug, Default)]
+struct BayesRhatState {
+    // Prefix sums let us evaluate the two split-chain moments in O(1) at
+    // each check.  Keeping the prefix moments rather than rescanning all
+    // retained samples avoids O(n_iter^2) work for long, non-converging runs.
+    h2_sum: Vec<f64>,
+    h2_sq_sum: Vec<f64>,
+    stable_checks: usize,
+}
+
+impl BayesRhatState {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            h2_sum: {
+                let mut values = Vec::with_capacity(capacity + 1);
+                values.push(0.0);
+                values
+            },
+            h2_sq_sum: {
+                let mut values = Vec::with_capacity(capacity + 1);
+                values.push(0.0);
+                values
+            },
+            stable_checks: 0,
+        }
+    }
+
+    #[inline]
+    fn observe(&mut self, h2: f64) -> bool {
+        if h2.is_finite() {
+            let sum = *self.h2_sum.last().unwrap_or(&0.0);
+            let sq_sum = *self.h2_sq_sum.last().unwrap_or(&0.0);
+            self.h2_sum.push(sum + h2);
+            self.h2_sq_sum.push(sq_sum + h2 * h2);
+        }
+        let n = self.h2_sum.len().saturating_sub(1);
+        if n < BAYES_RHAT_MIN_KEEP || n % BAYES_RHAT_CHECK_EVERY != 0 {
+            return false;
+        }
+        let rhat = split_rhat_from_prefix(&self.h2_sum, &self.h2_sq_sum);
+        if rhat.is_finite() && rhat < BAYES_RHAT_THRESHOLD {
+            self.stable_checks += 1;
+        } else {
+            self.stable_checks = 0;
+        }
+        self.stable_checks >= BAYES_RHAT_STABLE_CHECKS
+    }
+
+    #[inline]
+    fn value(&self) -> f64 {
+        split_rhat_from_prefix(&self.h2_sum, &self.h2_sq_sum)
+    }
+}
+
+fn split_rhat_from_prefix(sum: &[f64], sq_sum: &[f64]) -> f64 {
+    let n = sum.len().saturating_sub(1);
+    if sq_sum.len() != sum.len() {
+        return f64::NAN;
+    }
+    if n < 4 {
+        return f64::NAN;
+    }
+    // Use equal halves; an odd final sample is intentionally ignored.
+    let chain_n = n / 2;
+    if chain_n < 2 {
+        return f64::NAN;
+    }
+    let left_sum = sum[chain_n];
+    let left_sq_sum = sq_sum[chain_n];
+    let split_end = chain_n * 2;
+    let total_sum = sum[split_end];
+    let total_sq_sum = sq_sum[split_end];
+    let right_sum = total_sum - left_sum;
+    let right_sq_sum = total_sq_sum - left_sq_sum;
+    let mean_left = left_sum / chain_n as f64;
+    let mean_right = right_sum / chain_n as f64;
+    let var_left =
+        ((left_sq_sum - left_sum * left_sum / chain_n as f64) / (chain_n - 1) as f64).max(0.0);
+    let var_right =
+        ((right_sq_sum - right_sum * right_sum / chain_n as f64) / (chain_n - 1) as f64).max(0.0);
+    let within = 0.5 * (var_left + var_right);
+    let between = chain_n as f64 * (mean_left - mean_right) * (mean_left - mean_right) / 2.0;
+    let var_hat = ((chain_n - 1) as f64 / chain_n as f64) * within + between / chain_n as f64;
+    if !within.is_finite() || !var_hat.is_finite() {
+        return f64::NAN;
+    }
+    if within <= f64::MIN_POSITIVE {
+        return if var_hat <= f64::MIN_POSITIVE {
+            1.0
+        } else {
+            f64::INFINITY
+        };
+    }
+    (var_hat / within).sqrt().max(1.0)
+}
+
 fn fill_beta_trace_row(
     beta_trace: &mut [f64],
     row_idx: usize,
@@ -851,6 +957,7 @@ fn bayesb_core_impl(
         f64,
         f64,
         Vec<f64>,
+        f64,
     ),
     String,
 > {
@@ -974,6 +1081,7 @@ fn bayesb_core_impl(
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
     let mut n_keep = 0usize;
+    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
     let var_b_fixed = 1e10_f64;
 
     let chi_b_active = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
@@ -1103,6 +1211,9 @@ fn bayesb_core_impl(
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
             n_keep += 1;
+            if rhat_state.observe(h2) {
+                break;
+            }
         }
     }
 
@@ -1127,6 +1238,7 @@ fn bayesb_core_impl(
     }
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
+    let rhat_h2 = rhat_state.value();
 
     Ok((
         beta_sum,
@@ -1138,6 +1250,7 @@ fn bayesb_core_impl(
         prob_in_mean,
         n_active_mean,
         pip_sum,
+        rhat_h2,
     ))
 }
 
@@ -1159,7 +1272,21 @@ fn bayescpi_core_impl(
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
-) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, f64, Vec<f64>), String> {
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        Vec<f64>,
+        f64,
+    ),
+    String,
+> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -1279,6 +1406,7 @@ fn bayescpi_core_impl(
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
     let mut n_keep = 0usize;
+    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
     let var_b_fixed = 1e10_f64;
 
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
@@ -1395,6 +1523,9 @@ fn bayescpi_core_impl(
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
             n_keep += 1;
+            if rhat_state.observe(h2) {
+                break;
+            }
         }
     }
 
@@ -1419,6 +1550,7 @@ fn bayescpi_core_impl(
     }
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
+    let rhat_h2 = rhat_state.value();
 
     Ok((
         beta_sum,
@@ -1430,6 +1562,7 @@ fn bayescpi_core_impl(
         prob_in_mean,
         n_active_mean,
         pip_sum,
+        rhat_h2,
     ))
 }
 
@@ -1452,7 +1585,7 @@ fn bayesa_core_impl(
     s0_e_opt: Option<f64>,
     _min_abs_beta: f64,
     seed: Option<u64>,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64), String> {
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64), String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -1572,6 +1705,7 @@ fn bayesa_core_impl(
     let mut h2_sum = 0.0;
     let mut h2_sq_sum = 0.0;
     let mut n_keep = 0usize;
+    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
     let var_b_fixed = 1e10_f64;
 
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
@@ -1653,6 +1787,9 @@ fn bayesa_core_impl(
             h2_sum += h2;
             h2_sq_sum += h2 * h2;
             n_keep += 1;
+            if rhat_state.observe(h2) {
+                break;
+            }
         }
     }
 
@@ -1674,7 +1811,10 @@ fn bayesa_core_impl(
     if var_h2 < 0.0 {
         var_h2 = 0.0;
     }
-    Ok((beta_sum, alpha_sum, varb_sum, var_e_sum, h2_mean, var_h2))
+    let rhat_h2 = rhat_state.value();
+    Ok((
+        beta_sum, alpha_sum, varb_sum, var_e_sum, h2_mean, var_h2, rhat_h2,
+    ))
 }
 
 fn bayesa_packed_core_impl(
@@ -1704,7 +1844,7 @@ fn bayesa_packed_core_impl(
     _min_abs_beta: f64,
     seed: Option<u64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64), String> {
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64), String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -1872,6 +2012,7 @@ fn bayesa_packed_core_impl(
     let mut h2_sum = 0.0;
     let mut h2_sq_sum = 0.0;
     let mut n_keep = 0usize;
+    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
     let var_b_fixed = 1e10_f64;
 
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
@@ -1974,6 +2115,9 @@ fn bayesa_packed_core_impl(
             h2_sum += h2;
             h2_sq_sum += h2 * h2;
             n_keep += 1;
+            if rhat_state.observe(h2) {
+                break;
+            }
         }
     }
 
@@ -1995,7 +2139,10 @@ fn bayesa_packed_core_impl(
     if var_h2 < 0.0 {
         var_h2 = 0.0;
     }
-    Ok((beta_sum, alpha_sum, varb_sum, var_e_sum, h2_mean, var_h2))
+    let rhat_h2 = rhat_state.value();
+    Ok((
+        beta_sum, alpha_sum, varb_sum, var_e_sum, h2_mean, var_h2, rhat_h2,
+    ))
 }
 
 fn bayesb_packed_core_impl(
@@ -2037,6 +2184,7 @@ fn bayesb_packed_core_impl(
         f64,
         f64,
         Vec<f64>,
+        f64,
     ),
     String,
 > {
@@ -2225,6 +2373,7 @@ fn bayesb_packed_core_impl(
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
     let mut n_keep = 0usize;
+    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
     let var_b_fixed = 1e10_f64;
 
     let chi_b_active = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
@@ -2379,6 +2528,9 @@ fn bayesb_packed_core_impl(
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
             n_keep += 1;
+            if rhat_state.observe(h2) {
+                break;
+            }
         }
     }
 
@@ -2403,6 +2555,7 @@ fn bayesb_packed_core_impl(
     }
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
+    let rhat_h2 = rhat_state.value();
 
     Ok((
         beta_sum,
@@ -2414,6 +2567,7 @@ fn bayesb_packed_core_impl(
         prob_in_mean,
         n_active_mean,
         pip_sum,
+        rhat_h2,
     ))
 }
 
@@ -2443,7 +2597,21 @@ fn bayescpi_packed_core_impl(
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, f64, f64, Vec<f64>), String> {
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        Vec<f64>,
+        f64,
+    ),
+    String,
+> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -2625,6 +2793,7 @@ fn bayescpi_packed_core_impl(
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
     let mut n_keep = 0usize;
+    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
     let var_b_fixed = 1e10_f64;
 
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
@@ -2764,6 +2933,9 @@ fn bayescpi_packed_core_impl(
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
             n_keep += 1;
+            if rhat_state.observe(h2) {
+                break;
+            }
         }
     }
 
@@ -2788,6 +2960,7 @@ fn bayescpi_packed_core_impl(
     }
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
+    let rhat_h2 = rhat_state.value();
 
     Ok((
         beta_sum,
@@ -2799,6 +2972,7 @@ fn bayescpi_packed_core_impl(
         prob_in_mean,
         n_active_mean,
         pip_sum,
+        rhat_h2,
     ))
 }
 
@@ -2807,8 +2981,8 @@ fn bayescpi_packed_core_impl(
     y,
     m,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 1500,
+    burnin = 500,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -2841,6 +3015,7 @@ pub fn bayesa(
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
+    f64,
     f64,
     f64,
     f64,
@@ -2921,11 +3096,11 @@ pub fn bayesa(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2)) => {
+        Ok((beta, alpha, varb, vare, h2_mean, var_h2, rhat_h2)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2))
+            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2, rhat_h2))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -2936,8 +3111,8 @@ pub fn bayesa(
     y,
     m,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 3000,
+    burnin = 2000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -2978,6 +3153,7 @@ pub fn bayesb(
     f64,
     f64,
     Py<PyArray1<f64>>,
+    f64,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3057,7 +3233,18 @@ pub fn bayesb(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
+        Ok((
+            beta,
+            alpha,
+            varb,
+            vare,
+            h2_mean,
+            var_h2,
+            prob_in_mean,
+            n_active_mean,
+            pip,
+            rhat_h2,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
@@ -3072,6 +3259,7 @@ pub fn bayesb(
                 prob_in_mean,
                 n_active_mean,
                 pip_py,
+                rhat_h2,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3083,8 +3271,8 @@ pub fn bayesb(
     y,
     m,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 3000,
+    burnin = 2000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3121,6 +3309,7 @@ pub fn bayescpi(
     f64,
     f64,
     Py<PyArray1<f64>>,
+    f64,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3205,7 +3394,18 @@ pub fn bayescpi(
     });
 
     match result {
-        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
+        Ok((
+            beta,
+            alpha,
+            varb_mean,
+            vare,
+            h2_mean,
+            var_h2,
+            prob_in_mean,
+            n_active_mean,
+            pip,
+            rhat_h2,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let pip_py = pip.into_pyarray(py).into_bound().unbind();
@@ -3219,6 +3419,7 @@ pub fn bayescpi(
                 prob_in_mean,
                 n_active_mean,
                 pip_py,
+                rhat_h2,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3236,8 +3437,8 @@ pub fn bayescpi(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 1500,
+    burnin = 500,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3278,6 +3479,7 @@ pub fn bayesa_packed(
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
+    f64,
     f64,
     f64,
     f64,
@@ -3420,11 +3622,11 @@ pub fn bayesa_packed(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2)) => {
+        Ok((beta, alpha, varb, vare, h2_mean, var_h2, rhat_h2)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2))
+            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2, rhat_h2))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -3441,8 +3643,8 @@ pub fn bayesa_packed(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 3000,
+    burnin = 2000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3491,6 +3693,7 @@ pub fn bayesb_packed(
     f64,
     f64,
     Py<PyArray1<f64>>,
+    f64,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3632,7 +3835,18 @@ pub fn bayesb_packed(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
+        Ok((
+            beta,
+            alpha,
+            varb,
+            vare,
+            h2_mean,
+            var_h2,
+            prob_in_mean,
+            n_active_mean,
+            pip,
+            rhat_h2,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
@@ -3647,6 +3861,7 @@ pub fn bayesb_packed(
                 prob_in_mean,
                 n_active_mean,
                 pip_py,
+                rhat_h2,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3664,8 +3879,8 @@ pub fn bayesb_packed(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 3000,
+    burnin = 2000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3710,6 +3925,7 @@ pub fn bayescpi_packed(
     f64,
     f64,
     Py<PyArray1<f64>>,
+    f64,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3856,7 +4072,18 @@ pub fn bayescpi_packed(
     });
 
     match result {
-        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
+        Ok((
+            beta,
+            alpha,
+            varb_mean,
+            vare,
+            h2_mean,
+            var_h2,
+            prob_in_mean,
+            n_active_mean,
+            pip,
+            rhat_h2,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let pip_py = pip.into_pyarray(py).into_bound().unbind();
@@ -3870,6 +4097,7 @@ pub fn bayescpi_packed(
                 prob_in_mean,
                 n_active_mean,
                 pip_py,
+                rhat_h2,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3888,8 +4116,8 @@ pub fn bayescpi_packed(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 1500,
+    burnin = 500,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3935,6 +4163,7 @@ pub fn bayesa_stream_bed(
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
+    f64,
     f64,
     f64,
     f64,
@@ -4067,11 +4296,11 @@ pub fn bayesa_stream_bed(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2)) => {
+        Ok((beta, alpha, varb, vare, h2_mean, var_h2, rhat_h2)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2))
+            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2, rhat_h2))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -4089,8 +4318,8 @@ pub fn bayesa_stream_bed(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 3000,
+    burnin = 2000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -4144,6 +4373,7 @@ pub fn bayesb_stream_bed(
     f64,
     f64,
     Py<PyArray1<f64>>,
+    f64,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -4275,7 +4505,18 @@ pub fn bayesb_stream_bed(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
+        Ok((
+            beta,
+            alpha,
+            varb,
+            vare,
+            h2_mean,
+            var_h2,
+            prob_in_mean,
+            n_active_mean,
+            pip,
+            rhat_h2,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
@@ -4290,6 +4531,7 @@ pub fn bayesb_stream_bed(
                 prob_in_mean,
                 n_active_mean,
                 pip_py,
+                rhat_h2,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -4308,8 +4550,8 @@ pub fn bayesb_stream_bed(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 200,
-    burnin = 100,
+    n_iter = 3000,
+    burnin = 2000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -4359,6 +4601,7 @@ pub fn bayescpi_stream_bed(
     f64,
     f64,
     Py<PyArray1<f64>>,
+    f64,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -4495,7 +4738,18 @@ pub fn bayescpi_stream_bed(
     });
 
     match result {
-        Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2, prob_in_mean, n_active_mean, pip)) => {
+        Ok((
+            beta,
+            alpha,
+            varb_mean,
+            vare,
+            h2_mean,
+            var_h2,
+            prob_in_mean,
+            n_active_mean,
+            pip,
+            rhat_h2,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let pip_py = pip.into_pyarray(py).into_bound().unbind();
@@ -4509,6 +4763,7 @@ pub fn bayescpi_stream_bed(
                 prob_in_mean,
                 n_active_mean,
                 pip_py,
+                rhat_h2,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),

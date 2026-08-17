@@ -112,7 +112,7 @@ from janusx.gfreader import (
 )
 from janusx.pyBLUP.kfold import KFold as _LocalKFold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
-from janusx.pyBLUP.bayes import BAYES
+from janusx.pyBLUP.bayes import BAYES, bayes_mcmc_defaults as _bayes_mcmc_defaults
 from janusx.pyBLUP.ml import (
     MLGS,
     _HAS_SKLEARN,
@@ -11377,6 +11377,7 @@ def GSapi(
             packed_backend = (
                 "resident" if use_packed_resident_native else "stream"
             )
+            bayes_n_iter, bayes_burnin, bayes_thin = _bayes_mcmc_defaults(method)
             packed_kwargs: dict[str, typing.Any] = {
                 "y": y_vec,
                 "n_samples": int(n_total_samples),
@@ -11395,9 +11396,9 @@ def GSapi(
                 ),
                 "sample_indices": train_abs,
                 "x": None,
-                "n_iter": 400,
-                "burnin": 200,
-                "thin": 1,
+                "n_iter": int(bayes_n_iter),
+                "burnin": int(bayes_burnin),
+                "thin": int(bayes_thin),
                 "r2": float(r2_used),
                 "threads": int(max(0, int(n_jobs))),
                 "seed": None,
@@ -11444,12 +11445,27 @@ def GSapi(
             bayes_pip: np.ndarray | None = None
             if str(method) in {"BayesB", "BayesCpi"} and len(diag_tail) >= 3:
                 try:
-                    bayes_pip = np.ascontiguousarray(
-                        np.asarray(diag_tail[-1], dtype=np.float64).reshape(-1),
-                        dtype=np.float64,
-                    )
+                    beta_size = int(np.asarray(beta_raw).size)
+                    # New kernels append ``pip, rhat``; old kernels end at
+                    # ``pip``.  Use the tuple position rather than scalar
+                    # shape: with one marker, both PIP and R-hat are scalars.
+                    pip_item = diag_tail[-2] if len(diag_tail) >= 4 else diag_tail[-1]
+                    pip_arr = np.asarray(pip_item, dtype=np.float64).reshape(-1)
+                    if int(pip_arr.size) == beta_size:
+                        bayes_pip = np.ascontiguousarray(pip_arr, dtype=np.float64)
                 except Exception:
                     bayes_pip = None
+            bayes_rhat = float("nan")
+            # R-hat is present only in the new B/C tuple (PIP + scalar R-hat).
+            if len(diag_tail) >= 4 or str(method) == "BayesA":
+                try:
+                    candidate_rhat = np.asarray(
+                        diag_tail[-1], dtype=np.float64
+                    ).reshape(-1)
+                    if int(candidate_rhat.size) == 1:
+                        bayes_rhat = float(candidate_rhat[0])
+                except Exception:
+                    bayes_rhat = float("nan")
 
             if bayes_runtime_state is not None:
                 bayes_runtime_state["r2_used"] = float(r2_used)
@@ -11465,6 +11481,8 @@ def GSapi(
                 if len(diag_tail) >= 2:
                     bayes_runtime_state["prob_in_mean"] = float(diag_tail[0])
                     bayes_runtime_state["n_active_mean"] = float(diag_tail[1])
+                bayes_runtime_state["rhat_h2"] = float(bayes_rhat)
+                bayes_runtime_state["rhat"] = float(bayes_rhat)
 
             if need_train_pred:
                 if train_pred_idx is None:
@@ -11532,6 +11550,8 @@ def GSapi(
                         np.asarray(bayes_pip, dtype=np.float64).reshape(-1),
                         dtype=np.float64,
                     )
+                model_state["rhat_h2"] = float(bayes_rhat)
+                model_state["rhat"] = float(bayes_rhat)
             return (
                 np.asarray(train_pred, dtype=float).reshape(-1, 1),
                 np.asarray(test_pred, dtype=float).reshape(-1, 1),
@@ -11574,6 +11594,9 @@ def GSapi(
             )
             bayes_runtime_state["r2_n_used"] = int(r2_n_used)
             bayes_runtime_state["r2_n_total"] = int(r2_n_total)
+            model_rhat = float(getattr(model, "rhat_h2", getattr(model, "rhat", np.nan)))
+            bayes_runtime_state["rhat_h2"] = model_rhat
+            bayes_runtime_state["rhat"] = model_rhat
         if need_train_pred:
             if train_pred_idx is None:
                 train_pred = model.predict(Xtrain)
@@ -11606,6 +11629,8 @@ def GSapi(
                     np.asarray(pip_hat, dtype=np.float64).reshape(-1),
                     dtype=np.float64,
                 )
+            model_state["rhat_h2"] = float(getattr(model, "rhat_h2", np.nan))
+            model_state["rhat"] = float(getattr(model, "rhat", np.nan))
         return (
             np.asarray(train_pred, dtype=float).reshape(-1, 1),
             np.asarray(model.predict(Xtest), dtype=float).reshape(-1, 1),
@@ -11744,7 +11769,9 @@ def _run_method_task(
     gblup_vc_rows: list[dict[str, typing.Any]] = []
     gblup_final_state: dict[str, typing.Any] | None = None
     bayes_r2_rows: list[float] = []
+    bayes_rhat_rows: list[float] = []
     bayes_r2_final = float("nan")
+    bayes_rhat_final = float("nan")
     bayes_r2_source_final = ""
     bayes_r2_n_used_final = 0
     bayes_r2_n_total_final = 0
@@ -12758,6 +12785,13 @@ def _run_method_task(
                             and (not (bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2)))
                         ):
                             bayes_auto_r2_cache[bayes_r2_cache_key] = float(r2_used)
+                    rhat_call = float(
+                        bayes_state_call.get(
+                            "rhat_h2", bayes_state_call.get("rhat", np.nan)
+                        )
+                    )
+                    if np.isfinite(rhat_call):
+                        bayes_rhat_rows.append(float(rhat_call))
                 if (
                     method == "rrBLUP"
                     and rrblup_cv_reuse_enabled
@@ -13569,6 +13603,13 @@ def _run_method_task(
                     and (not (bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2)))
                 ):
                     bayes_auto_r2_cache[bayes_r2_final_key] = float(r2_used_final)
+            rhat_final_call = float(
+                bayes_state_final.get(
+                    "rhat_h2", bayes_state_final.get("rhat", np.nan)
+                )
+            )
+            if np.isfinite(rhat_final_call):
+                bayes_rhat_final = float(rhat_final_call)
         if method == "rrBLUP" and rr_state_final is not None:
             mode_used = str((rr_cfg_final or {}).get("pve_mode", "lambda")).strip().lower()
             if mode_used not in {"lambda", "trainvar"}:
@@ -13676,6 +13717,12 @@ def _run_method_task(
         bayes_r2_final = float(np.nanmean(np.asarray(bayes_r2_rows, dtype=np.float64)))
     if (
         method in {"BayesA", "BayesB", "BayesCpi"}
+        and (not np.isfinite(bayes_rhat_final))
+        and len(bayes_rhat_rows) > 0
+    ):
+        bayes_rhat_final = float(np.nanmean(np.asarray(bayes_rhat_rows, dtype=np.float64)))
+    if (
+        method in {"BayesA", "BayesB", "BayesCpi"}
         and (bayes_r2_source_final == "")
         and bayes_cv_reuse_enabled
         and np.isfinite(bayes_cv_shared_r2)
@@ -13718,6 +13765,7 @@ def _run_method_task(
         "test_pred": test_pred,
         "pve_final": float(pve_final),
         "bayes_r2_final": float(bayes_r2_final),
+        "bayes_rhat_final": float(bayes_rhat_final),
         "bayes_r2_source_final": str(bayes_r2_source_final),
         "bayes_r2_n_used_final": int(bayes_r2_n_used_final),
         "bayes_r2_n_total_final": int(bayes_r2_n_total_final),
@@ -14401,7 +14449,8 @@ def _run_methods_parallel(
             return rows
 
         if m in {"BayesA", "BayesB", "BayesCpi"}:
-            rows.append(("n_iter/burnin/thin", "400/200/1"))
+            n_iter, burnin, thin = _bayes_mcmc_defaults(m)
+            rows.append(("n_iter/burnin/thin", f"{n_iter}/{burnin}/{thin}"))
             r2_blup = float(result.get("bayes_r2_final", np.nan))
             r2_src = str(result.get("bayes_r2_source_final", "")).strip()
             r2_n_used = int(max(0, int(result.get("bayes_r2_n_used_final", 0) or 0)))
@@ -14419,6 +14468,14 @@ def _run_methods_parallel(
                 rows.append(("r2", "auto (BLUP pve(pheno)=NA)"))
             if m in {"BayesB", "BayesCpi"}:
                 rows.append(("prob_in/counts", "0.5/5.0"))
+            rhat = float(result.get("bayes_rhat_final", np.nan))
+            if not np.isfinite(rhat):
+                state_obj = result.get("model_state", None)
+                if isinstance(state_obj, typing.Mapping):
+                    rhat = float(
+                        state_obj.get("rhat_h2", state_obj.get("rhat", np.nan))
+                    )
+            rows.append(("Rhat(h2)", f"{rhat:.4f}" if np.isfinite(rhat) else "NA"))
             return rows
 
         if m in _ML_METHOD_MAP:
@@ -14447,7 +14504,7 @@ def _run_methods_parallel(
         return rows
 
     # Keep detail value column aligned across methods in the same run.
-    # Example: GBLUP `additive`, rrBLUP `auto -> EXACT`, Bayes `400/200/1`
+    # Example: GBLUP `additive`, rrBLUP `auto -> EXACT`, Bayes method-specific chain
     # should start from one shared column.
     detail_key_width = 0
     for _m in methods:
@@ -22324,6 +22381,21 @@ def _run_gs_pipeline_impl(
                         rows.append(("Ve", f"{ve_exact:.6g}"))
                     if np.isfinite(pve_exact):
                         rows.append(("PVE(pheno-scale)", f"{pve_exact:.3f}"))
+                    return rows
+
+                if m in {"BayesA", "BayesB", "BayesCpi"}:
+                    n_iter, burnin, thin = _bayes_mcmc_defaults(m)
+                    rows.append(("n_iter/burnin/thin", f"{n_iter}/{burnin}/{thin}"))
+                    if m in {"BayesB", "BayesCpi"}:
+                        rows.append(("prob_in/counts", "0.5/5.0"))
+                    rhat = _detail_float_or_nan(res_obj.get("bayes_rhat_final", np.nan))
+                    if not np.isfinite(rhat):
+                        state_obj = res_obj.get("model_state", None)
+                        if isinstance(state_obj, typing.Mapping):
+                            rhat = _detail_float_or_nan(
+                                state_obj.get("rhat_h2", state_obj.get("rhat", np.nan))
+                            )
+                    rows.append(("Rhat(h2)", f"{rhat:.4f}" if np.isfinite(rhat) else "NA"))
                     return rows
 
                 return rows
