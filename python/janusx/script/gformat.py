@@ -116,6 +116,7 @@ from ._common.genoio import (
     determine_genotype_source_from_args as determine_genotype_source,
     discover_id_sidecar_path,
     discover_site_path,
+    resolve_kfile_chunk_size,
     write_kfile_output,
     write_npy_output,
     write_text_output,
@@ -2939,6 +2940,14 @@ def main() -> None:
             miss_preview = ", ".join(keep_list[:10])
             raise ValueError(f"--keep selected 0 samples. Missing examples: {miss_preview}")
 
+    decode_chunk_size = (
+        resolve_kfile_chunk_size(
+            len(keep_sample_ids) if keep_sample_ids is not None else len(sample_ids)
+        )
+        if kfile_output
+        else 50_000
+    )
+
     use_rust_convert_direct = bool(
         _rust_convert_fastpath_enabled()
         and prune_spec is None
@@ -3050,7 +3059,7 @@ def main() -> None:
                 raise ValueError(f"VCF source path not found: {gfile}")
             c = _iter_vcf_direct_chunks(
                 str(source_path),
-                chunk_size=50_000,
+                chunk_size=decode_chunk_size,
                 sample_ids=keep_sample_ids,
                 maf_threshold=reader_maf,
                 max_missing_rate=reader_missing,
@@ -3068,7 +3077,7 @@ def main() -> None:
                 raise ValueError(f"HMP source path not found: {gfile}")
             c = _iter_hmp_direct_chunks(
                 str(source_path),
-                chunk_size=50_000,
+                chunk_size=decode_chunk_size,
                 sample_ids=keep_sample_ids,
                 maf_threshold=reader_maf,
                 max_missing_rate=reader_missing,
@@ -3088,7 +3097,7 @@ def main() -> None:
                 str(txt_matrix_path),
                 id_path=str(txt_id_path),
                 site_path=txt_site_path,
-                chunk_size=50_000,
+                chunk_size=decode_chunk_size,
                 sample_ids=keep_sample_ids,
                 maf_threshold=reader_maf,
                 max_missing_rate=reader_missing,
@@ -3104,7 +3113,7 @@ def main() -> None:
         else:
             c = load_genotype_chunks(
                 gfile,
-                chunk_size=50_000,
+                chunk_size=decode_chunk_size,
                 maf=reader_maf,
                 missing_rate=reader_missing,
                 impute=False,
@@ -3720,21 +3729,79 @@ def main() -> None:
     def _make_output_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
         if pruned_geno is not None and pruned_sites is not None:
             return _iter_snp_named_chunks(
-                _iter_chunks_from_matrix(pruned_geno, pruned_sites, chunk_size=50_000),
+                _iter_chunks_from_matrix(
+                    pruned_geno,
+                    pruned_sites,
+                    chunk_size=decode_chunk_size,
+                ),
                 snp_name_template,
             )
         return _iter_snp_named_chunks(_make_chunks(), snp_name_template)
 
     if out_fmt == "kfile":
         t0 = time.time()
-        written = write_kfile_output(
-            str(out_prefix),
-            out_sample_ids,
-            _make_output_chunks(),
-            total_sites=None,
-            max_missing_rate=float(args.geno),
-            maf_threshold=float(args.maf),
-        )
+        kfile_progress = None
+        kfile_progress_state = {"scanned": 0, "reported": 0}
+        if status_enabled:
+            kfile_progress = ProgressAdapter(
+                total=max(1, int(n_sites)),
+                desc="Converting kfile",
+                force_animate=True,
+                keep_display=False,
+                show_remaining=True,
+                emit_done=False,
+                log_unit="site",
+            )
+
+            def _on_kfile_progress(
+                scanned: int,
+                total: int,
+                kept: int,
+                filtered: int,
+            ) -> None:
+                scanned_i = max(0, int(scanned))
+                total_i = max(1, int(total), scanned_i)
+                if total_i != int(kfile_progress.total):
+                    kfile_progress.set_total(total_i)
+                previous = int(kfile_progress_state["reported"])
+                if scanned_i > previous:
+                    kfile_progress.update(scanned_i - previous)
+                    kfile_progress_state["reported"] = scanned_i
+                kfile_progress_state["scanned"] = scanned_i
+                kfile_progress.set_postfix(
+                    kept=int(kept),
+                    filtered=int(filtered),
+                )
+
+        try:
+            written = write_kfile_output(
+                str(out_prefix),
+                out_sample_ids,
+                _make_output_chunks(),
+                total_sites=int(n_sites),
+                max_missing_rate=float(args.geno),
+                maf_threshold=float(args.maf),
+                progress_callback=(
+                    _on_kfile_progress if kfile_progress is not None else None
+                ),
+                progress_every=max(1, int(decode_chunk_size)),
+            )
+            if kfile_progress is not None:
+                scanned_final = int(kfile_progress_state["scanned"])
+                if scanned_final > 0 and scanned_final != int(kfile_progress.total):
+                    kfile_progress.set_total(scanned_final)
+                if scanned_final > int(kfile_progress_state["reported"]):
+                    kfile_progress.update(
+                        scanned_final - int(kfile_progress_state["reported"])
+                    )
+                kfile_progress.set_postfix(
+                    kept=int(written),
+                    filtered=max(0, scanned_final - int(written)),
+                )
+                kfile_progress.finish()
+        finally:
+            if kfile_progress is not None:
+                kfile_progress.close()
         print(f"Samples: {len(out_sample_ids)}, sites: {int(written)}")
         log_success(logger, f"Format conversion completed in {time.time() - t0:.2f} s")
         log_success(logger, f"Output written: {output_display}")

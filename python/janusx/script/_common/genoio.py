@@ -7,7 +7,7 @@ import sys
 import tempfile
 import shutil
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
@@ -1720,8 +1720,16 @@ def transform_kfile_block(
     # Reader dosage is expected to be the exact 0/1/2 coding.  Do not round
     # arbitrary floating point values here: rounding would silently turn an
     # invalid call such as 0.6 into a homozygous reference call.
-    rounded = x
-    valid = np.isfinite(x) & ((rounded == 0.0) | (rounded == 2.0))
+    # Keep the two boolean work arrays reusable.  The previous expression
+    # materialized several full-size temporaries at once, which made a
+    # 50,000-row block surprisingly memory hungry for large panels.
+    is_two = np.equal(x, 2.0)
+    valid = np.isfinite(x)
+    is_zero = np.equal(x, 0.0)
+    np.logical_or(is_zero, is_two, out=is_zero)
+    np.logical_and(valid, is_zero, out=valid)
+    np.logical_and(is_two, valid, out=is_two)
+    del is_zero
     observed = np.sum(valid, axis=1, dtype=np.int64)
     missing_rate = 1.0 - (observed.astype(np.float64) / float(n_samples))
     keep = missing_rate <= (miss_limit + 1e-12)
@@ -1729,7 +1737,7 @@ def transform_kfile_block(
     # MAF is computed from observed 0/2 calls after heterozygotes become NA.
     # Sites with no observed calls are retained only when no MAF threshold was
     # requested; they are deterministically imputed to dosage 0.
-    alt_count = np.sum(valid & (rounded == 2.0), axis=1, dtype=np.int64)
+    alt_count = np.sum(is_two, axis=1, dtype=np.int64)
     with np.errstate(divide="ignore", invalid="ignore"):
         # Each dosage-2 individual contributes two alternate alleles.  The
         # factor of two cancels against the diploid denominator, leaving the
@@ -1744,18 +1752,52 @@ def transform_kfile_block(
         return np.empty((0, (n_samples + 7) // 8), dtype=np.uint8), []
 
     valid_keep = valid[keep_idx, :]
-    rounded_keep = rounded[keep_idx, :]
-    c0 = np.sum(valid_keep & (rounded_keep == 0.0), axis=1, dtype=np.int64)
-    c2 = np.sum(valid_keep & (rounded_keep == 2.0), axis=1, dtype=np.int64)
+    present = is_two[keep_idx, :]
+    del valid, is_two
+    observed_keep = observed[keep_idx]
+    c2 = np.sum(present, axis=1, dtype=np.int64)
+    c0 = observed_keep - c2
     # Tie order intentionally matches argmax([count_0, count_2]).
     mode_is_two = c2 > c0
-    present = valid_keep & (rounded_keep == 2.0)
     missing = ~valid_keep
     if np.any(missing):
         present[missing] = np.broadcast_to(mode_is_two[:, None], present.shape)[missing]
 
-    packed = np.packbits(present.astype(np.uint8, copy=False), axis=1, bitorder="little")
+    packed = np.packbits(present, axis=1, bitorder="little")
     return np.ascontiguousarray(packed, dtype=np.uint8), [sites_list[int(i)] for i in keep_idx]
+
+
+def resolve_kfile_chunk_size(
+    n_samples: int,
+    *,
+    target_mb: float | None = None,
+    min_rows: int = 256,
+    max_rows: int = 50_000,
+) -> int:
+    """Choose a bounded decode block for the memory-heavy kfile transform.
+
+    The converter keeps the source dosage matrix plus several boolean working
+    arrays while recoding heterozygotes and packing presence bits.  Budgeting
+    roughly 16 bytes per sample-cell keeps those temporaries bounded without
+    adding a pre-scan or changing the one-pass output order.  Set
+    ``JX_GFORMAT_KFILE_CHUNK_MB`` to tune the budget for a particular machine.
+    """
+    samples = max(1, int(n_samples))
+    lo = max(1, int(min_rows))
+    hi = max(lo, int(max_rows))
+    if target_mb is None:
+        raw_target = os.environ.get("JX_GFORMAT_KFILE_CHUNK_MB", "256")
+        try:
+            target = float(raw_target)
+        except (TypeError, ValueError):
+            target = 256.0
+    else:
+        target = float(target_mb)
+    if not np.isfinite(target) or target <= 0.0:
+        target = 256.0
+    budget_bytes = max(1, int(target * 1024.0 * 1024.0))
+    rows = budget_bytes // (samples * 16)
+    return int(max(lo, min(hi, rows)))
 
 def _require_bin01_writer():
     if _Bin01StreamWriter is None:
@@ -2023,6 +2065,8 @@ def write_kfile_output(
     total_sites: int | None = None,
     max_missing_rate: float = 1.0,
     maf_threshold: float = 0.0,
+    progress_callback: Callable[[int, int, int, int], None] | None = None,
+    progress_every: int = 0,
 ) -> int:
     """Stream dosage blocks into a BIM-headed binary-presence kfile."""
     ids = [str(x).strip() for x in sample_ids]
@@ -2055,7 +2099,12 @@ def write_kfile_output(
     temp_paths = {suffix: Path(f"{tmp_prefix}{suffix}") for suffix in suffixes}
     bytes_per_col = (n_samples + 7) // 8
     written = 0
-    progress, task_id, pbar = _open_site_progress("Writing kfile", total_sites)
+    scanned = 0
+    last_progress_scan = 0
+    if progress_callback is None:
+        progress, task_id, pbar = _open_site_progress("Writing kfile", total_sites)
+    else:
+        progress, task_id, pbar = None, None, None
     try:
         _write_kfile_idv_file(temp_paths[".idv"], ids)
         with (
@@ -2069,23 +2118,38 @@ def write_kfile_output(
                 bytes_per_col=bytes_per_col,
             )
             for block, sites in chunks:
+                sites_list = list(sites)
+                scanned += len(sites_list)
                 packed, kept_sites = transform_kfile_block(
                     np.asarray(block, dtype=np.float32),
-                    list(sites),
+                    sites_list,
                     max_missing_rate=miss_limit,
                     maf_threshold=maf_limit,
                 )
-                if packed.shape[0] == 0:
-                    continue
-                if int(packed.shape[1]) != bytes_per_col:
+                if packed.shape[0] > 0 and int(packed.shape[1]) != bytes_per_col:
                     raise ValueError(
                         f"kfile packed width mismatch: got {packed.shape[1]}, expected {bytes_per_col}"
                     )
-                bsite.write(np.asarray(packed, dtype=np.uint8).tobytes(order="C"))
-                for site in kept_sites:
-                    bim.write(_kfile_bim_row(site))
-                written += int(packed.shape[0])
-                _advance_site_progress(progress, task_id, pbar, int(packed.shape[0]))
+                if packed.shape[0] > 0:
+                    bsite.write(np.asarray(packed, dtype=np.uint8).tobytes(order="C"))
+                    for site in kept_sites:
+                        bim.write(_kfile_bim_row(site))
+                    written += int(packed.shape[0])
+                if progress_callback is None:
+                    _advance_site_progress(progress, task_id, pbar, len(sites_list))
+                elif (
+                    last_progress_scan == 0
+                    or progress_every <= 0
+                    or scanned - last_progress_scan >= int(progress_every)
+                ):
+                    callback_total = int(total_sites) if total_sites is not None else scanned
+                    progress_callback(
+                        int(scanned),
+                        int(max(callback_total, scanned)),
+                        int(written),
+                        int(scanned - written),
+                    )
+                    last_progress_scan = scanned
 
             if written <= 0:
                 raise ValueError("All variants were filtered out for kfile output")
@@ -2123,10 +2187,13 @@ def write_kfile_output(
 
         for suffix in (".idv", ".bim", ".bsite", ".meta.json"):
             os.replace(temp_paths[suffix], final_paths[suffix])
-        if total_sites is not None and written != int(total_sites):
-            print(
-                f"! Warning: Written kfile site count mismatch: {written} vs {total_sites}.",
-                file=sys.stderr,
+        if progress_callback is not None and scanned != last_progress_scan:
+            callback_total = int(total_sites) if total_sites is not None else scanned
+            progress_callback(
+                int(scanned),
+                int(max(callback_total, scanned)),
+                int(written),
+                int(scanned - written),
             )
         return written
     finally:
