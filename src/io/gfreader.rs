@@ -6,7 +6,7 @@ use pyo3::BoundObject;
 use memmap2::Advice;
 use memmap2::Mmap;
 use numpy::ndarray::{Array1, Array2};
-use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1};
 use rayon::prelude::*;
 #[cfg(target_arch = "x86")]
 use std::arch::x86 as x86_avx2;
@@ -8665,125 +8665,6 @@ impl NpyMmapReader {
     fn cursor(&self) -> usize {
         self.cursor
     }
-}
-
-#[pyfunction]
-pub fn gfd_packbits_from_dosage_block<'py>(
-    py: Python<'py>,
-    block: PyReadonlyArray2<'py, f32>,
-) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    let x = block.as_array();
-    if x.ndim() != 2 {
-        return Err(PyValueError::new_err(
-            "block must be 2D (n_sites, n_samples)",
-        ));
-    }
-    let n_rows = x.shape()[0];
-    let n_samples = x.shape()[1];
-    if n_samples == 0 {
-        let out = Array2::<u8>::zeros((0, 0));
-        #[allow(deprecated)]
-        return Ok(PyArray2::from_owned_array(py, out).into_bound());
-    }
-
-    let packed_cols = (n_samples + 7) / 8;
-    let out_rows = n_rows.saturating_mul(2);
-    let total = out_rows.saturating_mul(packed_cols);
-    let mut out: Vec<u8> = vec![0u8; total];
-
-    // Prefer zero-copy for contiguous blocks; otherwise make one contiguous copy.
-    let input_owned;
-    let input: &[f32] = if let Some(s) = x.as_slice_memory_order() {
-        s
-    } else {
-        let (raw, offset) = x.to_owned().into_raw_vec_and_offset();
-        let total = n_rows.saturating_mul(n_samples);
-        let start = offset.unwrap_or(0);
-        let end = start.saturating_add(total);
-        if end > raw.len() {
-            return Err(PyValueError::new_err(format!(
-                "block copy layout error: start={}, total={}, raw_len={}",
-                start,
-                total,
-                raw.len()
-            )));
-        }
-        input_owned = raw[start..end].to_vec();
-        &input_owned
-    };
-
-    #[inline]
-    fn normalize_g(v: f32) -> Option<u8> {
-        if !v.is_finite() || v < 0.0 {
-            None
-        } else {
-            let r = v.round();
-            if r <= 0.0 {
-                Some(0)
-            } else if r >= 2.0 {
-                Some(2)
-            } else {
-                Some(1)
-            }
-        }
-    }
-
-    py.detach(|| {
-        out.par_chunks_mut(2 * packed_cols)
-            .enumerate()
-            .for_each(|(r, out_rows2)| {
-                let row = &input[r * n_samples..(r + 1) * n_samples];
-
-                let mut c0: usize = 0;
-                let mut c1: usize = 0;
-                let mut c2: usize = 0;
-                for &v in row.iter() {
-                    if let Some(g) = normalize_g(v) {
-                        match g {
-                            0 => c0 += 1,
-                            1 => c1 += 1,
-                            _ => c2 += 1,
-                        }
-                    }
-                }
-                // Tie order follows numpy argmax([c0,c1,c2]) => 0 > 1 > 2 on ties.
-                let mode: u8 = if c0 >= c1 && c0 >= c2 {
-                    0
-                } else if c1 >= c2 {
-                    1
-                } else {
-                    2
-                };
-
-                let (left, right) = out_rows2.split_at_mut(packed_cols);
-                for b in 0..packed_cols {
-                    let base = b * 8;
-                    let mut lb: u8 = 0;
-                    let mut rb: u8 = 0;
-                    for bit in 0..8 {
-                        let i = base + bit;
-                        if i >= n_samples {
-                            break;
-                        }
-                        let g = normalize_g(row[i]).unwrap_or(mode);
-                        let mask = 1u8 << (bit as u8);
-                        if g != 0 {
-                            lb |= mask;
-                        }
-                        if g != 2 {
-                            rb |= mask;
-                        }
-                    }
-                    left[b] = lb;
-                    right[b] = rb;
-                }
-            });
-    });
-
-    let mat = Array2::from_shape_vec((out_rows, packed_cols), out)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    #[allow(deprecated)]
-    Ok(PyArray2::from_owned_array(py, mat).into_bound())
 }
 
 #[pyfunction]

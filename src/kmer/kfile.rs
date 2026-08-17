@@ -1,5 +1,6 @@
 use crate::breader::parse_bsite_header;
 use crate::kmer::format::{KmergeMeta, SampleEntry, BSITE_HEADER_SIZE};
+use crate::kmer::writer::read_idv_file;
 use anyhow::{bail, Context, Result};
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2};
@@ -10,7 +11,7 @@ use pyo3::BoundObject;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -23,6 +24,7 @@ struct KfileLayout {
     meta_path: PathBuf,
     bsite_path: PathBuf,
     idv_path: PathBuf,
+    bim_path: Option<PathBuf>,
     meta: KmergeMeta,
     samples: Vec<SampleEntry>,
 }
@@ -83,68 +85,42 @@ fn validate_meta(meta: &KmergeMeta, meta_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_idv_file(path: &Path) -> Result<Vec<SampleEntry>> {
-    let mut rows = Vec::new();
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
-        .from_path(path)
-        .with_context(|| format!("failed to open idv file: {}", path.display()))?;
-    let headers = reader
-        .headers()
-        .with_context(|| format!("failed to read idv header: {}", path.display()))?
-        .clone();
-    if headers.len() < 3
-        || headers.get(0) != Some("#idx")
-        || headers.get(1) != Some("sample_id")
-        || headers.get(2) != Some("kmc_prefix")
-    {
-        bail!("invalid idv header in {}", path.display());
-    }
-    for rec in reader.records() {
-        let rec = rec.with_context(|| format!("failed to parse idv row: {}", path.display()))?;
-        let index = rec
-            .get(0)
-            .ok_or_else(|| anyhow::anyhow!("missing idx in {}", path.display()))?
-            .parse::<u32>()
-            .with_context(|| format!("invalid idx in {}", path.display()))?;
-        let sample_id = rec
-            .get(1)
-            .ok_or_else(|| anyhow::anyhow!("missing sample_id in {}", path.display()))?
-            .trim()
-            .to_string();
-        if sample_id.is_empty() {
-            bail!("empty sample_id in {}", path.display());
-        }
-        let kmc_prefix = rec
-            .get(2)
-            .ok_or_else(|| anyhow::anyhow!("missing kmc_prefix in {}", path.display()))?
-            .to_string();
-        rows.push(SampleEntry {
-            index,
-            sample_id,
-            kmc_prefix,
-        });
-    }
-    rows.sort_by_key(|row| row.index);
-    let mut seen = HashSet::with_capacity(rows.len());
-    for (expected, row) in rows.iter().enumerate() {
-        if row.index as usize != expected {
-            bail!(
-                "idv indices must be contiguous from 0 in {} (saw {} at row {})",
+fn sibling_bim_path(meta_path: &Path) -> Option<PathBuf> {
+    let name = meta_path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".meta.json")?;
+    let candidate = meta_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{stem}.bim"));
+    candidate.is_file().then_some(candidate)
+}
+
+fn count_bim_rows(path: &Path) -> Result<usize> {
+    let reader = BufReader::new(
+        File::open(path)
+            .with_context(|| format!("failed to open BIM header: {}", path.display()))?,
+    );
+    let mut count = 0usize;
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| {
+            format!(
+                "failed to read BIM header {}:{}",
                 path.display(),
-                row.index,
-                expected
-            );
-        }
-        if !seen.insert(row.sample_id.clone()) {
-            bail!(
-                "duplicate sample_id in {}: {}",
-                path.display(),
-                row.sample_id
-            );
+                line_no + 1
+            )
+        })?;
+        if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
+            if line.split_whitespace().count() < 4 {
+                bail!(
+                    "malformed BIM header row at {}:{}",
+                    path.display(),
+                    line_no + 1
+                );
+            }
+            count = count.saturating_add(1);
         }
     }
-    Ok(rows)
+    Ok(count)
 }
 
 fn load_layout(prefix_or_meta: &Path) -> Result<KfileLayout> {
@@ -161,6 +137,28 @@ fn load_layout(prefix_or_meta: &Path) -> Result<KfileLayout> {
         .unwrap_or_else(|| PathBuf::from("."));
     let bsite_path = base_dir.join(&meta.bsite_file);
     let idv_path = base_dir.join(&meta.idv_file);
+    let bkmer_path = if meta.bkmer_file.trim().is_empty() {
+        None
+    } else {
+        Some(base_dir.join(&meta.bkmer_file))
+    };
+    let has_bkmer = bkmer_path.as_ref().is_some_and(|path| path.is_file());
+    let bim_path = if has_bkmer {
+        None
+    } else {
+        sibling_bim_path(&meta_path)
+    };
+    if let Some(path) = bim_path.as_ref() {
+        let rows = count_bim_rows(path)?;
+        if rows != usize::try_from(meta.n_kmers).context("n_kmers does not fit usize")? {
+            bail!(
+                "BIM header row count mismatch for {}: rows={} expected={}",
+                path.display(),
+                rows,
+                meta.n_kmers
+            );
+        }
+    }
     let mut bsite = File::open(&bsite_path)
         .with_context(|| format!("failed to open bsite file: {}", bsite_path.display()))?;
     let expected_payload = meta
@@ -209,6 +207,7 @@ fn load_layout(prefix_or_meta: &Path) -> Result<KfileLayout> {
         meta_path,
         bsite_path,
         idv_path,
+        bim_path,
         meta,
         samples,
     })
@@ -1586,6 +1585,13 @@ pub fn kfile_inspect_py<'py>(py: Python<'py>, prefix: String) -> PyResult<Bound<
     out.set_item("meta", layout.meta_path.to_string_lossy().as_ref())?;
     out.set_item("bsite", layout.bsite_path.to_string_lossy().as_ref())?;
     out.set_item("idv", layout.idv_path.to_string_lossy().as_ref())?;
+    out.set_item(
+        "bim",
+        layout
+            .bim_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+    )?;
     out.set_item("k", layout.meta.k)?;
     out.set_item("n_samples", layout.meta.n_samples)?;
     out.set_item("n_kmers", layout.meta.n_kmers)?;
@@ -1605,8 +1611,9 @@ pub fn kfile_inspect_py<'py>(py: Python<'py>, prefix: String) -> PyResult<Bound<
 mod tests {
     use super::{
         decode_bsite_chunk, decode_centered_row_full_identity_simd, decode_grm_prepared_block_into,
-        decode_grm_prepared_block_into_with_plan, maf_from_presence, prepare_grm_bsite_block,
-        KfileAssocSource, KfileBitsetDecodePlan, KfileChunkReader, KfileGrmSource,
+        decode_grm_prepared_block_into_with_plan, load_layout, maf_from_presence,
+        prepare_grm_bsite_block, KfileAssocSource, KfileBitsetDecodePlan, KfileChunkReader,
+        KfileGrmSource,
     };
     use crate::kmer::format::{BsiteHeader, KmergeMeta};
     use std::fs::{self, File};
@@ -1671,6 +1678,33 @@ mod tests {
             bucket_bits: 8,
             compression: "none".to_string(),
         }
+    }
+
+    #[test]
+    fn marker_kfile_uses_sibling_bim_when_bkmer_is_absent() {
+        let dir = grm_fixture_dir();
+        let mut meta = valid_grm_meta();
+        meta.k = 0;
+        meta.bkmer_file.clear();
+        let compact_idv = "s0\ns1\ns2\ns3\n";
+        write_grm_fixture(&dir, &meta, compact_idv, &[3, 15, 1]);
+        let bim_path = dir.join("fixture.bim");
+        fs::write(
+            &bim_path,
+            "1\trs1\t0\t1\tA\tG\n1\trs2\t0\t2\tA\tG\n1\trs3\t0\t3\tA\tG\n",
+        )
+        .expect("write BIM header");
+        let layout = load_layout(&dir.join("fixture")).expect("load marker kfile");
+        assert_eq!(layout.bim_path.as_deref(), Some(bim_path.as_path()));
+        assert_eq!(
+            layout
+                .samples
+                .iter()
+                .map(|sample| sample.sample_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s0", "s1", "s2", "s3"]
+        );
+        fs::remove_dir_all(dir).expect("remove fixture directory");
     }
 
     const VALID_IDV: &str =
