@@ -449,6 +449,156 @@ def _get_process_rss_bytes() -> int | None:
         return None
 
 
+def _parse_gs_memory_bytes(raw: object, *, default_unit: str = "bytes") -> int | None:
+    """Parse scheduler/cgroup memory values without changing other modules."""
+    text = str(raw or "").strip().lower()
+    if text == "" or text in {"max", "none", "unlimited", "infinity"}:
+        return None
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b?)?", text)
+    if match is None:
+        return None
+    try:
+        value = float(match.group(1))
+    except Exception:
+        return None
+    suffix = str(match.group(2) or "").strip().lower()
+    factors = {
+        "k": 1024,
+        "kb": 1024,
+        "ki": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mi": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gi": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "ti": 1024**4,
+        "tib": 1024**4,
+    }
+    if suffix:
+        factor = factors.get(suffix)
+    else:
+        factor = factors.get(str(default_unit).strip().lower(), 1)
+    if factor is None:
+        return None
+    parsed = int(value * float(factor))
+    return parsed if parsed > 0 and parsed < (1 << 60) else None
+
+
+def _detect_gs_memory_limit_bytes() -> int | None:
+    """Return the tightest scheduler/container memory limit when available."""
+    candidates: list[int] = []
+    for name in (
+        "SLURM_MEM_PER_NODE",
+        "SBATCH_MEM_PER_NODE",
+        "LSB_MAX_MEM",
+        "MEMORY_LIMIT_IN_MB",
+        "PBS_RESOURCE_LIST_MEM",
+        "PBS_RESOURCE_LIST_PMEM",
+        "PBS_RESOURCE_LIST_VMEM",
+    ):
+        parsed = _parse_gs_memory_bytes(os.environ.get(name, ""), default_unit="mb")
+        if parsed is not None:
+            candidates.append(int(parsed))
+
+    mem_per_cpu = _parse_gs_memory_bytes(
+        os.environ.get("SLURM_MEM_PER_CPU", ""),
+        default_unit="mb",
+    )
+    if mem_per_cpu is not None:
+        raw_cpus = (
+            os.environ.get("SLURM_CPUS_PER_TASK", "").strip()
+            or os.environ.get("OMP_NUM_THREADS", "").strip()
+            or os.environ.get("SLURM_CPUS_ON_NODE", "").strip()
+        )
+        try:
+            cpu_count = max(1, int(raw_cpus))
+        except Exception:
+            cpu_count = 1
+        candidates.append(int(mem_per_cpu) * int(cpu_count))
+
+    for path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                parsed = _parse_gs_memory_bytes(handle.read(), default_unit="bytes")
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            candidates.append(int(parsed))
+
+    return min(candidates) if candidates else None
+
+
+def _detect_gs_available_memory_bytes() -> tuple[int | None, int | None, int | None]:
+    """Return (available, effective_limit, current_rss) for GS route planning."""
+    try:
+        import psutil  # type: ignore
+
+        available = int(psutil.virtual_memory().available)
+    except Exception:
+        available = None
+    limit = _detect_gs_memory_limit_bytes()
+    rss = _get_process_rss_bytes()
+    if limit is not None:
+        limit_available = max(0, int(limit) - int(rss or 0))
+        available = (
+            limit_available
+            if available is None
+            else min(int(available), int(limit_available))
+        )
+    return available, limit, rss
+
+
+def _gs_route_budget_bytes(
+    *,
+    memory_gb: float | int | None,
+    auto_requested: bool,
+    available_bytes: int | None,
+    memory_limit_bytes: int | None,
+    rss_bytes: int | None,
+) -> tuple[int, str]:
+    """Resolve the safe half-memory budget used for GS genotype routing."""
+    gib = float(1024**3)
+    if not bool(auto_requested):
+        requested_gb = float(memory_gb if memory_gb is not None else 1.0)
+        budget = max(1, int(requested_gb * gib * 0.5))
+        return budget, "explicit -mem x0.5"
+
+    detected = False
+    if available_bytes is None and memory_limit_bytes is None and rss_bytes is None:
+        available_bytes, memory_limit_bytes, rss_bytes = _detect_gs_available_memory_bytes()
+        detected = True
+    effective_available = int(available_bytes or 0)
+    if memory_limit_bytes is not None and int(memory_limit_bytes) > 0:
+        limit_available = max(0, int(memory_limit_bytes) - int(rss_bytes or 0))
+        effective_available = (
+            limit_available
+            if effective_available <= 0
+            else min(effective_available, limit_available)
+        )
+    if effective_available <= 0:
+        # The shape-derived decode budget remains a safe fallback, but it is
+        # deliberately widened to at least 1 GiB for route selection.  It is
+        # not used to enlarge the decode block itself.
+        fallback_gb = max(1.0, 2.0 * float(memory_gb or 1.0))
+        effective_available = int(fallback_gb * gib)
+        reason = "auto fallback route floor"
+    else:
+        source = "detected available" if detected else "provided available"
+        if memory_limit_bytes is not None:
+            source += " constrained by limit"
+        reason = f"{source} x0.5"
+    return max(1, int(effective_available * 0.5)), reason
+
+
 def _debug_malloc_trim_enabled() -> bool:
     raw = str(os.getenv("JX_GS_DEBUG_MALLOC_TRIM", "0")).strip().lower()
     return raw in {"1", "true", "yes", "on", "y"}
@@ -643,9 +793,9 @@ def _packed_ctx_source_payload_bytes(packed_ctx: dict[str, typing.Any]) -> int:
 def _gs_bayes_resident_payload_cap_bytes(
     memory_gb: float | int | None = None,
 ) -> int:
-    # An explicit -mem is the single user-facing budget for all Bayes decode
-    # storage.  Keep the environment variable only as a legacy fallback when
-    # the user did not provide -mem, so it cannot silently override the CLI.
+    # Legacy payload-only fallback for callers that do not provide the new GS
+    # route budget. The main GS workflow uses `_gs_route_budget_bytes` and the
+    # full dense/resident peak estimates below.
     if memory_gb is not None:
         return int(max(0.0, float(_memory_gb_to_mb(memory_gb)))) * 1024 * 1024
     raw = os.getenv("JX_GS_BAYES_PACKED_MAX_MB", "").strip()
@@ -655,19 +805,109 @@ def _gs_bayes_resident_payload_cap_bytes(
     return 512 * 1024 * 1024
 
 
+def _gs_bayes_dense_predecode_policy_allows(n_samples: int, n_markers: int) -> bool:
+    """Mirror the native packed-Bayes dense predecode guard for route planning."""
+    raw_enabled = str(os.environ.get("JX_BAYES_PACKED_PREDECODE", "1")).strip().lower()
+    if raw_enabled in {"0", "false", "no", "off", "n"}:
+        return False
+    n = max(0, int(n_samples))
+    p = max(0, int(n_markers))
+    elem_count = n * p
+    if elem_count <= 0 or elem_count > 80_000_000:
+        return False
+    raw_cap = str(os.environ.get("JX_BAYES_PACKED_PREDECODE_MAX_MB", "768")).strip()
+    try:
+        cap_mb = max(1, int(raw_cap))
+    except Exception:
+        cap_mb = 768
+    dense_bytes = _estimate_dense_f32_bytes(n, p, copies=1)
+    return dense_bytes <= int(cap_mb) * 1024 * 1024
+
+
+def _gs_bayes_route_estimate(
+    *,
+    n_samples: int,
+    n_markers: int,
+    packed_payload_bytes: int,
+    decode_memory_gb: float | int,
+    route_budget_bytes: int,
+) -> dict[str, int | bool | str]:
+    """Estimate the peak genotype memory for dense/resident/stream routing."""
+    n = max(1, int(n_samples))
+    p = max(1, int(n_markers))
+    payload = max(0, int(packed_payload_bytes))
+    budget = max(1, int(route_budget_bytes))
+    block_rows = int(
+        max(
+            1,
+            min(
+                p,
+                int(
+                    _calc_stream_block_rows(
+                        n_samples=n,
+                        memory_gb=float(decode_memory_gb),
+                        elem_bytes=8,
+                        buffers=_GS_WORKING_BUFFERS_BAYES,
+                        min_rows=1,
+                    )
+                ),
+            ),
+        )
+    )
+    decode_block_bytes = _estimate_dense_f32_bytes(block_rows, n, copies=1)
+    decode_reserve_bytes = int(decode_block_bytes * _GS_WORKING_BUFFERS_BAYES)
+    dense_bytes = _estimate_dense_f32_bytes(p, n, copies=1)
+    dense_eligible = _gs_bayes_dense_predecode_policy_allows(n, p)
+    dense_peak_bytes = int(payload + dense_bytes + decode_block_bytes)
+    resident_peak_bytes = int(payload + decode_reserve_bytes)
+    promote_resident = bool(
+        resident_peak_bytes <= budget
+        and ((not dense_eligible) or dense_peak_bytes <= budget)
+    )
+    if not promote_resident:
+        selected_backend = "stream"
+    elif dense_eligible:
+        selected_backend = "resident+dense-predecode"
+    else:
+        selected_backend = "resident+double"
+    return {
+        "route_budget_bytes": budget,
+        "packed_payload_bytes": payload,
+        "block_rows": block_rows,
+        "decode_block_bytes": int(decode_block_bytes),
+        "decode_reserve_bytes": int(decode_reserve_bytes),
+        "dense_bytes": int(dense_bytes),
+        "dense_peak_bytes": dense_peak_bytes,
+        "resident_peak_bytes": resident_peak_bytes,
+        "dense_eligible": bool(dense_eligible),
+        "promote_resident": promote_resident,
+        "selected_backend": selected_backend,
+    }
+
+
 def _should_promote_bayes_resident_packed(
     packed_ctx: dict[str, typing.Any] | None,
     memory_gb: float | int | None = None,
+    *,
+    route_budget_bytes: int | None = None,
 ) -> bool:
     if packed_ctx is None or packed_ctx.get("packed", None) is not None:
         return False
     source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
     if source_prefix == "":
         return False
-    cap_bytes = _gs_bayes_resident_payload_cap_bytes(memory_gb=memory_gb)
-    if cap_bytes <= 0:
-        return False
-    return int(_packed_ctx_source_payload_bytes(packed_ctx)) <= int(cap_bytes)
+    payload_bytes = int(_packed_ctx_source_payload_bytes(packed_ctx))
+    if route_budget_bytes is None:
+        cap_bytes = _gs_bayes_resident_payload_cap_bytes(memory_gb=memory_gb)
+        return bool(cap_bytes > 0 and payload_bytes <= int(cap_bytes))
+    estimate = _gs_bayes_route_estimate(
+        n_samples=int(packed_ctx.get("n_samples", 0)),
+        n_markers=int(_packed_ctx_active_rows(packed_ctx)),
+        packed_payload_bytes=payload_bytes,
+        decode_memory_gb=float(memory_gb if memory_gb is not None else 1.0),
+        route_budget_bytes=int(route_budget_bytes),
+    )
+    return bool(estimate["promote_resident"])
 
 
 def _packed_ctx_dom_af(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
@@ -19690,9 +19930,11 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help_text=(
             "Decode block memory budget in GB for Bayesian packed/streamed BED "
             "kernels in GS. It controls reusable single/double decode buffers and "
-            "promotes a block covering all markers to dense. When omitted, GS "
-            "chooses a route-aware default from loaded sample/marker counts; "
-            "explicit -mem keeps the requested fixed budget."
+            "promotes a block covering all markers to dense. For genotype route "
+            "selection, explicit -mem contributes a 50% safety budget; when "
+            "omitted, GS separately detects available scheduler/container memory. "
+            "The decode block itself still uses a sample/marker shape default "
+            "when -mem is omitted."
         ),
         dest="memory",
     )
@@ -20445,6 +20687,8 @@ def _run_gs_pipeline_impl(
 
     gs_memory_auto_requested = bool(args.memory is None)
     gs_config_emitted = False
+    gs_route_budget_bytes: int | None = None
+    gs_route_budget_reason = "pending genotype inspection"
 
     def _emit_gs_configuration() -> None:
         nonlocal gs_config_emitted
@@ -20642,6 +20886,7 @@ def _run_gs_pipeline_impl(
         n_samples_total: int,
         n_markers_total: int,
     ) -> None:
+        nonlocal gs_route_budget_bytes, gs_route_budget_reason
         if args.memory is None:
             auto_memory_gb, auto_memory_reason = _resolve_gs_auto_decode_memory_gb(
                 methods=list(methods),
@@ -20663,6 +20908,22 @@ def _run_gs_pipeline_impl(
                 logger.info(auto_memory_msg)
             else:
                 _log_file_only(auto_memory_msg)
+        gs_route_budget_bytes, gs_route_budget_reason = _gs_route_budget_bytes(
+            memory_gb=float(args.memory),
+            auto_requested=bool(gs_memory_auto_requested),
+            available_bytes=None,
+            memory_limit_bytes=None,
+            rss_bytes=None,
+        )
+        route_memory_msg = (
+            "GS genotype route budget: "
+            f"{_format_debug_bytes(int(gs_route_budget_bytes))} "
+            f"(reason: {str(gs_route_budget_reason).strip() or 'route-aware default'})."
+        )
+        if bool(debug_mode):
+            logger.info(route_memory_msg)
+        else:
+            _log_file_only(route_memory_msg)
         _emit_gs_configuration()
 
     if log and (not gs_memory_auto_requested):
@@ -20931,14 +21192,34 @@ def _run_gs_pipeline_impl(
             enabled=bool(debug_mode),
         )
         _ensure_gs_memory_and_config(int(n), int(m))
-        if (
-            packed_meta_only_main_requested
-            and bayes_requested
-            and _should_promote_bayes_resident_packed(
+        bayes_route_should_promote = False
+        if packed_meta_only_main_requested and bayes_requested and packed_lmm_ctx is not None:
+            route_estimate = _gs_bayes_route_estimate(
+                n_samples=int(packed_lmm_ctx.get("n_samples", n)),
+                n_markers=int(_packed_ctx_active_rows(packed_lmm_ctx)),
+                packed_payload_bytes=int(_packed_ctx_source_payload_bytes(packed_lmm_ctx)),
+                decode_memory_gb=float(args.memory),
+                route_budget_bytes=int(gs_route_budget_bytes or 0),
+            )
+            bayes_route_should_promote = _should_promote_bayes_resident_packed(
                 packed_lmm_ctx,
                 memory_gb=args.memory,
+                route_budget_bytes=int(gs_route_budget_bytes or 0),
             )
-        ):
+            route_msg = (
+                "GS Bayes genotype route: "
+                f"{route_estimate['selected_backend']} | "
+                f"budget={_format_debug_bytes(int(route_estimate['route_budget_bytes']))} | "
+                f"payload={_format_debug_bytes(int(route_estimate['packed_payload_bytes']))} | "
+                f"resident_peak={_format_debug_bytes(int(route_estimate['resident_peak_bytes']))} | "
+                f"dense_peak={_format_debug_bytes(int(route_estimate['dense_peak_bytes']))} | "
+                f"block_rows={int(route_estimate['block_rows'])}"
+            )
+            if bool(debug_mode):
+                logger.info(route_msg)
+            else:
+                _log_file_only(route_msg)
+        if bayes_route_should_promote:
             resident_est_bytes = _packed_ctx_source_payload_bytes(
                 typing.cast(dict[str, typing.Any], packed_lmm_ctx)
             )
