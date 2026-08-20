@@ -148,7 +148,15 @@ jx reml -p example/rice6048.reml.tsv -n 3 -c year,loc -rc block -k rice.cGRM.npy
 Current GS model groups:
 
 - kernel models: `-GBLUP`, `-rrBLUP`
-- Bayesian models: `-BayesA`, `-BayesB`, `-BayesCpi`
+- Bayesian models: `-BayesA`, `-BayesB`, `-BayesC`
+
+`-BayesB` and `-BayesC` optionally accept a fixed marker inclusion
+probability, for example `-BayesB 0.05`. Without a numeric argument the
+inclusion probability is estimated during sampling.
+
+Bayesian GS uses a 3000-iteration R-hat upper limit (stability threshold 1.2)
+and runs 1000 additional burn-in iterations after the R-hat stability trigger;
+production sampling does not expose a thinning option.
 - ML models: `-RF`, `-ET`, `-GBDT`, `-XGB`, `-SVM`, `-ENET`
 
 Useful notes:

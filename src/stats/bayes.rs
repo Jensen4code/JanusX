@@ -14,7 +14,7 @@
 //! - `BayesB`: marker inclusion indicator
 //!   `delta_j ~ Bernoulli(pi)`, inactive markers have `beta_j = 0`, and active
 //!   markers follow the BayesA variance hierarchy.
-//! - `BayesCpi`: the same spike-and-slab inclusion structure as BayesB, but
+//! - `BayesC`: the same spike-and-slab inclusion structure as BayesB, but
 //!   active markers share a common marker variance and `pi` is updated from its
 //!   Beta-Binomial posterior.
 //!
@@ -22,8 +22,11 @@
 //! packed rows or `WindowedBedMatrix`. Small resident packed inputs may be
 //! predecoded once, but the streaming path remains the default maintained route
 //! for GS. Each MCMC iteration updates fixed effects, residual variance, marker
-//! effects, and inclusion/variance hyperparameters, and posterior means are
-//! returned after burn-in and thinning.
+//! effects, and inclusion/variance hyperparameters. Production kernels monitor
+//! split-chain R-hat up to a hard iteration limit, discard pre-convergence
+//! samples, run the requested post-convergence burn-in, and return posterior
+//! means from the remaining iterations. Trace-only kernels retain explicit
+//! thinning for diagnostic plots.
 
 use numpy::ndarray::Array2;
 use numpy::{
@@ -123,8 +126,8 @@ fn posterior_keep_iters(n_iter: usize, burnin: usize, thin: usize) -> Vec<i64> {
 // treated as two chains; this is useful for detecting a persistent drift in the
 // scalar variance component while keeping the production kernels streaming.
 const BAYES_RHAT_THRESHOLD: f64 = 1.20;
-const BAYES_RHAT_MIN_KEEP: usize = 100;
-const BAYES_RHAT_CHECK_EVERY: usize = 25;
+const BAYES_RHAT_MIN_KEEP: usize = 300;
+const BAYES_RHAT_CHECK_EVERY: usize = 50;
 const BAYES_RHAT_STABLE_CHECKS: usize = 3;
 
 #[derive(Debug, Default)]
@@ -155,6 +158,15 @@ impl BayesRhatState {
     }
 
     #[inline]
+    fn reset(&mut self) {
+        self.h2_sum.clear();
+        self.h2_sum.push(0.0);
+        self.h2_sq_sum.clear();
+        self.h2_sq_sum.push(0.0);
+        self.stable_checks = 0;
+    }
+
+    #[inline]
     fn observe(&mut self, h2: f64) -> bool {
         if h2.is_finite() {
             let sum = *self.h2_sum.last().unwrap_or(&0.0);
@@ -178,6 +190,107 @@ impl BayesRhatState {
     #[inline]
     fn value(&self) -> f64 {
         split_rhat_from_prefix(&self.h2_sum, &self.h2_sq_sum)
+    }
+}
+
+/// Controls R-hat monitoring, post-convergence burn-in, and posterior
+/// collection. `n_iter` is the hard upper bound for the complete chain. The
+/// burn-in is applied only after R-hat has stabilized; samples before that
+/// point are discarded. This avoids treating a fixed prefix (for example,
+/// iterations 1..2000) as burn-in before convergence is known.
+#[derive(Debug)]
+struct BayesSamplingController {
+    n_iter: usize,
+    burnin: usize,
+    thin: usize,
+    actual_iterations: usize,
+    n_keep: usize,
+    rhat_state: BayesRhatState,
+    convergence_iteration: usize,
+    burnin_end_iteration: usize,
+    post_rhat_triggered: bool,
+}
+
+impl BayesSamplingController {
+    fn new(n_iter: usize, burnin: usize, thin: usize) -> Self {
+        let thin = thin.max(1);
+        let target_keep = n_iter / thin + 1;
+        Self {
+            n_iter,
+            burnin,
+            thin,
+            actual_iterations: 0,
+            n_keep: 0,
+            rhat_state: BayesRhatState::with_capacity(target_keep + 1),
+            convergence_iteration: 0,
+            burnin_end_iteration: 0,
+            post_rhat_triggered: false,
+        }
+    }
+
+    #[inline]
+    fn should_run(&self) -> bool {
+        self.actual_iterations < self.n_iter
+    }
+
+    /// Advance one MCMC iteration and report whether it should be retained.
+    #[inline]
+    fn begin_iteration(&mut self) -> bool {
+        self.actual_iterations += 1;
+
+        if !self.post_rhat_triggered {
+            // Every iteration is monitored until convergence. `thin` is kept
+            // as a low-level compatibility option, but the public GS API
+            // always uses thin=1.
+            let it = self.actual_iterations - 1;
+            return it % self.thin == 0;
+        }
+
+        // Iterations immediately after the R-hat trigger are post-
+        // convergence burn-in and are deliberately not retained.
+        self.actual_iterations > self.burnin_end_iteration
+            && ((self.actual_iterations - self.burnin_end_iteration - 1) % self.thin == 0)
+    }
+
+    /// Observe a retained h2 sample. Returns true only for the iteration that
+    /// first reaches the stable-R-hat trigger and therefore requires callers
+    /// to clear their model-specific posterior accumulators.
+    #[inline]
+    fn observe(&mut self, h2: f64) -> bool {
+        self.n_keep += 1;
+        if !self.post_rhat_triggered {
+            if self.rhat_state.observe(h2) {
+                // A late convergence trigger must not consume the entire
+                // remaining chain in burn-in. Keep the pre-trigger posterior
+                // in that case; otherwise there would be no valid sample to
+                // report after the requested post-convergence burn-in.
+                if self.actual_iterations.saturating_add(self.burnin) >= self.n_iter {
+                    return false;
+                }
+                self.post_rhat_triggered = true;
+                self.convergence_iteration = self.actual_iterations;
+                self.burnin_end_iteration = self.actual_iterations.saturating_add(self.burnin);
+
+                self.n_keep = 0;
+                self.rhat_state.reset();
+                return true;
+            }
+        } else {
+            // The post-convergence samples are the estimates we report, so
+            // compute the final diagnostic from this fresh posterior window.
+            let _ = self.rhat_state.observe(h2);
+        }
+        false
+    }
+
+    #[inline]
+    fn n_keep(&self) -> usize {
+        self.n_keep
+    }
+
+    #[inline]
+    fn rhat_value(&self) -> f64 {
+        self.rhat_state.value()
     }
 }
 
@@ -943,6 +1056,7 @@ fn bayesb_core_impl(
     s0_b_opt: Option<f64>,
     prob_in_init: f64,
     counts: f64,
+    fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
@@ -958,6 +1072,8 @@ fn bayesb_core_impl(
         f64,
         Vec<f64>,
         f64,
+        usize,
+        usize,
     ),
     String,
 > {
@@ -965,7 +1081,8 @@ fn bayesb_core_impl(
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
     }
-    if !(prob_in_init > 0.0 && prob_in_init < 1.0) {
+    let prob_in_base = fixed_prob_in_opt.unwrap_or(prob_in_init);
+    if !(prob_in_base > 0.0 && prob_in_base < 1.0) {
         return Err("prob_in must be in (0, 1)".to_string());
     }
     if counts < 0.0 {
@@ -1030,7 +1147,7 @@ fn bayesb_core_impl(
             if msx <= 0.0 {
                 return Err("MSx must be positive to compute S0_b".to_string());
             }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_init
+            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
         }
     };
     if s0_b <= 0.0 {
@@ -1056,8 +1173,8 @@ fn bayesb_core_impl(
     let mut d = vec![0u8; p];
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
     let mut s = s0_b;
-    let mut prob_in = prob_in_init;
-    let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_init, counts);
+    let mut prob_in = prob_in_base;
+    let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
 
     let mut alpha = vec![0.0; q];
     let mut x2_x = vec![0.0; q];
@@ -1080,15 +1197,15 @@ fn bayesb_core_impl(
     let mut h2_sq_sum = 0.0;
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
-    let mut n_keep = 0usize;
-    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
     let var_b_fixed = 1e10_f64;
 
     let chi_b_active = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
     let chi_b_inactive = ChiSquared::new(df0_b).map_err(|e| e.to_string())?;
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
 
-    for it in 0..n_iter {
+    while schedule.should_run() {
+        let retain_sample = schedule.begin_iteration();
         let inv_var_e = 1.0 / var_e;
         let inv_var_b_fixed = 1.0 / var_b_fixed;
 
@@ -1182,10 +1299,12 @@ fn bayesb_core_impl(
         }
 
         let mrk_in = n_active as f64;
-        let a = mrk_in + counts_in;
-        let b = (p as f64 - mrk_in) + counts_out;
-        let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
-        prob_in = rng.sample(beta_dist);
+        let a = mrk_in + counts_in + 1.0;
+        let b = (p as f64 - mrk_in) + counts_out + 1.0;
+        if fixed_prob_in_opt.is_none() {
+            let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
+            prob_in = rng.sample(beta_dist);
+        }
 
         let ss_e = ddot_f64(&r, &r) + s0_e;
         var_e = ss_e / rng.sample(chi_e);
@@ -1193,7 +1312,7 @@ fn bayesb_core_impl(
             return Err("BayesB var_e became non-finite or non-positive".to_string());
         }
 
-        if it >= burnin && ((it - burnin) % thin == 0) {
+        if retain_sample {
             for j in 0..p {
                 // Posterior marker effect should be E[d_j * beta_j], not E[beta_j].
                 beta_sum[j] += (d[j] as f64) * beta[j];
@@ -1210,15 +1329,23 @@ fn bayesb_core_impl(
             h2_sq_sum += h2 * h2;
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
-            n_keep += 1;
-            if rhat_state.observe(h2) {
-                break;
+            if schedule.observe(h2) {
+                beta_sum.fill(0.0);
+                pip_sum.fill(0.0);
+                varb_sum.fill(0.0);
+                alpha_sum.fill(0.0);
+                var_e_sum = 0.0;
+                h2_sum = 0.0;
+                h2_sq_sum = 0.0;
+                prob_in_sum = 0.0;
+                n_active_sum = 0.0;
             }
         }
     }
 
+    let n_keep = schedule.n_keep();
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -1238,7 +1365,13 @@ fn bayesb_core_impl(
     }
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
-    let rhat_h2 = rhat_state.value();
+    let rhat_h2 = schedule.rhat_value();
+    let actual_iterations = schedule.actual_iterations;
+    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
+        0
+    } else {
+        schedule.convergence_iteration.saturating_add(1)
+    };
 
     Ok((
         beta_sum,
@@ -1251,10 +1384,12 @@ fn bayesb_core_impl(
         n_active_mean,
         pip_sum,
         rhat_h2,
+        actual_iterations,
+        burnin_start_iteration,
     ))
 }
 
-fn bayescpi_core_impl(
+fn bayesc_core_impl(
     y: &[f64],
     m: &[f64],
     x: &[f64],
@@ -1269,6 +1404,7 @@ fn bayescpi_core_impl(
     s0_b_opt: Option<f64>,
     prob_in_init: f64,
     counts: f64,
+    fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
@@ -1284,6 +1420,8 @@ fn bayescpi_core_impl(
         f64,
         Vec<f64>,
         f64,
+        usize,
+        usize,
     ),
     String,
 > {
@@ -1291,7 +1429,8 @@ fn bayescpi_core_impl(
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
     }
-    if !(prob_in_init > 0.0 && prob_in_init < 1.0) {
+    let prob_in_base = fixed_prob_in_opt.unwrap_or(prob_in_init);
+    if !(prob_in_base > 0.0 && prob_in_base < 1.0) {
         return Err("prob_in must be in (0, 1)".to_string());
     }
     if counts < 0.0 {
@@ -1356,7 +1495,7 @@ fn bayescpi_core_impl(
             if msx <= 0.0 {
                 return Err("MSx must be positive to compute S0_b".to_string());
             }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_init
+            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
         }
     };
     if s0_b <= 0.0 {
@@ -1379,9 +1518,9 @@ fn bayescpi_core_impl(
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
     let mut var_b = s0_b;
-    let mut prob_in = prob_in_init;
+    let mut prob_in = prob_in_base;
 
-    let counts_in = counts * prob_in_init;
+    let counts_in = counts * prob_in_base;
     let counts_out = counts - counts_in;
 
     let mut alpha = vec![0.0; q];
@@ -1405,14 +1544,14 @@ fn bayescpi_core_impl(
     let mut h2_sq_sum = 0.0;
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
-    let mut n_keep = 0usize;
-    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
     let var_b_fixed = 1e10_f64;
 
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
     let mut chi_b_cache: HashMap<usize, ChiSquared<f64>> = HashMap::new();
 
-    for it in 0..n_iter {
+    while schedule.should_run() {
+        let retain_sample = schedule.begin_iteration();
         let inv_var_e = 1.0 / var_e;
         let inv_var_b_fixed = 1.0 / var_b_fixed;
 
@@ -1447,7 +1586,7 @@ fn bayescpi_core_impl(
 
             let c = x2[j] * inv_var_e + 1.0 / var_b;
             if !(c.is_finite() && c > 0.0) {
-                return Err("Non-positive posterior precision in BayesCpi beta update".to_string());
+                return Err("Non-positive posterior precision in BayesC beta update".to_string());
             }
             let rhs = xe * inv_var_e;
             // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
@@ -1490,22 +1629,24 @@ fn bayescpi_core_impl(
         };
         var_b = ss_b / rng.sample(chi_b_eff);
         if !(var_b.is_finite() && var_b > 0.0) {
-            return Err("BayesCpi var_b became non-finite or non-positive".to_string());
+            return Err("BayesC var_b became non-finite or non-positive".to_string());
         }
 
         let mrk_in = mrk_in_usize as f64;
         let a = mrk_in + counts_in + 1.0;
         let b = (p as f64 - mrk_in) + counts_out + 1.0;
-        let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
-        prob_in = rng.sample(beta_dist);
+        if fixed_prob_in_opt.is_none() {
+            let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
+            prob_in = rng.sample(beta_dist);
+        }
 
         let ss_e = ddot_f64(&r, &r) + s0_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
-            return Err("BayesCpi var_e became non-finite or non-positive".to_string());
+            return Err("BayesC var_e became non-finite or non-positive".to_string());
         }
 
-        if it >= burnin && ((it - burnin) % thin == 0) {
+        if retain_sample {
             for j in 0..p {
                 // Posterior marker effect should be E[d_j * beta_j], not E[beta_j].
                 beta_sum[j] += (d[j] as f64) * beta[j];
@@ -1522,15 +1663,23 @@ fn bayescpi_core_impl(
             h2_sq_sum += h2 * h2;
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
-            n_keep += 1;
-            if rhat_state.observe(h2) {
-                break;
+            if schedule.observe(h2) {
+                beta_sum.fill(0.0);
+                pip_sum.fill(0.0);
+                alpha_sum.fill(0.0);
+                varb_sum = 0.0;
+                var_e_sum = 0.0;
+                h2_sum = 0.0;
+                h2_sq_sum = 0.0;
+                prob_in_sum = 0.0;
+                n_active_sum = 0.0;
             }
         }
     }
 
+    let n_keep = schedule.n_keep();
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -1550,7 +1699,13 @@ fn bayescpi_core_impl(
     }
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
-    let rhat_h2 = rhat_state.value();
+    let rhat_h2 = schedule.rhat_value();
+    let actual_iterations = schedule.actual_iterations;
+    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
+        0
+    } else {
+        schedule.convergence_iteration.saturating_add(1)
+    };
 
     Ok((
         beta_sum,
@@ -1563,6 +1718,8 @@ fn bayescpi_core_impl(
         n_active_mean,
         pip_sum,
         rhat_h2,
+        actual_iterations,
+        burnin_start_iteration,
     ))
 }
 
@@ -1585,7 +1742,20 @@ fn bayesa_core_impl(
     s0_e_opt: Option<f64>,
     _min_abs_beta: f64,
     seed: Option<u64>,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64), String> {
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        usize,
+        usize,
+    ),
+    String,
+> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -1704,14 +1874,14 @@ fn bayesa_core_impl(
     let mut var_e_sum = 0.0;
     let mut h2_sum = 0.0;
     let mut h2_sq_sum = 0.0;
-    let mut n_keep = 0usize;
-    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
     let var_b_fixed = 1e10_f64;
 
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
 
-    for it in 0..n_iter {
+    while schedule.should_run() {
+        let retain_sample = schedule.begin_iteration();
         let inv_var_e = 1.0 / var_e;
         let inv_var_b_fixed = 1.0 / var_b_fixed;
 
@@ -1773,7 +1943,7 @@ fn bayesa_core_impl(
             return Err("BayesA var_e became non-finite or non-positive".to_string());
         }
 
-        if it >= burnin && ((it - burnin) % thin == 0) {
+        if retain_sample {
             for j in 0..p {
                 beta_sum[j] += beta[j];
                 varb_sum[j] += var_b[j];
@@ -1786,15 +1956,20 @@ fn bayesa_core_impl(
             let h2 = var_g / (var_g + var_e);
             h2_sum += h2;
             h2_sq_sum += h2 * h2;
-            n_keep += 1;
-            if rhat_state.observe(h2) {
-                break;
+            if schedule.observe(h2) {
+                beta_sum.fill(0.0);
+                varb_sum.fill(0.0);
+                alpha_sum.fill(0.0);
+                var_e_sum = 0.0;
+                h2_sum = 0.0;
+                h2_sq_sum = 0.0;
             }
         }
     }
 
+    let n_keep = schedule.n_keep();
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -1811,9 +1986,23 @@ fn bayesa_core_impl(
     if var_h2 < 0.0 {
         var_h2 = 0.0;
     }
-    let rhat_h2 = rhat_state.value();
+    let rhat_h2 = schedule.rhat_value();
+    let actual_iterations = schedule.actual_iterations;
+    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
+        0
+    } else {
+        schedule.convergence_iteration.saturating_add(1)
+    };
     Ok((
-        beta_sum, alpha_sum, varb_sum, var_e_sum, h2_mean, var_h2, rhat_h2,
+        beta_sum,
+        alpha_sum,
+        varb_sum,
+        var_e_sum,
+        h2_mean,
+        var_h2,
+        rhat_h2,
+        actual_iterations,
+        burnin_start_iteration,
     ))
 }
 
@@ -1844,7 +2033,20 @@ fn bayesa_packed_core_impl(
     _min_abs_beta: f64,
     seed: Option<u64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, f64, f64, f64, f64), String> {
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        usize,
+        usize,
+    ),
+    String,
+> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -2011,14 +2213,14 @@ fn bayesa_packed_core_impl(
     let mut var_e_sum = 0.0;
     let mut h2_sum = 0.0;
     let mut h2_sq_sum = 0.0;
-    let mut n_keep = 0usize;
-    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
     let var_b_fixed = 1e10_f64;
 
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
 
-    for it in 0..n_iter {
+    while schedule.should_run() {
+        let retain_sample = schedule.begin_iteration();
         let inv_var_e = 1.0 / var_e;
         let inv_var_b_fixed = 1.0 / var_b_fixed;
 
@@ -2101,7 +2303,7 @@ fn bayesa_packed_core_impl(
             return Err("BayesA packed var_e became non-finite or non-positive".to_string());
         }
 
-        if it >= burnin && ((it - burnin) % thin == 0) {
+        if retain_sample {
             for j in 0..p {
                 beta_sum[j] += beta[j];
                 varb_sum[j] += var_b[j];
@@ -2114,15 +2316,20 @@ fn bayesa_packed_core_impl(
             let h2 = var_g / (var_g + var_e);
             h2_sum += h2;
             h2_sq_sum += h2 * h2;
-            n_keep += 1;
-            if rhat_state.observe(h2) {
-                break;
+            if schedule.observe(h2) {
+                beta_sum.fill(0.0);
+                varb_sum.fill(0.0);
+                alpha_sum.fill(0.0);
+                var_e_sum = 0.0;
+                h2_sum = 0.0;
+                h2_sq_sum = 0.0;
             }
         }
     }
 
+    let n_keep = schedule.n_keep();
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -2139,9 +2346,23 @@ fn bayesa_packed_core_impl(
     if var_h2 < 0.0 {
         var_h2 = 0.0;
     }
-    let rhat_h2 = rhat_state.value();
+    let rhat_h2 = schedule.rhat_value();
+    let actual_iterations = schedule.actual_iterations;
+    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
+        0
+    } else {
+        schedule.convergence_iteration.saturating_add(1)
+    };
     Ok((
-        beta_sum, alpha_sum, varb_sum, var_e_sum, h2_mean, var_h2, rhat_h2,
+        beta_sum,
+        alpha_sum,
+        varb_sum,
+        var_e_sum,
+        h2_mean,
+        var_h2,
+        rhat_h2,
+        actual_iterations,
+        burnin_start_iteration,
     ))
 }
 
@@ -2169,6 +2390,7 @@ fn bayesb_packed_core_impl(
     s0_b_opt: Option<f64>,
     prob_in_init: f64,
     counts: f64,
+    fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
@@ -2185,6 +2407,8 @@ fn bayesb_packed_core_impl(
         f64,
         Vec<f64>,
         f64,
+        usize,
+        usize,
     ),
     String,
 > {
@@ -2192,7 +2416,8 @@ fn bayesb_packed_core_impl(
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
     }
-    if !(prob_in_init > 0.0 && prob_in_init < 1.0) {
+    let prob_in_base = fixed_prob_in_opt.unwrap_or(prob_in_init);
+    if !(prob_in_base > 0.0 && prob_in_base < 1.0) {
         return Err("prob_in must be in (0, 1)".to_string());
     }
     if counts < 0.0 {
@@ -2239,6 +2464,7 @@ fn bayesb_packed_core_impl(
             s0_b_opt,
             prob_in_init,
             counts,
+            fixed_prob_in_opt,
             df0_e,
             s0_e_opt,
             seed,
@@ -2322,7 +2548,7 @@ fn bayesb_packed_core_impl(
             if msx <= 0.0 {
                 return Err("MSx must be positive to compute S0_b".to_string());
             }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_init
+            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
         }
     };
     if s0_b <= 0.0 {
@@ -2347,9 +2573,9 @@ fn bayesb_packed_core_impl(
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
-    let mut prob_in = prob_in_init;
+    let mut prob_in = prob_in_base;
     let mut s = s0_b;
-    let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_init, counts);
+    let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
 
     let mut alpha = vec![0.0; q];
     let mut xtx = vec![0.0_f64; q * q];
@@ -2372,15 +2598,15 @@ fn bayesb_packed_core_impl(
     let mut h2_sq_sum = 0.0;
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
-    let mut n_keep = 0usize;
-    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
     let var_b_fixed = 1e10_f64;
 
     let chi_b_active = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
     let chi_b_inactive = ChiSquared::new(df0_b).map_err(|e| e.to_string())?;
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
 
-    for it in 0..n_iter {
+    while schedule.should_run() {
+        let retain_sample = schedule.begin_iteration();
         let inv_var_e = 1.0 / var_e;
         let inv_var_b_fixed = 1.0 / var_b_fixed;
 
@@ -2499,10 +2725,12 @@ fn bayesb_packed_core_impl(
         }
 
         let mrk_in = n_active as f64;
-        let a = mrk_in + counts_in;
-        let b = (p as f64 - mrk_in) + counts_out;
-        let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
-        prob_in = rng.sample(beta_dist);
+        let a = mrk_in + counts_in + 1.0;
+        let b = (p as f64 - mrk_in) + counts_out + 1.0;
+        if fixed_prob_in_opt.is_none() {
+            let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
+            prob_in = rng.sample(beta_dist);
+        }
 
         let ss_e = ddot_f64(&r, &r) + s0_e;
         var_e = ss_e / rng.sample(chi_e);
@@ -2510,7 +2738,7 @@ fn bayesb_packed_core_impl(
             return Err("BayesB packed var_e became non-finite or non-positive".to_string());
         }
 
-        if it >= burnin && ((it - burnin) % thin == 0) {
+        if retain_sample {
             for j in 0..p {
                 // Posterior marker effect should be E[d_j * beta_j], not E[beta_j].
                 beta_sum[j] += (d[j] as f64) * beta[j];
@@ -2527,15 +2755,23 @@ fn bayesb_packed_core_impl(
             h2_sq_sum += h2 * h2;
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
-            n_keep += 1;
-            if rhat_state.observe(h2) {
-                break;
+            if schedule.observe(h2) {
+                beta_sum.fill(0.0);
+                pip_sum.fill(0.0);
+                varb_sum.fill(0.0);
+                alpha_sum.fill(0.0);
+                var_e_sum = 0.0;
+                h2_sum = 0.0;
+                h2_sq_sum = 0.0;
+                prob_in_sum = 0.0;
+                n_active_sum = 0.0;
             }
         }
     }
 
+    let n_keep = schedule.n_keep();
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -2555,7 +2791,13 @@ fn bayesb_packed_core_impl(
     }
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
-    let rhat_h2 = rhat_state.value();
+    let rhat_h2 = schedule.rhat_value();
+    let actual_iterations = schedule.actual_iterations;
+    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
+        0
+    } else {
+        schedule.convergence_iteration.saturating_add(1)
+    };
 
     Ok((
         beta_sum,
@@ -2568,10 +2810,12 @@ fn bayesb_packed_core_impl(
         n_active_mean,
         pip_sum,
         rhat_h2,
+        actual_iterations,
+        burnin_start_iteration,
     ))
 }
 
-fn bayescpi_packed_core_impl(
+fn bayesc_packed_core_impl(
     y: &[f64],
     source: &mut BayesPackedSource<'_>,
     n_samples: usize,
@@ -2593,6 +2837,7 @@ fn bayescpi_packed_core_impl(
     s0_b_opt: Option<f64>,
     prob_in_init: f64,
     counts: f64,
+    fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
@@ -2609,6 +2854,8 @@ fn bayescpi_packed_core_impl(
         f64,
         Vec<f64>,
         f64,
+        usize,
+        usize,
     ),
     String,
 > {
@@ -2616,7 +2863,8 @@ fn bayescpi_packed_core_impl(
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
     }
-    if !(prob_in_init > 0.0 && prob_in_init < 1.0) {
+    let prob_in_base = fixed_prob_in_opt.unwrap_or(prob_in_init);
+    if !(prob_in_base > 0.0 && prob_in_base < 1.0) {
         return Err("prob_in must be in (0, 1)".to_string());
     }
     if counts < 0.0 {
@@ -2646,7 +2894,7 @@ fn bayescpi_packed_core_impl(
         code4_lut,
         pool,
     )? {
-        return bayescpi_core_impl(
+        return bayesc_core_impl(
             y,
             &m_dense,
             x,
@@ -2661,6 +2909,7 @@ fn bayescpi_packed_core_impl(
             s0_b_opt,
             prob_in_init,
             counts,
+            fixed_prob_in_opt,
             df0_e,
             s0_e_opt,
             seed,
@@ -2744,7 +2993,7 @@ fn bayescpi_packed_core_impl(
             if msx <= 0.0 {
                 return Err("MSx must be positive to compute S0_b".to_string());
             }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_init
+            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
         }
     };
     if s0_b <= 0.0 {
@@ -2767,8 +3016,8 @@ fn bayescpi_packed_core_impl(
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
     let mut var_b = s0_b;
-    let mut prob_in = prob_in_init;
-    let counts_in = counts * prob_in_init;
+    let mut prob_in = prob_in_base;
+    let counts_in = counts * prob_in_base;
     let counts_out = counts - counts_in;
 
     let mut alpha = vec![0.0; q];
@@ -2792,14 +3041,14 @@ fn bayescpi_packed_core_impl(
     let mut h2_sq_sum = 0.0;
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
-    let mut n_keep = 0usize;
-    let mut rhat_state = BayesRhatState::with_capacity(n_iter.saturating_sub(burnin) / thin + 1);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
     let var_b_fixed = 1e10_f64;
 
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
     let mut chi_b_cache: HashMap<usize, ChiSquared<f64>> = HashMap::new();
 
-    for it in 0..n_iter {
+    while schedule.should_run() {
+        let retain_sample = schedule.begin_iteration();
         let inv_var_e = 1.0 / var_e;
         let inv_var_b_fixed = 1.0 / var_b_fixed;
 
@@ -2854,8 +3103,7 @@ fn bayescpi_packed_core_impl(
                 let c = x2[j] * inv_var_e + 1.0 / var_b;
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
-                        "Non-positive posterior precision in BayesCpi packed beta update"
-                            .to_string(),
+                        "Non-positive posterior precision in BayesC packed beta update".to_string(),
                     );
                 }
                 let rhs = xe * inv_var_e;
@@ -2900,22 +3148,24 @@ fn bayescpi_packed_core_impl(
         };
         var_b = ss_b / rng.sample(chi_b_eff);
         if !(var_b.is_finite() && var_b > 0.0) {
-            return Err("BayesCpi packed var_b became non-finite or non-positive".to_string());
+            return Err("BayesC packed var_b became non-finite or non-positive".to_string());
         }
 
         let mrk_in = mrk_in_usize as f64;
         let a = mrk_in + counts_in + 1.0;
         let b = (p as f64 - mrk_in) + counts_out + 1.0;
-        let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
-        prob_in = rng.sample(beta_dist);
+        if fixed_prob_in_opt.is_none() {
+            let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
+            prob_in = rng.sample(beta_dist);
+        }
 
         let ss_e = ddot_f64(&r, &r) + s0_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
-            return Err("BayesCpi packed var_e became non-finite or non-positive".to_string());
+            return Err("BayesC packed var_e became non-finite or non-positive".to_string());
         }
 
-        if it >= burnin && ((it - burnin) % thin == 0) {
+        if retain_sample {
             for j in 0..p {
                 // Posterior marker effect should be E[d_j * beta_j], not E[beta_j].
                 beta_sum[j] += (d[j] as f64) * beta[j];
@@ -2932,15 +3182,23 @@ fn bayescpi_packed_core_impl(
             h2_sq_sum += h2 * h2;
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
-            n_keep += 1;
-            if rhat_state.observe(h2) {
-                break;
+            if schedule.observe(h2) {
+                beta_sum.fill(0.0);
+                pip_sum.fill(0.0);
+                alpha_sum.fill(0.0);
+                varb_sum = 0.0;
+                var_e_sum = 0.0;
+                h2_sum = 0.0;
+                h2_sq_sum = 0.0;
+                prob_in_sum = 0.0;
+                n_active_sum = 0.0;
             }
         }
     }
 
+    let n_keep = schedule.n_keep();
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -2960,7 +3218,13 @@ fn bayescpi_packed_core_impl(
     }
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
-    let rhat_h2 = rhat_state.value();
+    let rhat_h2 = schedule.rhat_value();
+    let actual_iterations = schedule.actual_iterations;
+    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
+        0
+    } else {
+        schedule.convergence_iteration.saturating_add(1)
+    };
 
     Ok((
         beta_sum,
@@ -2973,6 +3237,8 @@ fn bayescpi_packed_core_impl(
         n_active_mean,
         pip_sum,
         rhat_h2,
+        actual_iterations,
+        burnin_start_iteration,
     ))
 }
 
@@ -2981,8 +3247,8 @@ fn bayescpi_packed_core_impl(
     y,
     m,
     x = None,
-    n_iter = 1500,
-    burnin = 500,
+    n_iter = 3000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3019,6 +3285,8 @@ pub fn bayesa(
     f64,
     f64,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3096,11 +3364,31 @@ pub fn bayesa(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, rhat_h2)) => {
+        Ok((
+            beta,
+            alpha,
+            varb,
+            vare,
+            h2_mean,
+            var_h2,
+            rhat_h2,
+            actual_iterations,
+            convergence_iteration,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2, rhat_h2))
+            Ok((
+                beta_py,
+                alpha_py,
+                varb_py,
+                vare,
+                h2_mean,
+                var_h2,
+                rhat_h2,
+                actual_iterations,
+                convergence_iteration,
+            ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -3112,7 +3400,7 @@ pub fn bayesa(
     m,
     x = None,
     n_iter = 3000,
-    burnin = 2000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3121,6 +3409,7 @@ pub fn bayesa(
     s0_b = None,
     prob_in = 0.5,
     counts = 10.0,
+    fixed_pi = None,
     df0_e = 5.0,
     s0_e = None,
     seed = None
@@ -3140,6 +3429,7 @@ pub fn bayesb(
     s0_b: Option<f64>,
     prob_in: f64,
     counts: f64,
+    fixed_pi: Option<f64>,
     df0_e: f64,
     s0_e: Option<f64>,
     seed: Option<u64>,
@@ -3154,6 +3444,8 @@ pub fn bayesb(
     f64,
     Py<PyArray1<f64>>,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3226,6 +3518,7 @@ pub fn bayesb(
             s0_b,
             prob_in,
             counts,
+            fixed_pi,
             df0_e,
             s0_e,
             seed,
@@ -3244,6 +3537,8 @@ pub fn bayesb(
             n_active_mean,
             pip,
             rhat_h2,
+            actual_iterations,
+            convergence_iteration,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -3260,6 +3555,8 @@ pub fn bayesb(
                 n_active_mean,
                 pip_py,
                 rhat_h2,
+                actual_iterations,
+                convergence_iteration,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3272,18 +3569,19 @@ pub fn bayesb(
     m,
     x = None,
     n_iter = 3000,
-    burnin = 2000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
     s0_b = None,
     prob_in = 0.5,
     counts = 10.0,
+    fixed_pi = None,
     df0_e = 5.0,
     s0_e = None,
     seed = None
 ))]
-pub fn bayescpi(
+pub fn bayesc(
     py: Python,
     y: PyReadonlyArray1<f64>,
     m: PyReadonlyArray2<f64>,
@@ -3296,6 +3594,7 @@ pub fn bayescpi(
     s0_b: Option<f64>,
     prob_in: f64,
     counts: f64,
+    fixed_pi: Option<f64>,
     df0_e: f64,
     s0_e: Option<f64>,
     seed: Option<u64>,
@@ -3310,6 +3609,8 @@ pub fn bayescpi(
     f64,
     Py<PyArray1<f64>>,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3372,7 +3673,7 @@ pub fn bayescpi(
     };
 
     let result = py.detach(|| {
-        bayescpi_core_impl(
+        bayesc_core_impl(
             y_vec.as_ref(),
             m_vec.as_ref(),
             x_vec.as_ref(),
@@ -3387,6 +3688,7 @@ pub fn bayescpi(
             s0_b,
             prob_in,
             counts,
+            fixed_pi,
             df0_e,
             s0_e,
             seed,
@@ -3405,6 +3707,8 @@ pub fn bayescpi(
             n_active_mean,
             pip,
             rhat_h2,
+            actual_iterations,
+            convergence_iteration,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -3420,6 +3724,8 @@ pub fn bayescpi(
                 n_active_mean,
                 pip_py,
                 rhat_h2,
+                actual_iterations,
+                convergence_iteration,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3437,8 +3743,8 @@ pub fn bayescpi(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 1500,
-    burnin = 500,
+    n_iter = 3000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3483,6 +3789,8 @@ pub fn bayesa_packed(
     f64,
     f64,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3622,11 +3930,31 @@ pub fn bayesa_packed(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, rhat_h2)) => {
+        Ok((
+            beta,
+            alpha,
+            varb,
+            vare,
+            h2_mean,
+            var_h2,
+            rhat_h2,
+            actual_iterations,
+            convergence_iteration,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2, rhat_h2))
+            Ok((
+                beta_py,
+                alpha_py,
+                varb_py,
+                vare,
+                h2_mean,
+                var_h2,
+                rhat_h2,
+                actual_iterations,
+                convergence_iteration,
+            ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -3644,7 +3972,7 @@ pub fn bayesa_packed(
     sample_indices,
     x = None,
     n_iter = 3000,
-    burnin = 2000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -3653,6 +3981,7 @@ pub fn bayesa_packed(
     s0_b = None,
     prob_in = 0.5,
     counts = 10.0,
+    fixed_pi = None,
     df0_e = 5.0,
     s0_e = None,
     threads = 0,
@@ -3679,6 +4008,7 @@ pub fn bayesb_packed(
     s0_b: Option<f64>,
     prob_in: f64,
     counts: f64,
+    fixed_pi: Option<f64>,
     df0_e: f64,
     s0_e: Option<f64>,
     threads: usize,
@@ -3694,6 +4024,8 @@ pub fn bayesb_packed(
     f64,
     Py<PyArray1<f64>>,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -3827,6 +4159,7 @@ pub fn bayesb_packed(
             s0_b,
             prob_in,
             counts,
+            fixed_pi,
             df0_e,
             s0_e,
             seed,
@@ -3846,6 +4179,8 @@ pub fn bayesb_packed(
             n_active_mean,
             pip,
             rhat_h2,
+            actual_iterations,
+            convergence_iteration,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -3862,6 +4197,8 @@ pub fn bayesb_packed(
                 n_active_mean,
                 pip_py,
                 rhat_h2,
+                actual_iterations,
+                convergence_iteration,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3880,19 +4217,20 @@ pub fn bayesb_packed(
     sample_indices,
     x = None,
     n_iter = 3000,
-    burnin = 2000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
     s0_b = None,
     prob_in = 0.5,
     counts = 10.0,
+    fixed_pi = None,
     df0_e = 5.0,
     s0_e = None,
     threads = 0,
     seed = None
 ))]
-pub fn bayescpi_packed(
+pub fn bayesc_packed(
     py: Python,
     y: PyReadonlyArray1<f64>,
     packed: PyReadonlyArray2<u8>,
@@ -3911,6 +4249,7 @@ pub fn bayescpi_packed(
     s0_b: Option<f64>,
     prob_in: f64,
     counts: f64,
+    fixed_pi: Option<f64>,
     df0_e: f64,
     s0_e: Option<f64>,
     threads: usize,
@@ -3926,6 +4265,8 @@ pub fn bayescpi_packed(
     f64,
     Py<PyArray1<f64>>,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -4042,7 +4383,7 @@ pub fn bayescpi_packed(
             packed_flat: packed_flat.as_ref(),
             bytes_per_snp,
         };
-        bayescpi_packed_core_impl(
+        bayesc_packed_core_impl(
             y_vec.as_ref(),
             &mut source,
             n_samples,
@@ -4064,6 +4405,7 @@ pub fn bayescpi_packed(
             s0_b,
             prob_in,
             counts,
+            fixed_pi,
             df0_e,
             s0_e,
             seed,
@@ -4083,6 +4425,8 @@ pub fn bayescpi_packed(
             n_active_mean,
             pip,
             rhat_h2,
+            actual_iterations,
+            convergence_iteration,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -4098,6 +4442,8 @@ pub fn bayescpi_packed(
                 n_active_mean,
                 pip_py,
                 rhat_h2,
+                actual_iterations,
+                convergence_iteration,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -4116,8 +4462,8 @@ pub fn bayescpi_packed(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 1500,
-    burnin = 500,
+    n_iter = 3000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -4167,6 +4513,8 @@ pub fn bayesa_stream_bed(
     f64,
     f64,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -4296,11 +4644,31 @@ pub fn bayesa_stream_bed(
     });
 
     match result {
-        Ok((beta, alpha, varb, vare, h2_mean, var_h2, rhat_h2)) => {
+        Ok((
+            beta,
+            alpha,
+            varb,
+            vare,
+            h2_mean,
+            var_h2,
+            rhat_h2,
+            actual_iterations,
+            convergence_iteration,
+        )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
             let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((beta_py, alpha_py, varb_py, vare, h2_mean, var_h2, rhat_h2))
+            Ok((
+                beta_py,
+                alpha_py,
+                varb_py,
+                vare,
+                h2_mean,
+                var_h2,
+                rhat_h2,
+                actual_iterations,
+                convergence_iteration,
+            ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -4319,7 +4687,7 @@ pub fn bayesa_stream_bed(
     sample_indices,
     x = None,
     n_iter = 3000,
-    burnin = 2000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -4328,6 +4696,7 @@ pub fn bayesa_stream_bed(
     s0_b = None,
     prob_in = 0.5,
     counts = 10.0,
+    fixed_pi = None,
     df0_e = 5.0,
     s0_e = None,
     threads = 0,
@@ -4357,6 +4726,7 @@ pub fn bayesb_stream_bed(
     s0_b: Option<f64>,
     prob_in: f64,
     counts: f64,
+    fixed_pi: Option<f64>,
     df0_e: f64,
     s0_e: Option<f64>,
     threads: usize,
@@ -4374,6 +4744,8 @@ pub fn bayesb_stream_bed(
     f64,
     Py<PyArray1<f64>>,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -4497,6 +4869,7 @@ pub fn bayesb_stream_bed(
             s0_b,
             prob_in,
             counts,
+            fixed_pi,
             df0_e,
             s0_e,
             seed,
@@ -4516,6 +4889,8 @@ pub fn bayesb_stream_bed(
             n_active_mean,
             pip,
             rhat_h2,
+            actual_iterations,
+            convergence_iteration,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -4532,6 +4907,8 @@ pub fn bayesb_stream_bed(
                 n_active_mean,
                 pip_py,
                 rhat_h2,
+                actual_iterations,
+                convergence_iteration,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -4551,13 +4928,14 @@ pub fn bayesb_stream_bed(
     sample_indices,
     x = None,
     n_iter = 3000,
-    burnin = 2000,
+    burnin = 1000,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
     s0_b = None,
     prob_in = 0.5,
     counts = 10.0,
+    fixed_pi = None,
     df0_e = 5.0,
     s0_e = None,
     threads = 0,
@@ -4565,7 +4943,7 @@ pub fn bayesb_stream_bed(
     block_rows = None,
     mmap_window_mb = None
 ))]
-pub fn bayescpi_stream_bed(
+pub fn bayesc_stream_bed(
     py: Python,
     prefix: String,
     y: PyReadonlyArray1<f64>,
@@ -4585,6 +4963,7 @@ pub fn bayescpi_stream_bed(
     s0_b: Option<f64>,
     prob_in: f64,
     counts: f64,
+    fixed_pi: Option<f64>,
     df0_e: f64,
     s0_e: Option<f64>,
     threads: usize,
@@ -4602,6 +4981,8 @@ pub fn bayescpi_stream_bed(
     f64,
     Py<PyArray1<f64>>,
     f64,
+    usize,
+    usize,
 )> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -4708,7 +5089,7 @@ pub fn bayescpi_stream_bed(
         };
         let packed_row_indices =
             parse_index_vec_i64_string(row_idx_raw.as_slice(), n_source, "row_indices")?;
-        bayescpi_packed_core_impl(
+        bayesc_packed_core_impl(
             y_vec.as_ref(),
             &mut source,
             n_samples,
@@ -4730,6 +5111,7 @@ pub fn bayescpi_stream_bed(
             s0_b,
             prob_in,
             counts,
+            fixed_pi,
             df0_e,
             s0_e,
             seed,
@@ -4749,6 +5131,8 @@ pub fn bayescpi_stream_bed(
             n_active_mean,
             pip,
             rhat_h2,
+            actual_iterations,
+            convergence_iteration,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -4764,6 +5148,8 @@ pub fn bayescpi_stream_bed(
                 n_active_mean,
                 pip_py,
                 rhat_h2,
+                actual_iterations,
+                convergence_iteration,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -5080,7 +5466,7 @@ fn bayesa_packed_trace_core_impl(
     }
 
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -5145,6 +5531,7 @@ fn bayesb_packed_trace_core_impl(
     s0_b_opt: Option<f64>,
     prob_in_init: f64,
     counts: f64,
+    fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
@@ -5155,7 +5542,8 @@ fn bayesb_packed_trace_core_impl(
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
     }
-    if !(prob_in_init > 0.0 && prob_in_init < 1.0) {
+    let prob_in_base = fixed_prob_in_opt.unwrap_or(prob_in_init);
+    if !(prob_in_base > 0.0 && prob_in_base < 1.0) {
         return Err("prob_in must be in (0, 1)".to_string());
     }
     if counts < 0.0 {
@@ -5250,7 +5638,7 @@ fn bayesb_packed_trace_core_impl(
             if msx <= 0.0 {
                 return Err("MSx must be positive to compute S0_b".to_string());
             }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_init
+            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
         }
     };
     if s0_b <= 0.0 {
@@ -5275,9 +5663,9 @@ fn bayesb_packed_trace_core_impl(
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
-    let mut prob_in = prob_in_init;
+    let mut prob_in = prob_in_base;
     let mut s = s0_b;
-    let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_init, counts);
+    let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
 
     let mut alpha = vec![0.0; q];
     let mut xtx = vec![0.0_f64; q * q];
@@ -5438,8 +5826,10 @@ fn bayesb_packed_trace_core_impl(
         let mrk_in = n_active as f64;
         let a = mrk_in + counts_in;
         let b = (p as f64 - mrk_in) + counts_out;
-        let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
-        prob_in = rng.sample(beta_dist);
+        if fixed_prob_in_opt.is_none() {
+            let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
+            prob_in = rng.sample(beta_dist);
+        }
 
         let ss_e = ddot_f64(&r, &r) + s0_e;
         var_e = ss_e / rng.sample(chi_e);
@@ -5484,7 +5874,7 @@ fn bayesb_packed_trace_core_impl(
     }
 
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -5527,7 +5917,7 @@ fn bayesb_packed_trace_core_impl(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bayescpi_packed_trace_core_impl(
+fn bayesc_packed_trace_core_impl(
     y: &[f64],
     packed_flat: &[u8],
     bytes_per_snp: usize,
@@ -5549,6 +5939,7 @@ fn bayescpi_packed_trace_core_impl(
     s0_b_opt: Option<f64>,
     prob_in_init: f64,
     counts: f64,
+    fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
     s0_e_opt: Option<f64>,
     seed: Option<u64>,
@@ -5559,7 +5950,8 @@ fn bayescpi_packed_trace_core_impl(
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
     }
-    if !(prob_in_init > 0.0 && prob_in_init < 1.0) {
+    let prob_in_base = fixed_prob_in_opt.unwrap_or(prob_in_init);
+    if !(prob_in_base > 0.0 && prob_in_base < 1.0) {
         return Err("prob_in must be in (0, 1)".to_string());
     }
     if counts < 0.0 {
@@ -5654,7 +6046,7 @@ fn bayescpi_packed_trace_core_impl(
             if msx <= 0.0 {
                 return Err("MSx must be positive to compute S0_b".to_string());
             }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_init
+            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
         }
     };
     if s0_b <= 0.0 {
@@ -5677,8 +6069,8 @@ fn bayescpi_packed_trace_core_impl(
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
     let mut var_b = s0_b;
-    let mut prob_in = prob_in_init;
-    let counts_in = counts * prob_in_init;
+    let mut prob_in = prob_in_base;
+    let counts_in = counts * prob_in_base;
     let counts_out = counts - counts_in;
 
     let mut alpha = vec![0.0; q];
@@ -5774,8 +6166,7 @@ fn bayescpi_packed_trace_core_impl(
                 let c = x2[j] * inv_var_e + 1.0 / var_b;
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
-                        "Non-positive posterior precision in BayesCpi packed beta update"
-                            .to_string(),
+                        "Non-positive posterior precision in BayesC packed beta update".to_string(),
                     );
                 }
                 let rhs = xe * inv_var_e;
@@ -5819,19 +6210,21 @@ fn bayescpi_packed_trace_core_impl(
         };
         var_b = ss_b / rng.sample(chi_b_eff);
         if !(var_b.is_finite() && var_b > 0.0) {
-            return Err("BayesCpi packed var_b became non-finite or non-positive".to_string());
+            return Err("BayesC packed var_b became non-finite or non-positive".to_string());
         }
 
         let mrk_in = mrk_in_usize as f64;
         let a = mrk_in + counts_in + 1.0;
         let b = (p as f64 - mrk_in) + counts_out + 1.0;
-        let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
-        prob_in = rng.sample(beta_dist);
+        if fixed_prob_in_opt.is_none() {
+            let beta_dist = Beta::new(a, b).map_err(|e| e.to_string())?;
+            prob_in = rng.sample(beta_dist);
+        }
 
         let ss_e = ddot_f64(&r, &r) + s0_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
-            return Err("BayesCpi packed var_e became non-finite or non-positive".to_string());
+            return Err("BayesC packed var_e became non-finite or non-positive".to_string());
         }
 
         let var_g = genetic_variance_from_residual(y, &r, x, &alpha, n, q);
@@ -5871,7 +6264,7 @@ fn bayescpi_packed_trace_core_impl(
     }
 
     if n_keep == 0 {
-        return Err("No posterior samples kept (check burnin/thin)".to_string());
+        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -6125,6 +6518,7 @@ pub fn bayesa_packed_trace<'py>(
     s0_b = None,
     prob_in = 0.5,
     counts = 10.0,
+    fixed_pi = None,
     df0_e = 5.0,
     s0_e = None,
     trace_snp_indices = None,
@@ -6152,6 +6546,7 @@ pub fn bayesb_packed_trace<'py>(
     s0_b: Option<f64>,
     prob_in: f64,
     counts: f64,
+    fixed_pi: Option<f64>,
     df0_e: f64,
     s0_e: Option<f64>,
     trace_snp_indices: Option<PyReadonlyArray1<i64>>,
@@ -6287,6 +6682,7 @@ pub fn bayesb_packed_trace<'py>(
             s0_b,
             prob_in,
             counts,
+            fixed_pi,
             df0_e,
             s0_e,
             seed,
@@ -6319,13 +6715,14 @@ pub fn bayesb_packed_trace<'py>(
     s0_b = None,
     prob_in = 0.5,
     counts = 10.0,
+    fixed_pi = None,
     df0_e = 5.0,
     s0_e = None,
     trace_snp_indices = None,
     threads = 0,
     seed = None
 ))]
-pub fn bayescpi_packed_trace<'py>(
+pub fn bayesc_packed_trace<'py>(
     py: Python<'py>,
     y: PyReadonlyArray1<f64>,
     packed: PyReadonlyArray2<u8>,
@@ -6344,6 +6741,7 @@ pub fn bayescpi_packed_trace<'py>(
     s0_b: Option<f64>,
     prob_in: f64,
     counts: f64,
+    fixed_pi: Option<f64>,
     df0_e: f64,
     s0_e: Option<f64>,
     trace_snp_indices: Option<PyReadonlyArray1<i64>>,
@@ -6462,7 +6860,7 @@ pub fn bayescpi_packed_trace<'py>(
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
     let result = py.detach(|| {
-        bayescpi_packed_trace_core_impl(
+        bayesc_packed_trace_core_impl(
             y_vec.as_ref(),
             packed_flat.as_ref(),
             bytes_per_snp,
@@ -6484,6 +6882,7 @@ pub fn bayescpi_packed_trace<'py>(
             s0_b,
             prob_in,
             counts,
+            fixed_pi,
             df0_e,
             s0_e,
             seed,

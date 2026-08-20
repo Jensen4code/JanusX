@@ -51,8 +51,8 @@ class GsConfig:
     blup: bool = False
     rrblup: bool = False
     bayesa: bool = False
-    bayesb: bool = False
-    bayescpi: bool = False
+    bayesb: bool | float = False
+    bayesc: bool | float = False
     rf: bool = False
     et: bool = False
     gbdt: bool = False
@@ -82,6 +82,16 @@ class GsConfig:
             kk = str(k).strip().lower()
             if kk not in {"a", "d", "ad"}:
                 raise ValueError(f"Unsupported GBLUP kernel token: {k}")
+        for name in ("bayesb", "bayesc"):
+            value = getattr(self, name)
+            if value is False or value is True or value is None:
+                continue
+            try:
+                pi = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be False/True or a fixed pi in (0, 1).") from exc
+            if not (0.0 < pi < 1.0):
+                raise ValueError(f"{name} fixed pi must be in (0, 1), got {value!r}.")
 
     def _selected_model_count(self) -> int:
         n = 0
@@ -90,8 +100,8 @@ class GsConfig:
         n += int(bool(self.blup))
         n += int(bool(self.rrblup))
         n += int(bool(self.bayesa))
-        n += int(bool(self.bayesb))
-        n += int(bool(self.bayescpi))
+        n += int(self.bayesb is not False and self.bayesb is not None)
+        n += int(self.bayesc is not False and self.bayesc is not None)
         n += int(bool(self.rf))
         n += int(bool(self.et))
         n += int(bool(self.gbdt))
@@ -131,10 +141,14 @@ class GsConfig:
             argv.append("-rrBLUP")
         if bool(self.bayesa):
             argv.append("-BayesA")
-        if bool(self.bayesb):
+        if self.bayesb is not False and self.bayesb is not None:
             argv.append("-BayesB")
-        if bool(self.bayescpi):
-            argv.append("-BayesCpi")
+            if self.bayesb is not True:
+                argv.append(str(float(self.bayesb)))
+        if self.bayesc is not False and self.bayesc is not None:
+            argv.append("-BayesC")
+            if self.bayesc is not True:
+                argv.append(str(float(self.bayesc)))
         if bool(self.rf):
             argv.append("-RF")
         if bool(self.et):

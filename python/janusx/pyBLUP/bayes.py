@@ -4,29 +4,99 @@ import typing
 import warnings
 import numpy as np
 
-from janusx.janusx import bayesa as _bayesa, bayesb as _bayesb, bayescpi as _bayescpi
+from janusx.janusx import bayesa as _bayesa, bayesb as _bayesb, bayesc as _bayesc
 from janusx.pyBLUP.mlm import BLUP
 
 _BAYESA_MIN_ABS_BETA_WARNED = False
 
-# Production GS defaults.  Keep these in one place so the Python wrappers,
-# the generic BAYES model, and the streaming GS route use the same chain
-# length/burn-in policy.
-BAYES_MCMC_DEFAULTS: dict[str, tuple[int, int, int]] = {
-    "BayesA": (1500, 500, 1),
-    "BayesB": (3000, 2000, 1),
-    "BayesCpi": (3000, 2000, 1),
+# Production GS defaults.  The first value is the hard upper bound for the
+# R-hat monitoring chain; the second is the post-convergence burn-in count.
+BAYES_MCMC_DEFAULTS: dict[str, tuple[int, int]] = {
+    "BayesA": (3000, 1000),
+    "BayesB": (3000, 1000),
+    "BayesC": (3000, 1000),
 }
 
 
-def bayes_mcmc_defaults(method: str) -> tuple[int, int, int]:
-    """Return ``(n_iter, burnin, thin)`` defaults for a Bayes method."""
+def bayes_mcmc_defaults(method: str) -> tuple[int, int]:
+    """Return ``(rhat_max_iter, post_convergence_burnin)`` defaults."""
     key = str(method).strip()
     try:
         return BAYES_MCMC_DEFAULTS[key]
     except KeyError as exc:
         supported = ", ".join(BAYES_MCMC_DEFAULTS)
         raise ValueError(f"Unsupported Bayes method {method!r}; use {supported}.") from exc
+
+
+def _scalar_from_native(value: object, *, integer: bool = False) -> float | int | None:
+    """Convert a scalar PyO3 diagnostic without accepting malformed arrays."""
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        if int(arr.size) != 1 or not np.isfinite(float(arr[0])):
+            return None
+        scalar = float(arr[0])
+        if integer:
+            if scalar < 0.0 or not np.isclose(scalar, round(scalar)):
+                return None
+            return int(round(scalar))
+        return scalar
+    except Exception:
+        return None
+
+
+def _parse_bayes_diagnostics(
+    method: str,
+    diag: typing.Sequence[object],
+    beta_size: int,
+) -> dict[str, object]:
+    """Parse legacy and current native Bayes diagnostic tails.
+
+    Current non-trace kernels append ``rhat, actual_iterations,
+    post_burnin_start_iteration`` for BayesA and ``pip, rhat, actual_iterations,
+    post_burnin_start_iteration`` for BayesB/BayesC.  The length-aware parser
+    keeps older installed extensions usable while avoiding the p==1 scalar PIP
+    ambiguity.
+    """
+    tail = list(diag)
+    pip_item: object | None = None
+    rhat_item: object | None = None
+    actual_item: object | None = None
+    post_start_item: object | None = None
+    method_key = str(method).strip().lower()
+    if method_key in {"bayesb", "bayesc"}:
+        if len(tail) >= 6:
+            pip_item, rhat_item, actual_item, post_start_item = tail[-4:]
+        elif len(tail) >= 4:
+            pip_item, rhat_item = tail[-2:]
+        elif len(tail) >= 3:
+            # Pre-R-hat B/C ABI: prob_in, n_active, pip.
+            pip_item = tail[-1]
+    elif len(tail) >= 3:
+        rhat_item, actual_item, post_start_item = tail[-3:]
+    elif tail:
+        rhat_item = tail[-1]
+
+    pip: np.ndarray | None = None
+    if pip_item is not None:
+        try:
+            candidate = np.asarray(pip_item, dtype=np.float64).reshape(-1)
+            if (
+                int(candidate.size) == int(beta_size)
+                and np.all(np.isfinite(candidate))
+                and np.all((candidate >= 0.0) & (candidate <= 1.0))
+            ):
+                pip = np.ascontiguousarray(candidate, dtype=np.float64)
+        except Exception:
+            pip = None
+    rhat = _scalar_from_native(rhat_item)
+    actual = _scalar_from_native(actual_item, integer=True)
+    post_start = _scalar_from_native(post_start_item, integer=True)
+    return {
+        "pip": pip,
+        "rhat_h2": float(rhat) if rhat is not None else float("nan"),
+        "actual_iterations": int(actual) if actual is not None else 0,
+        "post_burnin_start_iteration": int(post_start) if post_start is not None else 0,
+    }
 
 
 def _as_1d_f64(arr: np.ndarray, name: str) -> np.ndarray:
@@ -67,13 +137,22 @@ def _as_2d_f64_mxn(arr: np.ndarray, name: str, n_cols: int) -> np.ndarray:
     return np.ascontiguousarray(out)
 
 
+def _validate_fixed_pi(pi: Optional[float]) -> Optional[float]:
+    """Validate the optional fixed inclusion probability used by BayesB/C."""
+    if pi is None:
+        return None
+    value = float(pi)
+    if not np.isfinite(value) or not (0.0 < value < 1.0):
+        raise ValueError("pi must be finite and in (0, 1)")
+    return value
+
+
 def _call_bayesa(
     y: np.ndarray,
     m: np.ndarray,
     x: Optional[np.ndarray],
     n_iter: int,
     burnin: int,
-    thin: int,
     r2: float,
     df0_b: float,
     shape0: float,
@@ -83,14 +162,22 @@ def _call_bayesa(
     s0_e: Optional[float],
     min_abs_beta: float,
     seed: Optional[int],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    float,
+    float,
+    int,
+    int,
+]:
     n_iter = int(n_iter)
     burnin = int(burnin)
-    thin = int(thin)
+    thin = 1
     if n_iter <= burnin:
         raise ValueError("n_iter must be > burnin")
-    if thin < 1:
-        raise ValueError("thin must be >= 1")
     if not np.isfinite(float(min_abs_beta)) or float(min_abs_beta) < 0.0:
         raise ValueError("min_abs_beta is deprecated/ignored; keep it finite and >= 0")
     if not (0.0 < r2 < 1.0):
@@ -143,7 +230,6 @@ def _call_bayesb(
     x: Optional[np.ndarray],
     n_iter: int,
     burnin: int,
-    thin: int,
     r2: float,
     df0_b: float,
     shape0: float,
@@ -151,17 +237,29 @@ def _call_bayesb(
     s0_b: Optional[float],
     prob_in: float,
     counts: float,
+    pi: Optional[float],
     df0_e: float,
     s0_e: Optional[float],
     seed: Optional[int],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float, np.ndarray, float]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    float,
+    float,
+    float,
+    np.ndarray,
+    float,
+    int,
+    int,
+]:
     n_iter = int(n_iter)
     burnin = int(burnin)
-    thin = int(thin)
+    thin = 1
     if n_iter <= burnin:
         raise ValueError("n_iter must be > burnin")
-    if thin < 1:
-        raise ValueError("thin must be >= 1")
     if not (0.0 < r2 < 1.0):
         raise ValueError("r2 must be in (0, 1)")
     if df0_b <= 0.0 or df0_e <= 0.0:
@@ -183,6 +281,7 @@ def _call_bayesb(
         if seed < 0:
             raise ValueError("seed must be >= 0")
 
+    fixed_pi = _validate_fixed_pi(pi)
     return _bayesb(
         y=y,
         m=m,
@@ -197,35 +296,47 @@ def _call_bayesb(
         s0_b=s0_b,
         prob_in=float(prob_in),
         counts=float(counts),
+        fixed_pi=fixed_pi,
         df0_e=float(df0_e),
         s0_e=s0_e,
         seed=seed,
     )
 
 
-def _call_bayescpi(
+def _call_bayesc(
     y: np.ndarray,
     m: np.ndarray,
     x: Optional[np.ndarray],
     n_iter: int,
     burnin: int,
-    thin: int,
     r2: float,
     df0_b: float,
     s0_b: Optional[float],
     prob_in: float,
     counts: float,
+    pi: Optional[float],
     df0_e: float,
     s0_e: Optional[float],
     seed: Optional[int],
-) -> Tuple[np.ndarray, np.ndarray, float, float, float, float, float, float, np.ndarray, float]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    np.ndarray,
+    float,
+    int,
+    int,
+]:
     n_iter = int(n_iter)
     burnin = int(burnin)
-    thin = int(thin)
+    thin = 1
     if n_iter <= burnin:
         raise ValueError("n_iter must be > burnin")
-    if thin < 1:
-        raise ValueError("thin must be >= 1")
     if not (0.0 < r2 < 1.0):
         raise ValueError("r2 must be in (0, 1)")
     if df0_b <= 0.0 or df0_e <= 0.0:
@@ -243,7 +354,8 @@ def _call_bayescpi(
         if seed < 0:
             raise ValueError("seed must be >= 0")
 
-    return _bayescpi(
+    fixed_pi = _validate_fixed_pi(pi)
+    return _bayesc(
         y=y,
         m=m,
         x=x,
@@ -255,6 +367,7 @@ def _call_bayescpi(
         s0_b=s0_b,
         prob_in=float(prob_in),
         counts=float(counts),
+        fixed_pi=fixed_pi,
         df0_e=float(df0_e),
         s0_e=s0_e,
         seed=seed,
@@ -265,9 +378,8 @@ def BayesA(
     y: np.ndarray,
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
-    n_iter: int = 1500,
-    burnin: int = 500,
-    thin: int = 1,
+    n_iter: int = 3000,
+    burnin: int = 1000,
     r2: float = 0.5,
     prob_in: float = 0.5,
     counts: float = 5.0,
@@ -279,7 +391,17 @@ def BayesA(
     s0_e: Optional[float] = None,
     min_abs_beta: float = 1e-9,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    float,
+    float,
+    int,
+    int,
+]:
     """
     Python interface for the Rust BayesA kernel (PyO3).
 
@@ -296,12 +418,10 @@ def BayesA(
         Covariate matrix. 1D inputs are treated as a single covariate.
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
-    n_iter : int, default=1500
-        Total MCMC iterations.
-    burnin : int, default=500
-        Burn-in iterations. Must be < n_iter.
-    thin : int, default=1
-        Keep every `thin`-th sample after burn-in.
+    n_iter : int, default=3000
+        Maximum iterations used for R-hat monitoring and posterior sampling.
+    burnin : int, default=1000
+        Additional burn-in iterations after R-hat reaches the stability threshold.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.5
@@ -342,8 +462,14 @@ def BayesA(
         Posterior variance of heritability.
     rhat_h2 : float
         Split-chain R-hat of the retained posterior h2 samples.  The Rust
-        kernel may stop early after repeated values below its stability
-        threshold.
+        kernel may enter a post-convergence burn-in stage after repeated values
+        below its stability threshold.
+    actual_iterations : int
+        Number of MCMC updates actually performed, including any post-
+        convergence burn-in iterations.
+    post_burnin_start_iteration : int
+        One-based first iteration of the post-convergence burn-in stage, or 0
+        when the R-hat early-stop trigger was not reached.
     Raises
     ------
     ValueError
@@ -366,7 +492,6 @@ def BayesA(
         x_arr,
         n_iter,
         burnin,
-        thin,
         r2,
         df0_b,
         shape0,
@@ -383,11 +508,11 @@ def BayesB(
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
     n_iter: int = 3000,
-    burnin: int = 2000,
-    thin: int = 1,
+    burnin: int = 1000,
     r2: float = 0.5,
     prob_in: float = 0.5,
     counts: float = 5.0,
+    pi: Optional[float] = None,
     df0_b: float = 5.0,
     shape0: float = 1.1,
     rate0: Optional[float] = None,
@@ -395,7 +520,20 @@ def BayesB(
     df0_e: float = 5.0,
     s0_e: Optional[float] = None,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float, np.ndarray, float]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    float,
+    float,
+    float,
+    np.ndarray,
+    float,
+    int,
+    int,
+]:
     """
     Python interface for the Rust BayesB kernel (PyO3).
 
@@ -410,17 +548,18 @@ def BayesB(
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
     n_iter : int, default=3000
-        Total MCMC iterations.
-    burnin : int, default=2000
-        Burn-in iterations. Must be < n_iter.
-    thin : int, default=1
-        Keep every `thin`-th sample after burn-in.
+        Maximum iterations used for R-hat monitoring and posterior sampling.
+    burnin : int, default=1000
+        Additional burn-in iterations after R-hat reaches the stability threshold.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.5
         Prior inclusion probability for markers.
     counts : float, default=5.0
         Prior strength for inclusion probability.
+    pi : float, optional
+        Fixed marker inclusion probability. If omitted, the sampler updates
+        the inclusion probability from the active-marker counts.
     df0_b : float, default=5.0
         Prior degrees of freedom for marker effects.
     shape0 : float, default=1.1
@@ -459,6 +598,12 @@ def BayesB(
         Posterior inclusion probability for each marker.
     rhat_h2 : float
         Split-chain R-hat of the retained posterior h2 samples.
+    actual_iterations : int
+        Number of MCMC updates actually performed, including any post-
+        convergence burn-in iterations.
+    post_burnin_start_iteration : int
+        One-based first iteration of the post-convergence burn-in stage, or 0
+        when the R-hat early-stop trigger was not reached.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
@@ -472,7 +617,6 @@ def BayesB(
         x_arr,
         n_iter,
         burnin,
-        thin,
         r2,
         df0_b,
         shape0,
@@ -480,30 +624,44 @@ def BayesB(
         s0_b,
         prob_in,
         counts,
+        pi,
         df0_e,
         s0_e,
         seed,
     )
 
 
-def BayesCpi(
+def BayesC(
     y: np.ndarray,
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
     n_iter: int = 3000,
-    burnin: int = 2000,
-    thin: int = 1,
+    burnin: int = 1000,
     r2: float = 0.5,
     prob_in: float = 0.5,
     counts: float = 10.0,
+    pi: Optional[float] = None,
     df0_b: float = 5.0,
     s0_b: Optional[float] = None,
     df0_e: float = 5.0,
     s0_e: Optional[float] = None,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, float, float, float, float, float, float, np.ndarray, float]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    np.ndarray,
+    float,
+    int,
+    int,
+]:
     """
-    Python interface for the Rust BayesCpi kernel (PyO3).
+    Python interface for the Rust BayesC kernel (PyO3).
 
     Parameters
     ----------
@@ -516,17 +674,18 @@ def BayesCpi(
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
     n_iter : int, default=3000
-        Total MCMC iterations.
-    burnin : int, default=2000
-        Burn-in iterations. Must be < n_iter.
-    thin : int, default=1
-        Keep every `thin`-th sample after burn-in.
+        Maximum iterations used for R-hat monitoring and posterior sampling.
+    burnin : int, default=1000
+        Additional burn-in iterations after R-hat reaches the stability threshold.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.5
         Prior inclusion probability for markers.
     counts : float, default=10.0
         Prior strength for inclusion probability.
+    pi : float, optional
+        Fixed marker inclusion probability. If omitted, the sampler updates
+        the inclusion probability from the active-marker counts.
     df0_b : float, default=5.0
         Prior degrees of freedom for marker effects.
     s0_b : float, optional
@@ -561,6 +720,12 @@ def BayesCpi(
         Posterior inclusion probability for each marker.
     rhat_h2 : float
         Split-chain R-hat of the retained posterior h2 samples.
+    actual_iterations : int
+        Number of MCMC updates actually performed, including any post-
+        convergence burn-in iterations.
+    post_burnin_start_iteration : int
+        One-based first iteration of the post-convergence burn-in stage, or 0
+        when the R-hat early-stop trigger was not reached.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
@@ -568,18 +733,18 @@ def BayesCpi(
     if X is not None:
         x_arr = _as_2d_f64(X, "X", y_arr.shape[0], allow_1d=True)
 
-    return _call_bayescpi(
+    return _call_bayesc(
         y_arr,
         m_arr,
         x_arr,
         n_iter,
         burnin,
-        thin,
         r2,
         df0_b,
         s0_b,
         prob_in,
         counts,
+        pi,
         df0_e,
         s0_e,
         seed,
@@ -592,17 +757,17 @@ class BAYES:
         y: np.ndarray,
         M: np.ndarray,
         cov: np.ndarray | None = None,
-        method: typing.Literal["BayesA", "BayesB", "BayesCpi"] = "BayesA",
+        method: typing.Literal["BayesA", "BayesB", "BayesC"] = "BayesA",
         n_iter: Optional[int] = None,
         burnin: Optional[int] = None,
-        thin: int = 1,
         r2: Optional[float] = None,
         prob_in: float = 0.5,
         counts: float = 5.0,
+        pi: Optional[float] = None,
         seed: Optional[int] = None,
     ):
         """
-        Bayesian genomic prediction using BayesA/B/Cpi with minimal hyperparameters.
+        Bayesian genomic prediction using BayesA/B/C with minimal hyperparameters.
 
         Parameters
         ----------
@@ -612,15 +777,18 @@ class BAYES:
             Marker matrix of shape (m, n) with genotypes coded as 0/1/2.
         cov : np.ndarray, optional
             Fixed-effect design matrix of shape (n, p).
-        method : {"BayesA","BayesB","BayesCpi"}
+        method : {"BayesA","BayesB","BayesC"}
             Bayesian model to fit.
         r2 : float, optional
             Proportion of variance explained by markers. If None, estimated
             via GBLUP (BLUP with kinship=1).
         prob_in : float
-            Prior inclusion probability (BayesB/BayesCpi).
+            Prior inclusion probability (BayesB/BayesC).
         counts : float
-            Prior strength for inclusion probability (BayesB/BayesCpi).
+            Prior strength for inclusion probability (BayesB/BayesC).
+        pi : float, optional
+            Fixed marker inclusion probability for BayesB/BayesC. If omitted,
+            the sampler updates the inclusion probability from active markers.
 
         Attributes
         ----------
@@ -638,15 +806,25 @@ class BAYES:
             Posterior variance of heritability.
         rhat_h2 : float
             Split-chain R-hat of the retained posterior h2 samples.
+        rhat_max_iterations : int
+            Hard upper bound for R-hat monitoring and the complete chain.
+        post_convergence_burnin : int
+            Additional iterations discarded after the R-hat trigger.
+        actual_iterations : int
+            Number of MCMC updates actually performed, including any post-
+            convergence burn-in iterations.
+        post_burnin_start_iteration : int
+            One-based first iteration of the post-convergence burn-in stage, or 0
+            when the R-hat early-stop trigger was not reached.
         """
         method_map = {
             "BayesA": BayesA,
             "BayesB": BayesB,
-            "BayesCpi": BayesCpi,
+            "BayesC": BayesC,
         }
         if method not in method_map:
             raise ValueError(f"Unsupported Bayes method: {method}")
-        default_n_iter, default_burnin, _default_thin = bayes_mcmc_defaults(method)
+        default_n_iter, default_burnin = bayes_mcmc_defaults(method)
         if n_iter is None:
             n_iter = int(default_n_iter)
         if burnin is None:
@@ -675,59 +853,51 @@ class BAYES:
         self.pip_hat: np.ndarray | None = None
         self.rhat_h2: float = float("nan")
         self.rhat: float = float("nan")
+        self.rhat_max_iterations: int = int(n_iter)
+        self.post_convergence_burnin: int = int(burnin)
+        self.actual_iterations: int = 0
+        self.post_burnin_start_iteration: int = 0
+        self.burnin_start_iteration: int = 0
         self.r2_used: float | None = float(r2)
         self.r2_blup: float | None = (
             float(r2_blup_pheno_scale) if r2_blup_pheno_scale is not None else float("nan")
         )
         self.r2_source: str = "blup_auto" if r2_blup_pheno_scale is not None else "provided"
 
-        beta, alpha, varbeta, varep, h2_mean, varh2, *diag = method_map[method](
-            y,
-            M,
-            X,
+        method_kwargs = dict(
             n_iter=n_iter,
             burnin=burnin,
-            thin=thin,
             r2=float(r2),
             prob_in=prob_in,
             counts=counts,
             seed=seed,
         )
+        if method in {"BayesB", "BayesC"}:
+            method_kwargs["pi"] = pi
+        beta, alpha, varbeta, varep, h2_mean, varh2, *diag = method_map[method](
+            y,
+            M,
+            X,
+            **method_kwargs,
+        )
         self.beta_hat = beta.reshape(-1, 1);self.varbeta_hat = varbeta
         self.alpha_hat = alpha.reshape(-1, 1)
         self.varep_hat = float(varep)
         self.pve = float(h2_mean);self.varpve = float(varh2)
-        # The current native kernels append R-hat after the legacy return
-        # fields.  Keep parsing tolerant of older extensions so importing the
-        # Python package remains backwards compatible during an upgrade.
-        if method in {"BayesB", "BayesCpi"}:
-            # New kernels append ``pip, rhat``; old kernels ended at ``pip``.
-            pip_item = diag[-2] if len(diag) >= 4 else (diag[-1] if diag else None)
-            if pip_item is not None:
-                try:
-                    pip_arr = np.asarray(pip_item, dtype=np.float64).reshape(-1)
-                    if int(pip_arr.size) == int(self.beta_hat.size):
-                        self.pip_hat = np.ascontiguousarray(
-                            pip_arr.reshape(-1, 1), dtype=np.float64
-                        )
-                except Exception:
-                    self.pip_hat = None
-            if len(diag) >= 4:
-                try:
-                    rhat_arr = np.asarray(diag[-1], dtype=np.float64).reshape(-1)
-                    if int(rhat_arr.size) == 1 and np.isfinite(float(rhat_arr[0])):
-                        self.rhat_h2 = float(rhat_arr[0])
-                except Exception:
-                    pass
-        else:
-            for item in reversed(diag):
-                try:
-                    arr = np.asarray(item, dtype=np.float64).reshape(-1)
-                    if int(arr.size) == 1 and np.isfinite(float(arr[0])):
-                        self.rhat_h2 = float(arr[0])
-                        break
-                except Exception:
-                    continue
+        diagnostics = _parse_bayes_diagnostics(
+            method,
+            diag,
+            int(self.beta_hat.size),
+        )
+        pip = diagnostics["pip"]
+        if isinstance(pip, np.ndarray):
+            self.pip_hat = np.ascontiguousarray(pip.reshape(-1, 1), dtype=np.float64)
+        self.rhat_h2 = float(diagnostics["rhat_h2"])
+        self.actual_iterations = int(diagnostics["actual_iterations"])
+        self.post_burnin_start_iteration = int(
+            diagnostics["post_burnin_start_iteration"]
+        )
+        self.burnin_start_iteration = self.post_burnin_start_iteration
         self.rhat = float(self.rhat_h2)
         
     def predict(self,M:np.ndarray,cov:np.ndarray=None):
@@ -751,16 +921,15 @@ class BAYES:
 
 bayesA = BayesA
 bayesB = BayesB
-bayesCpi = BayesCpi
-
+bayesC = BayesC
 __all__ = [
     "BAYES_MCMC_DEFAULTS",
     "bayes_mcmc_defaults",
     "BayesA",
     "BayesB",
-    "BayesCpi",
+    "BayesC",
     "BAYES",
     "bayesA",
     "bayesB",
-    "bayesCpi",
+    "bayesC",
 ]

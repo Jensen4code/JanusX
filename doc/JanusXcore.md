@@ -14,7 +14,7 @@ Use these modules as the main public surface:
 | `janusx.assoc` | GWAS-style wrappers and file-mode orchestration | mirrors `jx gwas` |
 | `janusx.gs` | GS-style wrappers and result objects | mirrors `jx gs` |
 | `janusx.pyBLUP` | direct in-memory association, GRM, BLUP, and ML kernels | lower-level than `assoc` / `gs` |
-| `janusx.pyBLUP.bayes` | `BayesA`, `BayesB`, `BayesCpi`, `BAYES` | Bayesian GS imports live here, not at `janusx.pyBLUP` top level |
+| `janusx.pyBLUP.bayes` | `BayesA`, `BayesB`, `BayesC`, `BAYES` | Bayesian GS imports live here, not at `janusx.pyBLUP` top level |
 | `janusx.fastpop` | RSVD, ancestry decomposition, CVerror | mirrors `jx fastpop` |
 | `janusx.garfield.logreg` | logical conjunction search on binary features | lightweight Python-facing GARFIELD entry |
 | `janusx.gtools` | GFF/BED readers and region queries | annotation-centric helpers |
@@ -244,14 +244,20 @@ This layer is best when you already have in-memory matrices and want to bypass f
 
 ```python
 from janusx.pyBLUP import BLUP, MLGS
-from janusx.pyBLUP.bayes import BayesA, BayesB, BayesCpi, BAYES
+from janusx.pyBLUP.bayes import BayesA, BayesB, BayesC, BAYES
 ```
 
 Use:
 
 - `BLUP` for direct mixed-model prediction on in-memory matrices
 - `MLGS` for ML-based GS in Python
-- `BayesA`, `BayesB`, `BayesCpi`, or `BAYES` for Bayesian GS
+- `BayesA`, `BayesB`, `BayesC`, or `BAYES` for Bayesian GS. Pass `pi=` to
+  `BayesB`/`BayesC` to keep the marker inclusion probability fixed.
+
+Bayesian sampling uses a unified default of a 3000-iteration R-hat monitoring
+limit (stability threshold 1.2) followed by 1000 additional post-convergence
+burn-in iterations. The public Python wrappers expose only these two chain
+controls; thinning is fixed at one for production GS.
 
 The Bayesian imports live in `janusx.pyBLUP.bayes`, not in `janusx.pyBLUP` top-level exports.
 

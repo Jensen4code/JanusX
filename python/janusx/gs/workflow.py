@@ -10,7 +10,7 @@ Supported models
   - rrBLUP : Ridge regression BLUP (rrBLUP, kinship = None)
   - BayesA : Bayesian marker effect model (via pyBLUP.bayes)
   - BayesB : Bayesian variable selection model (via pyBLUP.bayes)
-  - BayesCpi : Bayesian variable selection model with shared variance (via pyBLUP.bayes)
+  - BayesC : Bayesian variable selection model with shared variance (via pyBLUP.bayes)
   - RF     : Random forest regression with GS-oriented inner tuning
   - ET     : Extra-trees regression with GS-oriented inner tuning
   - GBDT   : Histogram gradient boosting regression with inner tuning
@@ -112,7 +112,11 @@ from janusx.gfreader import (
 )
 from janusx.pyBLUP.kfold import KFold as _LocalKFold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
-from janusx.pyBLUP.bayes import BAYES, bayes_mcmc_defaults as _bayes_mcmc_defaults
+from janusx.pyBLUP.bayes import (
+    BAYES,
+    _parse_bayes_diagnostics,
+    bayes_mcmc_defaults as _bayes_mcmc_defaults,
+)
 from janusx.pyBLUP.ml import (
     MLGS,
     _HAS_SKLEARN,
@@ -1039,7 +1043,7 @@ def _methods_need_raw_additive_dense(methods: list[str]) -> bool:
 
 def _methods_need_rrblup_standardization(methods: list[str]) -> bool:
     return any(
-        (str(m) in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"})
+        (str(m) in {"rrBLUP", "BayesA", "BayesB", "BayesC"})
         or _is_blup_method(str(m))
         for m in methods
     )
@@ -1099,7 +1103,7 @@ def _is_binary_jxmodel_artifact_supported(method: str) -> bool:
 
 def _is_text_effect_jxmodel_supported(method: str) -> bool:
     m = str(method).strip()
-    return bool(_is_blup_method(m) or (m in {"BayesA", "BayesB", "BayesCpi"}))
+    return bool(_is_blup_method(m) or (m in {"BayesA", "BayesB", "BayesC"}))
 
 
 def _is_effect_export_supported(method: str) -> bool:
@@ -1108,7 +1112,7 @@ def _is_effect_export_supported(method: str) -> bool:
         _is_blup_method(m)
         or _is_gblup_method(m)
         or (m == "rrBLUP")
-        or (m in {"BayesA", "BayesB", "BayesCpi"})
+        or (m in {"BayesA", "BayesB", "BayesC"})
         or (m in _ML_METHOD_MAP)
     )
 
@@ -1153,7 +1157,7 @@ def _resolve_effect_export_method(
 
 
 def _known_jxmodel_methods() -> set[str]:
-    return _GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} | set(_ML_METHOD_MAP.keys())
+    return _GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesC"} | set(_ML_METHOD_MAP.keys())
 
 
 def _parse_jxmodel_method_from_name(path_like: str) -> str | None:
@@ -1280,9 +1284,30 @@ def _save_jxmodel(path: str, payload: dict[str, typing.Any]) -> None:
         pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+def _format_effect_beta(x: float) -> str:
+    if pd.isna(x):
+        return ""
+    x = float(x)
+    if x == 0.0:
+        return "0.0000"
+    if abs(x) < 1e-4:
+        return f"{x:.4e}"
+    return f"{x:.4f}"
+
+
 def _save_effect_text_jxmodel(path: str, table: pd.DataFrame) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    table.to_csv(str(path), sep="\t", index=False, float_format="%.6g")
+
+    out = table.copy()
+    if "beta" in out.columns:
+        out["beta"] = out["beta"].map(_format_effect_beta)
+
+    out.to_csv(
+        str(path),
+        sep="\t",
+        index=False,
+        float_format="%.6g",
+    )
 
 
 def _load_jxmodel(path: str) -> dict[str, typing.Any]:
@@ -1643,6 +1668,13 @@ def _extract_effect_vector_from_model_state(
 def _extract_pip_vector_from_model_state(
     model_state: dict[str, typing.Any],
 ) -> tuple[np.ndarray | None, str]:
+    method = str(model_state.get("method", "")).strip().lower()
+    beta_raw = model_state.get("beta", None)
+    try:
+        beta_len = int(np.asarray(beta_raw, dtype=np.float64).reshape(-1).size)
+    except Exception:
+        beta_len = 0
+    invalid_source = ""
     for key in ("pip", "posterior_inclusion_probability", "posterior_pip"):
         raw = model_state.get(str(key), None)
         if raw is None:
@@ -1653,8 +1685,18 @@ def _extract_pip_vector_from_model_state(
             continue
         if int(vec.size) <= 0:
             continue
+        if method in {"bayesb", "bayesc"}:
+            # PIP is marker-wise: it must align with beta and every value is
+            # a probability.  Reject stale/old states that stored a scalar
+            # diagnostic such as n_active_mean in this field.
+            if beta_len > 0 and int(vec.size) != beta_len:
+                invalid_source = f"invalid_model_state.{key}_length"
+                continue
+            if (not np.all(np.isfinite(vec))) or np.any(vec < 0.0) or np.any(vec > 1.0):
+                invalid_source = f"invalid_model_state.{key}_range"
+                continue
         return np.ascontiguousarray(vec, dtype=np.float64), f"model_state.{key}"
-    return None, "no_pip_in_model_state"
+    return None, invalid_source or "no_pip_in_model_state"
 
 
 def _attach_effect_export_hints_to_model_state(
@@ -3026,7 +3068,7 @@ def _resolve_gs_auto_decode_memory_gb(
 
     for method_name in methods:
         method_key = str(method_name)
-        if method_key in {"BayesA", "BayesB", "BayesCpi"}:
+        if method_key in {"BayesA", "BayesB", "BayesC"}:
             _push_candidate(
                 _memory_gb_for_target_decode_shape(
                     n_total,
@@ -8544,7 +8586,7 @@ def GSapi(
     Y: np.ndarray,
     Xtrain: typing.Any,
     Xtest: typing.Any,
-    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
+    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesC", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
     n_jobs: int = 1,
     seed: int = 42,
@@ -8560,6 +8602,7 @@ def GSapi(
     rrblup_progress_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
     gblup_runtime_state: dict[str, typing.Any] | None = None,
     bayes_auto_r2: float | None = None,
+    bayes_pi: float | None = None,
     bayes_runtime_state: dict[str, typing.Any] | None = None,
     bayes_auto_cfg: dict[str, typing.Any] | None = None,
     model_state: dict[str, typing.Any] | None = None,
@@ -8575,7 +8618,7 @@ def GSapi(
         Genotype matrix for training individuals, shape (m_markers, n_train).
     Xtest : np.ndarray
         Genotype matrix for test individuals, shape (m_markers, n_test).
-    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesCpi', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET'}
+    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesC', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET'}
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
@@ -8605,6 +8648,9 @@ def GSapi(
     bayes_auto_r2 : float, optional
         Optional precomputed BLUP phenotype-scale PVE used as Bayes `r2` prior. When omitted,
         Bayes models estimate it internally from BLUP.
+    bayes_pi : float, optional
+        Fixed marker inclusion probability for BayesB/BayesC. If omitted,
+        the sampler estimates the inclusion probability from active markers.
     bayes_runtime_state : dict, optional
         Mutable state sink for Bayes diagnostics (e.g. resolved `r2` source/value).
     bayes_auto_cfg : dict, optional
@@ -11252,7 +11298,7 @@ def GSapi(
             )
         return pred_train, pred_test, model.pve
 
-    if method in ("BayesA", "BayesB", "BayesCpi"):
+    if method in ("BayesA", "BayesB", "BayesC"):
         resolved_bayes_r2: float | None = None
         if bayes_auto_r2 is not None:
             try:
@@ -11290,214 +11336,228 @@ def GSapi(
                     dtype=np.int64,
                 )
 
-        row_mean, row_inv_sd = _ensure_packed_standard_stats_cached(packed_train)
-        row_flip_full = _ensure_packed_row_flip_cached(packed_train)
-        maf_full = np.ascontiguousarray(np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
-        n_total_samples = int(packed_train["n_samples"])
-        train_abs = np.ascontiguousarray(train_abs, dtype=np.int64)
-        active_row_idx = _packed_ctx_active_row_idx(packed_train)
-        source_prefix_raw = packed_train.get("source_prefix", None)
-        packed_raw = packed_train.get("packed", None)
-        packed_payload_arg: np.ndarray | None = None
-        if packed_raw is not None:
-            packed_payload_arg = np.ascontiguousarray(
-                np.asarray(packed_raw, dtype=np.uint8),
-                dtype=np.uint8,
+        if is_packed_input:
+            row_mean, row_inv_sd = _ensure_packed_standard_stats_cached(packed_train)
+            row_flip_full = _ensure_packed_row_flip_cached(packed_train)
+            maf_full = np.ascontiguousarray(np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+            n_total_samples = int(packed_train["n_samples"])
+            train_abs = np.ascontiguousarray(train_abs, dtype=np.int64)
+            active_row_idx = _packed_ctx_active_row_idx(packed_train)
+            source_prefix_raw = packed_train.get("source_prefix", None)
+            packed_raw = packed_train.get("packed", None)
+            packed_payload_arg: np.ndarray | None = None
+            if packed_raw is not None:
+                packed_payload_arg = np.ascontiguousarray(
+                    np.asarray(packed_raw, dtype=np.uint8),
+                    dtype=np.uint8,
+                )
+                if packed_payload_arg.ndim != 2:
+                    raise ValueError("Packed Bayes requires resident packed payload with ndim=2.")
+            compact_from_active = bool(
+                _packed_ctx_is_lazy_full(packed_train)
+                or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
             )
-            if packed_payload_arg.ndim != 2:
-                raise ValueError("Packed Bayes requires resident packed payload with ndim=2.")
-        compact_from_active = bool(
-            _packed_ctx_is_lazy_full(packed_train)
-            or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
-        )
-        if compact_from_active:
-            maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
-            row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-        else:
-            maf = maf_full
-            row_flip = row_flip_full
-
-        bayes_snp_block = _parse_nonnegative_int(
-            os.getenv("JX_BAYES_PACKED_SNP_BLOCK", "2048")
-        )
-        bayes_sample_chunk = _parse_nonnegative_int(
-            os.getenv("JX_BAYES_PACKED_SAMPLE_CHUNK", "4096")
-        )
-        bayes_snp_block = int(max(1, int(2048 if bayes_snp_block is None else bayes_snp_block)))
-        bayes_sample_chunk = int(max(1, int(4096 if bayes_sample_chunk is None else bayes_sample_chunk)))
-        bayes_stream_block_rows = int(
-            max(1, int(packed_train.get("__bayes_stream_block_rows__", 2048)))
-        )
-        bayes_stream_window_mb = int(
-            max(1, int(packed_train.get("__bayes_stream_window_mb__", 1)))
-        )
-
-        packed_stream_func_name = {
-            "BayesA": "bayesa_stream_bed",
-            "BayesB": "bayesb_stream_bed",
-            "BayesCpi": "bayescpi_stream_bed",
-        }.get(str(method))
-        packed_resident_func_name = {
-            "BayesA": "bayesa_packed",
-            "BayesB": "bayesb_packed",
-            "BayesCpi": "bayescpi_packed",
-        }.get(str(method))
-        use_packed_resident_native = bool(
-            (_jxrs is not None)
-            and (packed_resident_func_name is not None)
-            and (packed_payload_arg is not None)
-            and hasattr(_jxrs, str(packed_resident_func_name))
-        )
-        use_packed_stream_native = bool(
-            (_jxrs is not None)
-            and (packed_stream_func_name is not None)
-            and (source_prefix_raw is not None)
-            and (str(source_prefix_raw).strip() != "")
-            and hasattr(_jxrs, str(packed_stream_func_name))
-        )
-
-        if use_packed_resident_native or use_packed_stream_native:
-            y_vec = np.ascontiguousarray(np.asarray(Y, dtype=np.float64).reshape(-1), dtype=np.float64)
-            r2_blup = float("nan")
-            r2_source = "provided"
-            r2_n_used = int(y_vec.shape[0])
-            r2_n_total = int(y_vec.shape[0])
-            if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
-                r2_blup, r2_source, r2_n_used, r2_n_total = _estimate_bayes_auto_r2_from_blup(
-                    y=y_vec,
-                    Xtrain=packed_train,
-                    packed_train_indices=train_abs,
-                    cfg=bayes_auto_cfg,
-                    seed_offset=int(train_abs.shape[0]),
-                )
-                r2_fit = float(r2_blup)
+            if compact_from_active:
+                maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+                row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
             else:
-                r2_fit = float(resolved_bayes_r2)
-            r2_used = float(min(0.95, max(0.05, float(r2_fit))))
-            packed_backend = (
-                "resident" if use_packed_resident_native else "stream"
+                maf = maf_full
+                row_flip = row_flip_full
+
+            bayes_snp_block = _parse_nonnegative_int(
+                os.getenv("JX_BAYES_PACKED_SNP_BLOCK", "2048")
             )
-            bayes_n_iter, bayes_burnin, bayes_thin = _bayes_mcmc_defaults(method)
-            packed_kwargs: dict[str, typing.Any] = {
-                "y": y_vec,
-                "n_samples": int(n_total_samples),
-                "row_flip": np.ascontiguousarray(
-                    np.asarray(row_flip, dtype=np.bool_).reshape(-1),
-                    dtype=np.bool_,
-                ),
-                "row_maf": maf,
-                "row_mean": np.ascontiguousarray(
-                    np.asarray(row_mean, dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                ),
-                "row_inv_sd": np.ascontiguousarray(
-                    np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                ),
-                "sample_indices": train_abs,
-                "x": None,
-                "n_iter": int(bayes_n_iter),
-                "burnin": int(bayes_burnin),
-                "thin": int(bayes_thin),
-                "r2": float(r2_used),
-                "threads": int(max(0, int(n_jobs))),
-                "seed": None,
-            }
-            if use_packed_resident_native:
-                packed_kwargs["packed"] = typing.cast(np.ndarray, packed_payload_arg)
-                packed_fit_fn = getattr(_jxrs, str(packed_resident_func_name))
-            else:
-                packed_kwargs["prefix"] = str(source_prefix_raw)
-                packed_kwargs["row_indices"] = np.ascontiguousarray(
-                    np.asarray(active_row_idx, dtype=np.int64).reshape(-1),
-                    dtype=np.int64,
-                )
-                packed_kwargs["block_rows"] = int(bayes_stream_block_rows)
-                packed_kwargs["mmap_window_mb"] = int(bayes_stream_window_mb)
-                packed_fit_fn = getattr(_jxrs, str(packed_stream_func_name))
-            if str(method) in {"BayesB", "BayesCpi"}:
-                packed_kwargs["prob_in"] = 0.5
-                packed_kwargs["counts"] = 5.0
-            if str(method) == "BayesA":
-                packed_kwargs["min_abs_beta"] = 1e-9
+            bayes_sample_chunk = _parse_nonnegative_int(
+                os.getenv("JX_BAYES_PACKED_SAMPLE_CHUNK", "4096")
+            )
+            bayes_snp_block = int(max(1, int(2048 if bayes_snp_block is None else bayes_snp_block)))
+            bayes_sample_chunk = int(max(1, int(4096 if bayes_sample_chunk is None else bayes_sample_chunk)))
+            bayes_stream_block_rows = int(
+                max(1, int(packed_train.get("__bayes_stream_block_rows__", 2048)))
+            )
+            bayes_stream_window_mb = int(
+                max(1, int(packed_train.get("__bayes_stream_window_mb__", 1)))
+            )
 
-            packed_threads_compat_fallback = False
-            try:
-                packed_fit_ret = packed_fit_fn(**packed_kwargs)
-            except TypeError as e:
-                msg = str(e)
-                if "unexpected keyword argument 'threads'" in msg:
-                    packed_kwargs_retry = dict(packed_kwargs)
-                    packed_kwargs_retry.pop("threads", None)
-                    packed_fit_ret = packed_fit_fn(**packed_kwargs_retry)
-                    packed_threads_compat_fallback = True
+            packed_stream_func_name = {
+                "BayesA": "bayesa_stream_bed",
+                "BayesB": "bayesb_stream_bed",
+                "BayesC": "bayesc_stream_bed",
+            }.get(str(method))
+            packed_resident_func_name = {
+                "BayesA": "bayesa_packed",
+                "BayesB": "bayesb_packed",
+                "BayesC": "bayesc_packed",
+            }.get(str(method))
+            use_packed_resident_native = bool(
+                (_jxrs is not None)
+                and (packed_resident_func_name is not None)
+                and (packed_payload_arg is not None)
+                and hasattr(_jxrs, str(packed_resident_func_name))
+            )
+            use_packed_stream_native = bool(
+                (_jxrs is not None)
+                and (packed_stream_func_name is not None)
+                and (source_prefix_raw is not None)
+                and (str(source_prefix_raw).strip() != "")
+                and hasattr(_jxrs, str(packed_stream_func_name))
+            )
+
+            if use_packed_resident_native or use_packed_stream_native:
+                y_vec = np.ascontiguousarray(np.asarray(Y, dtype=np.float64).reshape(-1), dtype=np.float64)
+                r2_blup = float("nan")
+                r2_source = "provided"
+                r2_n_used = int(y_vec.shape[0])
+                r2_n_total = int(y_vec.shape[0])
+                if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
+                    r2_blup, r2_source, r2_n_used, r2_n_total = _estimate_bayes_auto_r2_from_blup(
+                        y=y_vec,
+                        Xtrain=packed_train,
+                        packed_train_indices=train_abs,
+                        cfg=bayes_auto_cfg,
+                        seed_offset=int(train_abs.shape[0]),
+                    )
+                    r2_fit = float(r2_blup)
                 else:
-                    raise
-            if str(method) == "BayesCpi":
-                beta_raw, alpha_raw, _varb_mean, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
-            else:
-                beta_raw, alpha_raw, _varb, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
-
-            pve = float(h2_mean)
-            bayes_beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
-            bayes_alpha = np.ascontiguousarray(np.asarray(alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
-            bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
-            bayes_pip: np.ndarray | None = None
-            if str(method) in {"BayesB", "BayesCpi"} and len(diag_tail) >= 3:
-                try:
-                    beta_size = int(np.asarray(beta_raw).size)
-                    # New kernels append ``pip, rhat``; old kernels end at
-                    # ``pip``.  Use the tuple position rather than scalar
-                    # shape: with one marker, both PIP and R-hat are scalars.
-                    pip_item = diag_tail[-2] if len(diag_tail) >= 4 else diag_tail[-1]
-                    pip_arr = np.asarray(pip_item, dtype=np.float64).reshape(-1)
-                    if int(pip_arr.size) == beta_size:
-                        bayes_pip = np.ascontiguousarray(pip_arr, dtype=np.float64)
-                except Exception:
-                    bayes_pip = None
-            bayes_rhat = float("nan")
-            # R-hat is present only in the new B/C tuple (PIP + scalar R-hat).
-            if len(diag_tail) >= 4 or str(method) == "BayesA":
-                try:
-                    candidate_rhat = np.asarray(
-                        diag_tail[-1], dtype=np.float64
-                    ).reshape(-1)
-                    if int(candidate_rhat.size) == 1:
-                        bayes_rhat = float(candidate_rhat[0])
-                except Exception:
-                    bayes_rhat = float("nan")
-
-            if bayes_runtime_state is not None:
-                bayes_runtime_state["r2_used"] = float(r2_used)
-                bayes_runtime_state["r2_blup"] = float(r2_blup)
-                bayes_runtime_state["r2_source"] = str(r2_source)
-                bayes_runtime_state["r2_n_used"] = int(r2_n_used)
-                bayes_runtime_state["r2_n_total"] = int(r2_n_total)
-                bayes_runtime_state["threads_requested"] = int(max(0, int(n_jobs)))
-                bayes_runtime_state["threads_compat_fallback"] = bool(
-                    packed_threads_compat_fallback
+                    r2_fit = float(resolved_bayes_r2)
+                r2_used = float(min(0.95, max(0.05, float(r2_fit))))
+                packed_backend = (
+                    "resident" if use_packed_resident_native else "stream"
                 )
-                bayes_runtime_state["packed_backend"] = str(packed_backend)
-                if len(diag_tail) >= 2:
-                    bayes_runtime_state["prob_in_mean"] = float(diag_tail[0])
-                    bayes_runtime_state["n_active_mean"] = float(diag_tail[1])
-                bayes_runtime_state["rhat_h2"] = float(bayes_rhat)
-                bayes_runtime_state["rhat"] = float(bayes_rhat)
-
-            if need_train_pred:
-                if train_pred_idx is None:
-                    train_pred_abs = train_abs
-                elif int(train_pred_idx.size) == 0:
-                    train_pred_abs = np.zeros((0,), dtype=np.int64)
+                bayes_n_iter, bayes_burnin = _bayes_mcmc_defaults(method)
+                packed_kwargs: dict[str, typing.Any] = {
+                    "y": y_vec,
+                    "n_samples": int(n_total_samples),
+                    "row_flip": np.ascontiguousarray(
+                        np.asarray(row_flip, dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    ),
+                    "row_maf": maf,
+                    "row_mean": np.ascontiguousarray(
+                        np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    ),
+                    "row_inv_sd": np.ascontiguousarray(
+                        np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    ),
+                    "sample_indices": train_abs,
+                    "x": None,
+                    "n_iter": int(bayes_n_iter),
+                    "burnin": int(bayes_burnin),
+                    "r2": float(r2_used),
+                    "threads": int(max(0, int(n_jobs))),
+                    "seed": None,
+                }
+                if use_packed_resident_native:
+                    packed_kwargs["packed"] = typing.cast(np.ndarray, packed_payload_arg)
+                    packed_fit_fn = getattr(_jxrs, str(packed_resident_func_name))
                 else:
-                    train_pred_abs = np.ascontiguousarray(
-                        train_abs[np.asarray(train_pred_idx, dtype=np.int64).reshape(-1)],
+                    packed_kwargs["prefix"] = str(source_prefix_raw)
+                    packed_kwargs["row_indices"] = np.ascontiguousarray(
+                        np.asarray(active_row_idx, dtype=np.int64).reshape(-1),
                         dtype=np.int64,
                     )
-                if int(train_pred_abs.size) > 0:
-                    train_pred = _predict_bayes_packed_from_effects(
-                        packed_ctx=packed_train,
-                        sample_indices=train_pred_abs,
+                    packed_kwargs["block_rows"] = int(bayes_stream_block_rows)
+                    packed_kwargs["mmap_window_mb"] = int(bayes_stream_window_mb)
+                    packed_fit_fn = getattr(_jxrs, str(packed_stream_func_name))
+                if str(method) in {"BayesB", "BayesC"}:
+                    packed_kwargs["prob_in"] = 0.5
+                    packed_kwargs["counts"] = 5.0
+                    if bayes_pi is not None:
+                        packed_kwargs["fixed_pi"] = float(bayes_pi)
+                if str(method) == "BayesA":
+                    packed_kwargs["min_abs_beta"] = 1e-9
+
+                packed_threads_compat_fallback = False
+                try:
+                    packed_fit_ret = packed_fit_fn(**packed_kwargs)
+                except TypeError as e:
+                    msg = str(e)
+                    if "unexpected keyword argument 'threads'" in msg:
+                        packed_kwargs_retry = dict(packed_kwargs)
+                        packed_kwargs_retry.pop("threads", None)
+                        packed_fit_ret = packed_fit_fn(**packed_kwargs_retry)
+                        packed_threads_compat_fallback = True
+                    else:
+                        raise
+                if str(method) == "BayesC":
+                    beta_raw, alpha_raw, _varb_mean, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
+                else:
+                    beta_raw, alpha_raw, _varb, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
+
+                pve = float(h2_mean)
+                bayes_beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+                bayes_alpha = np.ascontiguousarray(np.asarray(alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+                bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
+                bayes_diagnostics = _parse_bayes_diagnostics(
+                    str(method),
+                    diag_tail,
+                    int(np.asarray(beta_raw).size),
+                )
+                bayes_pip = typing.cast(np.ndarray | None, bayes_diagnostics["pip"])
+                bayes_rhat = float(bayes_diagnostics["rhat_h2"])
+                bayes_actual_iterations = int(bayes_diagnostics["actual_iterations"])
+                bayes_post_burnin_start = int(
+                    bayes_diagnostics["post_burnin_start_iteration"]
+                )
+
+                if bayes_runtime_state is not None:
+                    bayes_runtime_state["r2_used"] = float(r2_used)
+                    bayes_runtime_state["r2_blup"] = float(r2_blup)
+                    bayes_runtime_state["r2_source"] = str(r2_source)
+                    bayes_runtime_state["r2_n_used"] = int(r2_n_used)
+                    bayes_runtime_state["r2_n_total"] = int(r2_n_total)
+                    bayes_runtime_state["threads_requested"] = int(max(0, int(n_jobs)))
+                    bayes_runtime_state["threads_compat_fallback"] = bool(
+                        packed_threads_compat_fallback
+                    )
+                    bayes_runtime_state["packed_backend"] = str(packed_backend)
+                    if str(method) in {"BayesB", "BayesC"} and len(diag_tail) >= 2:
+                        bayes_runtime_state["prob_in_mean"] = float(diag_tail[0])
+                        bayes_runtime_state["n_active_mean"] = float(diag_tail[1])
+                    bayes_runtime_state["rhat_h2"] = float(bayes_rhat)
+                    bayes_runtime_state["rhat"] = float(bayes_rhat)
+                    bayes_runtime_state["rhat_max_iterations"] = int(bayes_n_iter)
+                    bayes_runtime_state["post_convergence_burnin"] = int(bayes_burnin)
+                    bayes_runtime_state["actual_iterations"] = int(bayes_actual_iterations)
+                    bayes_runtime_state["post_burnin_start_iteration"] = int(
+                        bayes_post_burnin_start
+                    )
+                    bayes_runtime_state["burnin_start_iteration"] = int(
+                        bayes_post_burnin_start
+                    )
+
+                if need_train_pred:
+                    if train_pred_idx is None:
+                        train_pred_abs = train_abs
+                    elif int(train_pred_idx.size) == 0:
+                        train_pred_abs = np.zeros((0,), dtype=np.int64)
+                    else:
+                        train_pred_abs = np.ascontiguousarray(
+                            train_abs[np.asarray(train_pred_idx, dtype=np.int64).reshape(-1)],
+                            dtype=np.int64,
+                        )
+                    if int(train_pred_abs.size) > 0:
+                        train_pred = _predict_bayes_packed_from_effects(
+                            packed_ctx=packed_train,
+                            sample_indices=train_pred_abs,
+                            alpha0=bayes_alpha0,
+                            beta=bayes_beta,
+                            row_mean=row_mean,
+                            row_inv_sd=row_inv_sd,
+                            snp_block_size=bayes_snp_block,
+                            sample_chunk_size=bayes_sample_chunk,
+                        )
+                    else:
+                        train_pred = np.zeros((0, 1), dtype=float)
+                else:
+                    train_pred = np.zeros((0, 1), dtype=float)
+
+                if int(test_abs.size) > 0:
+                    test_pred = _predict_bayes_packed_from_effects(
+                        packed_ctx=typing.cast(dict[str, typing.Any], Xtest),
+                        sample_indices=test_abs,
                         alpha0=bayes_alpha0,
                         beta=bayes_beta,
                         row_mean=row_mean,
@@ -11506,62 +11566,53 @@ def GSapi(
                         sample_chunk_size=bayes_sample_chunk,
                     )
                 else:
-                    train_pred = np.zeros((0, 1), dtype=float)
-            else:
-                train_pred = np.zeros((0, 1), dtype=float)
-
-            if int(test_abs.size) > 0:
-                test_pred = _predict_bayes_packed_from_effects(
-                    packed_ctx=typing.cast(dict[str, typing.Any], Xtest),
-                    sample_indices=test_abs,
-                    alpha0=bayes_alpha0,
-                    beta=bayes_beta,
-                    row_mean=row_mean,
-                    row_inv_sd=row_inv_sd,
-                    snp_block_size=bayes_snp_block,
-                    sample_chunk_size=bayes_sample_chunk,
-                )
-            else:
-                test_pred = np.zeros((0, 1), dtype=float)
-            if model_state is not None:
-                model_state["kind"] = "bayes_linear"
-                model_state["method"] = str(method)
-                model_state["alpha"] = float(bayes_alpha0)
-                model_state["beta"] = np.ascontiguousarray(
-                    np.asarray(bayes_beta, dtype=np.float64).reshape(-1),
-                    dtype=np.float64,
-                )
-                model_state["packed"] = True
-                model_state["standardized"] = True
-                model_state["row_mean"] = np.ascontiguousarray(
-                    np.asarray(row_mean, dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                )
-                model_state["row_inv_sd"] = np.ascontiguousarray(
-                    np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                )
-                model_state["packed_backend"] = str(packed_backend)
-                model_state["snp_block_size"] = int(max(1, int(bayes_snp_block)))
-                model_state["sample_chunk_size"] = int(max(1, int(bayes_sample_chunk)))
-                model_state["pve"] = float(pve)
-                if bayes_pip is not None:
-                    model_state["pip"] = np.ascontiguousarray(
-                        np.asarray(bayes_pip, dtype=np.float64).reshape(-1),
+                    test_pred = np.zeros((0, 1), dtype=float)
+                if model_state is not None:
+                    model_state["kind"] = "bayes_linear"
+                    model_state["method"] = str(method)
+                    model_state["alpha"] = float(bayes_alpha0)
+                    model_state["beta"] = np.ascontiguousarray(
+                        np.asarray(bayes_beta, dtype=np.float64).reshape(-1),
                         dtype=np.float64,
                     )
-                model_state["rhat_h2"] = float(bayes_rhat)
-                model_state["rhat"] = float(bayes_rhat)
-            return (
-                np.asarray(train_pred, dtype=float).reshape(-1, 1),
-                np.asarray(test_pred, dtype=float).reshape(-1, 1),
-                pve,
+                    model_state["packed"] = True
+                    model_state["standardized"] = True
+                    model_state["row_mean"] = np.ascontiguousarray(
+                        np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    model_state["row_inv_sd"] = np.ascontiguousarray(
+                        np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    model_state["packed_backend"] = str(packed_backend)
+                    model_state["snp_block_size"] = int(max(1, int(bayes_snp_block)))
+                    model_state["sample_chunk_size"] = int(max(1, int(bayes_sample_chunk)))
+                    model_state["pve"] = float(pve)
+                    if bayes_pip is not None:
+                        model_state["pip"] = np.ascontiguousarray(
+                            np.asarray(bayes_pip, dtype=np.float64).reshape(-1),
+                            dtype=np.float64,
+                        )
+                    model_state["rhat_h2"] = float(bayes_rhat)
+                    model_state["rhat"] = float(bayes_rhat)
+                    model_state["rhat_max_iterations"] = int(bayes_n_iter)
+                    model_state["post_convergence_burnin"] = int(bayes_burnin)
+                    model_state["actual_iterations"] = int(bayes_actual_iterations)
+                    model_state["post_burnin_start_iteration"] = int(
+                        bayes_post_burnin_start
+                    )
+                    model_state["burnin_start_iteration"] = int(bayes_post_burnin_start)
+                return (
+                    np.asarray(train_pred, dtype=float).reshape(-1, 1),
+                    np.asarray(test_pred, dtype=float).reshape(-1, 1),
+                    pve,
+                )
+            raise RuntimeError(
+                "Packed Bayes requires Rust resident `bayes*_packed` or streaming "
+                "`bayes*_stream_bed` kernels. "
+                "Rebuild/install the current JanusX extension."
             )
-        raise RuntimeError(
-            "Packed Bayes requires Rust resident `bayes*_packed` or streaming "
-            "`bayes*_stream_bed` kernels. "
-            "Rebuild/install the current JanusX extension."
-        )
 
         if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
             r2_blup, r2_source, r2_n_used, r2_n_total = _estimate_bayes_auto_r2_from_blup(
@@ -11577,7 +11628,13 @@ def GSapi(
             r2_source = "provided"
             r2_n_used = int(np.asarray(Y).reshape(-1).shape[0])
             r2_n_total = int(np.asarray(Y).reshape(-1).shape[0])
-        model = BAYES(Y.reshape(-1, 1), Xtrain, method=method, r2=resolved_bayes_r2)
+        model = BAYES(
+            Y.reshape(-1, 1),
+            Xtrain,
+            method=method,
+            r2=resolved_bayes_r2,
+            pi=bayes_pi,
+        )
         pve = model.pve
         if bayes_runtime_state is not None:
             bayes_runtime_state["r2_used"] = float(getattr(model, "r2_used", np.nan))
@@ -11597,6 +11654,21 @@ def GSapi(
             model_rhat = float(getattr(model, "rhat_h2", getattr(model, "rhat", np.nan)))
             bayes_runtime_state["rhat_h2"] = model_rhat
             bayes_runtime_state["rhat"] = model_rhat
+            bayes_runtime_state["rhat_max_iterations"] = int(
+                getattr(model, "rhat_max_iterations", 0)
+            )
+            bayes_runtime_state["post_convergence_burnin"] = int(
+                getattr(model, "post_convergence_burnin", 0)
+            )
+            bayes_runtime_state["actual_iterations"] = int(
+                getattr(model, "actual_iterations", 0)
+            )
+            bayes_runtime_state["post_burnin_start_iteration"] = int(
+                getattr(model, "post_burnin_start_iteration", 0)
+            )
+            bayes_runtime_state["burnin_start_iteration"] = int(
+                getattr(model, "post_burnin_start_iteration", 0)
+            )
         if need_train_pred:
             if train_pred_idx is None:
                 train_pred = model.predict(Xtrain)
@@ -11631,6 +11703,19 @@ def GSapi(
                 )
             model_state["rhat_h2"] = float(getattr(model, "rhat_h2", np.nan))
             model_state["rhat"] = float(getattr(model, "rhat", np.nan))
+            model_state["rhat_max_iterations"] = int(
+                getattr(model, "rhat_max_iterations", 0)
+            )
+            model_state["post_convergence_burnin"] = int(
+                getattr(model, "post_convergence_burnin", 0)
+            )
+            model_state["actual_iterations"] = int(getattr(model, "actual_iterations", 0))
+            model_state["post_burnin_start_iteration"] = int(
+                getattr(model, "post_burnin_start_iteration", 0)
+            )
+            model_state["burnin_start_iteration"] = int(
+                getattr(model, "post_burnin_start_iteration", 0)
+            )
         return (
             np.asarray(train_pred, dtype=float).reshape(-1, 1),
             np.asarray(model.predict(Xtest), dtype=float).reshape(-1, 1),
@@ -11732,6 +11817,7 @@ def _run_method_task(
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
     bayes_auto_r2_cache: dict[str, float] | None = None,
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
+    bayes_pi: float | None = None,
     save_model_artifact: bool = False,
     stage_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
 ) -> dict[str, typing.Any]:
@@ -11770,8 +11856,13 @@ def _run_method_task(
     gblup_final_state: dict[str, typing.Any] | None = None
     bayes_r2_rows: list[float] = []
     bayes_rhat_rows: list[float] = []
+    bayes_actual_iterations_rows: list[int] = []
+    bayes_post_burnin_start_rows: list[int] = []
     bayes_r2_final = float("nan")
     bayes_rhat_final = float("nan")
+    bayes_actual_iterations_final = 0
+    bayes_post_burnin_start_final = 0
+    bayes_final_sampling_metadata_seen = False
     bayes_r2_source_final = ""
     bayes_r2_n_used_final = 0
     bayes_r2_n_total_final = 0
@@ -11793,9 +11884,9 @@ def _run_method_task(
         "rrBLUP",
         "BayesA",
         "BayesB",
-        "BayesCpi",
+        "BayesC",
     }
-    bayes_methods = {"BayesA", "BayesB", "BayesCpi"}
+    bayes_methods = {"BayesA", "BayesB", "BayesC"}
     bayes_cfg_base = dict(bayes_auto_r2_cfg or {})
     bayes_cv_reuse_enabled = bool(
         method in bayes_methods
@@ -12739,7 +12830,7 @@ def _run_method_task(
                         pp.setdefault("phase_label", f"fold {_fold_id}/{_cv_total}")
                         rrblup_progress_hook(str(event), pp)
                     rr_progress_call = _fold_rr_progress
-                if method in {"BayesA", "BayesB", "BayesCpi"}:
+                if method in {"BayesA", "BayesB", "BayesC"}:
                     if bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2):
                         bayes_r2_call = float(bayes_cv_shared_r2)
                         bayes_r2_cache_key = bayes_cv_shared_key
@@ -12770,12 +12861,13 @@ def _run_method_task(
                     rrblup_progress_hook=rr_progress_call,
                     gblup_runtime_state=gblup_state_call,
                     bayes_auto_r2=bayes_r2_call,
+                    bayes_pi=bayes_pi,
                     bayes_runtime_state=bayes_state_call,
                     bayes_auto_cfg=bayes_auto_r2_cfg,
                 )
                 if _is_gblup_method(str(method)) and gblup_state_call is not None:
                     _append_gblup_vc_row(int(fold_id), dict(gblup_state_call))
-                if method in {"BayesA", "BayesB", "BayesCpi"} and bayes_state_call is not None:
+                if method in {"BayesA", "BayesB", "BayesC"} and bayes_state_call is not None:
                     r2_used = float(bayes_state_call.get("r2_used", np.nan))
                     if np.isfinite(r2_used):
                         bayes_r2_rows.append(float(r2_used))
@@ -12792,6 +12884,19 @@ def _run_method_task(
                     )
                     if np.isfinite(rhat_call):
                         bayes_rhat_rows.append(float(rhat_call))
+                    try:
+                        actual_call = int(bayes_state_call.get("actual_iterations", 0) or 0)
+                    except Exception:
+                        actual_call = 0
+                    try:
+                        post_start_call = int(
+                            bayes_state_call.get("post_burnin_start_iteration", 0) or 0
+                        )
+                    except Exception:
+                        post_start_call = 0
+                    if actual_call > 0:
+                        bayes_actual_iterations_rows.append(actual_call)
+                    bayes_post_burnin_start_rows.append(max(0, post_start_call))
                 if (
                     method == "rrBLUP"
                     and rrblup_cv_reuse_enabled
@@ -13531,7 +13636,7 @@ def _run_method_task(
                     pp.setdefault("phase_label", "final")
                     rrblup_progress_hook(str(event), pp)
                 rr_progress_final = _final_rr_progress
-        if method in {"BayesA", "BayesB", "BayesCpi"}:
+        if method in {"BayesA", "BayesB", "BayesC"}:
             if bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2):
                 bayes_r2_final_key = bayes_cv_shared_key
                 bayes_r2_final_call = float(bayes_cv_shared_r2)
@@ -13566,8 +13671,9 @@ def _run_method_task(
             rrblup_runtime_state=rr_state_final,
             rrblup_progress_hook=rr_progress_final,
             gblup_runtime_state=gblup_state_final,
-            bayes_auto_r2=bayes_r2_final_call,
-            bayes_runtime_state=bayes_state_final,
+                bayes_auto_r2=bayes_r2_final_call,
+                bayes_pi=bayes_pi,
+                bayes_runtime_state=bayes_state_final,
             bayes_auto_cfg=bayes_auto_r2_cfg,
             model_state=model_state_call,
         )
@@ -13578,7 +13684,11 @@ def _run_method_task(
             model_state_final = dict(model_state_call)
         if _is_gblup_method(str(method)) and gblup_state_final is not None:
             gblup_final_state = dict(gblup_state_final)
-        if method in {"BayesA", "BayesB", "BayesCpi"} and bayes_state_final is not None:
+        if method in {"BayesA", "BayesB", "BayesC"} and bayes_state_final is not None:
+            bayes_final_sampling_metadata_seen = bool(
+                "actual_iterations" in bayes_state_final
+                or "post_burnin_start_iteration" in bayes_state_final
+            )
             r2_used_final = float(bayes_state_final.get("r2_used", np.nan))
             if np.isfinite(r2_used_final):
                 bayes_r2_final = float(r2_used_final)
@@ -13610,6 +13720,18 @@ def _run_method_task(
             )
             if np.isfinite(rhat_final_call):
                 bayes_rhat_final = float(rhat_final_call)
+            try:
+                bayes_actual_iterations_final = int(
+                    bayes_state_final.get("actual_iterations", 0) or 0
+                )
+            except Exception:
+                bayes_actual_iterations_final = 0
+            try:
+                bayes_post_burnin_start_final = int(
+                    bayes_state_final.get("post_burnin_start_iteration", 0) or 0
+                )
+            except Exception:
+                bayes_post_burnin_start_final = 0
         if method == "rrBLUP" and rr_state_final is not None:
             mode_used = str((rr_cfg_final or {}).get("pve_mode", "lambda")).strip().lower()
             if mode_used not in {"lambda", "trainvar"}:
@@ -13710,19 +13832,39 @@ def _run_method_task(
         if ml_tuning_cache is not None:
             pve_final = float(ml_tuning_cache.get("pve", np.nan))
     if (
-        method in {"BayesA", "BayesB", "BayesCpi"}
+        method in {"BayesA", "BayesB", "BayesC"}
         and (not np.isfinite(bayes_r2_final))
         and len(bayes_r2_rows) > 0
     ):
         bayes_r2_final = float(np.nanmean(np.asarray(bayes_r2_rows, dtype=np.float64)))
     if (
-        method in {"BayesA", "BayesB", "BayesCpi"}
+        method in {"BayesA", "BayesB", "BayesC"}
         and (not np.isfinite(bayes_rhat_final))
         and len(bayes_rhat_rows) > 0
     ):
         bayes_rhat_final = float(np.nanmean(np.asarray(bayes_rhat_rows, dtype=np.float64)))
     if (
-        method in {"BayesA", "BayesB", "BayesCpi"}
+        method in {"BayesA", "BayesB", "BayesC"}
+        and (not bayes_final_sampling_metadata_seen)
+        and bayes_actual_iterations_final <= 0
+        and len(bayes_actual_iterations_rows) > 0
+    ):
+        bayes_actual_iterations_final = int(round(float(np.nanmean(
+            np.asarray(bayes_actual_iterations_rows, dtype=np.float64)
+        ))))
+    if (
+        method in {"BayesA", "BayesB", "BayesC"}
+        and (not bayes_final_sampling_metadata_seen)
+        and bayes_post_burnin_start_final <= 0
+        and len(bayes_post_burnin_start_rows) > 0
+    ):
+        # A zero means that no chain reached the post-convergence stage.  If
+        # any fold did trigger it, preserve the first positive start index.
+        positive_starts = [x for x in bayes_post_burnin_start_rows if int(x) > 0]
+        if positive_starts:
+            bayes_post_burnin_start_final = int(min(positive_starts))
+    if (
+        method in {"BayesA", "BayesB", "BayesC"}
         and (bayes_r2_source_final == "")
         and bayes_cv_reuse_enabled
         and np.isfinite(bayes_cv_shared_r2)
@@ -13766,6 +13908,8 @@ def _run_method_task(
         "pve_final": float(pve_final),
         "bayes_r2_final": float(bayes_r2_final),
         "bayes_rhat_final": float(bayes_rhat_final),
+        "bayes_actual_iterations_final": int(bayes_actual_iterations_final),
+        "bayes_post_burnin_start_final": int(bayes_post_burnin_start_final),
         "bayes_r2_source_final": str(bayes_r2_source_final),
         "bayes_r2_n_used_final": int(bayes_r2_n_used_final),
         "bayes_r2_n_total_final": int(bayes_r2_n_total_final),
@@ -14141,6 +14285,7 @@ def _run_methods_parallel(
     rrblup_solver: str = "pcg",
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
+    bayes_pi_by_method: dict[str, float | None] | None = None,
     save_model_artifact: bool = False,
     emit_cv_progress_bar: bool = True,
     emit_method_summary: bool = True,
@@ -14231,7 +14376,7 @@ def _run_methods_parallel(
                 var_g if (mode == "d" and np.isfinite(var_g)) else sigma_g2
             )
             def _fmt_var(x: float) -> str:
-                return f"{x:.6g}"
+                return f"{x:.3f}"
             if mode in {"a", "ad"} and np.isfinite(va):
                 rows.append(("Va", _fmt_var(va)))
             if mode in {"d", "ad"} and np.isfinite(vd):
@@ -14360,9 +14505,9 @@ def _run_methods_parallel(
                 if not np.isfinite(pve_vc):
                     pve_vc = float(rr_state.get("pve_pheno_scale", rr_state.get("pve_used", np.nan)))
                 if np.isfinite(va):
-                    rows.append(("Va", f"{va:.6g}"))
+                    rows.append(("Va", f"{va:.3g}"))
                 if np.isfinite(ve):
-                    rows.append(("Ve", f"{ve:.6g}"))
+                    rows.append(("Ve", f"{ve:.3g}"))
                 if np.isfinite(pve_vc):
                     rows.append(("PVE(pheno-scale)", f"{pve_vc:.3f}"))
                 return rows
@@ -14415,7 +14560,7 @@ def _run_methods_parallel(
                     )
                 )
                 if np.isfinite(lam_exact):
-                    rows.append(("lambda", f"{lam_exact:.6g}"))
+                    rows.append(("lambda", f"{lam_exact:.3g}"))
                 va_exact = float(
                     rr_state.get(
                         "var_g",
@@ -14435,9 +14580,9 @@ def _run_methods_parallel(
                     )
                 )
                 if np.isfinite(va_exact):
-                    rows.append(("Va", f"{va_exact:.6g}"))
+                    rows.append(("Va", f"{va_exact:.3g}"))
                 if np.isfinite(ve_exact):
-                    rows.append(("Ve", f"{ve_exact:.6g}"))
+                    rows.append(("Ve", f"{ve_exact:.3g}"))
                 pve_exact = float(
                     rr_state.get(
                         "pve_pheno_scale",
@@ -14448,9 +14593,9 @@ def _run_methods_parallel(
                     rows.append(("PVE(pheno-scale)", f"{pve_exact:.3f}"))
             return rows
 
-        if m in {"BayesA", "BayesB", "BayesCpi"}:
-            n_iter, burnin, thin = _bayes_mcmc_defaults(m)
-            rows.append(("n_iter/burnin/thin", f"{n_iter}/{burnin}/{thin}"))
+        if m in {"BayesA", "BayesB", "BayesC"}:
+            n_iter, burnin = _bayes_mcmc_defaults(m)
+            rows.append(("rhat_max_iter/burnin", f"{n_iter}/{burnin}"))
             r2_blup = float(result.get("bayes_r2_final", np.nan))
             r2_src = str(result.get("bayes_r2_source_final", "")).strip()
             r2_n_used = int(max(0, int(result.get("bayes_r2_n_used_final", 0) or 0)))
@@ -14458,15 +14603,15 @@ def _run_methods_parallel(
             if np.isfinite(r2_blup):
                 if r2_n_total > 0 and r2_n_used > 0 and r2_n_used < r2_n_total:
                     rows.append(
-                        ("r2", f"auto (BLUP pve(pheno)={r2_blup:.3g}, n={r2_n_used}/{r2_n_total})")
+                        ("r2", f"{r2_blup:.3g}")
                     )
                 elif r2_src.startswith("cv_shared_reuse"):
-                    rows.append(("r2", f"auto (BLUP pve(pheno)={r2_blup:.6g}, cv-shared)"))
+                    rows.append(("r2", f"{r2_blup:.3g}"))
                 else:
-                    rows.append(("r2", f"auto (BLUP pve(pheno)={r2_blup:.6g})"))
+                    rows.append(("r2", f"{r2_blup:.3g}"))
             else:
-                rows.append(("r2", "auto (BLUP pve(pheno)=NA)"))
-            if m in {"BayesB", "BayesCpi"}:
+                rows.append(("r2", "NA"))
+            if m in {"BayesB", "BayesC"}:
                 rows.append(("prob_in/counts", "0.5/5.0"))
             rhat = float(result.get("bayes_rhat_final", np.nan))
             if not np.isfinite(rhat):
@@ -14475,7 +14620,25 @@ def _run_methods_parallel(
                     rhat = float(
                         state_obj.get("rhat_h2", state_obj.get("rhat", np.nan))
                     )
-            rows.append(("Rhat(h2)", f"{rhat:.4f}" if np.isfinite(rhat) else "NA"))
+            rows.append(("Rhat(h2)", f"{rhat:.3f}" if np.isfinite(rhat) else "NA"))
+            actual_iterations = int(result.get("bayes_actual_iterations_final", 0) or 0)
+            post_burnin_start = int(result.get("bayes_post_burnin_start_final", 0) or 0)
+            if actual_iterations <= 0:
+                state_obj = result.get("model_state", None)
+                if isinstance(state_obj, typing.Mapping):
+                    actual_iterations = int(state_obj.get("actual_iterations", 0) or 0)
+                    post_burnin_start = int(
+                        state_obj.get("post_burnin_start_iteration", post_burnin_start) or 0
+                    )
+            rows.append(("actual_iterations", str(actual_iterations) if actual_iterations > 0 else "NA"))
+            rows.append(
+                (
+                    "burnin_start_iteration",
+                    str(post_burnin_start) if post_burnin_start > 0 else "NA",
+                )
+            )
+            if post_burnin_start > 0:
+                rows.append(("post_convergence_burnin", str(burnin)))
             return rows
 
         if m in _ML_METHOD_MAP:
@@ -15661,6 +15824,11 @@ def _run_methods_parallel(
                         rrblup_adamw_cfg=rr_cfg_cur,
                         bayes_auto_r2_cache=bayes_auto_r2_cache_shared,
                         bayes_auto_r2_cfg=bayes_auto_r2_cfg,
+                        bayes_pi=(
+                            None
+                            if bayes_pi_by_method is None
+                            else bayes_pi_by_method.get(str(m))
+                        ),
                         save_model_artifact=save_model_artifact,
                         stage_hook=_stage_hook,
                     )
@@ -16628,6 +16796,11 @@ def _run_methods_parallel(
                         rrblup_adamw_cfg=rr_cfg_cur,
                         bayes_auto_r2_cache=bayes_auto_r2_cache_shared,
                         bayes_auto_r2_cfg=bayes_auto_r2_cfg,
+                        bayes_pi=(
+                            None
+                            if bayes_pi_by_method is None
+                            else bayes_pi_by_method.get(str(m))
+                        ),
                         save_model_artifact=save_model_artifact,
                         stage_hook=_stage_hook,
                     )
@@ -18745,17 +18918,23 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     )
     model_group.add_argument(
         "-BayesB", "--BayesB",
-        action="store_true",
+        nargs="?",
+        const=True,
+        type=float,
+        metavar="PI",
         default=False,
-        help="Use BayesB model for training and prediction "
-             "(default: %(default)s).",
+        help="Use BayesB; optionally provide PI for fixed inclusion probability "
+             "(e.g. -BayesB 0.05). Without PI, estimate it from active markers.",
     )
     model_group.add_argument(
-        "-BayesCpi", "--BayesCpi",
-        action="store_true",
+        "-BayesC", "--BayesC",
+        nargs="?",
+        const=True,
+        type=float,
+        metavar="PI",
         default=False,
-        help="Use BayesCpi model for training and prediction "
-             "(default: %(default)s).",
+        help="Use BayesC; optionally provide PI for fixed inclusion probability "
+             "(e.g. -BayesC 0.05). Without PI, estimate it from active markers.",
     )
     model_group.add_argument(
         "-RF", "--RF",
@@ -19559,6 +19738,26 @@ def _run_gs_pipeline_impl(
     use_spinner = stdout_is_tty()
     if args is None:
         args = parse_args(argv)
+    def _resolve_bayes_cli_value(name: str) -> tuple[bool, float | None]:
+        raw = getattr(args, name, False)
+        if raw is False or raw is None:
+            return False, None
+        if raw is True:
+            return True, None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"-{name} expects an optional PI in (0, 1).") from exc
+        if not np.isfinite(value) or not (0.0 < value < 1.0):
+            raise ValueError(f"-{name} PI must be finite and in (0, 1), got {raw!r}.")
+        return True, value
+
+    bayes_b_enabled, bayes_b_pi = _resolve_bayes_cli_value("BayesB")
+    bayes_c_enabled, bayes_c_pi = _resolve_bayes_cli_value("BayesC")
+    bayes_pi_by_method: dict[str, float | None] = {
+        "BayesB": bayes_b_pi,
+        "BayesC": bayes_c_pi,
+    }
     debug_mode = bool(getattr(args, "verbose", False))
     if bool(debug_mode):
         os.environ.setdefault("JX_GFREADER_RSS_DEBUG", "1")
@@ -19740,7 +19939,7 @@ def _run_gs_pipeline_impl(
     )
     blup_requested = bool(args.BLUP)
     pcg_requested = bool(blup_requested and (rr_solver_mode == "pcg"))
-    bayes_requested = bool(bool(args.BayesA) or bool(args.BayesB) or bool(args.BayesCpi))
+    bayes_requested = bool(bool(args.BayesA) or bayes_b_enabled or bayes_c_enabled)
     packed_model_requested = bool(
         blup_requested or bayes_requested
     )
@@ -19860,10 +20059,10 @@ def _run_gs_pipeline_impl(
         methods.append(BLUP_METHOD)
     if args.BayesA:
         methods.append("BayesA")
-    if args.BayesB:
+    if bayes_b_enabled:
         methods.append("BayesB")
-    if args.BayesCpi:
-        methods.append("BayesCpi")
+    if bayes_c_enabled:
+        methods.append("BayesC")
     if args.RF:
         methods.append("RF")
     if args.ET:
@@ -19911,7 +20110,7 @@ def _run_gs_pipeline_impl(
     if len(methods) == 0:
         logger.error(
             "No model selected. Use "
-            "--BLUP/--BayesA/--BayesB/--BayesCpi/--RF/--ET/--GBDT/--XGB/--SVM/--ENET "
+            "--BLUP/--BayesA/--BayesB/--BayesC/--RF/--ET/--GBDT/--XGB/--SVM/--ENET "
             "or provide --model with discoverable *.jxmodel files."
         )
         raise SystemExit(1)
@@ -20071,7 +20270,7 @@ def _run_gs_pipeline_impl(
                 detail = f"solver={solver_txt}"
             elif str(m) in {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}:
                 detail = "compact tuning=on"
-            elif str(m) in {"BayesA", "BayesB", "BayesCpi"}:
+            elif str(m) in {"BayesA", "BayesB", "BayesC"}:
                 detail = "bayesian marker model"
             model_rows.append((f"{i}. {_method_display_name(str(m))}", detail))
         memory_cfg = _format_gs_memory_cfg(
@@ -20427,7 +20626,7 @@ def _run_gs_pipeline_impl(
         getattr(args, "ldprune_spec", None),
     )
     bayes_requested = bool(
-        any(str(m) in {"BayesA", "BayesB", "BayesCpi"} for m in methods)
+        any(str(m) in {"BayesA", "BayesB", "BayesC"} for m in methods)
     )
     stream_meta_method_set = {
         _GBLUP_METHOD_ADD,
@@ -20437,7 +20636,7 @@ def _run_gs_pipeline_impl(
         "rrBLUP",
         "BayesA",
         "BayesB",
-        "BayesCpi",
+        "BayesC",
     }
     ml_requested = bool(any(m in ml_methods for m in methods))
     packed_meta_only_main_requested = bool(
@@ -22197,11 +22396,11 @@ def _run_gs_pipeline_impl(
                         var_g if (mode == "d" and np.isfinite(var_g)) else sigma_g2
                     )
                     if mode in {"a", "ad"} and np.isfinite(va):
-                        rows.append(("Va", f"{va:.6g}"))
+                        rows.append(("Va", f"{va:.3g}"))
                     if mode in {"d", "ad"} and np.isfinite(vd):
-                        rows.append(("Vd", f"{vd:.6g}"))
+                        rows.append(("Vd", f"{vd:.3g}"))
                     if np.isfinite(sigma_e2):
-                        rows.append(("Ve", f"{sigma_e2:.6g}"))
+                        rows.append(("Ve", f"{sigma_e2:.3g}"))
                     pve_final = _detail_float_or_nan(res_obj.get("pve_final", np.nan))
                     if np.isfinite(pve_final):
                         rows.append(("PVE(pheno-scale)", f"{pve_final:.3f}"))
@@ -22309,9 +22508,9 @@ def _run_gs_pipeline_impl(
                                 rr_state.get("pve_pheno_scale", rr_state.get("pve_used", np.nan))
                             )
                         if np.isfinite(va):
-                            rows.append(("Va", f"{va:.6g}"))
+                            rows.append(("Va", f"{va:.3g}"))
                         if np.isfinite(ve):
-                            rows.append(("Ve", f"{ve:.6g}"))
+                            rows.append(("Ve", f"{ve:.3g}"))
                         if np.isfinite(pve_vc):
                             rows.append(("PVE(pheno-scale)", f"{pve_vc:.3f}"))
                         return rows
@@ -22341,7 +22540,7 @@ def _run_gs_pipeline_impl(
                         )
                     )
                     if np.isfinite(lam_exact):
-                        rows.append(("lambda", f"{lam_exact:.6g}"))
+                        rows.append(("lambda", f"{lam_exact:.3g}"))
                     va_exact = _detail_float_or_nan(
                         rr_state.get(
                             "var_g",
@@ -22376,17 +22575,17 @@ def _run_gs_pipeline_impl(
                         )
                     )
                     if np.isfinite(va_exact):
-                        rows.append(("Va", f"{va_exact:.6g}"))
+                        rows.append(("Va", f"{va_exact:.3g}"))
                     if np.isfinite(ve_exact):
-                        rows.append(("Ve", f"{ve_exact:.6g}"))
+                        rows.append(("Ve", f"{ve_exact:.3g}"))
                     if np.isfinite(pve_exact):
                         rows.append(("PVE(pheno-scale)", f"{pve_exact:.3f}"))
                     return rows
 
-                if m in {"BayesA", "BayesB", "BayesCpi"}:
-                    n_iter, burnin, thin = _bayes_mcmc_defaults(m)
-                    rows.append(("n_iter/burnin/thin", f"{n_iter}/{burnin}/{thin}"))
-                    if m in {"BayesB", "BayesCpi"}:
+                if m in {"BayesA", "BayesB", "BayesC"}:
+                    n_iter, burnin = _bayes_mcmc_defaults(m)
+                    rows.append(("rhat_max_iter/burnin", f"{n_iter}/{burnin}"))
+                    if m in {"BayesB", "BayesC"}:
                         rows.append(("prob_in/counts", "0.5/5.0"))
                     rhat = _detail_float_or_nan(res_obj.get("bayes_rhat_final", np.nan))
                     if not np.isfinite(rhat):
@@ -22395,7 +22594,37 @@ def _run_gs_pipeline_impl(
                             rhat = _detail_float_or_nan(
                                 state_obj.get("rhat_h2", state_obj.get("rhat", np.nan))
                             )
-                    rows.append(("Rhat(h2)", f"{rhat:.4f}" if np.isfinite(rhat) else "NA"))
+                    rows.append(("Rhat(h2)", f"{rhat:.3f}" if np.isfinite(rhat) else "NA"))
+                    actual_iterations = int(
+                        res_obj.get("bayes_actual_iterations_final", 0) or 0
+                    )
+                    post_burnin_start = int(
+                        res_obj.get("bayes_post_burnin_start_final", 0) or 0
+                    )
+                    if actual_iterations <= 0:
+                        state_obj = res_obj.get("model_state", None)
+                        if isinstance(state_obj, typing.Mapping):
+                            actual_iterations = int(state_obj.get("actual_iterations", 0) or 0)
+                            post_burnin_start = int(
+                                state_obj.get(
+                                    "post_burnin_start_iteration", post_burnin_start
+                                )
+                                or 0
+                            )
+                    rows.append(
+                        (
+                            "actual_iterations",
+                            str(actual_iterations) if actual_iterations > 0 else "NA",
+                        )
+                    )
+                    rows.append(
+                        (
+                            "burnin_start_iteration",
+                            str(post_burnin_start) if post_burnin_start > 0 else "NA",
+                        )
+                    )
+                    if post_burnin_start > 0:
+                        rows.append(("post_convergence_burnin", str(burnin)))
                     return rows
 
                 return rows
@@ -22927,6 +23156,7 @@ def _run_gs_pipeline_impl(
                 rrblup_solver=rrblup_solver,
                 rrblup_adamw_cfg=rrblup_adamw_cfg,
                 bayes_auto_r2_cfg=bayes_auto_r2_cfg,
+                bayes_pi_by_method=bayes_pi_by_method,
                 save_model_artifact=bool(args.save_model),
                 emit_cv_progress_bar=True,
                 emit_method_summary=False,

@@ -756,13 +756,36 @@ def _resolve_effect_col(
     raise ValueError("No numeric effect columns found.")
 
 
+def _sanitize_effect_table_pip(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop out-of-range PIP cells from legacy effect tables.
+
+    Older Bayes exports could write a scalar diagnostic (for example
+    ``n_active_mean``) into the PIP column.  Keep valid probability cells but
+    make invalid cells missing so downstream plots never treat diagnostics as
+    posterior inclusion probabilities.
+    """
+    pip_col = next(
+        (str(col) for col in df.columns if str(col).strip().lower() == "pip"),
+        None,
+    )
+    if pip_col is None:
+        return df
+    values = pd.to_numeric(df[pip_col], errors="coerce")
+    invalid = values.notna() & ((values < 0.0) | (values > 1.0))
+    if not bool(invalid.any()):
+        return df
+    out = df.copy()
+    out.loc[invalid, pip_col] = np.nan
+    return out
+
+
 def _load_effect_table(path: str) -> pd.DataFrame:
     ext = Path(path).suffix.lower()
     if ext == ".jxmodel":
         try:
             df = pd.read_csv(path, sep="\t")
             if df.shape[1] > 1:
-                return df
+                return _sanitize_effect_table_pip(df)
         except Exception:
             pass
         try:
@@ -795,7 +818,7 @@ def _load_effect_table(path: str) -> pd.DataFrame:
                     genotype_prefix_hint=prefix_hint,
                     fallback_marker_count=fallback_marker_count,
                 )
-                return table
+                return _sanitize_effect_table_pip(table)
         except Exception:
             pass
     if ext == ".csv":

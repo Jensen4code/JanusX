@@ -171,7 +171,7 @@ def scatterh(
     else:
         stat_txt = f"Test MAE: {mae(ttest):.2f}\nTest R2: {r2(ttest):.2f}"
     ax2.text(
-        -0.2,
+        0.98,
         0.04,
         stat_txt,
         transform=ax2.transAxes,

@@ -43,7 +43,7 @@ TEXT_EFFECT_HEADERS = {
     "BLUP": ["chr", "pos", "snp", "beta"],
     "BayesA": ["chr", "pos", "snp", "beta"],
     "BayesB": ["chr", "pos", "snp", "beta", "pip"],
-    "BayesCpi": ["chr", "pos", "snp", "beta", "pip"],
+    "BayesC": ["chr", "pos", "snp", "beta", "pip"],
 }
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
@@ -862,7 +862,7 @@ def validate_gs_file_input_debug_outputs(
 ) -> Path:
     summary_path = validate_gs_output_basics(outdir, prefix_name=prefix_name, trait_name=trait_name)
     if expected_models is None:
-        expected_model_names = ["BLUP", "BayesA", "BayesB", "BayesCpi"]
+        expected_model_names = ["BLUP", "BayesA", "BayesB", "BayesC"]
     else:
         expected_model_names = [str(x).strip() for x in expected_models if str(x).strip()]
 
@@ -1362,7 +1362,7 @@ def run_gs_file_suite(
             "-BLUP",
             "-BayesA",
             "-BayesB",
-            "-BayesCpi",
+            "-BayesC",
             "-cv",
             str(cv_folds),
             "-save-model",
@@ -1413,7 +1413,7 @@ def run_gs_bfile_suite(
             "-BLUP",
             "-BayesA",
             "-BayesB",
-            "-BayesCpi",
+            "-BayesC",
             "-maf",
             "0",
             "-geno",
@@ -1434,7 +1434,7 @@ def run_gs_bfile_suite(
         prefix_name=GS_BFILE_PREFIX_NAME,
         trait_name=TRAIT_NAME,
     )
-    for method_name in ["BLUP", "BayesA", "BayesB", "BayesCpi"]:
+    for method_name in ["BLUP", "BayesA", "BayesB", "BayesC"]:
         validate_text_effect_artifact(summary_path, method_name=method_name, expected_rows=expected_rows)
     sep()
 

@@ -25,7 +25,7 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 **Main capabilities**:
 
 - Genome-Wide Association Study (GWAS): `lm`, `lmm`, `fvlmm`, `farmcpu`
-- Genomic Selection (GS): `BLUP`, `BayesA/B/Cpi`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
+- Genomic Selection (GS): `BLUP`, `BayesA/B/C`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
 - Streaming genotype IO for VCF/HMP/PLINK
 - Post-analysis workflows: `postgwas`, `postgs`
 - Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `fastpop`
@@ -107,7 +107,9 @@ jx postgwas -i a.tsv b.tsv c.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha
 # n>15,000 & m>15,000 rrBLUP with PCG (Jacobi)
 jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BLUP -o test -cv 5
 # Bayesian methods
-jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BayesA -BayesB -BayesCpi -o test -cv 5
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BayesA -BayesB -BayesC -o test -cv 5
+# Append a value to BayesB/BayesC to fix the marker inclusion probability:
+# jx gs ... -BayesB 0.05 -BayesC 0.10
 ```
 
 ```text

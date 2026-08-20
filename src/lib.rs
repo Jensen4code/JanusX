@@ -186,8 +186,8 @@ use algwas::algwas_packed_to_tsv;
 use assoc2tsv::GwasAssocTsvWriter;
 use bayes::{
     bayesa, bayesa_packed, bayesa_packed_trace, bayesa_stream_bed, bayesb, bayesb_packed,
-    bayesb_packed_trace, bayesb_stream_bed, bayescpi, bayescpi_packed, bayescpi_packed_trace,
-    bayescpi_stream_bed,
+    bayesb_packed_trace, bayesb_stream_bed, bayesc, bayesc_packed, bayesc_packed_trace,
+    bayesc_stream_bed,
 };
 use binwriter::Bin01StreamWriter;
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
@@ -975,16 +975,16 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fastlmm_reml_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb, m)?)?;
-    m.add_function(wrap_pyfunction!(bayescpi, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesc, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa_packed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb_packed, m)?)?;
-    m.add_function(wrap_pyfunction!(bayescpi_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesc_packed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa_stream_bed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb_stream_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(bayescpi_stream_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesc_stream_bed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa_packed_trace, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb_packed_trace, m)?)?;
-    m.add_function(wrap_pyfunction!(bayescpi_packed_trace, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesc_packed_trace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega_bed, m)?)?;
