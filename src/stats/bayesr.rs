@@ -15,10 +15,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::bayes::{
-    bayes_packed_blas_threads, bayes_packed_block_rows, daxpy_inplace_f64, ddot_f64,
-    genetic_variance_from_residual, update_alpha_gauss_seidel_blas, BayesMarkerBackend,
-    BayesPackedSource, BayesSamplingController, DenseBayesBackend, PackedBayesBackend,
-    BAYES_POSTERIOR_SAMPLES,
+    bayes_packed_blas_threads, bayes_packed_block_rows, ddot_f64, genetic_variance_from_residual,
+    marker_conditional_dot_f64, update_alpha_gauss_seidel_blas, update_marker_residual_f64,
+    BayesMarkerBackend, BayesPackedSource, BayesSamplingController, DenseBayesBackend,
+    PackedBayesBackend, BAYES_POSTERIOR_SAMPLES,
 };
 use crate::blas::OpenBlasThreadGuard;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
@@ -188,14 +188,9 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
         }
     };
 
-    let block_rows = backend.block_rows().max(1).min(p.max(1));
-    let mut marker_block = vec![0.0_f64; block_rows.saturating_mul(n)];
     let mut x2 = vec![0.0_f64; p];
     let mut mean_x = vec![0.0_f64; p];
-    for row_start in (0..p).step_by(block_rows) {
-        let row_end = (row_start + block_rows).min(p);
-        let block_len = (row_end - row_start) * n;
-        backend.fill_block(row_start, row_end, &mut marker_block[..block_len], n)?;
+    backend.for_each_block(|row_start, row_end, marker_block| {
         for offset in 0..(row_end - row_start) {
             let row = &marker_block[offset * n..(offset + 1) * n];
             let mut sum_sq = 0.0;
@@ -207,7 +202,8 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
             x2[row_start + offset] = sum_sq;
             mean_x[row_start + offset] = sum / n as f64;
         }
-    }
+        Ok(())
+    })?;
     let msx =
         x2.iter().sum::<f64>() / n as f64 - mean_x.iter().map(|value| value * value).sum::<f64>();
     if !(msx.is_finite() && msx > 0.0) {
@@ -301,18 +297,12 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
             &mut rng,
         );
 
-        for row_start in (0..p).step_by(block_rows) {
-            let row_end = (row_start + block_rows).min(p);
-            let block_len = (row_end - row_start) * n;
-            backend.fill_block(row_start, row_end, &mut marker_block[..block_len], n)?;
+        backend.for_each_block(|row_start, row_end, marker_block| {
             for offset in 0..(row_end - row_start) {
                 let j = row_start + offset;
                 let marker = &marker_block[offset * n..(offset + 1) * n];
                 let old_beta = beta[j];
-                if old_beta != 0.0 {
-                    daxpy_inplace_f64(old_beta, marker, &mut residual);
-                }
-                let u = ddot_f64(&residual, marker);
+                let u = marker_conditional_dot_f64(&residual, marker, old_beta, x2[j]);
                 let log_weights =
                     component_log_weights(&pi, &gamma_array, u, x2[j], sigma_lambda2, var_e)?;
                 let q_component = normalize_component_log_weights(&log_weights)?;
@@ -329,12 +319,7 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
                     posterior_mean + posterior_var.sqrt() * z
                 };
                 beta[j] = new_beta;
-                // Component membership, not the sampled magnitude, determines
-                // whether this marker contributes to the residual. A slab
-                // draw can be non-zero even when it is extremely small.
-                if selected > 0 {
-                    daxpy_inplace_f64(-new_beta, marker, &mut residual);
-                }
+                update_marker_residual_f64(old_beta, new_beta, marker, &mut residual);
 
                 if retain_sample {
                     beta_sum[j] += new_beta;
@@ -345,7 +330,8 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
 
         let mut active_count = 0usize;
         let mut scaled_sum = 0.0_f64;
@@ -685,6 +671,30 @@ fn bayesr_packed_core_impl<'a>(
         block_rows,
         pool,
     )?;
+    // Keep the backend policy shared with BayesA/B/C: when the memory budget
+    // supplies a block covering every active marker, decode once and run the
+    // dense sampler rather than repeatedly decoding the same BED rows for
+    // every MCMC iteration.
+    if let Some(m_dense) = backend.maybe_predecode_dense_f64()? {
+        let mut dense_backend = DenseBayesBackend::new(&m_dense, sample_indices.len(), p)?;
+        return bayesr_core_impl(
+            &mut dense_backend,
+            y,
+            x,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_e,
+            prior_ss_e,
+            pi_init,
+            gamma,
+            df0_lambda,
+            s0_lambda2,
+            seed,
+        );
+    }
     bayesr_core_impl(
         &mut backend,
         y,
@@ -726,7 +736,8 @@ fn bayesr_packed_core_impl<'a>(
     df0_lambda = 1.0,
     s0_lambda2 = 1.0,
     threads = 0,
-    seed = None
+    seed = None,
+    block_rows = None
 ))]
 pub fn bayesr_packed<'py>(
     py: Python<'py>,
@@ -751,6 +762,7 @@ pub fn bayesr_packed<'py>(
     s0_lambda2: f64,
     threads: usize,
     seed: Option<u64>,
+    block_rows: Option<usize>,
 ) -> PyResult<Bound<'py, PyDict>> {
     if n_samples == 0 {
         return Err(PyValueError::new_err("BayesR n_samples must be > 0"));
@@ -830,7 +842,7 @@ pub fn bayesr_packed<'py>(
             df0_lambda,
             s0_lambda2,
             seed,
-            None,
+            block_rows,
             pool,
         )
     });

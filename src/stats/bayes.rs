@@ -46,6 +46,7 @@ use rand_distr::{Beta, ChiSquared, Gamma, StandardNormal};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, OnceLock};
 
 use crate::bedmath::{decode_standardized_packed_block_f32, is_identity_indices};
@@ -594,6 +595,36 @@ pub(crate) fn daxpy_inplace_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
     }
 }
 
+/// Return the conditional marker score without materializing `r + x_j beta_j`.
+///
+/// The maintained residual is `r = y - X beta`, so it still contains the
+/// current marker effect.  Adding `beta_j * d_j` recovers
+/// `x_j^T (r + x_j beta_j)` with a single dot product over the samples.
+#[inline]
+pub(crate) fn marker_conditional_dot_f64(
+    residual: &[f64],
+    marker: &[f64],
+    old_beta: f64,
+    marker_ss: f64,
+) -> f64 {
+    ddot_f64(residual, marker) + old_beta * marker_ss
+}
+
+/// Update a maintained residual after replacing one marker effect.
+///
+/// Since `r = y - X beta`, changing `beta_j` from `old_beta` to `new_beta`
+/// requires `r += x_j * (old_beta - new_beta)`.  Keeping this as one BLAS
+/// AXPY avoids separate remove/add scans of the sample vector.
+#[inline]
+pub(crate) fn update_marker_residual_f64(
+    old_beta: f64,
+    new_beta: f64,
+    marker: &[f64],
+    residual: &mut [f64],
+) {
+    daxpy_inplace_f64(old_beta - new_beta, marker, residual);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_alpha_gauss_seidel_blas(
     x: &[f64],
@@ -679,6 +710,14 @@ fn parse_env_truthy(raw: &str) -> Option<bool> {
         return Some(false);
     }
     None
+}
+
+#[inline]
+fn bayes_packed_double_buffer_enabled() -> bool {
+    env::var("JX_BAYES_PACKED_DOUBLE_BUFFER")
+        .ok()
+        .and_then(|raw| parse_env_truthy(&raw))
+        .unwrap_or(true)
 }
 
 #[inline]
@@ -778,6 +817,22 @@ pub(crate) enum BayesPackedSource<'a> {
     Windowed(WindowedBedMatrix),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BayesDecodeMode {
+    Dense,
+    Single,
+    Double,
+}
+
+#[inline]
+pub(crate) fn bayes_decode_mode(p: usize, block_rows: usize) -> BayesDecodeMode {
+    if p == 0 || block_rows >= p {
+        BayesDecodeMode::Dense
+    } else {
+        BayesDecodeMode::Double
+    }
+}
+
 /// Common marker access contract used by every Bayesian marker sampler.
 ///
 /// Marker rows are returned in standardized f64 form.  The statistical
@@ -794,6 +849,24 @@ pub(crate) trait BayesMarkerBackend {
         out_block: &mut [f64],
         n: usize,
     ) -> Result<(), String>;
+
+    fn for_each_block<F>(&mut self, mut f: F) -> Result<(), String>
+    where
+        F: FnMut(usize, usize, &[f64]) -> Result<(), String>,
+        Self: Sized,
+    {
+        let n = self.n_samples();
+        let p = self.n_markers();
+        let block_rows = self.block_rows().max(1).min(p.max(1));
+        let mut block = vec![0.0_f64; block_rows * n];
+        for row_start in (0..p).step_by(block_rows) {
+            let row_end = (row_start + block_rows).min(p);
+            let block_len = (row_end - row_start) * n;
+            self.fill_block(row_start, row_end, &mut block[..block_len], n)?;
+            f(row_start, row_end, &block[..block_len])?;
+        }
+        Ok(())
+    }
 }
 
 /// Dense marker backend used by the in-memory Bayes entry points.
@@ -853,9 +926,10 @@ impl BayesMarkerBackend for DenseBayesBackend<'_> {
 /// Shared packed/stream BED backend.
 ///
 /// This owns all source-specific state (row/sample mapping, decode scratch,
-/// thread pool and source window).  Any future decode policy such as
-/// double-buffering therefore belongs here and automatically applies to all
-/// Bayes models that consume this backend.
+/// thread pool and source window).  An explicit memory-derived block uses two
+/// reusable decode buffers by default; when that block covers every active
+/// marker, the source is materialized once and the dense backend is used.
+/// Keeping this policy here makes it apply uniformly to every Bayes model.
 pub(crate) struct PackedBayesBackend<'a, 'source> {
     source: &'a mut BayesPackedSource<'source>,
     n_samples_total: usize,
@@ -869,6 +943,7 @@ pub(crate) struct PackedBayesBackend<'a, 'source> {
     block_rows: usize,
     pool: Option<&'a Arc<rayon::ThreadPool>>,
     scratch_f32: Vec<f32>,
+    decode_mode: BayesDecodeMode,
 }
 
 impl<'a, 'source> PackedBayesBackend<'a, 'source> {
@@ -899,10 +974,21 @@ impl<'a, 'source> PackedBayesBackend<'a, 'source> {
         if sample_indices.is_empty() || sample_indices.iter().any(|&i| i >= n_samples_total) {
             return Err("Bayes packed sample indices are invalid".to_string());
         }
+        let explicit_block_rows = block_rows.is_some();
         let resolved_block_rows = block_rows
             .unwrap_or_else(|| bayes_packed_block_rows(sample_indices.len(), p))
             .max(1)
             .min(p);
+        let decode_mode = if explicit_block_rows {
+            let base_mode = bayes_decode_mode(p, resolved_block_rows);
+            if base_mode == BayesDecodeMode::Double && !bayes_packed_double_buffer_enabled() {
+                BayesDecodeMode::Single
+            } else {
+                base_mode
+            }
+        } else {
+            BayesDecodeMode::Single
+        };
         Ok(Self {
             source,
             n_samples_total,
@@ -916,13 +1002,16 @@ impl<'a, 'source> PackedBayesBackend<'a, 'source> {
             block_rows: resolved_block_rows,
             pool,
             scratch_f32: Vec::new(),
+            decode_mode,
         })
     }
 
-    /// Materialize a resident packed source only when the common predecode
-    /// policy allows it.  Windowed BED sources always remain streamed.
+    /// Materialize a packed source when the common predecode policy allows it.
+    /// An explicit block covering all active markers forces this dense path,
+    /// including for a windowed BED source.
     pub(crate) fn maybe_predecode_dense_f64(&mut self) -> Result<Option<Vec<f64>>, String> {
-        maybe_predecode_source_dense_f64(
+        let force_dense = self.decode_mode == BayesDecodeMode::Dense;
+        let dense = maybe_predecode_source_dense_f64(
             &mut self.source,
             self.n_samples_total,
             self.row_flip,
@@ -934,7 +1023,137 @@ impl<'a, 'source> PackedBayesBackend<'a, 'source> {
             self.packed_row_indices,
             packed_byte_lut().code4(),
             self.pool,
-        )
+            Some(self.block_rows),
+            force_dense,
+        )?;
+        if dense.is_some() {
+            self.decode_mode = BayesDecodeMode::Dense;
+        }
+        Ok(dense)
+    }
+
+    fn duplicate_source(&self) -> Result<BayesPackedSource<'source>, String> {
+        match &*self.source {
+            BayesPackedSource::Resident {
+                packed_flat,
+                bytes_per_snp,
+            } => Ok(BayesPackedSource::Resident {
+                packed_flat,
+                bytes_per_snp: *bytes_per_snp,
+            }),
+            BayesPackedSource::Windowed(matrix) => {
+                Ok(BayesPackedSource::Windowed(matrix.duplicate()?))
+            }
+        }
+    }
+
+    pub(crate) fn for_each_block<F>(&mut self, mut f: F) -> Result<(), String>
+    where
+        F: FnMut(usize, usize, &[f64]) -> Result<(), String>,
+    {
+        if self.decode_mode == BayesDecodeMode::Double {
+            return self.for_each_block_double(&mut f);
+        }
+        let n = self.sample_indices.len();
+        let block_rows = self.block_rows.max(1).min(self.p.max(1));
+        let mut block = vec![0.0_f64; block_rows * n];
+        for row_start in (0..self.p).step_by(block_rows) {
+            let row_end = (row_start + block_rows).min(self.p);
+            let block_len = (row_end - row_start) * n;
+            self.fill_block(row_start, row_end, &mut block[..block_len], n)?;
+            f(row_start, row_end, &block[..block_len])?;
+        }
+        Ok(())
+    }
+
+    fn for_each_block_double<F>(&mut self, f: &mut F) -> Result<(), String>
+    where
+        F: FnMut(usize, usize, &[f64]) -> Result<(), String>,
+    {
+        let worker_source = self.duplicate_source()?;
+        let n = self.sample_indices.len();
+        let p = self.p;
+        let block_rows = self.block_rows.max(1).min(p.max(1));
+        let n_samples_total = self.n_samples_total;
+        let row_flip = self.row_flip;
+        let row_mean = self.row_mean;
+        let row_inv_sd = self.row_inv_sd;
+        let packed_row_indices = self.packed_row_indices;
+        let sample_indices = self.sample_indices;
+        let full_sample_fast = self.full_sample_fast;
+        let pool = self.pool;
+        let code4_lut = packed_byte_lut().code4();
+
+        std::thread::scope(|scope| {
+            let (request_tx, request_rx) = sync_channel::<(usize, usize, Vec<f64>)>(2);
+            let (ready_tx, ready_rx) = sync_channel::<Result<(usize, usize, Vec<f64>), String>>(2);
+
+            scope.spawn(move || {
+                let mut source = worker_source;
+                let mut scratch_f32 = Vec::<f32>::new();
+                while let Ok((row_start, row_end, mut block)) = request_rx.recv() {
+                    let block_len = (row_end - row_start) * n;
+                    let result = decode_source_block_standardized_into(
+                        &mut source,
+                        n_samples_total,
+                        row_start,
+                        row_end,
+                        sample_indices,
+                        full_sample_fast,
+                        packed_row_indices,
+                        row_flip,
+                        row_mean,
+                        row_inv_sd,
+                        code4_lut,
+                        &mut block[..block_len],
+                        n,
+                        pool,
+                        &mut scratch_f32,
+                    )
+                    .map(|_| (row_start, row_end, block));
+                    if ready_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let mut blocks = (0..p).step_by(block_rows).map(|row_start| {
+                let row_end = (row_start + block_rows).min(p);
+                (row_start, row_end)
+            });
+            let send_request =
+                |row_start: usize, row_end: usize, mut block: Vec<f64>| -> Result<(), String> {
+                    let block_len = (row_end - row_start) * n;
+                    if block.len() != block_len {
+                        block.resize(block_len, 0.0);
+                    }
+                    request_tx
+                        .send((row_start, row_end, block))
+                        .map_err(|_| "Bayes double-buffer worker stopped".to_string())
+                };
+
+            let mut in_flight = 0usize;
+            for _ in 0..2 {
+                if let Some((row_start, row_end)) = blocks.next() {
+                    send_request(row_start, row_end, Vec::new())?;
+                    in_flight += 1;
+                }
+            }
+
+            while in_flight > 0 {
+                let ready = ready_rx
+                    .recv()
+                    .map_err(|_| "Bayes double-buffer worker stopped".to_string())??;
+                let (row_start, row_end, block) = ready;
+                in_flight -= 1;
+                f(row_start, row_end, &block)?;
+                if let Some((next_start, next_end)) = blocks.next() {
+                    send_request(next_start, next_end, block)?;
+                    in_flight += 1;
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1115,15 +1334,20 @@ fn maybe_predecode_source_dense_f64(
     packed_row_indices: Option<&[usize]>,
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
+    block_rows_override: Option<usize>,
+    force_dense: bool,
 ) -> Result<Option<Vec<f64>>, String> {
-    if matches!(source, BayesPackedSource::Windowed(_)) {
+    if !force_dense && matches!(source, BayesPackedSource::Windowed(_)) {
         return Ok(None);
     }
-    if !bayes_packed_should_predecode_dense(n, p) {
+    if !force_dense && !bayes_packed_should_predecode_dense(n, p) {
         return Ok(None);
     }
     let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let block_rows = bayes_packed_block_rows(n, p);
+    let block_rows = block_rows_override
+        .unwrap_or_else(|| bayes_packed_block_rows(n, p))
+        .max(1)
+        .min(p.max(1));
     let mut dense_f64 = vec![0.0_f64; p * n];
     let mut scratch_f32 = Vec::<f32>::new();
     for st in (0..p).step_by(block_rows) {
@@ -1415,12 +1639,7 @@ fn bayesb_core_impl(
         for j in 0..p {
             let m_j = &m[j * n..(j + 1) * n];
             let b_old = beta[j];
-            if b_old != 0.0 {
-                // Remove current marker effect first so r represents r_{-j}.
-                daxpy_inplace_f64(b_old, m_j, &mut r);
-            }
-
-            let xe = ddot_f64(&r, m_j);
+            let xe = marker_conditional_dot_f64(&r, m_j, b_old, x2[j]);
 
             let c = x2[j] * inv_var_e + 1.0 / var_b[j];
             if !(c.is_finite() && c > 0.0) {
@@ -1442,9 +1661,10 @@ fn bayesb_core_impl(
             if new_d == 1 {
                 let z_beta: f64 = rng.sample(StandardNormal);
                 let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                daxpy_inplace_f64(-new_beta, m_j, &mut r);
+                update_marker_residual_f64(b_old, new_beta, m_j, &mut r);
                 beta[j] = new_beta;
             } else {
+                update_marker_residual_f64(b_old, 0.0, m_j, &mut r);
                 beta[j] = 0.0;
             }
         }
@@ -1760,12 +1980,7 @@ fn bayesc_core_impl(
         for j in 0..p {
             let m_j = &m[j * n..(j + 1) * n];
             let b_old = beta[j];
-            if d[j] == 1 {
-                // Remove current marker effect first so r represents r_{-j}.
-                daxpy_inplace_f64(b_old, m_j, &mut r);
-            }
-
-            let xe = ddot_f64(&r, m_j);
+            let xe = marker_conditional_dot_f64(&r, m_j, b_old, x2[j]);
 
             let c = x2[j] * inv_var_e + 1.0 / var_b;
             if !(c.is_finite() && c > 0.0) {
@@ -1787,9 +2002,10 @@ fn bayesc_core_impl(
             if new_d == 1 {
                 let z_beta: f64 = rng.sample(StandardNormal);
                 let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                daxpy_inplace_f64(-new_beta, m_j, &mut r);
+                update_marker_residual_f64(b_old, new_beta, m_j, &mut r);
                 beta[j] = new_beta;
             } else {
+                update_marker_residual_f64(b_old, 0.0, m_j, &mut r);
                 beta[j] = 0.0;
             }
         }
@@ -2086,14 +2302,12 @@ fn bayesa_core_impl(
 
         for j in 0..p {
             let m_j = &m[j * n..(j + 1) * n];
-            let mut rhs = ddot_f64(m_j, &r);
-            rhs = rhs * inv_var_e + x2[j] * beta[j] * inv_var_e;
+            let rhs = marker_conditional_dot_f64(&r, m_j, beta[j], x2[j]) * inv_var_e;
             let c = x2[j] * inv_var_e + 1.0 / var_b[j];
             let z_beta: f64 = rng.sample(StandardNormal);
             let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
 
-            let delta = beta[j] - new_beta;
-            daxpy_inplace_f64(delta, m_j, &mut r);
+            update_marker_residual_f64(beta[j], new_beta, m_j, &mut r);
             beta[j] = new_beta;
         }
 
@@ -2291,14 +2505,10 @@ fn bayesa_packed_core_impl(
         }
     };
 
-    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
-    let mut m_block = vec![0.0_f64; block_rows * n];
-    for st in (0..p).step_by(block_rows) {
-        let ed = (st + block_rows).min(p);
+    backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
-        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -2310,7 +2520,8 @@ fn bayesa_packed_core_impl(
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
         }
-    }
+        Ok(())
+    })?;
     let mut sum_x2 = 0.0;
     let mut sum_mean_x2 = 0.0;
     for j in 0..p {
@@ -2419,24 +2630,21 @@ fn bayesa_packed_core_impl(
             &mut rng,
         );
 
-        for st in (0..p).step_by(block_rows) {
-            let ed = (st + block_rows).min(p);
+        backend.for_each_block(|st, ed, m_block| {
             let br = ed - st;
-            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
-                let mut rhs = ddot_f64(m_row, &r);
-                rhs = rhs * inv_var_e + x2[j] * beta[j] * inv_var_e;
+                let rhs = marker_conditional_dot_f64(&r, m_row, beta[j], x2[j]) * inv_var_e;
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 let z_beta: f64 = rng.sample(StandardNormal);
                 let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
 
-                let delta = beta[j] - new_beta;
-                daxpy_inplace_f64(delta, m_row, &mut r);
+                update_marker_residual_f64(beta[j], new_beta, m_row, &mut r);
                 beta[j] = new_beta;
             }
-        }
+            Ok(())
+        })?;
 
         for j in 0..p {
             var_b[j] = (s + beta[j] * beta[j]) / rng.sample(chi_b);
@@ -2646,14 +2854,10 @@ fn bayesb_packed_core_impl(
         }
     };
 
-    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
-    let mut m_block = vec![0.0_f64; block_rows * n];
-    for st in (0..p).step_by(block_rows) {
-        let ed = (st + block_rows).min(p);
+    backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
-        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -2665,7 +2869,8 @@ fn bayesb_packed_core_impl(
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
         }
-    }
+        Ok(())
+    })?;
     let mut sum_x2 = 0.0;
     let mut sum_mean_x2 = 0.0;
     for j in 0..p {
@@ -2772,20 +2977,13 @@ fn bayesb_packed_core_impl(
 
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
-        for st in (0..p).step_by(block_rows) {
-            let ed = (st + block_rows).min(p);
+        backend.for_each_block(|st, ed, m_block| {
             let br = ed - st;
-            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
                 let b_old = beta[j];
-                if b_old != 0.0 {
-                    // Remove current marker effect first so r represents r_{-j}.
-                    daxpy_inplace_f64(b_old, m_row, &mut r);
-                }
-
-                let xe = ddot_f64(&r, m_row);
+                let xe = marker_conditional_dot_f64(&r, m_row, b_old, x2[j]);
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
@@ -2808,13 +3006,15 @@ fn bayesb_packed_core_impl(
                 if new_d == 1 {
                     let z_beta: f64 = rng.sample(StandardNormal);
                     let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                    daxpy_inplace_f64(-new_beta, m_row, &mut r);
+                    update_marker_residual_f64(b_old, new_beta, m_row, &mut r);
                     beta[j] = new_beta;
                 } else {
+                    update_marker_residual_f64(b_old, 0.0, m_row, &mut r);
                     beta[j] = 0.0;
                 }
             }
-        }
+            Ok(())
+        })?;
 
         let mut n_active = 0usize;
         for j in 0..p {
@@ -3056,14 +3256,10 @@ fn bayesc_packed_core_impl(
         }
     };
 
-    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
-    let mut m_block = vec![0.0_f64; block_rows * n];
-    for st in (0..p).step_by(block_rows) {
-        let ed = (st + block_rows).min(p);
+    backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
-        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -3075,7 +3271,8 @@ fn bayesc_packed_core_impl(
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
         }
-    }
+        Ok(())
+    })?;
     let mut sum_x2 = 0.0;
     let mut sum_mean_x2 = 0.0;
     for j in 0..p {
@@ -3179,20 +3376,13 @@ fn bayesc_packed_core_impl(
 
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
-        for st in (0..p).step_by(block_rows) {
-            let ed = (st + block_rows).min(p);
+        backend.for_each_block(|st, ed, m_block| {
             let br = ed - st;
-            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
                 let b_old = beta[j];
-                if d[j] == 1 {
-                    // Remove current marker effect first so r represents r_{-j}.
-                    daxpy_inplace_f64(b_old, m_row, &mut r);
-                }
-
-                let xe = ddot_f64(&r, m_row);
+                let xe = marker_conditional_dot_f64(&r, m_row, b_old, x2[j]);
                 let c = x2[j] * inv_var_e + 1.0 / var_b;
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
@@ -3215,13 +3405,15 @@ fn bayesc_packed_core_impl(
                 if new_d == 1 {
                     let z_beta: f64 = rng.sample(StandardNormal);
                     let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                    daxpy_inplace_f64(-new_beta, m_row, &mut r);
+                    update_marker_residual_f64(b_old, new_beta, m_row, &mut r);
                     beta[j] = new_beta;
                 } else {
+                    update_marker_residual_f64(b_old, 0.0, m_row, &mut r);
                     beta[j] = 0.0;
                 }
             }
-        }
+            Ok(())
+        })?;
 
         let mut mrk_in_usize = 0usize;
         let mut ss_b = 0.0;
@@ -3851,7 +4043,8 @@ pub fn bayesc(
     prior_ss_e = None,
     min_abs_beta = 1e-9,
     threads = 0,
-    seed = None
+    seed = None,
+    block_rows = None
 ))]
 pub fn bayesa_packed(
     py: Python,
@@ -3877,6 +4070,7 @@ pub fn bayesa_packed(
     min_abs_beta: f64,
     threads: usize,
     seed: Option<u64>,
+    block_rows: Option<usize>,
 ) -> PyResult<(
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
@@ -4022,7 +4216,7 @@ pub fn bayesa_packed(
             prior_ss_e,
             min_abs_beta,
             seed,
-            None,
+            block_rows,
             pool_ref,
         )
     });
@@ -4085,7 +4279,8 @@ pub fn bayesa_packed(
     df0_e = 5.0,
     prior_ss_e = None,
     threads = 0,
-    seed = None
+    seed = None,
+    block_rows = None
 ))]
 pub fn bayesb_packed(
     py: Python,
@@ -4113,6 +4308,7 @@ pub fn bayesb_packed(
     prior_ss_e: Option<f64>,
     threads: usize,
     seed: Option<u64>,
+    block_rows: Option<usize>,
 ) -> PyResult<(
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
@@ -4263,7 +4459,7 @@ pub fn bayesb_packed(
             df0_e,
             prior_ss_e,
             seed,
-            None,
+            block_rows,
             pool_ref,
         )
     });
@@ -4330,7 +4526,8 @@ pub fn bayesb_packed(
     df0_e = 5.0,
     prior_ss_e = None,
     threads = 0,
-    seed = None
+    seed = None,
+    block_rows = None
 ))]
 pub fn bayesc_packed(
     py: Python,
@@ -4356,6 +4553,7 @@ pub fn bayesc_packed(
     prior_ss_e: Option<f64>,
     threads: usize,
     seed: Option<u64>,
+    block_rows: Option<usize>,
 ) -> PyResult<(
     Py<PyArray1<f64>>,
     Py<PyArray1<f64>>,
@@ -4511,7 +4709,7 @@ pub fn bayesc_packed(
             df0_e,
             prior_ss_e,
             seed,
-            None,
+            block_rows,
             pool_ref,
         )
     });
@@ -5295,6 +5493,7 @@ fn bayesa_packed_trace_core_impl(
     prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
     trace_snp_indices: &[usize],
+    block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<PackedBayesTraceResult, String> {
     let n_f = n as f64;
@@ -5326,7 +5525,7 @@ fn bayesa_packed_trace_core_impl(
         row_inv_sd,
         None,
         sample_idx,
-        None,
+        block_rows,
         pool,
     )?;
 
@@ -5342,14 +5541,10 @@ fn bayesa_packed_trace_core_impl(
         }
     };
 
-    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
-    let mut m_block = vec![0.0_f64; block_rows * n];
-    for st in (0..p).step_by(block_rows) {
-        let ed = (st + block_rows).min(p);
+    backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
-        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -5361,7 +5556,8 @@ fn bayesa_packed_trace_core_impl(
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
         }
-    }
+        Ok(())
+    })?;
     let mut sum_x2 = 0.0;
     let mut sum_mean_x2 = 0.0;
     for j in 0..p {
@@ -5482,24 +5678,21 @@ fn bayesa_packed_trace_core_impl(
             &mut rng,
         );
 
-        for st in (0..p).step_by(block_rows) {
-            let ed = (st + block_rows).min(p);
+        backend.for_each_block(|st, ed, m_block| {
             let br = ed - st;
-            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
-                let mut rhs = ddot_f64(m_row, &r);
-                rhs = rhs * inv_var_e + x2[j] * beta[j] * inv_var_e;
+                let rhs = marker_conditional_dot_f64(&r, m_row, beta[j], x2[j]) * inv_var_e;
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 let z_beta: f64 = rng.sample(StandardNormal);
                 let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
 
-                let delta = beta[j] - new_beta;
-                daxpy_inplace_f64(delta, m_row, &mut r);
+                update_marker_residual_f64(beta[j], new_beta, m_row, &mut r);
                 beta[j] = new_beta;
             }
-        }
+            Ok(())
+        })?;
 
         for j in 0..p {
             var_b[j] = (s + beta[j] * beta[j]) / rng.sample(chi_b);
@@ -5630,6 +5823,7 @@ fn bayesb_packed_trace_core_impl(
     prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
     trace_snp_indices: &[usize],
+    block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<PackedBayesTraceResult, String> {
     let n_f = n as f64;
@@ -5668,7 +5862,7 @@ fn bayesb_packed_trace_core_impl(
         row_inv_sd,
         None,
         sample_idx,
-        None,
+        block_rows,
         pool,
     )?;
 
@@ -5684,14 +5878,10 @@ fn bayesb_packed_trace_core_impl(
         }
     };
 
-    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
-    let mut m_block = vec![0.0_f64; block_rows * n];
-    for st in (0..p).step_by(block_rows) {
-        let ed = (st + block_rows).min(p);
+    backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
-        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -5703,7 +5893,8 @@ fn bayesb_packed_trace_core_impl(
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
         }
-    }
+        Ok(())
+    })?;
     let mut sum_x2 = 0.0;
     let mut sum_mean_x2 = 0.0;
     for j in 0..p {
@@ -5821,19 +6012,13 @@ fn bayesb_packed_trace_core_impl(
 
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
-        for st in (0..p).step_by(block_rows) {
-            let ed = (st + block_rows).min(p);
+        backend.for_each_block(|st, ed, m_block| {
             let br = ed - st;
-            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
                 let b_old = beta[j];
-                if b_old != 0.0 {
-                    daxpy_inplace_f64(b_old, m_row, &mut r);
-                }
-
-                let xe = ddot_f64(&r, m_row);
+                let xe = marker_conditional_dot_f64(&r, m_row, b_old, x2[j]);
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
@@ -5855,13 +6040,15 @@ fn bayesb_packed_trace_core_impl(
                 if new_d == 1 {
                     let z_beta: f64 = rng.sample(StandardNormal);
                     let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                    daxpy_inplace_f64(-new_beta, m_row, &mut r);
+                    update_marker_residual_f64(b_old, new_beta, m_row, &mut r);
                     beta[j] = new_beta;
                 } else {
+                    update_marker_residual_f64(b_old, 0.0, m_row, &mut r);
                     beta[j] = 0.0;
                 }
             }
-        }
+            Ok(())
+        })?;
 
         let mut n_active = 0usize;
         for j in 0..p {
@@ -6020,6 +6207,7 @@ fn bayesc_packed_trace_core_impl(
     prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
     trace_snp_indices: &[usize],
+    block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<PackedBayesTraceResult, String> {
     let n_f = n as f64;
@@ -6058,7 +6246,7 @@ fn bayesc_packed_trace_core_impl(
         row_inv_sd,
         None,
         sample_idx,
-        None,
+        block_rows,
         pool,
     )?;
 
@@ -6074,14 +6262,10 @@ fn bayesc_packed_trace_core_impl(
         }
     };
 
-    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
-    let mut m_block = vec![0.0_f64; block_rows * n];
-    for st in (0..p).step_by(block_rows) {
-        let ed = (st + block_rows).min(p);
+    backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
-        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -6093,7 +6277,8 @@ fn bayesc_packed_trace_core_impl(
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
         }
-    }
+        Ok(())
+    })?;
     let mut sum_x2 = 0.0;
     let mut sum_mean_x2 = 0.0;
     for j in 0..p {
@@ -6208,19 +6393,13 @@ fn bayesc_packed_trace_core_impl(
 
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
-        for st in (0..p).step_by(block_rows) {
-            let ed = (st + block_rows).min(p);
+        backend.for_each_block(|st, ed, m_block| {
             let br = ed - st;
-            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
                 let b_old = beta[j];
-                if d[j] == 1 {
-                    daxpy_inplace_f64(b_old, m_row, &mut r);
-                }
-
-                let xe = ddot_f64(&r, m_row);
+                let xe = marker_conditional_dot_f64(&r, m_row, b_old, x2[j]);
                 let c = x2[j] * inv_var_e + 1.0 / var_b;
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
@@ -6242,13 +6421,15 @@ fn bayesc_packed_trace_core_impl(
                 if new_d == 1 {
                     let z_beta: f64 = rng.sample(StandardNormal);
                     let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                    daxpy_inplace_f64(-new_beta, m_row, &mut r);
+                    update_marker_residual_f64(b_old, new_beta, m_row, &mut r);
                     beta[j] = new_beta;
                 } else {
+                    update_marker_residual_f64(b_old, 0.0, m_row, &mut r);
                     beta[j] = 0.0;
                 }
             }
-        }
+            Ok(())
+        })?;
 
         let mut mrk_in_usize = 0usize;
         let mut ss_b = 0.0;
@@ -6388,7 +6569,8 @@ fn bayesc_packed_trace_core_impl(
     min_abs_beta = 1e-9,
     trace_snp_indices = None,
     threads = 0,
-    seed = None
+    seed = None,
+    block_rows = None
 ))]
 pub fn bayesa_packed_trace<'py>(
     py: Python<'py>,
@@ -6415,6 +6597,7 @@ pub fn bayesa_packed_trace<'py>(
     trace_snp_indices: Option<PyReadonlyArray1<i64>>,
     threads: usize,
     seed: Option<u64>,
+    block_rows: Option<usize>,
 ) -> PyResult<Bound<'py, PyDict>> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -6546,6 +6729,7 @@ pub fn bayesa_packed_trace<'py>(
             prior_ss_e,
             seed,
             &trace_idx,
+            block_rows,
             pool_ref,
         )
     });
@@ -6581,7 +6765,8 @@ pub fn bayesa_packed_trace<'py>(
     prior_ss_e = None,
     trace_snp_indices = None,
     threads = 0,
-    seed = None
+    seed = None,
+    block_rows = None
 ))]
 pub fn bayesb_packed_trace<'py>(
     py: Python<'py>,
@@ -6610,6 +6795,7 @@ pub fn bayesb_packed_trace<'py>(
     trace_snp_indices: Option<PyReadonlyArray1<i64>>,
     threads: usize,
     seed: Option<u64>,
+    block_rows: Option<usize>,
 ) -> PyResult<Bound<'py, PyDict>> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -6745,6 +6931,7 @@ pub fn bayesb_packed_trace<'py>(
             prior_ss_e,
             seed,
             &trace_idx,
+            block_rows,
             pool_ref,
         )
     });
@@ -6778,7 +6965,8 @@ pub fn bayesb_packed_trace<'py>(
     prior_ss_e = None,
     trace_snp_indices = None,
     threads = 0,
-    seed = None
+    seed = None,
+    block_rows = None
 ))]
 pub fn bayesc_packed_trace<'py>(
     py: Python<'py>,
@@ -6805,6 +6993,7 @@ pub fn bayesc_packed_trace<'py>(
     trace_snp_indices: Option<PyReadonlyArray1<i64>>,
     threads: usize,
     seed: Option<u64>,
+    block_rows: Option<usize>,
 ) -> PyResult<Bound<'py, PyDict>> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
@@ -6945,6 +7134,7 @@ pub fn bayesc_packed_trace<'py>(
             prior_ss_e,
             seed,
             &trace_idx,
+            block_rows,
             pool_ref,
         )
     });
@@ -6959,18 +7149,70 @@ mod backend_tests {
     use super::*;
 
     #[test]
+    fn marker_conditional_update_matches_remove_dot_add_reference() {
+        let marker = [0.0_f64, 1.0, 2.0, 1.0, 0.0];
+        let residual = [1.5_f64, -0.5, 2.0, 0.25, -1.0];
+        let old_beta = -0.37_f64;
+        let new_beta = 0.82_f64;
+        let d = ddot_f64(&marker, &marker);
+
+        let mut reference_residual = residual;
+        daxpy_inplace_f64(old_beta, &marker, &mut reference_residual);
+        let reference_u = ddot_f64(&reference_residual, &marker);
+        daxpy_inplace_f64(-new_beta, &marker, &mut reference_residual);
+
+        let fast_u = marker_conditional_dot_f64(&residual, &marker, old_beta, d);
+        let mut fast_residual = residual;
+        update_marker_residual_f64(old_beta, new_beta, &marker, &mut fast_residual);
+
+        assert!((fast_u - reference_u).abs() < 1e-12);
+        for (fast, reference) in fast_residual.iter().zip(reference_residual.iter()) {
+            assert!((fast - reference).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn bayes_decode_plan_uses_dense_when_one_block_covers_all_markers() {
+        assert_eq!(bayes_decode_mode(4, 4), BayesDecodeMode::Dense);
+        assert_eq!(bayes_decode_mode(3, 4), BayesDecodeMode::Dense);
+        assert_eq!(bayes_decode_mode(5, 4), BayesDecodeMode::Double);
+    }
+
+    #[test]
     fn dense_backend_reads_requested_marker_block() {
-        let matrix = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let matrix = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let mut backend = DenseBayesBackend::new(&matrix, 4, 2).expect("valid dense backend");
         assert_eq!(backend.n_samples(), 4);
         assert_eq!(backend.n_markers(), 2);
         assert_eq!(backend.block_rows(), 2);
 
-        let mut block = vec![0.0_f64; 4];
+        let mut block = vec![0.0_f32; 4];
         backend
             .fill_block(1, 2, &mut block, 4)
             .expect("valid dense block");
         assert_eq!(block, vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn mixed_precision_marker_helpers_match_f64_reference() {
+        let marker_f32 = [0.0_f32, 1.0, 2.0, 1.0, 0.0];
+        let marker_f64 = marker_f32.map(f64::from);
+        let residual = [1.5_f64, -0.5, 2.0, 0.25, -1.0];
+        let old_beta = -0.37_f64;
+        let new_beta = 0.82_f64;
+        let d = ddot_f64(&marker_f64, &marker_f64);
+
+        let reference_u = marker_conditional_dot_f64(&residual, &marker_f64, old_beta, d);
+        let mixed_u = marker_conditional_dot_f32_f64(&residual, &marker_f32, old_beta, d);
+        assert!((mixed_u - reference_u).abs() < 1e-12);
+
+        let mut reference_residual = residual;
+        update_marker_residual_f64(old_beta, new_beta, &marker_f64, &mut reference_residual);
+        let mut mixed_residual = residual;
+        update_marker_residual_f32_f64(old_beta, new_beta, &marker_f32, &mut mixed_residual);
+        for (mixed, reference) in mixed_residual.iter().zip(reference_residual.iter()) {
+            assert!((mixed - reference).abs() < 1e-12);
+        }
     }
 
     #[test]
@@ -6993,5 +7235,45 @@ mod backend_tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn packed_backend_double_buffer_preserves_marker_order() {
+        // Four samples, three SNP rows, two-bit BED codes.  The values are
+        // intentionally distinct so an out-of-order prefetch is observable.
+        let packed = [0b00_11_10_00_u8, 0b11_00_10_11_u8, 0b10_10_10_10_u8];
+        let mut source = BayesPackedSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp: 1,
+        };
+        let mut backend = PackedBayesBackend::new(
+            &mut source,
+            4,
+            3,
+            &[false, false, false],
+            &[0.0, 0.0, 0.0],
+            &[1.0, 1.0, 1.0],
+            None,
+            &[0, 1, 2, 3],
+            Some(1),
+            None,
+        )
+        .expect("valid packed backend");
+
+        let mut starts = Vec::new();
+        let mut rows = Vec::new();
+        backend
+            .for_each_block(|start, end, block| {
+                starts.push((start, end));
+                rows.push(block.to_vec());
+                Ok(())
+            })
+            .expect("double-buffered scan succeeds");
+
+        assert_eq!(starts, vec![(0, 1), (1, 2), (2, 3)]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![0.0, 1.0, 2.0, 0.0]);
+        assert_eq!(rows[1], vec![2.0, 1.0, 0.0, 2.0]);
+        assert_eq!(rows[2], vec![1.0, 1.0, 1.0, 1.0]);
     }
 }

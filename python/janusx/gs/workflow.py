@@ -643,12 +643,15 @@ def _packed_ctx_source_payload_bytes(packed_ctx: dict[str, typing.Any]) -> int:
 def _gs_bayes_resident_payload_cap_bytes(
     memory_gb: float | int | None = None,
 ) -> int:
+    # An explicit -mem is the single user-facing budget for all Bayes decode
+    # storage.  Keep the environment variable only as a legacy fallback when
+    # the user did not provide -mem, so it cannot silently override the CLI.
+    if memory_gb is not None:
+        return int(max(0.0, float(_memory_gb_to_mb(memory_gb)))) * 1024 * 1024
     raw = os.getenv("JX_GS_BAYES_PACKED_MAX_MB", "").strip()
     parsed = _parse_nonnegative_int(raw)
     if parsed is not None:
         return int(max(0, int(parsed))) * 1024 * 1024
-    if memory_gb is not None:
-        return int(max(0.0, float(_memory_gb_to_mb(memory_gb)))) * 1024 * 1024
     return 512 * 1024 * 1024
 
 
@@ -2775,7 +2778,10 @@ _GS_AUTO_MEM_MIN_GB = 0.125
 _GS_WORKING_BUFFERS_GBLUP = 2
 _GS_WORKING_BUFFERS_PCG = 2
 _GS_WORKING_BUFFERS_EXACT_STREAM = 2
-_GS_WORKING_BUFFERS_BAYES = 1
+# Bayes streamed/resident packed kernels use two decode buffers whenever the
+# memory budget can provide them.  If the resulting block covers all active
+# markers, the native backend promotes the job to a dense decoded matrix.
+_GS_WORKING_BUFFERS_BAYES = 2
 
 
 def _normalize_memory_gb(memory_gb: float | int | None) -> float | None:
@@ -3481,6 +3487,7 @@ def _attach_stream_decode_budget_to_packed_ctx(
         buffers=_GS_WORKING_BUFFERS_BAYES,
     )
     ctx["__bayes_stream_block_rows__"] = int(bayes_rows)
+    ctx["__bayes_decode_buffers__"] = int(_GS_WORKING_BUFFERS_BAYES)
     ctx["__bayes_stream_window_mb__"] = int(
         _stream_window_mb_from_block_rows(n_samples=n_samples, block_rows=bayes_rows)
     )
@@ -11529,6 +11536,7 @@ def GSapi(
                 }
                 if use_packed_resident_native:
                     packed_kwargs["packed"] = typing.cast(np.ndarray, packed_payload_arg)
+                    packed_kwargs["block_rows"] = int(bayes_stream_block_rows)
                     packed_fit_fn = getattr(_jxrs, str(packed_resident_func_name))
                 else:
                     packed_kwargs["prefix"] = str(source_prefix_raw)
@@ -19680,8 +19688,10 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         optional_group,
         default=None,
         help_text=(
-            "Working memory budget in GB for streamed BED kernels in GS. "
-            "When omitted, GS chooses a route-aware default from loaded sample/marker counts; "
+            "Decode block memory budget in GB for Bayesian packed/streamed BED "
+            "kernels in GS. It controls reusable single/double decode buffers and "
+            "promotes a block covering all markers to dense. When omitted, GS "
+            "chooses a route-aware default from loaded sample/marker counts; "
             "explicit -mem keeps the requested fixed budget."
         ),
         dest="memory",

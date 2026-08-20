@@ -598,6 +598,39 @@ impl WindowedBedMatrix {
         })
     }
 
+    /// Create an independent mmap/window cursor over the same BED payload.
+    ///
+    /// The duplicate is used by streamed Bayesian double buffering: one
+    /// cursor belongs to the decode worker while the caller consumes the
+    /// previously decoded block.  The file and mmap are independent, but the
+    /// underlying BED pages remain shared by the operating system.
+    pub fn duplicate(&self) -> Result<Self, String> {
+        let file = self.file.try_clone().map_err(|e| e.to_string())?;
+        // Every Bayesian scan starts at marker zero.  Do not inherit the
+        // caller's last window (which is usually near the end of the BED
+        // file), otherwise the worker would immediately remap before its
+        // first block.
+        let (mmap, mmap_offset, window_len_snps) = Self::map_window(
+            &file,
+            self.bed_len,
+            0,
+            self.target_window_snps,
+            self.bytes_per_snp,
+        )?;
+        Ok(Self {
+            file,
+            n_samples_full: self.n_samples_full,
+            bytes_per_snp: self.bytes_per_snp,
+            bed_len: self.bed_len,
+            mmap,
+            mmap_offset,
+            window_start_snp: 0,
+            window_len_snps,
+            target_window_snps: self.target_window_snps,
+            scratch: Vec::new(),
+        })
+    }
+
     #[inline]
     pub fn n_samples_full(&self) -> usize {
         self.n_samples_full
