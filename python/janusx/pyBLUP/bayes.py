@@ -8,9 +8,10 @@ from janusx.janusx import bayesa as _bayesa, bayesb as _bayesb, bayesc as _bayes
 from janusx.pyBLUP.mlm import BLUP
 
 _BAYESA_MIN_ABS_BETA_WARNED = False
+BAYES_POSTERIOR_SAMPLE_TARGET = 1000
 
-# Production GS defaults.  The first value is the hard upper bound for the
-# R-hat monitoring chain; the second is the post-convergence burn-in count.
+# Production GS defaults. The first value is the hard upper bound for the
+# R-hat monitoring phase; the second is the fixed posterior sample target.
 BAYES_MCMC_DEFAULTS: dict[str, tuple[int, int]] = {
     "BayesA": (3000, 1000),
     "BayesB": (3000, 1000),
@@ -19,7 +20,7 @@ BAYES_MCMC_DEFAULTS: dict[str, tuple[int, int]] = {
 
 
 def bayes_mcmc_defaults(method: str) -> tuple[int, int]:
-    """Return ``(rhat_max_iter, post_convergence_burnin)`` defaults."""
+    """Return ``(rhat_max_iter, posterior_samples)`` defaults."""
     key = str(method).strip()
     try:
         return BAYES_MCMC_DEFAULTS[key]
@@ -51,28 +52,35 @@ def _parse_bayes_diagnostics(
 ) -> dict[str, object]:
     """Parse legacy and current native Bayes diagnostic tails.
 
-    Current non-trace kernels append ``rhat, actual_iterations,
-    post_burnin_start_iteration`` for BayesA and ``pip, rhat, actual_iterations,
-    post_burnin_start_iteration`` for BayesB/BayesC.  The length-aware parser
-    keeps older installed extensions usable while avoiding the p==1 scalar PIP
-    ambiguity.
+    The current BayesA kernel appends ``rhat, actual_iterations,
+    convergence_iteration, posterior_samples``. BayesB/BayesC retain a
+    12-element Rust ABI (PyO3 tuple support is limited to 12 items), while the
+    Python wrappers append the fixed posterior count. The parser also accepts
+    older installed extensions and avoids the p==1 scalar PIP ambiguity.
     """
     tail = list(diag)
     pip_item: object | None = None
     rhat_item: object | None = None
     actual_item: object | None = None
-    post_start_item: object | None = None
+    convergence_item: object | None = None
+    posterior_item: object | None = None
     method_key = str(method).strip().lower()
     if method_key in {"bayesb", "bayesc"}:
-        if len(tail) >= 6:
-            pip_item, rhat_item, actual_item, post_start_item = tail[-4:]
+        if len(tail) >= 7:
+            pip_item, rhat_item, actual_item, convergence_item, posterior_item = tail[-5:]
+        elif len(tail) >= 6:
+            # Previous ABI: pip, rhat, actual_iterations, post-burn-in start.
+            pip_item, rhat_item, actual_item, convergence_item = tail[-4:]
         elif len(tail) >= 4:
             pip_item, rhat_item = tail[-2:]
         elif len(tail) >= 3:
             # Pre-R-hat B/C ABI: prob_in, n_active, pip.
             pip_item = tail[-1]
+    elif len(tail) >= 4:
+        rhat_item, actual_item, convergence_item, posterior_item = tail[-4:]
     elif len(tail) >= 3:
-        rhat_item, actual_item, post_start_item = tail[-3:]
+        # Previous ABI: rhat, actual_iterations, post-burn-in start.
+        rhat_item, actual_item, convergence_item = tail[-3:]
     elif tail:
         rhat_item = tail[-1]
 
@@ -90,12 +98,19 @@ def _parse_bayes_diagnostics(
             pip = None
     rhat = _scalar_from_native(rhat_item)
     actual = _scalar_from_native(actual_item, integer=True)
-    post_start = _scalar_from_native(post_start_item, integer=True)
+    convergence = _scalar_from_native(convergence_item, integer=True)
+    posterior = _scalar_from_native(posterior_item, integer=True)
+    posterior_count = (
+        int(posterior)
+        if posterior is not None
+        else (BAYES_POSTERIOR_SAMPLE_TARGET if actual is not None and actual > 0 else 0)
+    )
     return {
         "pip": pip,
         "rhat_h2": float(rhat) if rhat is not None else float("nan"),
         "actual_iterations": int(actual) if actual is not None else 0,
-        "post_burnin_start_iteration": int(post_start) if post_start is not None else 0,
+        "convergence_iteration": int(convergence) if convergence is not None else 0,
+        "posterior_samples": posterior_count,
     }
 
 
@@ -172,12 +187,13 @@ def _call_bayesa(
     float,
     int,
     int,
+    int,
 ]:
     n_iter = int(n_iter)
     burnin = int(burnin)
     thin = 1
-    if n_iter <= burnin:
-        raise ValueError("n_iter must be > burnin")
+    if n_iter <= 0:
+        raise ValueError("n_iter must be > 0")
     if not np.isfinite(float(min_abs_beta)) or float(min_abs_beta) < 0.0:
         raise ValueError("min_abs_beta is deprecated/ignored; keep it finite and >= 0")
     if not (0.0 < r2 < 1.0):
@@ -254,12 +270,13 @@ def _call_bayesb(
     float,
     int,
     int,
+    int,
 ]:
     n_iter = int(n_iter)
     burnin = int(burnin)
     thin = 1
-    if n_iter <= burnin:
-        raise ValueError("n_iter must be > burnin")
+    if n_iter <= 0:
+        raise ValueError("n_iter must be > 0")
     if not (0.0 < r2 < 1.0):
         raise ValueError("r2 must be in (0, 1)")
     if df0_b <= 0.0 or df0_e <= 0.0:
@@ -282,7 +299,7 @@ def _call_bayesb(
             raise ValueError("seed must be >= 0")
 
     fixed_pi = _validate_fixed_pi(pi)
-    return _bayesb(
+    native_result = _bayesb(
         y=y,
         m=m,
         x=x,
@@ -301,6 +318,9 @@ def _call_bayesb(
         s0_e=s0_e,
         seed=seed,
     )
+    # The native B/C ABI remains a 12-item tuple for PyO3 compatibility;
+    # expose the fixed posterior count at the Python API boundary.
+    return (*native_result, BAYES_POSTERIOR_SAMPLE_TARGET)
 
 
 def _call_bayesc(
@@ -331,12 +351,13 @@ def _call_bayesc(
     float,
     int,
     int,
+    int,
 ]:
     n_iter = int(n_iter)
     burnin = int(burnin)
     thin = 1
-    if n_iter <= burnin:
-        raise ValueError("n_iter must be > burnin")
+    if n_iter <= 0:
+        raise ValueError("n_iter must be > 0")
     if not (0.0 < r2 < 1.0):
         raise ValueError("r2 must be in (0, 1)")
     if df0_b <= 0.0 or df0_e <= 0.0:
@@ -355,7 +376,7 @@ def _call_bayesc(
             raise ValueError("seed must be >= 0")
 
     fixed_pi = _validate_fixed_pi(pi)
-    return _bayesc(
+    native_result = _bayesc(
         y=y,
         m=m,
         x=x,
@@ -372,6 +393,7 @@ def _call_bayesc(
         s0_e=s0_e,
         seed=seed,
     )
+    return (*native_result, BAYES_POSTERIOR_SAMPLE_TARGET)
 
 
 def BayesA(
@@ -401,6 +423,7 @@ def BayesA(
     float,
     int,
     int,
+    int,
 ]:
     """
     Python interface for the Rust BayesA kernel (PyO3).
@@ -419,9 +442,12 @@ def BayesA(
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
     n_iter : int, default=3000
-        Maximum iterations used for R-hat monitoring and posterior sampling.
+        Maximum iterations used for R-hat monitoring. After convergence, the
+        sampler collects exactly 1000 posterior samples; without convergence,
+        it collects a fallback 1000 samples after this limit.
     burnin : int, default=1000
-        Additional burn-in iterations after R-hat reaches the stability threshold.
+        Deprecated compatibility argument; the production sampler no longer
+        performs a second burn-in stage.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.5
@@ -461,15 +487,14 @@ def BayesA(
     varh2 : float
         Posterior variance of heritability.
     rhat_h2 : float
-        Split-chain R-hat of the retained posterior h2 samples.  The Rust
-        kernel may enter a post-convergence burn-in stage after repeated values
-        below its stability threshold.
+        Split-chain R-hat of the retained posterior h2 samples.
     actual_iterations : int
-        Number of MCMC updates actually performed, including any post-
-        convergence burn-in iterations.
-    post_burnin_start_iteration : int
-        One-based first iteration of the post-convergence burn-in stage, or 0
-        when the R-hat early-stop trigger was not reached.
+        Number of MCMC updates actually performed.
+    convergence_iteration : int
+        One-based iteration at which R-hat reached the stability threshold, or
+        0 when the fallback window was used.
+    posterior_samples : int
+        Number of posterior samples retained (normally exactly 1000).
     Raises
     ------
     ValueError
@@ -533,6 +558,7 @@ def BayesB(
     float,
     int,
     int,
+    int,
 ]:
     """
     Python interface for the Rust BayesB kernel (PyO3).
@@ -548,9 +574,10 @@ def BayesB(
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
     n_iter : int, default=3000
-        Maximum iterations used for R-hat monitoring and posterior sampling.
+        Maximum iterations used for R-hat monitoring, followed by a fixed
+        1000-sample posterior window.
     burnin : int, default=1000
-        Additional burn-in iterations after R-hat reaches the stability threshold.
+        Deprecated compatibility argument; ignored by the production sampler.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.5
@@ -599,11 +626,12 @@ def BayesB(
     rhat_h2 : float
         Split-chain R-hat of the retained posterior h2 samples.
     actual_iterations : int
-        Number of MCMC updates actually performed, including any post-
-        convergence burn-in iterations.
-    post_burnin_start_iteration : int
-        One-based first iteration of the post-convergence burn-in stage, or 0
-        when the R-hat early-stop trigger was not reached.
+        Number of MCMC updates actually performed.
+    convergence_iteration : int
+        One-based iteration at which R-hat reached the stability threshold, or
+        0 when the fallback window was used.
+    posterior_samples : int
+        Number of posterior samples retained (normally exactly 1000).
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
@@ -659,6 +687,7 @@ def BayesC(
     float,
     int,
     int,
+    int,
 ]:
     """
     Python interface for the Rust BayesC kernel (PyO3).
@@ -674,9 +703,10 @@ def BayesC(
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
     n_iter : int, default=3000
-        Maximum iterations used for R-hat monitoring and posterior sampling.
+        Maximum iterations used for R-hat monitoring, followed by a fixed
+        1000-sample posterior window.
     burnin : int, default=1000
-        Additional burn-in iterations after R-hat reaches the stability threshold.
+        Deprecated compatibility argument; ignored by the production sampler.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.5
@@ -721,11 +751,12 @@ def BayesC(
     rhat_h2 : float
         Split-chain R-hat of the retained posterior h2 samples.
     actual_iterations : int
-        Number of MCMC updates actually performed, including any post-
-        convergence burn-in iterations.
-    post_burnin_start_iteration : int
-        One-based first iteration of the post-convergence burn-in stage, or 0
-        when the R-hat early-stop trigger was not reached.
+        Number of MCMC updates actually performed.
+    convergence_iteration : int
+        One-based iteration at which R-hat reached the stability threshold, or
+        0 when the fallback window was used.
+    posterior_samples : int
+        Number of posterior samples retained (normally exactly 1000).
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
@@ -807,15 +838,14 @@ class BAYES:
         rhat_h2 : float
             Split-chain R-hat of the retained posterior h2 samples.
         rhat_max_iterations : int
-            Hard upper bound for R-hat monitoring and the complete chain.
-        post_convergence_burnin : int
-            Additional iterations discarded after the R-hat trigger.
+            Hard upper bound for R-hat monitoring.
+        convergence_iteration : int
+            Iteration at which R-hat converged, or 0 when the fallback window
+            was used.
+        posterior_samples : int
+            Number of posterior samples retained after monitoring.
         actual_iterations : int
-            Number of MCMC updates actually performed, including any post-
-            convergence burn-in iterations.
-        post_burnin_start_iteration : int
-            One-based first iteration of the post-convergence burn-in stage, or 0
-            when the R-hat early-stop trigger was not reached.
+            Number of MCMC updates actually performed.
         """
         method_map = {
             "BayesA": BayesA,
@@ -824,11 +854,13 @@ class BAYES:
         }
         if method not in method_map:
             raise ValueError(f"Unsupported Bayes method: {method}")
-        default_n_iter, default_burnin = bayes_mcmc_defaults(method)
+        default_n_iter, default_posterior_samples = bayes_mcmc_defaults(method)
         if n_iter is None:
             n_iter = int(default_n_iter)
         if burnin is None:
-            burnin = int(default_burnin)
+            # Keep the public argument for compatibility. The native sampler
+            # uses its fixed 1000-sample posterior target instead.
+            burnin = int(default_posterior_samples)
 
         r2_blup_pheno_scale: float | None = None
         if r2 is None:
@@ -854,10 +886,10 @@ class BAYES:
         self.rhat_h2: float = float("nan")
         self.rhat: float = float("nan")
         self.rhat_max_iterations: int = int(n_iter)
-        self.post_convergence_burnin: int = int(burnin)
+        self.posterior_sample_target: int = BAYES_POSTERIOR_SAMPLE_TARGET
         self.actual_iterations: int = 0
-        self.post_burnin_start_iteration: int = 0
-        self.burnin_start_iteration: int = 0
+        self.convergence_iteration: int = 0
+        self.posterior_samples: int = 0
         self.r2_used: float | None = float(r2)
         self.r2_blup: float | None = (
             float(r2_blup_pheno_scale) if r2_blup_pheno_scale is not None else float("nan")
@@ -894,10 +926,8 @@ class BAYES:
             self.pip_hat = np.ascontiguousarray(pip.reshape(-1, 1), dtype=np.float64)
         self.rhat_h2 = float(diagnostics["rhat_h2"])
         self.actual_iterations = int(diagnostics["actual_iterations"])
-        self.post_burnin_start_iteration = int(
-            diagnostics["post_burnin_start_iteration"]
-        )
-        self.burnin_start_iteration = self.post_burnin_start_iteration
+        self.convergence_iteration = int(diagnostics["convergence_iteration"])
+        self.posterior_samples = int(diagnostics["posterior_samples"])
         self.rhat = float(self.rhat_h2)
         
     def predict(self,M:np.ndarray,cov:np.ndarray=None):
@@ -924,6 +954,7 @@ bayesB = BayesB
 bayesC = BayesC
 __all__ = [
     "BAYES_MCMC_DEFAULTS",
+    "BAYES_POSTERIOR_SAMPLE_TARGET",
     "bayes_mcmc_defaults",
     "BayesA",
     "BayesB",

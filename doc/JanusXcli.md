@@ -154,9 +154,11 @@ Current GS model groups:
 probability, for example `-BayesB 0.05`. Without a numeric argument the
 inclusion probability is estimated during sampling.
 
-Bayesian GS uses a 3000-iteration R-hat upper limit (stability threshold 1.2)
-and runs 1000 additional burn-in iterations after the R-hat stability trigger;
-production sampling does not expose a thinning option.
+Bayesian GS uses a 3000-iteration R-hat upper limit (stability threshold 1.2).
+After R-hat converges, the next 1000 iterations are retained as posterior
+samples. If it does not converge by the limit, the following 1000 iterations
+form a fallback posterior window (maximum 4000 iterations). Production
+sampling does not expose a thinning option.
 - ML models: `-RF`, `-ET`, `-GBDT`, `-XGB`, `-SVM`, `-ENET`
 
 Useful notes:

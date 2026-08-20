@@ -24,9 +24,10 @@
 //! for GS. Each MCMC iteration updates fixed effects, residual variance, marker
 //! effects, and inclusion/variance hyperparameters. Production kernels monitor
 //! split-chain R-hat up to a hard iteration limit, discard pre-convergence
-//! samples, run the requested post-convergence burn-in, and return posterior
-//! means from the remaining iterations. Trace-only kernels retain explicit
-//! thinning for diagnostic plots.
+//! samples once the threshold is reached, and return means from the next 1000
+//! posterior samples. If the limit is reached without convergence, the next
+//! 1000 iterations form the fallback posterior window. Trace-only kernels
+//! retain explicit thinning for diagnostic plots.
 
 use numpy::ndarray::Array2;
 use numpy::{
@@ -125,10 +126,11 @@ fn posterior_keep_iters(n_iter: usize, burnin: usize, thin: usize) -> Vec<i64> {
 // from the retained posterior h2 samples.  The two consecutive halves are
 // treated as two chains; this is useful for detecting a persistent drift in the
 // scalar variance component while keeping the production kernels streaming.
-const BAYES_RHAT_THRESHOLD: f64 = 1.20;
-const BAYES_RHAT_MIN_KEEP: usize = 300;
+const BAYES_RHAT_THRESHOLD: f64 = 1.10;
+const BAYES_RHAT_MIN_KEEP: usize = 500;
 const BAYES_RHAT_CHECK_EVERY: usize = 50;
 const BAYES_RHAT_STABLE_CHECKS: usize = 3;
+const BAYES_POSTERIOR_SAMPLES: usize = 1000;
 
 #[derive(Debug, Default)]
 struct BayesRhatState {
@@ -193,99 +195,96 @@ impl BayesRhatState {
     }
 }
 
-/// Controls R-hat monitoring, post-convergence burn-in, and posterior
-/// collection. `n_iter` is the hard upper bound for the complete chain. The
-/// burn-in is applied only after R-hat has stabilized; samples before that
-/// point are discarded. This avoids treating a fixed prefix (for example,
-/// iterations 1..2000) as burn-in before convergence is known.
+/// Controls R-hat monitoring and posterior collection. `n_iter` is the upper
+/// bound for the monitoring phase. Once R-hat stabilizes, the pre-trigger
+/// summaries are discarded and exactly `BAYES_POSTERIOR_SAMPLES` subsequent
+/// samples are retained. If the monitoring phase reaches `n_iter` without
+/// convergence, the same posterior collection phase starts as a fallback.
 #[derive(Debug)]
 struct BayesSamplingController {
     n_iter: usize,
-    burnin: usize,
     thin: usize,
     actual_iterations: usize,
-    n_keep: usize,
+    posterior_samples: usize,
     rhat_state: BayesRhatState,
     convergence_iteration: usize,
-    burnin_end_iteration: usize,
-    post_rhat_triggered: bool,
+    collecting_posterior: bool,
 }
 
 impl BayesSamplingController {
-    fn new(n_iter: usize, burnin: usize, thin: usize) -> Self {
+    fn new(n_iter: usize, _burnin: usize, thin: usize) -> Self {
         let thin = thin.max(1);
-        let target_keep = n_iter / thin + 1;
+        let target_keep = BAYES_POSTERIOR_SAMPLES / thin + 1;
         Self {
             n_iter,
-            burnin,
             thin,
             actual_iterations: 0,
-            n_keep: 0,
+            posterior_samples: 0,
             rhat_state: BayesRhatState::with_capacity(target_keep + 1),
             convergence_iteration: 0,
-            burnin_end_iteration: 0,
-            post_rhat_triggered: false,
+            collecting_posterior: false,
         }
     }
 
     #[inline]
     fn should_run(&self) -> bool {
-        self.actual_iterations < self.n_iter
+        if self.collecting_posterior {
+            self.posterior_samples < BAYES_POSTERIOR_SAMPLES
+        } else {
+            // A low-level caller may request `thin > 1`. Allow the monitor
+            // to reach the first retained iteration at or after `n_iter`, so
+            // the fallback transition is still observed instead of exiting
+            // with zero posterior samples. Production GS fixes thin=1.
+            let remainder = self.n_iter.saturating_sub(1) % self.thin;
+            let monitor_end = self.n_iter + (self.thin - remainder) % self.thin;
+            self.actual_iterations < monitor_end
+        }
     }
 
-    /// Advance one MCMC iteration and report whether it should be retained.
+    /// Advance one MCMC iteration and report whether its summary is retained.
     #[inline]
     fn begin_iteration(&mut self) -> bool {
         self.actual_iterations += 1;
-
-        if !self.post_rhat_triggered {
-            // Every iteration is monitored until convergence. `thin` is kept
-            // as a low-level compatibility option, but the public GS API
-            // always uses thin=1.
-            let it = self.actual_iterations - 1;
-            return it % self.thin == 0;
-        }
-
-        // Iterations immediately after the R-hat trigger are post-
-        // convergence burn-in and are deliberately not retained.
-        self.actual_iterations > self.burnin_end_iteration
-            && ((self.actual_iterations - self.burnin_end_iteration - 1) % self.thin == 0)
+        let it = self.actual_iterations - 1;
+        it % self.thin == 0
     }
 
-    /// Observe a retained h2 sample. Returns true only for the iteration that
-    /// first reaches the stable-R-hat trigger and therefore requires callers
-    /// to clear their model-specific posterior accumulators.
+    /// Observe a retained h2 sample. Returns true when the monitoring summary
+    /// must be cleared before the next iteration starts formal posterior
+    /// collection.
     #[inline]
     fn observe(&mut self, h2: f64) -> bool {
-        self.n_keep += 1;
-        if !self.post_rhat_triggered {
-            if self.rhat_state.observe(h2) {
-                // A late convergence trigger must not consume the entire
-                // remaining chain in burn-in. Keep the pre-trigger posterior
-                // in that case; otherwise there would be no valid sample to
-                // report after the requested post-convergence burn-in.
-                if self.actual_iterations.saturating_add(self.burnin) >= self.n_iter {
-                    return false;
-                }
-                self.post_rhat_triggered = true;
-                self.convergence_iteration = self.actual_iterations;
-                self.burnin_end_iteration = self.actual_iterations.saturating_add(self.burnin);
-
-                self.n_keep = 0;
-                self.rhat_state.reset();
-                return true;
-            }
-        } else {
-            // The post-convergence samples are the estimates we report, so
-            // compute the final diagnostic from this fresh posterior window.
+        if self.collecting_posterior {
+            self.posterior_samples += 1;
             let _ = self.rhat_state.observe(h2);
+            return false;
         }
+
+        if self.rhat_state.observe(h2) {
+            self.collecting_posterior = true;
+            self.convergence_iteration = self.actual_iterations;
+            self.posterior_samples = 0;
+            self.rhat_state.reset();
+            return true;
+        }
+
+        // No convergence by the monitoring upper bound: use the following
+        // 1000 iterations as the fallback posterior window. There is no
+        // convergence iteration to report in this branch.
+        if self.actual_iterations >= self.n_iter {
+            self.collecting_posterior = true;
+            self.convergence_iteration = 0;
+            self.posterior_samples = 0;
+            self.rhat_state.reset();
+            return true;
+        }
+
         false
     }
 
     #[inline]
-    fn n_keep(&self) -> usize {
-        self.n_keep
+    fn posterior_samples(&self) -> usize {
+        self.posterior_samples
     }
 
     #[inline]
@@ -1074,6 +1073,7 @@ fn bayesb_core_impl(
         f64,
         usize,
         usize,
+        usize,
     ),
     String,
 > {
@@ -1343,9 +1343,9 @@ fn bayesb_core_impl(
         }
     }
 
-    let n_keep = schedule.n_keep();
+    let n_keep = schedule.posterior_samples();
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept after the R-hat monitoring phase".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -1367,11 +1367,8 @@ fn bayesb_core_impl(
     let n_active_mean = n_active_sum * inv_keep;
     let rhat_h2 = schedule.rhat_value();
     let actual_iterations = schedule.actual_iterations;
-    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
-        0
-    } else {
-        schedule.convergence_iteration.saturating_add(1)
-    };
+    let convergence_iteration = schedule.convergence_iteration;
+    let posterior_samples = schedule.posterior_samples();
 
     Ok((
         beta_sum,
@@ -1385,7 +1382,8 @@ fn bayesb_core_impl(
         pip_sum,
         rhat_h2,
         actual_iterations,
-        burnin_start_iteration,
+        convergence_iteration,
+        posterior_samples,
     ))
 }
 
@@ -1420,6 +1418,7 @@ fn bayesc_core_impl(
         f64,
         Vec<f64>,
         f64,
+        usize,
         usize,
         usize,
     ),
@@ -1677,9 +1676,9 @@ fn bayesc_core_impl(
         }
     }
 
-    let n_keep = schedule.n_keep();
+    let n_keep = schedule.posterior_samples();
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept after the R-hat monitoring phase".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -1701,11 +1700,8 @@ fn bayesc_core_impl(
     let n_active_mean = n_active_sum * inv_keep;
     let rhat_h2 = schedule.rhat_value();
     let actual_iterations = schedule.actual_iterations;
-    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
-        0
-    } else {
-        schedule.convergence_iteration.saturating_add(1)
-    };
+    let convergence_iteration = schedule.convergence_iteration;
+    let posterior_samples = schedule.posterior_samples();
 
     Ok((
         beta_sum,
@@ -1719,7 +1715,8 @@ fn bayesc_core_impl(
         pip_sum,
         rhat_h2,
         actual_iterations,
-        burnin_start_iteration,
+        convergence_iteration,
+        posterior_samples,
     ))
 }
 
@@ -1751,6 +1748,7 @@ fn bayesa_core_impl(
         f64,
         f64,
         f64,
+        usize,
         usize,
         usize,
     ),
@@ -1967,9 +1965,9 @@ fn bayesa_core_impl(
         }
     }
 
-    let n_keep = schedule.n_keep();
+    let n_keep = schedule.posterior_samples();
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept after the R-hat monitoring phase".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -1988,11 +1986,8 @@ fn bayesa_core_impl(
     }
     let rhat_h2 = schedule.rhat_value();
     let actual_iterations = schedule.actual_iterations;
-    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
-        0
-    } else {
-        schedule.convergence_iteration.saturating_add(1)
-    };
+    let convergence_iteration = schedule.convergence_iteration;
+    let posterior_samples = schedule.posterior_samples();
     Ok((
         beta_sum,
         alpha_sum,
@@ -2002,7 +1997,8 @@ fn bayesa_core_impl(
         var_h2,
         rhat_h2,
         actual_iterations,
-        burnin_start_iteration,
+        convergence_iteration,
+        posterior_samples,
     ))
 }
 
@@ -2042,6 +2038,7 @@ fn bayesa_packed_core_impl(
         f64,
         f64,
         f64,
+        usize,
         usize,
         usize,
     ),
@@ -2327,9 +2324,9 @@ fn bayesa_packed_core_impl(
         }
     }
 
-    let n_keep = schedule.n_keep();
+    let n_keep = schedule.posterior_samples();
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept after the R-hat monitoring phase".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -2348,11 +2345,8 @@ fn bayesa_packed_core_impl(
     }
     let rhat_h2 = schedule.rhat_value();
     let actual_iterations = schedule.actual_iterations;
-    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
-        0
-    } else {
-        schedule.convergence_iteration.saturating_add(1)
-    };
+    let convergence_iteration = schedule.convergence_iteration;
+    let posterior_samples = schedule.posterior_samples();
     Ok((
         beta_sum,
         alpha_sum,
@@ -2362,7 +2356,8 @@ fn bayesa_packed_core_impl(
         var_h2,
         rhat_h2,
         actual_iterations,
-        burnin_start_iteration,
+        convergence_iteration,
+        posterior_samples,
     ))
 }
 
@@ -2407,6 +2402,7 @@ fn bayesb_packed_core_impl(
         f64,
         Vec<f64>,
         f64,
+        usize,
         usize,
         usize,
     ),
@@ -2769,9 +2765,9 @@ fn bayesb_packed_core_impl(
         }
     }
 
-    let n_keep = schedule.n_keep();
+    let n_keep = schedule.posterior_samples();
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept after the R-hat monitoring phase".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -2793,11 +2789,8 @@ fn bayesb_packed_core_impl(
     let n_active_mean = n_active_sum * inv_keep;
     let rhat_h2 = schedule.rhat_value();
     let actual_iterations = schedule.actual_iterations;
-    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
-        0
-    } else {
-        schedule.convergence_iteration.saturating_add(1)
-    };
+    let convergence_iteration = schedule.convergence_iteration;
+    let posterior_samples = schedule.posterior_samples();
 
     Ok((
         beta_sum,
@@ -2811,7 +2804,8 @@ fn bayesb_packed_core_impl(
         pip_sum,
         rhat_h2,
         actual_iterations,
-        burnin_start_iteration,
+        convergence_iteration,
+        posterior_samples,
     ))
 }
 
@@ -2854,6 +2848,7 @@ fn bayesc_packed_core_impl(
         f64,
         Vec<f64>,
         f64,
+        usize,
         usize,
         usize,
     ),
@@ -3196,9 +3191,9 @@ fn bayesc_packed_core_impl(
         }
     }
 
-    let n_keep = schedule.n_keep();
+    let n_keep = schedule.posterior_samples();
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept after the R-hat monitoring phase".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -3220,11 +3215,8 @@ fn bayesc_packed_core_impl(
     let n_active_mean = n_active_sum * inv_keep;
     let rhat_h2 = schedule.rhat_value();
     let actual_iterations = schedule.actual_iterations;
-    let burnin_start_iteration = if schedule.convergence_iteration == 0 {
-        0
-    } else {
-        schedule.convergence_iteration.saturating_add(1)
-    };
+    let convergence_iteration = schedule.convergence_iteration;
+    let posterior_samples = schedule.posterior_samples();
 
     Ok((
         beta_sum,
@@ -3238,7 +3230,8 @@ fn bayesc_packed_core_impl(
         pip_sum,
         rhat_h2,
         actual_iterations,
-        burnin_start_iteration,
+        convergence_iteration,
+        posterior_samples,
     ))
 }
 
@@ -3287,9 +3280,10 @@ pub fn bayesa(
     f64,
     usize,
     usize,
+    usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -3374,6 +3368,7 @@ pub fn bayesa(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -3388,6 +3383,7 @@ pub fn bayesa(
                 rhat_h2,
                 actual_iterations,
                 convergence_iteration,
+                posterior_samples,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -3447,8 +3443,8 @@ pub fn bayesb(
     usize,
     usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -3539,6 +3535,7 @@ pub fn bayesb(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            _posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -3612,8 +3609,8 @@ pub fn bayesc(
     usize,
     usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -3709,6 +3706,7 @@ pub fn bayesc(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            _posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -3791,9 +3789,10 @@ pub fn bayesa_packed(
     f64,
     usize,
     usize,
+    usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -3940,6 +3939,7 @@ pub fn bayesa_packed(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -3954,6 +3954,7 @@ pub fn bayesa_packed(
                 rhat_h2,
                 actual_iterations,
                 convergence_iteration,
+                posterior_samples,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -4027,8 +4028,8 @@ pub fn bayesb_packed(
     usize,
     usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -4181,6 +4182,7 @@ pub fn bayesb_packed(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            _posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -4268,8 +4270,8 @@ pub fn bayesc_packed(
     usize,
     usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -4427,6 +4429,7 @@ pub fn bayesc_packed(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            _posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -4515,9 +4518,10 @@ pub fn bayesa_stream_bed(
     f64,
     usize,
     usize,
+    usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -4654,6 +4658,7 @@ pub fn bayesa_stream_bed(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -4668,6 +4673,7 @@ pub fn bayesa_stream_bed(
                 rhat_h2,
                 actual_iterations,
                 convergence_iteration,
+                posterior_samples,
             ))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
@@ -4747,8 +4753,8 @@ pub fn bayesb_stream_bed(
     usize,
     usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -4891,6 +4897,7 @@ pub fn bayesb_stream_bed(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            _posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -4984,8 +4991,8 @@ pub fn bayesc_stream_bed(
     usize,
     usize,
 )> {
-    if n_iter <= burnin {
-        return Err(PyValueError::new_err("n_iter must be > burnin"));
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
     }
     if thin == 0 {
         return Err(PyValueError::new_err("thin must be >= 1"));
@@ -5133,6 +5140,7 @@ pub fn bayesc_stream_bed(
             rhat_h2,
             actual_iterations,
             convergence_iteration,
+            _posterior_samples,
         )) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
@@ -5466,7 +5474,7 @@ fn bayesa_packed_trace_core_impl(
     }
 
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept for the requested trace iterations".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -5874,7 +5882,7 @@ fn bayesb_packed_trace_core_impl(
     }
 
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept for the requested trace iterations".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;
@@ -6264,7 +6272,7 @@ fn bayesc_packed_trace_core_impl(
     }
 
     if n_keep == 0 {
-        return Err("No posterior samples kept; R-hat convergence left no post-convergence samples before the iteration limit".to_string());
+        return Err("No posterior samples kept for the requested trace iterations".to_string());
     }
 
     let inv_keep = 1.0 / n_keep as f64;

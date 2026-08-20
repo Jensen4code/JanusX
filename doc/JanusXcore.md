@@ -255,9 +255,13 @@ Use:
   `BayesB`/`BayesC` to keep the marker inclusion probability fixed.
 
 Bayesian sampling uses a unified default of a 3000-iteration R-hat monitoring
-limit (stability threshold 1.2) followed by 1000 additional post-convergence
-burn-in iterations. The public Python wrappers expose only these two chain
-controls; thinning is fixed at one for production GS.
+limit (stability threshold 1.2). Once R-hat converges, the monitoring summary
+is discarded and the next 1000 iterations are retained as posterior samples.
+If convergence is not reached by the limit, the following 1000 iterations are
+used as a fallback posterior window, so the maximum chain length is 4000.
+The public Python wrappers keep `burnin` as a compatibility argument but it no
+longer controls a second burn-in stage; thinning is fixed at one for production
+GS.
 
 The Bayesian imports live in `janusx.pyBLUP.bayes`, not in `janusx.pyBLUP` top-level exports.
 

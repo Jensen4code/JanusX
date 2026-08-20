@@ -11424,7 +11424,7 @@ def GSapi(
                 packed_backend = (
                     "resident" if use_packed_resident_native else "stream"
                 )
-                bayes_n_iter, bayes_burnin = _bayes_mcmc_defaults(method)
+                bayes_n_iter, bayes_posterior_target = _bayes_mcmc_defaults(method)
                 packed_kwargs: dict[str, typing.Any] = {
                     "y": y_vec,
                     "n_samples": int(n_total_samples),
@@ -11444,7 +11444,9 @@ def GSapi(
                     "sample_indices": train_abs,
                     "x": None,
                     "n_iter": int(bayes_n_iter),
-                    "burnin": int(bayes_burnin),
+                    # Kept for native API compatibility; the sampler uses a
+                    # fixed 1000-sample posterior window after monitoring.
+                    "burnin": int(bayes_posterior_target),
                     "r2": float(r2_used),
                     "threads": int(max(0, int(n_jobs))),
                     "seed": None,
@@ -11498,8 +11500,11 @@ def GSapi(
                 bayes_pip = typing.cast(np.ndarray | None, bayes_diagnostics["pip"])
                 bayes_rhat = float(bayes_diagnostics["rhat_h2"])
                 bayes_actual_iterations = int(bayes_diagnostics["actual_iterations"])
-                bayes_post_burnin_start = int(
-                    bayes_diagnostics["post_burnin_start_iteration"]
+                bayes_convergence_iteration = int(
+                    bayes_diagnostics["convergence_iteration"]
+                )
+                bayes_posterior_samples = int(
+                    bayes_diagnostics["posterior_samples"]
                 )
 
                 if bayes_runtime_state is not None:
@@ -11519,13 +11524,15 @@ def GSapi(
                     bayes_runtime_state["rhat_h2"] = float(bayes_rhat)
                     bayes_runtime_state["rhat"] = float(bayes_rhat)
                     bayes_runtime_state["rhat_max_iterations"] = int(bayes_n_iter)
-                    bayes_runtime_state["post_convergence_burnin"] = int(bayes_burnin)
-                    bayes_runtime_state["actual_iterations"] = int(bayes_actual_iterations)
-                    bayes_runtime_state["post_burnin_start_iteration"] = int(
-                        bayes_post_burnin_start
+                    bayes_runtime_state["posterior_sample_target"] = int(
+                        bayes_posterior_target
                     )
-                    bayes_runtime_state["burnin_start_iteration"] = int(
-                        bayes_post_burnin_start
+                    bayes_runtime_state["actual_iterations"] = int(bayes_actual_iterations)
+                    bayes_runtime_state["convergence_iteration"] = int(
+                        bayes_convergence_iteration
+                    )
+                    bayes_runtime_state["posterior_samples"] = int(
+                        bayes_posterior_samples
                     )
 
                 if need_train_pred:
@@ -11597,12 +11604,16 @@ def GSapi(
                     model_state["rhat_h2"] = float(bayes_rhat)
                     model_state["rhat"] = float(bayes_rhat)
                     model_state["rhat_max_iterations"] = int(bayes_n_iter)
-                    model_state["post_convergence_burnin"] = int(bayes_burnin)
-                    model_state["actual_iterations"] = int(bayes_actual_iterations)
-                    model_state["post_burnin_start_iteration"] = int(
-                        bayes_post_burnin_start
+                    model_state["posterior_sample_target"] = int(
+                        bayes_posterior_target
                     )
-                    model_state["burnin_start_iteration"] = int(bayes_post_burnin_start)
+                    model_state["actual_iterations"] = int(bayes_actual_iterations)
+                    model_state["convergence_iteration"] = int(
+                        bayes_convergence_iteration
+                    )
+                    model_state["posterior_samples"] = int(
+                        bayes_posterior_samples
+                    )
                 return (
                     np.asarray(train_pred, dtype=float).reshape(-1, 1),
                     np.asarray(test_pred, dtype=float).reshape(-1, 1),
@@ -11657,17 +11668,17 @@ def GSapi(
             bayes_runtime_state["rhat_max_iterations"] = int(
                 getattr(model, "rhat_max_iterations", 0)
             )
-            bayes_runtime_state["post_convergence_burnin"] = int(
-                getattr(model, "post_convergence_burnin", 0)
+            bayes_runtime_state["posterior_sample_target"] = int(
+                getattr(model, "posterior_sample_target", 1000)
             )
             bayes_runtime_state["actual_iterations"] = int(
                 getattr(model, "actual_iterations", 0)
             )
-            bayes_runtime_state["post_burnin_start_iteration"] = int(
-                getattr(model, "post_burnin_start_iteration", 0)
+            bayes_runtime_state["convergence_iteration"] = int(
+                getattr(model, "convergence_iteration", 0)
             )
-            bayes_runtime_state["burnin_start_iteration"] = int(
-                getattr(model, "post_burnin_start_iteration", 0)
+            bayes_runtime_state["posterior_samples"] = int(
+                getattr(model, "posterior_samples", 0)
             )
         if need_train_pred:
             if train_pred_idx is None:
@@ -11706,15 +11717,15 @@ def GSapi(
             model_state["rhat_max_iterations"] = int(
                 getattr(model, "rhat_max_iterations", 0)
             )
-            model_state["post_convergence_burnin"] = int(
-                getattr(model, "post_convergence_burnin", 0)
+            model_state["posterior_sample_target"] = int(
+                getattr(model, "posterior_sample_target", 1000)
             )
             model_state["actual_iterations"] = int(getattr(model, "actual_iterations", 0))
-            model_state["post_burnin_start_iteration"] = int(
-                getattr(model, "post_burnin_start_iteration", 0)
+            model_state["convergence_iteration"] = int(
+                getattr(model, "convergence_iteration", 0)
             )
-            model_state["burnin_start_iteration"] = int(
-                getattr(model, "post_burnin_start_iteration", 0)
+            model_state["posterior_samples"] = int(
+                getattr(model, "posterior_samples", 0)
             )
         return (
             np.asarray(train_pred, dtype=float).reshape(-1, 1),
@@ -11857,11 +11868,13 @@ def _run_method_task(
     bayes_r2_rows: list[float] = []
     bayes_rhat_rows: list[float] = []
     bayes_actual_iterations_rows: list[int] = []
-    bayes_post_burnin_start_rows: list[int] = []
+    bayes_convergence_iteration_rows: list[int] = []
+    bayes_posterior_samples_rows: list[int] = []
     bayes_r2_final = float("nan")
     bayes_rhat_final = float("nan")
     bayes_actual_iterations_final = 0
-    bayes_post_burnin_start_final = 0
+    bayes_convergence_iteration_final = 0
+    bayes_posterior_samples_final = 0
     bayes_final_sampling_metadata_seen = False
     bayes_r2_source_final = ""
     bayes_r2_n_used_final = 0
@@ -12889,14 +12902,21 @@ def _run_method_task(
                     except Exception:
                         actual_call = 0
                     try:
-                        post_start_call = int(
-                            bayes_state_call.get("post_burnin_start_iteration", 0) or 0
+                        convergence_call = int(
+                            bayes_state_call.get("convergence_iteration", 0) or 0
                         )
                     except Exception:
-                        post_start_call = 0
+                        convergence_call = 0
+                    try:
+                        posterior_samples_call = int(
+                            bayes_state_call.get("posterior_samples", 0) or 0
+                        )
+                    except Exception:
+                        posterior_samples_call = 0
                     if actual_call > 0:
                         bayes_actual_iterations_rows.append(actual_call)
-                    bayes_post_burnin_start_rows.append(max(0, post_start_call))
+                    bayes_convergence_iteration_rows.append(max(0, convergence_call))
+                    bayes_posterior_samples_rows.append(max(0, posterior_samples_call))
                 if (
                     method == "rrBLUP"
                     and rrblup_cv_reuse_enabled
@@ -13687,7 +13707,7 @@ def _run_method_task(
         if method in {"BayesA", "BayesB", "BayesC"} and bayes_state_final is not None:
             bayes_final_sampling_metadata_seen = bool(
                 "actual_iterations" in bayes_state_final
-                or "post_burnin_start_iteration" in bayes_state_final
+                or "posterior_samples" in bayes_state_final
             )
             r2_used_final = float(bayes_state_final.get("r2_used", np.nan))
             if np.isfinite(r2_used_final):
@@ -13727,11 +13747,17 @@ def _run_method_task(
             except Exception:
                 bayes_actual_iterations_final = 0
             try:
-                bayes_post_burnin_start_final = int(
-                    bayes_state_final.get("post_burnin_start_iteration", 0) or 0
+                bayes_convergence_iteration_final = int(
+                    bayes_state_final.get("convergence_iteration", 0) or 0
                 )
             except Exception:
-                bayes_post_burnin_start_final = 0
+                bayes_convergence_iteration_final = 0
+            try:
+                bayes_posterior_samples_final = int(
+                    bayes_state_final.get("posterior_samples", 0) or 0
+                )
+            except Exception:
+                bayes_posterior_samples_final = 0
         if method == "rrBLUP" and rr_state_final is not None:
             mode_used = str((rr_cfg_final or {}).get("pve_mode", "lambda")).strip().lower()
             if mode_used not in {"lambda", "trainvar"}:
@@ -13855,14 +13881,27 @@ def _run_method_task(
     if (
         method in {"BayesA", "BayesB", "BayesC"}
         and (not bayes_final_sampling_metadata_seen)
-        and bayes_post_burnin_start_final <= 0
-        and len(bayes_post_burnin_start_rows) > 0
+        and bayes_convergence_iteration_final <= 0
+        and len(bayes_convergence_iteration_rows) > 0
     ):
-        # A zero means that no chain reached the post-convergence stage.  If
-        # any fold did trigger it, preserve the first positive start index.
-        positive_starts = [x for x in bayes_post_burnin_start_rows if int(x) > 0]
-        if positive_starts:
-            bayes_post_burnin_start_final = int(min(positive_starts))
+        # A zero means that no chain reached the R-hat threshold. If any fold
+        # did converge, preserve the first positive convergence iteration.
+        positive_iterations = [
+            x for x in bayes_convergence_iteration_rows if int(x) > 0
+        ]
+        if positive_iterations:
+            bayes_convergence_iteration_final = int(min(positive_iterations))
+    if (
+        method in {"BayesA", "BayesB", "BayesC"}
+        and (not bayes_final_sampling_metadata_seen)
+        and bayes_posterior_samples_final <= 0
+        and len(bayes_posterior_samples_rows) > 0
+    ):
+        positive_samples = [x for x in bayes_posterior_samples_rows if int(x) > 0]
+        if positive_samples:
+            bayes_posterior_samples_final = int(round(float(np.nanmean(
+                np.asarray(positive_samples, dtype=np.float64)
+            ))))
     if (
         method in {"BayesA", "BayesB", "BayesC"}
         and (bayes_r2_source_final == "")
@@ -13909,7 +13948,8 @@ def _run_method_task(
         "bayes_r2_final": float(bayes_r2_final),
         "bayes_rhat_final": float(bayes_rhat_final),
         "bayes_actual_iterations_final": int(bayes_actual_iterations_final),
-        "bayes_post_burnin_start_final": int(bayes_post_burnin_start_final),
+        "bayes_convergence_iteration_final": int(bayes_convergence_iteration_final),
+        "bayes_posterior_samples_final": int(bayes_posterior_samples_final),
         "bayes_r2_source_final": str(bayes_r2_source_final),
         "bayes_r2_n_used_final": int(bayes_r2_n_used_final),
         "bayes_r2_n_total_final": int(bayes_r2_n_total_final),
@@ -14594,8 +14634,6 @@ def _run_methods_parallel(
             return rows
 
         if m in {"BayesA", "BayesB", "BayesC"}:
-            n_iter, burnin = _bayes_mcmc_defaults(m)
-            rows.append(("rhat_max_iter/burnin", f"{n_iter}/{burnin}"))
             r2_blup = float(result.get("bayes_r2_final", np.nan))
             r2_src = str(result.get("bayes_r2_source_final", "")).strip()
             r2_n_used = int(max(0, int(result.get("bayes_r2_n_used_final", 0) or 0)))
@@ -14622,23 +14660,35 @@ def _run_methods_parallel(
                     )
             rows.append(("Rhat(h2)", f"{rhat:.3f}" if np.isfinite(rhat) else "NA"))
             actual_iterations = int(result.get("bayes_actual_iterations_final", 0) or 0)
-            post_burnin_start = int(result.get("bayes_post_burnin_start_final", 0) or 0)
+            convergence_iteration = int(
+                result.get("bayes_convergence_iteration_final", 0) or 0
+            )
+            posterior_samples = int(
+                result.get("bayes_posterior_samples_final", 0) or 0
+            )
             if actual_iterations <= 0:
                 state_obj = result.get("model_state", None)
                 if isinstance(state_obj, typing.Mapping):
                     actual_iterations = int(state_obj.get("actual_iterations", 0) or 0)
-                    post_burnin_start = int(
-                        state_obj.get("post_burnin_start_iteration", post_burnin_start) or 0
+                    convergence_iteration = int(
+                        state_obj.get("convergence_iteration", convergence_iteration) or 0
                     )
-            rows.append(("actual_iterations", str(actual_iterations) if actual_iterations > 0 else "NA"))
+                    posterior_samples = int(
+                        state_obj.get("posterior_samples", posterior_samples) or 0
+                    )
             rows.append(
                 (
-                    "burnin_start_iteration",
-                    str(post_burnin_start) if post_burnin_start > 0 else "NA",
+                    "convergence_iteration",
+                    str(convergence_iteration) if convergence_iteration > 0 else "NA",
                 )
             )
-            if post_burnin_start > 0:
-                rows.append(("post_convergence_burnin", str(burnin)))
+            rows.append(
+                (
+                    "posterior_samples",
+                    str(posterior_samples) if posterior_samples > 0 else "NA",
+                )
+            )
+            rows.append(("actual_iterations", str(actual_iterations) if actual_iterations > 0 else "NA"))
             return rows
 
         if m in _ML_METHOD_MAP:
@@ -22583,8 +22633,6 @@ def _run_gs_pipeline_impl(
                     return rows
 
                 if m in {"BayesA", "BayesB", "BayesC"}:
-                    n_iter, burnin = _bayes_mcmc_defaults(m)
-                    rows.append(("rhat_max_iter/burnin", f"{n_iter}/{burnin}"))
                     if m in {"BayesB", "BayesC"}:
                         rows.append(("prob_in/counts", "0.5/5.0"))
                     rhat = _detail_float_or_nan(res_obj.get("bayes_rhat_final", np.nan))
@@ -22598,33 +22646,43 @@ def _run_gs_pipeline_impl(
                     actual_iterations = int(
                         res_obj.get("bayes_actual_iterations_final", 0) or 0
                     )
-                    post_burnin_start = int(
-                        res_obj.get("bayes_post_burnin_start_final", 0) or 0
+                    convergence_iteration = int(
+                        res_obj.get("bayes_convergence_iteration_final", 0) or 0
+                    )
+                    posterior_samples = int(
+                        res_obj.get("bayes_posterior_samples_final", 0) or 0
                     )
                     if actual_iterations <= 0:
                         state_obj = res_obj.get("model_state", None)
                         if isinstance(state_obj, typing.Mapping):
                             actual_iterations = int(state_obj.get("actual_iterations", 0) or 0)
-                            post_burnin_start = int(
+                            convergence_iteration = int(
                                 state_obj.get(
-                                    "post_burnin_start_iteration", post_burnin_start
+                                    "convergence_iteration", convergence_iteration
                                 )
                                 or 0
                             )
+                            posterior_samples = int(
+                                state_obj.get("posterior_samples", posterior_samples) or 0
+                            )
+                    rows.append(
+                        (
+                            "convergence_iteration",
+                            str(convergence_iteration) if convergence_iteration > 0 else "NA",
+                        )
+                    )
+                    rows.append(
+                        (
+                            "posterior_samples",
+                            str(posterior_samples) if posterior_samples > 0 else "NA",
+                        )
+                    )
                     rows.append(
                         (
                             "actual_iterations",
                             str(actual_iterations) if actual_iterations > 0 else "NA",
                         )
                     )
-                    rows.append(
-                        (
-                            "burnin_start_iteration",
-                            str(post_burnin_start) if post_burnin_start > 0 else "NA",
-                        )
-                    )
-                    if post_burnin_start > 0:
-                        rows.append(("post_convergence_burnin", str(burnin)))
                     return rows
 
                 return rows
