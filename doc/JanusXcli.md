@@ -283,7 +283,6 @@ Use launcher `jx` when you want the full external workflow to run.
 - `simulation`: extended simulation and benchmarking workflow
 - `benchmark`: FarmCPU benchmark workflow
 - `gblupbench`: GBLUP benchmark workflow
-- `bayesbench`: packed Bayes kernel benchmark workflow
 - `garfieldbench`: GARFIELD local-interval benchmark workflow
 
 ## 5. Practical notes
