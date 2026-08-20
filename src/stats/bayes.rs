@@ -38,7 +38,7 @@ use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyDict};
 use pyo3::{prelude::*, BoundObject};
 use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng, TryRngCore};
@@ -49,14 +49,110 @@ use std::env;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, OnceLock};
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::{vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32};
+
+#[cfg(all(test, target_arch = "aarch64"))]
+use std::arch::aarch64::{
+    vcvt_f64_f32, vdupq_n_f64, vfmaq_f64, vget_high_f32, vget_low_f32, vld1q_f64, vst1q_f64,
+};
+
 use crate::bedmath::{decode_standardized_packed_block_f32, is_identity_indices};
+#[cfg(test)]
+use crate::blas::cblas_daxpy_dispatch;
 use crate::blas::{
-    cblas_daxpy_dispatch, cblas_ddot_dispatch, cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard,
-    CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+    cblas_ddot_dispatch, cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
+    CBLAS_NO_TRANS, CBLAS_TRANS,
 };
 use crate::decode::decode_prepared_additive_block_packed_f32;
 use crate::gload::WindowedBedMatrix;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
+
+/// Dense marker input held for the duration of a native sampler call.
+///
+/// A contiguous float32 NumPy array is kept as a `PyReadonlyArray2` so its
+/// borrow remains active while the GIL is detached.  The sampler can then
+/// read the marker rows directly without first allocating and copying a
+/// second `Vec<f32>`.  Non-contiguous and float64 inputs use the owned
+/// fallback, preserving the old logical row-major conversion semantics.
+pub(crate) enum DenseF32Input<'py> {
+    Borrowed {
+        array: PyReadonlyArray2<'py, f32>,
+        rows: usize,
+        cols: usize,
+    },
+    Owned {
+        data: Vec<f32>,
+        rows: usize,
+        cols: usize,
+    },
+}
+
+impl DenseF32Input<'_> {
+    #[inline]
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            Self::Borrowed { rows, .. } | Self::Owned { rows, .. } => *rows,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn cols(&self) -> usize {
+        match self {
+            Self::Borrowed { cols, .. } | Self::Owned { cols, .. } => *cols,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Borrowed { array, .. } => array
+                .as_slice()
+                .expect("borrowed dense float32 input must be contiguous"),
+            Self::Owned { data, .. } => data,
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_borrowed(&self) -> bool {
+        matches!(self, Self::Borrowed { .. })
+    }
+}
+
+pub(crate) fn array2_to_f32_input<'py>(
+    obj: &Bound<'py, PyAny>,
+    label: &str,
+) -> PyResult<DenseF32Input<'py>> {
+    if let Ok(arr) = obj.extract::<PyReadonlyArray2<'py, f32>>() {
+        let view = arr.as_array();
+        let (rows, cols) = view.dim();
+        if arr.as_slice().is_ok() {
+            return Ok(DenseF32Input::Borrowed {
+                array: arr,
+                rows,
+                cols,
+            });
+        }
+        return Ok(DenseF32Input::Owned {
+            data: view.iter().copied().collect(),
+            rows,
+            cols,
+        });
+    }
+    if let Ok(arr) = obj.extract::<PyReadonlyArray2<'py, f64>>() {
+        let view = arr.as_array();
+        let (rows, cols) = view.dim();
+        return Ok(DenseF32Input::Owned {
+            data: view.iter().map(|value| *value as f32).collect(),
+            rows,
+            cols,
+        });
+    }
+    Err(PyValueError::new_err(format!(
+        "{label} must be a 2D float32 or float64 numpy array"
+    )))
+}
 
 fn array1_to_vec(arr: &PyReadonlyArray1<f64>) -> Vec<f64> {
     arr.as_array().iter().copied().collect()
@@ -72,6 +168,22 @@ fn array2_to_vec(arr: &PyReadonlyArray2<f64>) -> Vec<f64> {
         }
     }
     out
+}
+
+#[inline]
+pub(crate) fn copy_f64_to_f32(src: &[f64], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (out, value) in dst.iter_mut().zip(src.iter()) {
+        *out = *value as f32;
+    }
+}
+
+#[inline]
+pub(crate) fn copy_f32_to_f64(src: &[f32], dst: &mut [f64]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (out, value) in dst.iter_mut().zip(src.iter()) {
+        *out = *value as f64;
+    }
 }
 
 fn parse_optional_index_vec_i64(
@@ -569,6 +681,7 @@ pub(crate) fn ddot_f64(x: &[f64], y: &[f64]) -> f64 {
 }
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn daxpy_inplace_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
     debug_assert_eq!(x.len(), y.len());
     if alpha == 0.0_f64 || x.is_empty() {
@@ -601,6 +714,7 @@ pub(crate) fn daxpy_inplace_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
 /// current marker effect.  Adding `beta_j * d_j` recovers
 /// `x_j^T (r + x_j beta_j)` with a single dot product over the samples.
 #[inline]
+#[cfg(test)]
 pub(crate) fn marker_conditional_dot_f64(
     residual: &[f64],
     marker: &[f64],
@@ -610,12 +724,296 @@ pub(crate) fn marker_conditional_dot_f64(
     ddot_f64(residual, marker) + old_beta * marker_ss
 }
 
+/// Mixed-precision marker score: f32 genotype storage with an f64 residual
+/// and f64 accumulation.  This is intentionally separate from the all-f64
+/// helper so callers cannot accidentally downcast the residual or statistic.
+#[inline]
+#[cfg(test)]
+pub(crate) fn marker_conditional_dot_f32_f64(
+    residual: &[f64],
+    marker: &[f32],
+    old_beta: f64,
+    marker_ss: f64,
+) -> f64 {
+    debug_assert_eq!(residual.len(), marker.len());
+    // ARM64 NEON converts four f32 marker values to two f64x2 vectors and
+    // accumulates in f64.  This avoids a scalar cast on every product while
+    // preserving the mixed-precision accumulator contract.
+    let (mut dot, mut i) = {
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { marker_dot_f32_f64_neon(residual, marker) }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            (0.0_f64, 0usize)
+        }
+    };
+    while i + 4 <= marker.len() {
+        dot = residual[i].mul_add(marker[i] as f64, dot);
+        dot = residual[i + 1].mul_add(marker[i + 1] as f64, dot);
+        dot = residual[i + 2].mul_add(marker[i + 2] as f64, dot);
+        dot = residual[i + 3].mul_add(marker[i + 3] as f64, dot);
+        i += 4;
+    }
+    while i < marker.len() {
+        dot = residual[i].mul_add(marker[i] as f64, dot);
+        i += 1;
+    }
+    dot + old_beta * marker_ss
+}
+
+/// Marker score for the hot Gibbs loop when both the standardized marker and
+/// maintained marker residual are f32.  Genotypes and the repeatedly streamed
+/// residual stay compact, while the score is accumulated in f64 so marker
+/// ordering and posterior draws remain stable under mixed precision.
+#[inline]
+#[cfg(test)]
+pub(crate) fn marker_conditional_dot_f32_f32(
+    residual: &[f32],
+    marker: &[f32],
+    old_beta: f64,
+    marker_ss: f64,
+) -> f64 {
+    marker_conditional_dot_f32_f32_blocked(residual, marker, old_beta, marker_ss)
+}
+
+#[inline]
+#[cfg(test)]
+pub(crate) fn marker_conditional_dot_f32_f32_fast(
+    residual: &[f32],
+    marker: &[f32],
+    old_beta: f64,
+    marker_ss: f64,
+) -> f64 {
+    debug_assert_eq!(residual.len(), marker.len());
+    let (mut dot, mut i) = {
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { marker_dot_f32_f32_f64_neon(residual, marker) }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            (0.0_f64, 0usize)
+        }
+    };
+    while i < marker.len() {
+        dot = (residual[i] as f64).mul_add(marker[i] as f64, dot);
+        i += 1;
+    }
+    dot + old_beta * marker_ss
+}
+
+/// Compute the conditional marker score with f32 vector accumulators and a
+/// f64 accumulator between SIMD blocks.  The previous kernel converted every
+/// f32 lane to f64 before the FMA; that preserved more dot-product precision
+/// than the marker input carries, but made the hot path conversion-bound on
+/// Apple NEON.  Summing each 4-lane block in f32 and promoting only the block
+/// total retains a bounded mixed-precision error while avoiding per-lane f64
+/// conversion.
+#[inline]
+pub(crate) fn marker_conditional_dot_f32_f32_blocked(
+    residual: &[f32],
+    marker: &[f32],
+    old_beta: f64,
+    marker_ss: f64,
+) -> f64 {
+    debug_assert_eq!(residual.len(), marker.len());
+    let (mut dot, mut i) = {
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { marker_dot_f32_f32_blocked_neon(residual, marker) }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut acc0 = 0.0_f32;
+            let mut acc1 = 0.0_f32;
+            let mut acc2 = 0.0_f32;
+            let mut acc3 = 0.0_f32;
+            let limit = marker.len() / 4 * 4;
+            let mut i = 0usize;
+            while i < limit {
+                acc0 += residual[i] * marker[i];
+                acc1 += residual[i + 1] * marker[i + 1];
+                acc2 += residual[i + 2] * marker[i + 2];
+                acc3 += residual[i + 3] * marker[i + 3];
+                i += 4;
+            }
+            (
+                f64::from(acc0) + f64::from(acc1) + f64::from(acc2) + f64::from(acc3),
+                i,
+            )
+        }
+    };
+    while i < marker.len() {
+        dot += f64::from(residual[i] * marker[i]);
+        i += 1;
+    }
+    dot + old_beta * marker_ss
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[inline]
+unsafe fn marker_dot_f32_f32_f64_neon(residual: &[f32], marker: &[f32]) -> (f64, usize) {
+    let limit = marker.len() / 8 * 8;
+    let mut i = 0usize;
+    let mut acc0_lo = vdupq_n_f64(0.0);
+    let mut acc0_hi = vdupq_n_f64(0.0);
+    let mut acc1_lo = vdupq_n_f64(0.0);
+    let mut acc1_hi = vdupq_n_f64(0.0);
+    while i < limit {
+        let m0 = vld1q_f32(marker.as_ptr().add(i));
+        let r0 = vld1q_f32(residual.as_ptr().add(i));
+        let m1 = vld1q_f32(marker.as_ptr().add(i + 4));
+        let r1 = vld1q_f32(residual.as_ptr().add(i + 4));
+        acc0_lo = vfmaq_f64(
+            acc0_lo,
+            vcvt_f64_f32(vget_low_f32(r0)),
+            vcvt_f64_f32(vget_low_f32(m0)),
+        );
+        acc0_hi = vfmaq_f64(
+            acc0_hi,
+            vcvt_f64_f32(vget_high_f32(r0)),
+            vcvt_f64_f32(vget_high_f32(m0)),
+        );
+        acc1_lo = vfmaq_f64(
+            acc1_lo,
+            vcvt_f64_f32(vget_low_f32(r1)),
+            vcvt_f64_f32(vget_low_f32(m1)),
+        );
+        acc1_hi = vfmaq_f64(
+            acc1_hi,
+            vcvt_f64_f32(vget_high_f32(r1)),
+            vcvt_f64_f32(vget_high_f32(m1)),
+        );
+        i += 8;
+    }
+    if i + 4 <= marker.len() {
+        let m = vld1q_f32(marker.as_ptr().add(i));
+        let r = vld1q_f32(residual.as_ptr().add(i));
+        acc0_lo = vfmaq_f64(
+            acc0_lo,
+            vcvt_f64_f32(vget_low_f32(r)),
+            vcvt_f64_f32(vget_low_f32(m)),
+        );
+        acc0_hi = vfmaq_f64(
+            acc0_hi,
+            vcvt_f64_f32(vget_high_f32(r)),
+            vcvt_f64_f32(vget_high_f32(m)),
+        );
+        i += 4;
+    }
+    let mut lanes0_lo = [0.0_f64; 2];
+    let mut lanes0_hi = [0.0_f64; 2];
+    let mut lanes1_lo = [0.0_f64; 2];
+    let mut lanes1_hi = [0.0_f64; 2];
+    vst1q_f64(lanes0_lo.as_mut_ptr(), acc0_lo);
+    vst1q_f64(lanes0_hi.as_mut_ptr(), acc0_hi);
+    vst1q_f64(lanes1_lo.as_mut_ptr(), acc1_lo);
+    vst1q_f64(lanes1_hi.as_mut_ptr(), acc1_hi);
+    (
+        lanes0_lo[0]
+            + lanes0_lo[1]
+            + lanes0_hi[0]
+            + lanes0_hi[1]
+            + lanes1_lo[0]
+            + lanes1_lo[1]
+            + lanes1_hi[0]
+            + lanes1_hi[1],
+        i,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn marker_dot_f32_f32_blocked_neon(residual: &[f32], marker: &[f32]) -> (f64, usize) {
+    let limit = marker.len() / 16 * 16;
+    let mut i = 0usize;
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    while i < limit {
+        acc0 = vfmaq_f32(
+            acc0,
+            vld1q_f32(residual.as_ptr().add(i)),
+            vld1q_f32(marker.as_ptr().add(i)),
+        );
+        acc1 = vfmaq_f32(
+            acc1,
+            vld1q_f32(residual.as_ptr().add(i + 4)),
+            vld1q_f32(marker.as_ptr().add(i + 4)),
+        );
+        acc2 = vfmaq_f32(
+            acc2,
+            vld1q_f32(residual.as_ptr().add(i + 8)),
+            vld1q_f32(marker.as_ptr().add(i + 8)),
+        );
+        acc3 = vfmaq_f32(
+            acc3,
+            vld1q_f32(residual.as_ptr().add(i + 12)),
+            vld1q_f32(marker.as_ptr().add(i + 12)),
+        );
+        i += 16;
+    }
+    let mut lanes0 = [0.0_f32; 4];
+    let mut lanes1 = [0.0_f32; 4];
+    let mut lanes2 = [0.0_f32; 4];
+    let mut lanes3 = [0.0_f32; 4];
+    vst1q_f32(lanes0.as_mut_ptr(), acc0);
+    vst1q_f32(lanes1.as_mut_ptr(), acc1);
+    vst1q_f32(lanes2.as_mut_ptr(), acc2);
+    vst1q_f32(lanes3.as_mut_ptr(), acc3);
+    let mut dot = lanes0.iter().copied().map(f64::from).sum::<f64>()
+        + lanes1.iter().copied().map(f64::from).sum::<f64>()
+        + lanes2.iter().copied().map(f64::from).sum::<f64>()
+        + lanes3.iter().copied().map(f64::from).sum::<f64>();
+
+    if i + 4 <= marker.len() {
+        let acc = vfmaq_f32(
+            vdupq_n_f32(0.0),
+            vld1q_f32(residual.as_ptr().add(i)),
+            vld1q_f32(marker.as_ptr().add(i)),
+        );
+        let mut lanes = [0.0_f32; 4];
+        vst1q_f32(lanes.as_mut_ptr(), acc);
+        dot += lanes.iter().copied().map(f64::from).sum::<f64>();
+        i += 4;
+    }
+    (dot, i)
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[inline]
+unsafe fn marker_dot_f32_f64_neon(residual: &[f64], marker: &[f32]) -> (f64, usize) {
+    let limit = marker.len() / 4 * 4;
+    let mut i = 0usize;
+    let mut acc_lo = vdupq_n_f64(0.0);
+    let mut acc_hi = vdupq_n_f64(0.0);
+    while i < limit {
+        let m = vld1q_f32(marker.as_ptr().add(i));
+        let m_lo = vcvt_f64_f32(vget_low_f32(m));
+        let m_hi = vcvt_f64_f32(vget_high_f32(m));
+        let r_lo = vld1q_f64(residual.as_ptr().add(i));
+        let r_hi = vld1q_f64(residual.as_ptr().add(i + 2));
+        acc_lo = vfmaq_f64(acc_lo, r_lo, m_lo);
+        acc_hi = vfmaq_f64(acc_hi, r_hi, m_hi);
+        i += 4;
+    }
+    let mut lanes_lo = [0.0_f64; 2];
+    let mut lanes_hi = [0.0_f64; 2];
+    vst1q_f64(lanes_lo.as_mut_ptr(), acc_lo);
+    vst1q_f64(lanes_hi.as_mut_ptr(), acc_hi);
+    (lanes_lo[0] + lanes_lo[1] + lanes_hi[0] + lanes_hi[1], i)
+}
+
 /// Update a maintained residual after replacing one marker effect.
 ///
 /// Since `r = y - X beta`, changing `beta_j` from `old_beta` to `new_beta`
 /// requires `r += x_j * (old_beta - new_beta)`.  Keeping this as one BLAS
 /// AXPY avoids separate remove/add scans of the sample vector.
 #[inline]
+#[cfg(test)]
 pub(crate) fn update_marker_residual_f64(
     old_beta: f64,
     new_beta: f64,
@@ -623,6 +1021,188 @@ pub(crate) fn update_marker_residual_f64(
     residual: &mut [f64],
 ) {
     daxpy_inplace_f64(old_beta - new_beta, marker, residual);
+}
+
+/// Mixed-precision residual update.  The residual remains f64 for numerical
+/// stability while the marker is read from the f32 backend buffer.
+#[inline]
+#[cfg(test)]
+pub(crate) fn update_marker_residual_f32_f64(
+    old_beta: f64,
+    new_beta: f64,
+    marker: &[f32],
+    residual: &mut [f64],
+) {
+    debug_assert_eq!(marker.len(), residual.len());
+    let alpha = old_beta - new_beta;
+    let mut i = {
+        #[cfg(all(test, target_arch = "aarch64"))]
+        {
+            unsafe { update_marker_residual_f32_f64_neon(alpha, marker, residual) }
+        }
+        #[cfg(not(all(test, target_arch = "aarch64")))]
+        {
+            0usize
+        }
+    };
+    while i + 4 <= marker.len() {
+        residual[i] = alpha.mul_add(marker[i] as f64, residual[i]);
+        residual[i + 1] = alpha.mul_add(marker[i + 1] as f64, residual[i + 1]);
+        residual[i + 2] = alpha.mul_add(marker[i + 2] as f64, residual[i + 2]);
+        residual[i + 3] = alpha.mul_add(marker[i + 3] as f64, residual[i + 3]);
+        i += 4;
+    }
+    while i < marker.len() {
+        residual[i] = alpha.mul_add(marker[i] as f64, residual[i]);
+        i += 1;
+    }
+}
+
+/// f32 marker residual update.  `alpha` is retained in f64 because sampled
+/// effects are f64; the per-sample update is intentionally rounded once when
+/// written back to the f32 residual buffer.
+#[inline]
+pub(crate) fn update_marker_residual_f32(
+    old_beta: f64,
+    new_beta: f64,
+    marker: &[f32],
+    residual: &mut [f32],
+) {
+    debug_assert_eq!(marker.len(), residual.len());
+    let alpha = (old_beta - new_beta) as f32;
+    // Spike components frequently leave a marker at exactly zero.  Avoid a
+    // full sample-vector traversal when replacing zero by zero; this is the
+    // dominant case for BayesB/C/R and is also safe for all backends.
+    if alpha == 0.0_f32 || marker.is_empty() {
+        return;
+    }
+    let mut i = {
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { update_marker_residual_f32_neon(alpha, marker, residual) }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            0usize
+        }
+    };
+    while i + 4 <= marker.len() {
+        residual[i] = alpha.mul_add(marker[i], residual[i]);
+        residual[i + 1] = alpha.mul_add(marker[i + 1], residual[i + 1]);
+        residual[i + 2] = alpha.mul_add(marker[i + 2], residual[i + 2]);
+        residual[i + 3] = alpha.mul_add(marker[i + 3], residual[i + 3]);
+        i += 4;
+    }
+    while i < marker.len() {
+        residual[i] = alpha.mul_add(marker[i], residual[i]);
+        i += 1;
+    }
+}
+
+/// Unified marker Gibbs kernel.  The conditional score is reduced once, the
+/// caller samples the model-specific new effect from that score, and the
+/// maintained f32 residual is updated before returning.  Keeping this
+/// transition in one inlined function makes all BayesA/B/C/R backends share
+/// the same SIMD dot/update path.  The two vector traversals are intentional:
+/// a Gibbs draw cannot update the residual until its conditional draw is known.
+#[inline]
+pub(crate) fn bayes_marker_update_f32<F>(
+    residual: &mut [f32],
+    marker: &[f32],
+    old_beta: f64,
+    marker_ss: f64,
+    choose_beta: F,
+) -> (f64, f64)
+where
+    F: FnOnce(f64) -> f64,
+{
+    bayes_marker_update_f32_fused(residual, marker, old_beta, marker_ss, choose_beta)
+}
+
+/// Fast marker transition for models whose conditional draw cannot fail.
+/// Keeping score, callback, and residual replacement in one inline function
+/// removes the Result/closure adapter from BayesA/B/C while retaining the
+/// required two streaming passes: the new beta is not known until the score
+/// reduction has completed.
+#[inline]
+pub(crate) fn bayes_marker_update_f32_fused<F>(
+    residual: &mut [f32],
+    marker: &[f32],
+    old_beta: f64,
+    marker_ss: f64,
+    choose_beta: F,
+) -> (f64, f64)
+where
+    F: FnOnce(f64) -> f64,
+{
+    let u = marker_conditional_dot_f32_f32_blocked(residual, marker, old_beta, marker_ss);
+    let new_beta = choose_beta(u);
+    update_marker_residual_f32(old_beta, new_beta, marker, residual);
+    (u, new_beta)
+}
+
+/// Result-returning form used by BayesR, whose component posterior calculation
+/// performs input validation inside the marker callback.
+#[inline]
+pub(crate) fn bayes_marker_update_f32_result<F>(
+    residual: &mut [f32],
+    marker: &[f32],
+    old_beta: f64,
+    marker_ss: f64,
+    choose_beta: F,
+) -> Result<(f64, f64), String>
+where
+    F: FnOnce(f64) -> Result<f64, String>,
+{
+    let u = marker_conditional_dot_f32_f32_blocked(residual, marker, old_beta, marker_ss);
+    let new_beta = choose_beta(u)?;
+    update_marker_residual_f32(old_beta, new_beta, marker, residual);
+    Ok((u, new_beta))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn update_marker_residual_f32_neon(
+    alpha: f32,
+    marker: &[f32],
+    residual: &mut [f32],
+) -> usize {
+    let limit = marker.len() / 4 * 4;
+    let alpha_v = vdupq_n_f32(alpha);
+    let mut i = 0usize;
+    while i < limit {
+        let m = vld1q_f32(marker.as_ptr().add(i));
+        let r = vld1q_f32(residual.as_ptr().add(i));
+        let out = vfmaq_f32(r, m, alpha_v);
+        vst1q_f32(residual.as_mut_ptr().add(i), out);
+        i += 4;
+    }
+    i
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[inline]
+unsafe fn update_marker_residual_f32_f64_neon(
+    alpha: f64,
+    marker: &[f32],
+    residual: &mut [f64],
+) -> usize {
+    let limit = marker.len() / 4 * 4;
+    let alpha_v = vdupq_n_f64(alpha);
+    let mut i = 0usize;
+    while i < limit {
+        let m = vld1q_f32(marker.as_ptr().add(i));
+        let m_lo = vcvt_f64_f32(vget_low_f32(m));
+        let m_hi = vcvt_f64_f32(vget_high_f32(m));
+        let r_lo = vld1q_f64(residual.as_ptr().add(i));
+        let r_hi = vld1q_f64(residual.as_ptr().add(i + 2));
+        let out_lo = vfmaq_f64(r_lo, m_lo, alpha_v);
+        let out_hi = vfmaq_f64(r_hi, m_hi, alpha_v);
+        vst1q_f64(residual.as_mut_ptr().add(i), out_lo);
+        vst1q_f64(residual.as_mut_ptr().add(i + 2), out_hi);
+        i += 4;
+    }
+    i
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -726,7 +1306,7 @@ pub(crate) fn bayes_packed_block_rows(n: usize, p: usize) -> usize {
         return 1;
     }
     let default_target_bytes: usize = 32 * 1024 * 1024;
-    let bytes_per_row = n.saturating_mul(std::mem::size_of::<f64>()).max(1);
+    let bytes_per_row = n.saturating_mul(std::mem::size_of::<f32>()).max(1);
     let mut rows = (default_target_bytes / bytes_per_row).max(1);
     rows = rows.clamp(8, 2048);
     if let Ok(raw) = env::var("JX_BAYES_PACKED_ROW_BLOCK") {
@@ -790,7 +1370,7 @@ fn bayes_packed_should_predecode_dense(n: usize, p: usize) -> bool {
     if elem_cnt == 0 {
         return false;
     }
-    let dense_bytes = elem_cnt.saturating_mul(std::mem::size_of::<f64>());
+    let dense_bytes = elem_cnt.saturating_mul(std::mem::size_of::<f32>());
     let cap_bytes = bayes_packed_predecode_max_mb().saturating_mul(1024 * 1024);
     if dense_bytes > cap_bytes {
         return false;
@@ -835,9 +1415,11 @@ pub(crate) fn bayes_decode_mode(p: usize, block_rows: usize) -> BayesDecodeMode 
 
 /// Common marker access contract used by every Bayesian marker sampler.
 ///
-/// Marker rows are returned in standardized f64 form.  The statistical
-/// kernels only depend on this small interface, so resident packed BED,
-/// windowed BED, and dense inputs can share the same sampler implementation.
+/// Marker rows are returned in standardized f32 form.  The fixed-effect
+/// residual is synchronized in f64 outside the marker sweep, while the hot
+/// marker residual and genotype buffers are f32 and all reductions remain f64.
+/// Resident packed BED, windowed BED, and dense inputs therefore share one
+/// compact marker path.
 pub(crate) trait BayesMarkerBackend {
     fn n_samples(&self) -> usize;
     fn n_markers(&self) -> usize;
@@ -846,19 +1428,19 @@ pub(crate) trait BayesMarkerBackend {
         &mut self,
         row_start: usize,
         row_end: usize,
-        out_block: &mut [f64],
+        out_block: &mut [f32],
         n: usize,
     ) -> Result<(), String>;
 
     fn for_each_block<F>(&mut self, mut f: F) -> Result<(), String>
     where
-        F: FnMut(usize, usize, &[f64]) -> Result<(), String>,
+        F: FnMut(usize, usize, &[f32]) -> Result<(), String>,
         Self: Sized,
     {
         let n = self.n_samples();
         let p = self.n_markers();
         let block_rows = self.block_rows().max(1).min(p.max(1));
-        let mut block = vec![0.0_f64; block_rows * n];
+        let mut block = vec![0.0_f32; block_rows * n];
         for row_start in (0..p).step_by(block_rows) {
             let row_end = (row_start + block_rows).min(p);
             let block_len = (row_end - row_start) * n;
@@ -871,14 +1453,14 @@ pub(crate) trait BayesMarkerBackend {
 
 /// Dense marker backend used by the in-memory Bayes entry points.
 pub(crate) struct DenseBayesBackend<'a> {
-    matrix: &'a [f64],
+    matrix: &'a [f32],
     n: usize,
     p: usize,
     block_rows: usize,
 }
 
 impl<'a> DenseBayesBackend<'a> {
-    pub(crate) fn new(matrix: &'a [f64], n: usize, p: usize) -> Result<Self, String> {
+    pub(crate) fn new(matrix: &'a [f32], n: usize, p: usize) -> Result<Self, String> {
         if matrix.len() != p.saturating_mul(n) {
             return Err("Bayes dense genotype dimensions are incompatible".to_string());
         }
@@ -908,7 +1490,7 @@ impl BayesMarkerBackend for DenseBayesBackend<'_> {
         &mut self,
         row_start: usize,
         row_end: usize,
-        out_block: &mut [f64],
+        out_block: &mut [f32],
         n: usize,
     ) -> Result<(), String> {
         if row_start > row_end || row_end > self.p || n != self.n {
@@ -919,6 +1501,24 @@ impl BayesMarkerBackend for DenseBayesBackend<'_> {
             return Err("Bayes dense block buffer has an invalid length".to_string());
         }
         out_block.copy_from_slice(&self.matrix[row_start * n..row_end * n]);
+        Ok(())
+    }
+
+    /// Dense rows are already resident and contiguous.  Passing a borrowed
+    /// slice avoids copying every marker block into a staging buffer on every
+    /// MCMC iteration; packed/stream backends keep the default fill path.
+    fn for_each_block<F>(&mut self, mut f: F) -> Result<(), String>
+    where
+        F: FnMut(usize, usize, &[f32]) -> Result<(), String>,
+        Self: Sized,
+    {
+        let n = self.n;
+        let p = self.p;
+        let block_rows = self.block_rows.max(1).min(p.max(1));
+        for row_start in (0..p).step_by(block_rows) {
+            let row_end = (row_start + block_rows).min(p);
+            f(row_start, row_end, &self.matrix[row_start * n..row_end * n])?;
+        }
         Ok(())
     }
 }
@@ -1009,9 +1609,9 @@ impl<'a, 'source> PackedBayesBackend<'a, 'source> {
     /// Materialize a packed source when the common predecode policy allows it.
     /// An explicit block covering all active markers forces this dense path,
     /// including for a windowed BED source.
-    pub(crate) fn maybe_predecode_dense_f64(&mut self) -> Result<Option<Vec<f64>>, String> {
+    pub(crate) fn maybe_predecode_dense_f32(&mut self) -> Result<Option<Vec<f32>>, String> {
         let force_dense = self.decode_mode == BayesDecodeMode::Dense;
-        let dense = maybe_predecode_source_dense_f64(
+        let dense = maybe_predecode_source_dense_f32(
             &mut self.source,
             self.n_samples_total,
             self.row_flip,
@@ -1049,14 +1649,14 @@ impl<'a, 'source> PackedBayesBackend<'a, 'source> {
 
     pub(crate) fn for_each_block<F>(&mut self, mut f: F) -> Result<(), String>
     where
-        F: FnMut(usize, usize, &[f64]) -> Result<(), String>,
+        F: FnMut(usize, usize, &[f32]) -> Result<(), String>,
     {
         if self.decode_mode == BayesDecodeMode::Double {
             return self.for_each_block_double(&mut f);
         }
         let n = self.sample_indices.len();
         let block_rows = self.block_rows.max(1).min(self.p.max(1));
-        let mut block = vec![0.0_f64; block_rows * n];
+        let mut block = vec![0.0_f32; block_rows * n];
         for row_start in (0..self.p).step_by(block_rows) {
             let row_end = (row_start + block_rows).min(self.p);
             let block_len = (row_end - row_start) * n;
@@ -1068,7 +1668,7 @@ impl<'a, 'source> PackedBayesBackend<'a, 'source> {
 
     fn for_each_block_double<F>(&mut self, f: &mut F) -> Result<(), String>
     where
-        F: FnMut(usize, usize, &[f64]) -> Result<(), String>,
+        F: FnMut(usize, usize, &[f32]) -> Result<(), String>,
     {
         let worker_source = self.duplicate_source()?;
         let n = self.sample_indices.len();
@@ -1085,8 +1685,8 @@ impl<'a, 'source> PackedBayesBackend<'a, 'source> {
         let code4_lut = packed_byte_lut().code4();
 
         std::thread::scope(|scope| {
-            let (request_tx, request_rx) = sync_channel::<(usize, usize, Vec<f64>)>(2);
-            let (ready_tx, ready_rx) = sync_channel::<Result<(usize, usize, Vec<f64>), String>>(2);
+            let (request_tx, request_rx) = sync_channel::<(usize, usize, Vec<f32>)>(2);
+            let (ready_tx, ready_rx) = sync_channel::<Result<(usize, usize, Vec<f32>), String>>(2);
 
             scope.spawn(move || {
                 let mut source = worker_source;
@@ -1122,7 +1722,7 @@ impl<'a, 'source> PackedBayesBackend<'a, 'source> {
                 (row_start, row_end)
             });
             let send_request =
-                |row_start: usize, row_end: usize, mut block: Vec<f64>| -> Result<(), String> {
+                |row_start: usize, row_end: usize, mut block: Vec<f32>| -> Result<(), String> {
                     let block_len = (row_end - row_start) * n;
                     if block.len() != block_len {
                         block.resize(block_len, 0.0);
@@ -1174,7 +1774,7 @@ impl BayesMarkerBackend for PackedBayesBackend<'_, '_> {
         &mut self,
         row_start: usize,
         row_end: usize,
-        out_block: &mut [f64],
+        out_block: &mut [f32],
         n: usize,
     ) -> Result<(), String> {
         if row_start > row_end || row_end > self.p || n != self.sample_indices.len() {
@@ -1236,7 +1836,7 @@ pub(crate) fn decode_source_block_standardized_into(
     row_mean: &[f32],
     row_inv_sd: &[f32],
     code4_lut: &[[u8; 4]; 256],
-    out_block: &mut [f64],
+    out_block: &mut [f32],
     n: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
     scratch_f32: &mut Vec<f32>,
@@ -1290,9 +1890,7 @@ pub(crate) fn decode_source_block_standardized_into(
                     tmp,
                     pool,
                 )?;
-                for (dst, &src) in out_block.iter_mut().zip(tmp.iter()) {
-                    *dst = src as f64;
-                }
+                out_block.copy_from_slice(tmp);
                 return Ok(());
             } else {
                 matrix.read_source_range(row_start, row_end)?
@@ -1315,14 +1913,12 @@ pub(crate) fn decode_source_block_standardized_into(
             )?;
         }
     }
-    for (dst, &src) in out_block.iter_mut().zip(tmp.iter()) {
-        *dst = src as f64;
-    }
+    out_block.copy_from_slice(tmp);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn maybe_predecode_source_dense_f64(
+fn maybe_predecode_source_dense_f32(
     source: &mut BayesPackedSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
@@ -1336,7 +1932,7 @@ fn maybe_predecode_source_dense_f64(
     pool: Option<&Arc<rayon::ThreadPool>>,
     block_rows_override: Option<usize>,
     force_dense: bool,
-) -> Result<Option<Vec<f64>>, String> {
+) -> Result<Option<Vec<f32>>, String> {
     if !force_dense && matches!(source, BayesPackedSource::Windowed(_)) {
         return Ok(None);
     }
@@ -1348,7 +1944,7 @@ fn maybe_predecode_source_dense_f64(
         .unwrap_or_else(|| bayes_packed_block_rows(n, p))
         .max(1)
         .min(p.max(1));
-    let mut dense_f64 = vec![0.0_f64; p * n];
+    let mut dense_f32 = vec![0.0_f32; p * n];
     let mut scratch_f32 = Vec::<f32>::new();
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
@@ -1365,13 +1961,13 @@ fn maybe_predecode_source_dense_f64(
             row_mean,
             row_inv_sd,
             code4_lut,
-            &mut dense_f64[st * n..(st + br) * n],
+            &mut dense_f32[st * n..(st + br) * n],
             n,
             pool,
             &mut scratch_f32,
         )?;
     }
-    Ok(Some(dense_f64))
+    Ok(Some(dense_f32))
 }
 
 pub(crate) fn genetic_variance_from_residual(
@@ -1448,7 +2044,7 @@ fn bayes_positive_floor(x: f64) -> f64 {
 
 fn bayesb_core_impl(
     y: &[f64],
-    m: &[f64],
+    m: &[f32],
     x: &[f64],
     n: usize,
     p: usize,
@@ -1516,15 +2112,15 @@ fn bayesb_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     for j in 0..p {
         let mut s = 0.0;
         let mut msum = 0.0;
         for i in 0..n {
             let v = m[j * n + i];
-            s += v * v;
-            msum += v;
+            s += (v as f64) * (v as f64);
+            msum += v as f64;
         }
         x2[j] = s;
         mean_x[j] = msum / n_f;
@@ -1596,6 +2192,7 @@ fn bayesb_core_impl(
     }
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut pip_sum = vec![0.0; p];
     let mut varb_sum = vec![0.0; p];
@@ -1634,41 +2231,42 @@ fn bayesb_core_impl(
             alpha[k] = new_alpha;
         }
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
         for j in 0..p {
             let m_j = &m[j * n..(j + 1) * n];
             let b_old = beta[j];
-            let xe = marker_conditional_dot_f64(&r, m_j, b_old, x2[j]);
-
             let c = x2[j] * inv_var_e + 1.0 / var_b[j];
             if !(c.is_finite() && c > 0.0) {
                 return Err("Non-positive posterior precision in BayesB beta update".to_string());
             }
-            let rhs = xe * inv_var_e;
-            // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
-            let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b[j] * c).ln();
-            let log_odds = log_odds_prior + log_bf10;
-            let p_in = if log_odds >= 0.0 {
-                1.0 / (1.0 + (-log_odds).exp())
-            } else {
-                let e = log_odds.exp();
-                e / (1.0 + e)
-            };
-            let new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+            let mut new_d = 0u8;
+            let (_, new_beta) =
+                bayes_marker_update_f32(&mut marker_residual, m_j, b_old, x2[j], |xe| {
+                    let rhs = xe * inv_var_e;
+                    // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
+                    let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b[j] * c).ln();
+                    let log_odds = log_odds_prior + log_bf10;
+                    let p_in = if log_odds >= 0.0 {
+                        1.0 / (1.0 + (-log_odds).exp())
+                    } else {
+                        let e = log_odds.exp();
+                        e / (1.0 + e)
+                    };
+                    new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                    if new_d == 1 {
+                        let z_beta: f64 = rng.sample(StandardNormal);
+                        rhs / c + (1.0 / c).sqrt() * z_beta
+                    } else {
+                        0.0
+                    }
+                });
             d[j] = new_d;
-
-            if new_d == 1 {
-                let z_beta: f64 = rng.sample(StandardNormal);
-                let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                update_marker_residual_f64(b_old, new_beta, m_j, &mut r);
-                beta[j] = new_beta;
-            } else {
-                update_marker_residual_f64(b_old, 0.0, m_j, &mut r);
-                beta[j] = 0.0;
-            }
+            beta[j] = new_beta;
         }
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         let mut n_active = 0usize;
         for j in 0..p {
             if d[j] == 1 {
@@ -1793,7 +2391,7 @@ fn bayesb_core_impl(
 
 fn bayesc_core_impl(
     y: &[f64],
-    m: &[f64],
+    m: &[f32],
     x: &[f64],
     n: usize,
     p: usize,
@@ -1859,15 +2457,15 @@ fn bayesc_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     for j in 0..p {
         let mut s = 0.0;
         let mut msum = 0.0;
         for i in 0..n {
             let v = m[j * n + i];
-            s += v * v;
-            msum += v;
+            s += (v as f64) * (v as f64);
+            msum += v as f64;
         }
         x2[j] = s;
         mean_x[j] = msum / n_f;
@@ -1938,6 +2536,7 @@ fn bayesc_core_impl(
     }
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut pip_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
@@ -1975,41 +2574,42 @@ fn bayesc_core_impl(
             alpha[k] = new_alpha;
         }
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
         for j in 0..p {
             let m_j = &m[j * n..(j + 1) * n];
             let b_old = beta[j];
-            let xe = marker_conditional_dot_f64(&r, m_j, b_old, x2[j]);
-
             let c = x2[j] * inv_var_e + 1.0 / var_b;
             if !(c.is_finite() && c > 0.0) {
                 return Err("Non-positive posterior precision in BayesC beta update".to_string());
             }
-            let rhs = xe * inv_var_e;
-            // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
-            let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b * c).ln();
-            let log_odds = log_odds_prior + log_bf10;
-            let p_in = if log_odds >= 0.0 {
-                1.0 / (1.0 + (-log_odds).exp())
-            } else {
-                let e = log_odds.exp();
-                e / (1.0 + e)
-            };
-            let new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+            let mut new_d = 0u8;
+            let (_, new_beta) =
+                bayes_marker_update_f32(&mut marker_residual, m_j, b_old, x2[j], |xe| {
+                    let rhs = xe * inv_var_e;
+                    // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
+                    let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b * c).ln();
+                    let log_odds = log_odds_prior + log_bf10;
+                    let p_in = if log_odds >= 0.0 {
+                        1.0 / (1.0 + (-log_odds).exp())
+                    } else {
+                        let e = log_odds.exp();
+                        e / (1.0 + e)
+                    };
+                    new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                    if new_d == 1 {
+                        let z_beta: f64 = rng.sample(StandardNormal);
+                        rhs / c + (1.0 / c).sqrt() * z_beta
+                    } else {
+                        0.0
+                    }
+                });
             d[j] = new_d;
-
-            if new_d == 1 {
-                let z_beta: f64 = rng.sample(StandardNormal);
-                let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                update_marker_residual_f64(b_old, new_beta, m_j, &mut r);
-                beta[j] = new_beta;
-            } else {
-                update_marker_residual_f64(b_old, 0.0, m_j, &mut r);
-                beta[j] = 0.0;
-            }
+            beta[j] = new_beta;
         }
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         let mut mrk_in_usize = 0usize;
         let mut ss_b = 0.0;
         for j in 0..p {
@@ -2122,7 +2722,7 @@ fn bayesc_core_impl(
 
 fn bayesa_core_impl(
     y: &[f64],
-    m: &[f64],
+    m: &[f32],
     x: &[f64],
     n: usize,
     p: usize,
@@ -2178,15 +2778,15 @@ fn bayesa_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     for j in 0..p {
         let mut s = 0.0;
         let mut msum = 0.0;
         for i in 0..n {
             let v = m[j * n + i];
-            s += v * v;
-            msum += v;
+            s += (v as f64) * (v as f64);
+            msum += v as f64;
         }
         x2[j] = s;
         mean_x[j] = msum / n_f;
@@ -2266,6 +2866,7 @@ fn bayesa_core_impl(
     }
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut varb_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
@@ -2300,17 +2901,20 @@ fn bayesa_core_impl(
             alpha[k] = new_alpha;
         }
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         for j in 0..p {
             let m_j = &m[j * n..(j + 1) * n];
-            let rhs = marker_conditional_dot_f64(&r, m_j, beta[j], x2[j]) * inv_var_e;
             let c = x2[j] * inv_var_e + 1.0 / var_b[j];
             let z_beta: f64 = rng.sample(StandardNormal);
-            let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-
-            update_marker_residual_f64(beta[j], new_beta, m_j, &mut r);
+            let old_beta = beta[j];
+            let (_, new_beta) =
+                bayes_marker_update_f32(&mut marker_residual, m_j, old_beta, x2[j], |u| {
+                    u * inv_var_e / c + (1.0 / c).sqrt() * z_beta
+                });
             beta[j] = new_beta;
         }
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         for j in 0..p {
             var_b[j] = (s + beta[j] * beta[j]) / rng.sample(chi_b);
             if !(var_b[j].is_finite() && var_b[j] > 0.0) {
@@ -2469,7 +3073,7 @@ fn bayesa_packed_core_impl(
         backend_block_rows,
         pool,
     )?;
-    if let Some(m_dense) = backend.maybe_predecode_dense_f64()? {
+    if let Some(m_dense) = backend.maybe_predecode_dense_f32()? {
         return bayesa_core_impl(
             y,
             &m_dense,
@@ -2505,8 +3109,8 @@ fn bayesa_packed_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
         for off in 0..br {
@@ -2514,8 +3118,8 @@ fn bayesa_packed_core_impl(
             let mut s = 0.0;
             let mut msum = 0.0;
             for &v in row {
-                s += v * v;
-                msum += v;
+                s += (v as f64) * (v as f64);
+                msum += v as f64;
             }
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
@@ -2597,6 +3201,7 @@ fn bayesa_packed_core_impl(
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut varb_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
@@ -2630,22 +3235,25 @@ fn bayesa_packed_core_impl(
             &mut rng,
         );
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         backend.for_each_block(|st, ed, m_block| {
             let br = ed - st;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
-                let rhs = marker_conditional_dot_f64(&r, m_row, beta[j], x2[j]) * inv_var_e;
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 let z_beta: f64 = rng.sample(StandardNormal);
-                let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-
-                update_marker_residual_f64(beta[j], new_beta, m_row, &mut r);
+                let old_beta = beta[j];
+                let (_, new_beta) =
+                    bayes_marker_update_f32(&mut marker_residual, m_row, old_beta, x2[j], |u| {
+                        u * inv_var_e / c + (1.0 / c).sqrt() * z_beta
+                    });
                 beta[j] = new_beta;
             }
             Ok(())
         })?;
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         for j in 0..p {
             var_b[j] = (s + beta[j] * beta[j]) / rng.sample(chi_b);
             if !(var_b[j].is_finite() && var_b[j] > 0.0) {
@@ -2816,7 +3424,7 @@ fn bayesb_packed_core_impl(
         backend_block_rows,
         pool,
     )?;
-    if let Some(m_dense) = backend.maybe_predecode_dense_f64()? {
+    if let Some(m_dense) = backend.maybe_predecode_dense_f32()? {
         return bayesb_core_impl(
             y,
             &m_dense,
@@ -2854,8 +3462,8 @@ fn bayesb_packed_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
         for off in 0..br {
@@ -2863,8 +3471,8 @@ fn bayesb_packed_core_impl(
             let mut s = 0.0;
             let mut msum = 0.0;
             for &v in row {
-                s += v * v;
-                msum += v;
+                s += (v as f64) * (v as f64);
+                msum += v as f64;
             }
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
@@ -2938,6 +3546,7 @@ fn bayesb_packed_core_impl(
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut pip_sum = vec![0.0; p];
     let mut varb_sum = vec![0.0; p];
@@ -2975,6 +3584,7 @@ fn bayesb_packed_core_impl(
             &mut rng,
         );
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
         backend.for_each_block(|st, ed, m_block| {
@@ -2983,39 +3593,40 @@ fn bayesb_packed_core_impl(
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
                 let b_old = beta[j];
-                let xe = marker_conditional_dot_f64(&r, m_row, b_old, x2[j]);
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
                         "Non-positive posterior precision in BayesB packed beta update".to_string(),
                     );
                 }
-                let rhs = xe * inv_var_e;
-                // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
-                let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b[j] * c).ln();
-                let log_odds = log_odds_prior + log_bf10;
-                let p_in = if log_odds >= 0.0 {
-                    1.0 / (1.0 + (-log_odds).exp())
-                } else {
-                    let e = log_odds.exp();
-                    e / (1.0 + e)
-                };
-                let new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                let mut new_d = 0u8;
+                let (_, new_beta) =
+                    bayes_marker_update_f32(&mut marker_residual, m_row, b_old, x2[j], |xe| {
+                        let rhs = xe * inv_var_e;
+                        // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
+                        let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b[j] * c).ln();
+                        let log_odds = log_odds_prior + log_bf10;
+                        let p_in = if log_odds >= 0.0 {
+                            1.0 / (1.0 + (-log_odds).exp())
+                        } else {
+                            let e = log_odds.exp();
+                            e / (1.0 + e)
+                        };
+                        new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                        if new_d == 1 {
+                            let z_beta: f64 = rng.sample(StandardNormal);
+                            rhs / c + (1.0 / c).sqrt() * z_beta
+                        } else {
+                            0.0
+                        }
+                    });
                 d[j] = new_d;
-
-                if new_d == 1 {
-                    let z_beta: f64 = rng.sample(StandardNormal);
-                    let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                    update_marker_residual_f64(b_old, new_beta, m_row, &mut r);
-                    beta[j] = new_beta;
-                } else {
-                    update_marker_residual_f64(b_old, 0.0, m_row, &mut r);
-                    beta[j] = 0.0;
-                }
+                beta[j] = new_beta;
             }
             Ok(())
         })?;
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         let mut n_active = 0usize;
         for j in 0..p {
             if d[j] == 1 {
@@ -3220,7 +3831,7 @@ fn bayesc_packed_core_impl(
         backend_block_rows,
         pool,
     )?;
-    if let Some(m_dense) = backend.maybe_predecode_dense_f64()? {
+    if let Some(m_dense) = backend.maybe_predecode_dense_f32()? {
         return bayesc_core_impl(
             y,
             &m_dense,
@@ -3256,8 +3867,8 @@ fn bayesc_packed_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
         for off in 0..br {
@@ -3265,8 +3876,8 @@ fn bayesc_packed_core_impl(
             let mut s = 0.0;
             let mut msum = 0.0;
             for &v in row {
-                s += v * v;
-                msum += v;
+                s += (v as f64) * (v as f64);
+                msum += v as f64;
             }
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
@@ -3338,6 +3949,7 @@ fn bayesc_packed_core_impl(
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut pip_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
@@ -3374,6 +3986,7 @@ fn bayesc_packed_core_impl(
             &mut rng,
         );
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
         backend.for_each_block(|st, ed, m_block| {
@@ -3382,39 +3995,40 @@ fn bayesc_packed_core_impl(
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
                 let b_old = beta[j];
-                let xe = marker_conditional_dot_f64(&r, m_row, b_old, x2[j]);
                 let c = x2[j] * inv_var_e + 1.0 / var_b;
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
                         "Non-positive posterior precision in BayesC packed beta update".to_string(),
                     );
                 }
-                let rhs = xe * inv_var_e;
-                // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
-                let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b * c).ln();
-                let log_odds = log_odds_prior + log_bf10;
-                let p_in = if log_odds >= 0.0 {
-                    1.0 / (1.0 + (-log_odds).exp())
-                } else {
-                    let e = log_odds.exp();
-                    e / (1.0 + e)
-                };
-                let new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                let mut new_d = 0u8;
+                let (_, new_beta) =
+                    bayes_marker_update_f32(&mut marker_residual, m_row, b_old, x2[j], |xe| {
+                        let rhs = xe * inv_var_e;
+                        // Collapsed d_j sampler: integrate out beta_j when evaluating d_j.
+                        let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b * c).ln();
+                        let log_odds = log_odds_prior + log_bf10;
+                        let p_in = if log_odds >= 0.0 {
+                            1.0 / (1.0 + (-log_odds).exp())
+                        } else {
+                            let e = log_odds.exp();
+                            e / (1.0 + e)
+                        };
+                        new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                        if new_d == 1 {
+                            let z_beta: f64 = rng.sample(StandardNormal);
+                            rhs / c + (1.0 / c).sqrt() * z_beta
+                        } else {
+                            0.0
+                        }
+                    });
                 d[j] = new_d;
-
-                if new_d == 1 {
-                    let z_beta: f64 = rng.sample(StandardNormal);
-                    let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                    update_marker_residual_f64(b_old, new_beta, m_row, &mut r);
-                    beta[j] = new_beta;
-                } else {
-                    update_marker_residual_f64(b_old, 0.0, m_row, &mut r);
-                    beta[j] = 0.0;
-                }
+                beta[j] = new_beta;
             }
             Ok(())
         })?;
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         let mut mrk_in_usize = 0usize;
         let mut ss_b = 0.0;
         for j in 0..p {
@@ -3546,7 +4160,7 @@ fn bayesc_packed_core_impl(
 pub fn bayesa(
     py: Python,
     y: PyReadonlyArray1<f64>,
-    m: PyReadonlyArray2<f64>,
+    m: Bound<'_, PyAny>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
     burnin: usize,
@@ -3598,15 +4212,12 @@ pub fn bayesa(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let m_shape = m.shape();
-    if m_shape[1] != n {
+    let m_input = array2_to_f32_input(&m, "M")?;
+    if m_input.cols() != n {
         return Err(PyValueError::new_err("M cols must match len(y)"));
     }
-    let p = m_shape[0];
-    let m_vec: Cow<'_, [f64]> = match m.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(array2_to_vec(&m)),
-    };
+    let p = m_input.rows();
+    let m_slice = m_input.as_slice();
 
     let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
         Some(arr) => {
@@ -3627,7 +4238,7 @@ pub fn bayesa(
     let result = py.detach(|| {
         bayesa_core_impl(
             y_vec.as_ref(),
-            m_vec.as_ref(),
+            m_slice,
             x_vec.as_ref(),
             n,
             p,
@@ -3703,7 +4314,7 @@ pub fn bayesa(
 pub fn bayesb(
     py: Python,
     y: PyReadonlyArray1<f64>,
-    m: PyReadonlyArray2<f64>,
+    m: Bound<'_, PyAny>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
     burnin: usize,
@@ -3760,15 +4371,12 @@ pub fn bayesb(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let m_shape = m.shape();
-    if m_shape[1] != n {
+    let m_input = array2_to_f32_input(&m, "M")?;
+    if m_input.cols() != n {
         return Err(PyValueError::new_err("M cols must match len(y)"));
     }
-    let p = m_shape[0];
-    let m_vec: Cow<'_, [f64]> = match m.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(array2_to_vec(&m)),
-    };
+    let p = m_input.rows();
+    let m_slice = m_input.as_slice();
 
     let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
         Some(arr) => {
@@ -3789,7 +4397,7 @@ pub fn bayesb(
     let result = py.detach(|| {
         bayesb_core_impl(
             y_vec.as_ref(),
-            m_vec.as_ref(),
+            m_slice,
             x_vec.as_ref(),
             n,
             p,
@@ -3871,7 +4479,7 @@ pub fn bayesb(
 pub fn bayesc(
     py: Python,
     y: PyReadonlyArray1<f64>,
-    m: PyReadonlyArray2<f64>,
+    m: Bound<'_, PyAny>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
     burnin: usize,
@@ -3933,15 +4541,12 @@ pub fn bayesc(
         Err(_) => Cow::Owned(array1_to_vec(&y)),
     };
     let n = y_vec.len();
-    let m_shape = m.shape();
-    if m_shape[1] != n {
+    let m_input = array2_to_f32_input(&m, "M")?;
+    if m_input.cols() != n {
         return Err(PyValueError::new_err("M cols must match len(y)"));
     }
-    let p = m_shape[0];
-    let m_vec: Cow<'_, [f64]> = match m.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(array2_to_vec(&m)),
-    };
+    let p = m_input.rows();
+    let m_slice = m_input.as_slice();
 
     let (x_vec, q): (Cow<'_, [f64]>, usize) = match &x {
         Some(arr) => {
@@ -3962,7 +4567,7 @@ pub fn bayesc(
     let result = py.detach(|| {
         bayesc_core_impl(
             y_vec.as_ref(),
-            m_vec.as_ref(),
+            m_slice,
             x_vec.as_ref(),
             n,
             p,
@@ -5541,8 +6146,8 @@ fn bayesa_packed_trace_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
         for off in 0..br {
@@ -5550,8 +6155,8 @@ fn bayesa_packed_trace_core_impl(
             let mut s = 0.0;
             let mut msum = 0.0;
             for &v in row {
-                s += v * v;
-                msum += v;
+                s += (v as f64) * (v as f64);
+                msum += v as f64;
             }
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
@@ -5633,6 +6238,7 @@ fn bayesa_packed_trace_core_impl(
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
     let mut var_e_sum = 0.0;
@@ -5678,22 +6284,25 @@ fn bayesa_packed_trace_core_impl(
             &mut rng,
         );
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         backend.for_each_block(|st, ed, m_block| {
             let br = ed - st;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
-                let rhs = marker_conditional_dot_f64(&r, m_row, beta[j], x2[j]) * inv_var_e;
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 let z_beta: f64 = rng.sample(StandardNormal);
-                let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-
-                update_marker_residual_f64(beta[j], new_beta, m_row, &mut r);
+                let old_beta = beta[j];
+                let (_, new_beta) =
+                    bayes_marker_update_f32(&mut marker_residual, m_row, old_beta, x2[j], |u| {
+                        u * inv_var_e / c + (1.0 / c).sqrt() * z_beta
+                    });
                 beta[j] = new_beta;
             }
             Ok(())
         })?;
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         for j in 0..p {
             var_b[j] = (s + beta[j] * beta[j]) / rng.sample(chi_b);
             if !(var_b[j].is_finite() && var_b[j] > 0.0) {
@@ -5878,8 +6487,8 @@ fn bayesb_packed_trace_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
         for off in 0..br {
@@ -5887,8 +6496,8 @@ fn bayesb_packed_trace_core_impl(
             let mut s = 0.0;
             let mut msum = 0.0;
             for &v in row {
-                s += v * v;
-                msum += v;
+                s += (v as f64) * (v as f64);
+                msum += v as f64;
             }
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
@@ -5962,6 +6571,7 @@ fn bayesb_packed_trace_core_impl(
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
     let mut var_e_sum = 0.0;
@@ -6010,6 +6620,7 @@ fn bayesb_packed_trace_core_impl(
             &mut rng,
         );
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
         backend.for_each_block(|st, ed, m_block| {
@@ -6018,38 +6629,39 @@ fn bayesb_packed_trace_core_impl(
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
                 let b_old = beta[j];
-                let xe = marker_conditional_dot_f64(&r, m_row, b_old, x2[j]);
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
                         "Non-positive posterior precision in BayesB packed beta update".to_string(),
                     );
                 }
-                let rhs = xe * inv_var_e;
-                let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b[j] * c).ln();
-                let log_odds = log_odds_prior + log_bf10;
-                let p_in = if log_odds >= 0.0 {
-                    1.0 / (1.0 + (-log_odds).exp())
-                } else {
-                    let e = log_odds.exp();
-                    e / (1.0 + e)
-                };
-                let new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                let mut new_d = 0u8;
+                let (_, new_beta) =
+                    bayes_marker_update_f32(&mut marker_residual, m_row, b_old, x2[j], |xe| {
+                        let rhs = xe * inv_var_e;
+                        let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b[j] * c).ln();
+                        let log_odds = log_odds_prior + log_bf10;
+                        let p_in = if log_odds >= 0.0 {
+                            1.0 / (1.0 + (-log_odds).exp())
+                        } else {
+                            let e = log_odds.exp();
+                            e / (1.0 + e)
+                        };
+                        new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                        if new_d == 1 {
+                            let z_beta: f64 = rng.sample(StandardNormal);
+                            rhs / c + (1.0 / c).sqrt() * z_beta
+                        } else {
+                            0.0
+                        }
+                    });
                 d[j] = new_d;
-
-                if new_d == 1 {
-                    let z_beta: f64 = rng.sample(StandardNormal);
-                    let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                    update_marker_residual_f64(b_old, new_beta, m_row, &mut r);
-                    beta[j] = new_beta;
-                } else {
-                    update_marker_residual_f64(b_old, 0.0, m_row, &mut r);
-                    beta[j] = 0.0;
-                }
+                beta[j] = new_beta;
             }
             Ok(())
         })?;
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         let mut n_active = 0usize;
         for j in 0..p {
             if d[j] == 1 {
@@ -6262,8 +6874,8 @@ fn bayesc_packed_trace_core_impl(
         }
     };
 
-    let mut x2 = vec![0.0; p];
-    let mut mean_x = vec![0.0; p];
+    let mut x2 = vec![0.0_f64; p];
+    let mut mean_x = vec![0.0_f64; p];
     backend.for_each_block(|st, ed, m_block| {
         let br = ed - st;
         for off in 0..br {
@@ -6271,8 +6883,8 @@ fn bayesc_packed_trace_core_impl(
             let mut s = 0.0;
             let mut msum = 0.0;
             for &v in row {
-                s += v * v;
-                msum += v;
+                s += (v as f64) * (v as f64);
+                msum += v as f64;
             }
             x2[st + off] = s;
             mean_x[st + off] = msum / n_f;
@@ -6344,6 +6956,7 @@ fn bayesc_packed_trace_core_impl(
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
     let mut r = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
     let mut var_e_sum = 0.0;
@@ -6391,6 +7004,7 @@ fn bayesc_packed_trace_core_impl(
             &mut rng,
         );
 
+        copy_f64_to_f32(&r, &mut marker_residual);
         let log_odds_prior = (prob_in / (1.0 - prob_in)).ln();
 
         backend.for_each_block(|st, ed, m_block| {
@@ -6399,38 +7013,39 @@ fn bayesc_packed_trace_core_impl(
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
                 let b_old = beta[j];
-                let xe = marker_conditional_dot_f64(&r, m_row, b_old, x2[j]);
                 let c = x2[j] * inv_var_e + 1.0 / var_b;
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
                         "Non-positive posterior precision in BayesC packed beta update".to_string(),
                     );
                 }
-                let rhs = xe * inv_var_e;
-                let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b * c).ln();
-                let log_odds = log_odds_prior + log_bf10;
-                let p_in = if log_odds >= 0.0 {
-                    1.0 / (1.0 + (-log_odds).exp())
-                } else {
-                    let e = log_odds.exp();
-                    e / (1.0 + e)
-                };
-                let new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                let mut new_d = 0u8;
+                let (_, new_beta) =
+                    bayes_marker_update_f32(&mut marker_residual, m_row, b_old, x2[j], |xe| {
+                        let rhs = xe * inv_var_e;
+                        let log_bf10 = 0.5 * rhs * rhs / c - 0.5 * (var_b * c).ln();
+                        let log_odds = log_odds_prior + log_bf10;
+                        let p_in = if log_odds >= 0.0 {
+                            1.0 / (1.0 + (-log_odds).exp())
+                        } else {
+                            let e = log_odds.exp();
+                            e / (1.0 + e)
+                        };
+                        new_d = if rng.random::<f64>() < p_in { 1u8 } else { 0u8 };
+                        if new_d == 1 {
+                            let z_beta: f64 = rng.sample(StandardNormal);
+                            rhs / c + (1.0 / c).sqrt() * z_beta
+                        } else {
+                            0.0
+                        }
+                    });
                 d[j] = new_d;
-
-                if new_d == 1 {
-                    let z_beta: f64 = rng.sample(StandardNormal);
-                    let new_beta = rhs / c + (1.0 / c).sqrt() * z_beta;
-                    update_marker_residual_f64(b_old, new_beta, m_row, &mut r);
-                    beta[j] = new_beta;
-                } else {
-                    update_marker_residual_f64(b_old, 0.0, m_row, &mut r);
-                    beta[j] = 0.0;
-                }
+                beta[j] = new_beta;
             }
             Ok(())
         })?;
 
+        copy_f32_to_f64(&marker_residual, &mut r);
         let mut mrk_in_usize = 0usize;
         let mut ss_b = 0.0;
         for j in 0..p {
@@ -7194,6 +7809,23 @@ mod backend_tests {
     }
 
     #[test]
+    fn dense_backend_iterates_borrowed_marker_rows() {
+        let matrix = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let matrix_ptr = matrix.as_ptr();
+        let mut backend = DenseBayesBackend::new(&matrix, 4, 2).expect("valid dense backend");
+        let mut blocks = 0usize;
+        backend
+            .for_each_block(|row_start, row_end, block| {
+                assert_eq!(block.as_ptr(), unsafe { matrix_ptr.add(row_start * 4) });
+                assert_eq!(block.len(), (row_end - row_start) * 4);
+                blocks += 1;
+                Ok(())
+            })
+            .expect("dense borrowed iteration succeeds");
+        assert_eq!(blocks, 1);
+    }
+
+    #[test]
     fn mixed_precision_marker_helpers_match_f64_reference() {
         let marker_f32 = [0.0_f32, 1.0, 2.0, 1.0, 0.0];
         let marker_f64 = marker_f32.map(f64::from);
@@ -7213,6 +7845,161 @@ mod backend_tests {
         for (mixed, reference) in mixed_residual.iter().zip(reference_residual.iter()) {
             assert!((mixed - reference).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn f32_residual_marker_helpers_match_f64_reference_with_rounding_bound() {
+        let marker = [0.0_f32, 1.0, 2.0, 1.0, 0.0];
+        let residual_f64 = [1.5_f64, -0.5, 2.0, 0.25, -1.0];
+        let residual_f32 = residual_f64.map(|value| value as f32);
+        let marker_f64 = marker.map(f64::from);
+        let old_beta = -0.37_f64;
+        let new_beta = 0.82_f64;
+        let d = ddot_f64(&marker_f64, &marker_f64);
+
+        let reference_u = marker_conditional_dot_f64(&residual_f64, &marker_f64, old_beta, d);
+        let f32_u = marker_conditional_dot_f32_f32(&residual_f32, &marker, old_beta, d);
+        assert!((f32_u - reference_u).abs() < 1e-6);
+
+        let mut reference_residual = residual_f64;
+        update_marker_residual_f64(old_beta, new_beta, &marker_f64, &mut reference_residual);
+        let mut f32_out = residual_f32;
+        update_marker_residual_f32(old_beta, new_beta, &marker, &mut f32_out);
+        for (actual, expected) in f32_out.iter().zip(reference_residual.iter()) {
+            assert!((*actual as f64 - *expected).abs() < 2e-6);
+        }
+    }
+
+    #[test]
+    fn fast_f32_marker_dot_matches_f64_reference_with_float32_bound() {
+        let marker = [
+            0.03125_f32,
+            1.0,
+            2.0,
+            1.0,
+            -0.1171875,
+            -0.5,
+            0.25,
+            0.6875,
+            -1.375,
+            0.203125,
+            0.8125,
+        ];
+        let residual = [
+            1.5_f32,
+            -0.5,
+            2.0,
+            0.25,
+            -1.0,
+            0.75,
+            -0.125,
+            0.33333334,
+            -0.7777778,
+            1.2345679,
+            -0.44444445,
+        ];
+        let marker_f64 = marker.map(f64::from);
+        let residual_f64 = residual.map(f64::from);
+        let marker_ss = marker_f64.iter().map(|v| v * v).sum::<f64>();
+        let expected = marker_conditional_dot_f64(&residual_f64, &marker_f64, -0.37, marker_ss);
+        let actual = marker_conditional_dot_f32_f32_fast(&residual, &marker, -0.37, marker_ss);
+        assert!((actual - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn blocked_f32_marker_dot_matches_f64_reference() {
+        let marker: Vec<f32> = (0..257).map(|i| ((i as f32) * 0.03125).sin()).collect();
+        let residual: Vec<f32> = (0..257)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.75)
+            .collect();
+        let marker_f64: Vec<f64> = marker.iter().copied().map(f64::from).collect();
+        let residual_f64: Vec<f64> = residual.iter().copied().map(f64::from).collect();
+        let marker_ss = marker_f64.iter().map(|v| v * v).sum::<f64>();
+        let expected = marker_conditional_dot_f64(&residual_f64, &marker_f64, -0.37, marker_ss);
+        let actual = marker_conditional_dot_f32_f32_blocked(&residual, &marker, -0.37, marker_ss);
+        assert!((actual - expected).abs() < 2e-5);
+    }
+
+    #[test]
+    fn fused_marker_update_matches_dot_then_axpy_reference() {
+        let marker = [0.0_f32, 1.0, 2.0, 1.0, 0.0, -0.5, 0.25, 1.25];
+        let initial = [1.5_f32, -0.5, 2.0, 0.25, -1.0, 0.75, -0.125, 0.33333334];
+        let old_beta = -0.37_f64;
+        let marker_ss = marker
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>();
+        let expected_u =
+            marker_conditional_dot_f32_f32_blocked(&initial, &marker, old_beta, marker_ss);
+        let expected_beta = 0.125 + 0.03125 * expected_u;
+        let mut expected_residual = initial;
+        update_marker_residual_f32(old_beta, expected_beta, &marker, &mut expected_residual);
+
+        let mut actual_residual = initial;
+        let (actual_u, actual_beta) = bayes_marker_update_f32_fused(
+            &mut actual_residual,
+            &marker,
+            old_beta,
+            marker_ss,
+            |u| 0.125 + 0.03125 * u,
+        );
+        assert_eq!(actual_u, expected_u);
+        assert_eq!(actual_beta, expected_beta);
+        assert_eq!(actual_residual, expected_residual);
+    }
+
+    #[test]
+    fn dense_f32_input_keeps_contiguous_python_storage_borrowed() {
+        Python::initialize();
+        Python::attach(|py| {
+            let array = numpy::PyArray2::<f32>::zeros(py, (2, 3), false);
+            let any = array.as_any();
+            let input = array2_to_f32_input(&any, "M").expect("valid float32 matrix");
+            assert!(input.is_borrowed());
+            assert_eq!(input.rows(), 2);
+            assert_eq!(input.cols(), 3);
+            assert_eq!(input.as_slice(), &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        });
+    }
+
+    #[test]
+    fn dense_f64_input_uses_owned_float32_fallback() {
+        Python::initialize();
+        Python::attach(|py| {
+            let array = numpy::PyArray2::<f64>::zeros(py, (2, 3), false);
+            let any = array.as_any();
+            let input = array2_to_f32_input(&any, "M").expect("valid float64 matrix");
+            assert!(!input.is_borrowed());
+            assert_eq!(input.rows(), 2);
+            assert_eq!(input.cols(), 3);
+            assert_eq!(input.as_slice(), &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        });
+    }
+
+    #[test]
+    fn unified_marker_update_returns_score_and_updates_residual() {
+        let marker = [0.0_f32, 1.0, 2.0, 1.0, 0.0];
+        let mut residual = [1.5_f32, -0.5, 2.0, 0.25, -1.0];
+        let old_beta = -0.37_f64;
+        let new_beta = 0.82_f64;
+        let marker_ss = marker
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>();
+        let expected_u = marker_conditional_dot_f32_f32(&residual, &marker, old_beta, marker_ss);
+        let (u, actual_beta) =
+            bayes_marker_update_f32(&mut residual, &marker, old_beta, marker_ss, |_| new_beta);
+        assert_eq!(actual_beta, new_beta);
+        assert_eq!(u, expected_u);
+    }
+
+    #[test]
+    fn zero_marker_update_is_a_noop() {
+        let marker = [0.0_f32, 1.0, 2.0, 1.0, 0.0];
+        let mut residual = [1.5_f32, -0.5, 2.0, 0.25, -1.0];
+        let expected = residual;
+        update_marker_residual_f32(0.0, 0.0, &marker, &mut residual);
+        assert_eq!(residual, expected);
     }
 
     #[test]

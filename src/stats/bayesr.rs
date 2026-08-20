@@ -6,7 +6,7 @@
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyDict};
 use pyo3::{prelude::*, BoundObject};
 use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng, TryRngCore};
@@ -15,10 +15,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::bayes::{
-    bayes_packed_blas_threads, bayes_packed_block_rows, ddot_f64, genetic_variance_from_residual,
-    marker_conditional_dot_f64, update_alpha_gauss_seidel_blas, update_marker_residual_f64,
-    BayesMarkerBackend, BayesPackedSource, BayesSamplingController, DenseBayesBackend,
-    PackedBayesBackend, BAYES_POSTERIOR_SAMPLES,
+    array2_to_f32_input, bayes_marker_update_f32_result, bayes_packed_blas_threads,
+    bayes_packed_block_rows, copy_f32_to_f64, copy_f64_to_f32, ddot_f64,
+    genetic_variance_from_residual, update_alpha_gauss_seidel_blas, BayesMarkerBackend,
+    BayesPackedSource, BayesSamplingController, DenseBayesBackend, PackedBayesBackend,
+    BAYES_POSTERIOR_SAMPLES,
 };
 use crate::blas::OpenBlasThreadGuard;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
@@ -47,6 +48,29 @@ fn validate_bayesr_prior(pi: &[f64], gamma: &[f64]) -> Result<(), String> {
     Ok(())
 }
 
+#[inline]
+fn component_log_weights_unchecked(
+    log_pi: &[f64; BAYESR_COMPONENTS],
+    tau2: &[f64; BAYESR_COMPONENTS],
+    u: f64,
+    d: f64,
+    sigma_e2: f64,
+) -> [f64; BAYESR_COMPONENTS] {
+    if !(u.is_finite() && d.is_finite() && d >= 0.0) {
+        debug_assert!(u.is_finite() && d.is_finite() && d >= 0.0);
+    }
+    let mut out = [0.0; BAYESR_COMPONENTS];
+    out[0] = log_pi[0];
+    for k in 1..BAYESR_COMPONENTS {
+        let component_tau2 = tau2[k];
+        let denom = sigma_e2 + component_tau2 * d;
+        out[k] = log_pi[k] - 0.5 * (1.0 + component_tau2 * d / sigma_e2).ln()
+            + component_tau2 * u * u / (2.0 * sigma_e2 * denom);
+    }
+    out
+}
+
+#[cfg(test)]
 fn component_log_weights(
     pi: &[f64],
     gamma: &[f64],
@@ -65,23 +89,21 @@ fn component_log_weights(
     if !(sigma_e2.is_finite() && sigma_e2 > 0.0) {
         return Err("BayesR sigma_e2 must be finite and > 0".to_string());
     }
-    let mut out = [0.0; BAYESR_COMPONENTS];
-    out[0] = pi[0].ln();
-    for k in 1..BAYESR_COMPONENTS {
-        let tau2 = gamma[k] * sigma_lambda2;
-        let denom = sigma_e2 + tau2 * d;
-        out[k] = pi[k].ln() - 0.5 * (1.0 + tau2 * d / sigma_e2).ln()
-            + tau2 * u * u / (2.0 * sigma_e2 * denom);
+    let mut log_pi = [0.0_f64; BAYESR_COMPONENTS];
+    let mut tau2 = [0.0_f64; BAYESR_COMPONENTS];
+    for k in 0..BAYESR_COMPONENTS {
+        log_pi[k] = pi[k].ln();
+        tau2[k] = gamma[k] * sigma_lambda2;
     }
-    Ok(out)
+    Ok(component_log_weights_unchecked(
+        &log_pi, &tau2, u, d, sigma_e2,
+    ))
 }
 
-fn normalize_component_log_weights(
-    log_weights: &[f64],
-) -> Result<[f64; BAYESR_COMPONENTS], String> {
-    if log_weights.len() != BAYESR_COMPONENTS || !log_weights.iter().all(|v| v.is_finite()) {
-        return Err("BayesR component log weights must contain four finite values".to_string());
-    }
+#[inline]
+fn normalize_component_log_weights_unchecked(
+    log_weights: &[f64; BAYESR_COMPONENTS],
+) -> [f64; BAYESR_COMPONENTS] {
     let max_log = log_weights
         .iter()
         .copied()
@@ -91,11 +113,25 @@ fn normalize_component_log_weights(
         *dst = (*value - max_log).exp();
     }
     let total: f64 = q.iter().sum();
-    if !(total.is_finite() && total > 0.0) {
-        return Err("BayesR component weights are not normalizable".to_string());
-    }
     for value in &mut q {
         *value /= total;
+    }
+    q
+}
+
+#[cfg(test)]
+fn normalize_component_log_weights(
+    log_weights: &[f64],
+) -> Result<[f64; BAYESR_COMPONENTS], String> {
+    if log_weights.len() != BAYESR_COMPONENTS || !log_weights.iter().all(|v| v.is_finite()) {
+        return Err("BayesR component log weights must contain four finite values".to_string());
+    }
+    let mut fixed = [0.0_f64; BAYESR_COMPONENTS];
+    fixed.copy_from_slice(log_weights);
+    let q = normalize_component_log_weights_unchecked(&fixed);
+    let total: f64 = q.iter().sum();
+    if !(total.is_finite() && total > 0.0) {
+        return Err("BayesR component weights are not normalizable".to_string());
     }
     Ok(q)
 }
@@ -193,9 +229,10 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     backend.for_each_block(|row_start, row_end, marker_block| {
         for offset in 0..(row_end - row_start) {
             let row = &marker_block[offset * n..(offset + 1) * n];
-            let mut sum_sq = 0.0;
-            let mut sum = 0.0;
+            let mut sum_sq = 0.0_f64;
+            let mut sum = 0.0_f64;
             for &value in row {
+                let value = value as f64;
                 sum_sq += value * value;
                 sum += value;
             }
@@ -264,7 +301,12 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
 
     let mut beta = vec![0.0_f64; p];
     let mut component = vec![0usize; p];
+    // Fixed-effect updates and posterior diagnostics retain f64 precision.  A
+    // separate f32 marker residual is used only during the O(n * p) Gibbs
+    // sweep, cutting the repeatedly streamed residual bandwidth in half while
+    // retaining f64 dot-product accumulation.
     let mut residual = y.to_vec();
+    let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0_f64; p];
     let mut beta_second_sum = vec![0.0_f64; p];
     let mut pip_sum = vec![0.0_f64; p];
@@ -281,6 +323,15 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     while schedule.should_run() {
         let retain_sample = schedule.begin_iteration();
         let inv_var_e = 1.0 / var_e;
+        // These four values are constant for an entire marker sweep.  Moving
+        // the logarithms and gamma*sigma multiplication out of the inner
+        // SNP loop removes eight scalar operations from every marker update.
+        let mut log_pi = [0.0_f64; BAYESR_COMPONENTS];
+        let mut tau2 = [0.0_f64; BAYESR_COMPONENTS];
+        for k in 0..BAYESR_COMPONENTS {
+            log_pi[k] = pi[k].ln();
+            tau2[k] = gamma_array[k] * sigma_lambda2;
+        }
         update_alpha_gauss_seidel_blas(
             x,
             n,
@@ -297,29 +348,42 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
             &mut rng,
         );
 
+        copy_f64_to_f32(&residual, &mut marker_residual);
+
         backend.for_each_block(|row_start, row_end, marker_block| {
             for offset in 0..(row_end - row_start) {
                 let j = row_start + offset;
                 let marker = &marker_block[offset * n..(offset + 1) * n];
                 let old_beta = beta[j];
-                let u = marker_conditional_dot_f64(&residual, marker, old_beta, x2[j]);
-                let log_weights =
-                    component_log_weights(&pi, &gamma_array, u, x2[j], sigma_lambda2, var_e)?;
-                let q_component = normalize_component_log_weights(&log_weights)?;
-                let selected = sample_component(&q_component, &mut rng);
-                component[j] = selected;
-                let new_beta = if selected == 0 {
-                    0.0
-                } else {
-                    let tau2 = gamma_array[selected] * sigma_lambda2;
-                    let precision = x2[j] * inv_var_e + 1.0 / tau2;
-                    let posterior_var = 1.0 / precision;
-                    let posterior_mean = posterior_var * u * inv_var_e;
-                    let z: f64 = rng.sample(StandardNormal);
-                    posterior_mean + posterior_var.sqrt() * z
-                };
+                let mut q_component = [0.0_f64; BAYESR_COMPONENTS];
+                let (_, new_beta) = bayes_marker_update_f32_result(
+                    &mut marker_residual,
+                    marker,
+                    old_beta,
+                    x2[j],
+                    |u| {
+                        if !u.is_finite() {
+                            return Err(
+                                "BayesR marker sufficient statistics must be finite".to_string()
+                            );
+                        }
+                        let log_weights =
+                            component_log_weights_unchecked(&log_pi, &tau2, u, x2[j], var_e);
+                        q_component = normalize_component_log_weights_unchecked(&log_weights);
+                        let selected = sample_component(&q_component, &mut rng);
+                        component[j] = selected;
+                        if selected == 0 {
+                            Ok(0.0)
+                        } else {
+                            let precision = x2[j] * inv_var_e + 1.0 / tau2[selected];
+                            let posterior_var = 1.0 / precision;
+                            let posterior_mean = posterior_var * u * inv_var_e;
+                            let z: f64 = rng.sample(StandardNormal);
+                            Ok(posterior_mean + posterior_var.sqrt() * z)
+                        }
+                    },
+                )?;
                 beta[j] = new_beta;
-                update_marker_residual_f64(old_beta, new_beta, marker, &mut residual);
 
                 if retain_sample {
                     beta_sum[j] += new_beta;
@@ -332,6 +396,8 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
             }
             Ok(())
         })?;
+
+        copy_f32_to_f64(&marker_residual, &mut residual);
 
         let mut active_count = 0usize;
         let mut scaled_sum = 0.0_f64;
@@ -561,7 +627,7 @@ fn bayesr_result_to_pydict<'py>(
 pub fn bayesr<'py>(
     py: Python<'py>,
     y: PyReadonlyArray1<'py, f64>,
-    m: PyReadonlyArray2<'py, f64>,
+    m: Bound<'py, PyAny>,
     x: Option<PyReadonlyArray2<'py, f64>>,
     n_iter: usize,
     burnin: usize,
@@ -580,15 +646,12 @@ pub fn bayesr<'py>(
     } else {
         array1_to_vec(&y)
     };
-    let m_shape = m.shape();
-    if m_shape.len() != 2 || m_shape[1] != y_vec.len() {
+    let m_input = array2_to_f32_input(&m, "BayesR M")?;
+    if m_input.cols() != y_vec.len() {
         return Err(PyValueError::new_err("BayesR M cols must match len(y)"));
     }
-    let m_vec = if let Ok(slice) = m.as_slice() {
-        slice.to_vec()
-    } else {
-        array2_to_vec(&m)
-    };
+    let m_rows = m_input.rows();
+    let m_slice = m_input.as_slice();
     let (x_vec, q) = match x.as_ref() {
         Some(arr) => {
             let shape = arr.shape();
@@ -607,7 +670,7 @@ pub fn bayesr<'py>(
     let pi_vec = parse_bayesr_prior(pi.as_ref(), &BAYESR_DEFAULT_PI, "pi")?;
     let gamma_vec = parse_bayesr_prior(gamma.as_ref(), &BAYESR_DEFAULT_GAMMA, "gamma")?;
     let result = py.detach(|| {
-        let mut backend = DenseBayesBackend::new(&m_vec, y_vec.len(), m_shape[0])?;
+        let mut backend = DenseBayesBackend::new(m_slice, y_vec.len(), m_rows)?;
         bayesr_core_impl(
             &mut backend,
             &y_vec,
@@ -675,7 +738,7 @@ fn bayesr_packed_core_impl<'a>(
     // supplies a block covering every active marker, decode once and run the
     // dense sampler rather than repeatedly decoding the same BED rows for
     // every MCMC iteration.
-    if let Some(m_dense) = backend.maybe_predecode_dense_f64()? {
+    if let Some(m_dense) = backend.maybe_predecode_dense_f32()? {
         let mut dense_backend = DenseBayesBackend::new(&m_dense, sample_indices.len(), p)?;
         return bayesr_core_impl(
             &mut dense_backend,
@@ -1000,9 +1063,15 @@ mod tests {
         let gamma: [f64; 4] = [0.0, 0.01, 0.1, 1.0];
         let got = super::component_log_weights(&pi, &gamma, 2.5, 3.0, 1.7, 0.8)
             .expect("valid BayesR component parameters");
+        let log_pi = pi.map(f64::ln);
+        let tau2 = gamma.map(|value| value * 1.7);
+        let fast = super::component_log_weights_unchecked(&log_pi, &tau2, 2.5, 3.0, 0.8);
 
         assert_eq!(got.len(), 4);
         assert!((got[0] - pi[0].ln()).abs() < 1e-12);
+        for k in 0..4 {
+            assert!((got[k] - fast[k]).abs() < 1e-12);
+        }
         for k in 1..4 {
             let tau2 = gamma[k] * 1.7;
             let expected = pi[k].ln() - 0.5 * (1.0 + tau2 * 3.0 / 0.8).ln()

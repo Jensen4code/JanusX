@@ -147,10 +147,13 @@ def _as_2d_f64(
         raise ValueError(f"{name} rows must match len(y)")
     return np.ascontiguousarray(out)
 
-def _as_2d_f64_mxn(arr: np.ndarray, name: str, n_cols: int) -> np.ndarray:
+def _as_2d_marker_mxn(arr: np.ndarray, name: str, n_cols: int) -> np.ndarray:
     if arr is None:
         raise ValueError(f"{name} cannot be None")
-    out = np.asarray(arr, dtype=np.float64)
+    # Native Bayes marker backends store and traverse standardized markers as
+    # float32.  Normalize at this boundary so a dense call does not retain a
+    # second float64 marker matrix while Rust creates its compact copy.
+    out = np.asarray(arr, dtype=np.float32)
     if out.ndim != 2:
         raise ValueError(f"{name} must be a 2D array")
     if out.shape[1] != n_cols:
@@ -501,8 +504,9 @@ def BayesA(
     """
     Python interface for the Rust BayesA kernel (PyO3).
 
-    This wrapper normalizes inputs to contiguous float64 arrays and passes
-    them to the Rust implementation `janusx.janusx.bayesa`.
+    This wrapper normalizes phenotypes/covariates to float64 and marker rows
+    to contiguous float32 before passing them to the Rust implementation
+    `janusx.janusx.bayesa`.
 
     Parameters
     ----------
@@ -576,11 +580,12 @@ def BayesA(
 
     Notes
     -----
-    - Inputs are copied to contiguous float64 arrays before calling Rust.
+    - Phenotypes and covariates are float64; marker rows are float32 because
+      the native Gibbs backend uses float32 marker/residual storage.
     - M is expected to be (m, n) with n == len(y).
     """
     y_arr = _as_1d_f64(y, "y")
-    m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
+    m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
     x_arr = None
     if X is not None:
         x_arr = _as_2d_f64(X, "X", y_arr.shape[0], allow_1d=True)
@@ -709,7 +714,7 @@ def BayesB(
         Number of posterior samples retained (normally exactly 1000).
     """
     y_arr = _as_1d_f64(y, "y")
-    m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
+    m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
     x_arr = None
     if X is not None:
         x_arr = _as_2d_f64(X, "X", y_arr.shape[0], allow_1d=True)
@@ -835,7 +840,7 @@ def BayesC(
         Number of posterior samples retained (normally exactly 1000).
     """
     y_arr = _as_1d_f64(y, "y")
-    m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
+    m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
     x_arr = None
     if X is not None:
         x_arr = _as_2d_f64(X, "X", y_arr.shape[0], allow_1d=True)
@@ -905,7 +910,7 @@ def BayesR(
     probabilities averaged over the retained posterior samples.
     """
     y_arr = _as_1d_f64(y, "y")
-    m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
+    m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
     x_arr = None
     if X is not None:
         x_arr = _as_2d_f64(X, "X", y_arr.shape[0], allow_1d=True)
