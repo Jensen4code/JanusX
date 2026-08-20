@@ -4,7 +4,12 @@ import typing
 import warnings
 import numpy as np
 
-from janusx.janusx import bayesa as _bayesa, bayesb as _bayesb, bayesc as _bayesc
+from janusx.janusx import (
+    bayesa as _bayesa,
+    bayesb as _bayesb,
+    bayesc as _bayesc,
+    bayesr as _bayesr,
+)
 from janusx.pyBLUP.mlm import BLUP
 
 _BAYESA_MIN_ABS_BETA_WARNED = False
@@ -16,6 +21,7 @@ BAYES_MCMC_DEFAULTS: dict[str, tuple[int, int]] = {
     "BayesA": (3000, 1000),
     "BayesB": (3000, 1000),
     "BayesC": (3000, 1000),
+    "BayesR": (3000, 1000),
 }
 
 
@@ -174,7 +180,7 @@ def _call_bayesa(
     rate0: Optional[float],
     s0_b: Optional[float],
     df0_e: float,
-    s0_e: Optional[float],
+    prior_ss_e: Optional[float],
     min_abs_beta: float,
     seed: Optional[int],
 ) -> Tuple[
@@ -206,8 +212,8 @@ def _call_bayesa(
         raise ValueError("rate0 must be > 0")
     if s0_b is not None and s0_b <= 0.0:
         raise ValueError("s0_b must be > 0")
-    if s0_e is not None and s0_e <= 0.0:
-        raise ValueError("s0_e must be > 0")
+    if prior_ss_e is not None and prior_ss_e <= 0.0:
+        raise ValueError("prior_ss_e must be > 0")
     if seed is not None:
         seed = int(seed)
         if seed < 0:
@@ -234,7 +240,7 @@ def _call_bayesa(
         rate0=rate0,
         s0_b=s0_b,
         df0_e=float(df0_e),
-        s0_e=s0_e,
+        prior_ss_e=prior_ss_e,
         min_abs_beta=float(min_abs_beta),
         seed=seed,
     )
@@ -255,7 +261,7 @@ def _call_bayesb(
     counts: float,
     pi: Optional[float],
     df0_e: float,
-    s0_e: Optional[float],
+    prior_ss_e: Optional[float],
     seed: Optional[int],
 ) -> Tuple[
     np.ndarray,
@@ -287,8 +293,8 @@ def _call_bayesb(
         raise ValueError("rate0 must be > 0")
     if s0_b is not None and s0_b <= 0.0:
         raise ValueError("s0_b must be > 0")
-    if s0_e is not None and s0_e <= 0.0:
-        raise ValueError("s0_e must be > 0")
+    if prior_ss_e is not None and prior_ss_e <= 0.0:
+        raise ValueError("prior_ss_e must be > 0")
     if not (0.0 < prob_in < 1.0):
         raise ValueError("prob_in must be in (0, 1)")
     if counts < 0.0:
@@ -315,7 +321,7 @@ def _call_bayesb(
         counts=float(counts),
         fixed_pi=fixed_pi,
         df0_e=float(df0_e),
-        s0_e=s0_e,
+        prior_ss_e=prior_ss_e,
         seed=seed,
     )
     # The native B/C ABI remains a 12-item tuple for PyO3 compatibility;
@@ -336,7 +342,7 @@ def _call_bayesc(
     counts: float,
     pi: Optional[float],
     df0_e: float,
-    s0_e: Optional[float],
+    prior_ss_e: Optional[float],
     seed: Optional[int],
 ) -> Tuple[
     np.ndarray,
@@ -364,8 +370,8 @@ def _call_bayesc(
         raise ValueError("df0_b and df0_e must be > 0")
     if s0_b is not None and s0_b <= 0.0:
         raise ValueError("s0_b must be > 0")
-    if s0_e is not None and s0_e <= 0.0:
-        raise ValueError("s0_e must be > 0")
+    if prior_ss_e is not None and prior_ss_e <= 0.0:
+        raise ValueError("prior_ss_e must be > 0")
     if not (0.0 < prob_in < 1.0):
         raise ValueError("prob_in must be in (0, 1)")
     if counts < 0.0:
@@ -390,10 +396,77 @@ def _call_bayesc(
         counts=float(counts),
         fixed_pi=fixed_pi,
         df0_e=float(df0_e),
-        s0_e=s0_e,
+        prior_ss_e=prior_ss_e,
         seed=seed,
     )
     return (*native_result, BAYES_POSTERIOR_SAMPLE_TARGET)
+
+
+def _call_bayesr(
+    y: np.ndarray,
+    m: np.ndarray,
+    x: Optional[np.ndarray],
+    n_iter: int,
+    burnin: int,
+    r2: float,
+    df0_e: float,
+    prior_ss_e: Optional[float],
+    pi: Optional[np.ndarray],
+    gamma: Optional[np.ndarray],
+    df0_lambda: float,
+    s0_lambda2: float,
+    seed: Optional[int],
+) -> dict[str, object]:
+    n_iter = int(n_iter)
+    burnin = int(burnin)
+    if n_iter <= 0:
+        raise ValueError("n_iter must be > 0")
+    if not (0.0 < r2 < 1.0):
+        raise ValueError("r2 must be in (0, 1)")
+    if df0_e <= 0.0 or df0_lambda <= 0.0:
+        raise ValueError("df0_e and df0_lambda must be > 0")
+    if prior_ss_e is not None and prior_ss_e <= 0.0:
+        raise ValueError("prior_ss_e must be > 0")
+    if s0_lambda2 <= 0.0:
+        raise ValueError("s0_lambda2 must be > 0")
+    if seed is not None:
+        seed = int(seed)
+        if seed < 0:
+            raise ValueError("seed must be >= 0")
+
+    def _prior(values: Optional[np.ndarray], default: tuple[float, ...], name: str) -> np.ndarray:
+        if values is None:
+            return np.ascontiguousarray(np.asarray(default, dtype=np.float64))
+        arr = np.ascontiguousarray(np.asarray(values, dtype=np.float64).reshape(-1))
+        if arr.size != 4 or not np.all(np.isfinite(arr)):
+            raise ValueError(f"BayesR {name} must contain exactly four finite values")
+        return arr
+
+    pi_arr = _prior(pi, (0.90, 0.06, 0.03, 0.01), "pi")
+    gamma_arr = _prior(gamma, (0.0, 0.01, 0.1, 1.0), "gamma")
+    if np.any(pi_arr <= 0.0):
+        raise ValueError("BayesR pi values must be > 0")
+    if abs(float(gamma_arr[0])) > 1e-15 or np.any(gamma_arr[1:] <= 0.0):
+        raise ValueError("BayesR gamma must start with 0 and have positive non-spike values")
+
+    return dict(
+        _bayesr(
+            y=y,
+            m=m,
+            x=x,
+            n_iter=n_iter,
+            burnin=burnin,
+            thin=1,
+            r2=float(r2),
+            df0_e=float(df0_e),
+            prior_ss_e=prior_ss_e,
+            pi=pi_arr,
+            gamma=gamma_arr,
+            df0_lambda=float(df0_lambda),
+            s0_lambda2=float(s0_lambda2),
+            seed=seed,
+        )
+    )
 
 
 def BayesA(
@@ -410,7 +483,7 @@ def BayesA(
     rate0: Optional[float] = None,
     s0_b: Optional[float] = None,
     df0_e: float = 5.0,
-    s0_e: Optional[float] = None,
+    prior_ss_e: Optional[float] = None,
     min_abs_beta: float = 1e-9,
     seed: Optional[int] = None,
 ) -> Tuple[
@@ -464,8 +537,9 @@ def BayesA(
         Prior scale for marker effects; if None, computed from data.
     df0_e : float, default=5.0
         Prior degrees of freedom for residual variance.
-    s0_e : float, optional
-        Prior scale for residual variance; if None, derived from data.
+    prior_ss_e : float, optional
+        Residual prior sum-of-squares ``nu_0 * S_0^2``; if None, derived from
+        data. This is not ``S_0^2`` alone.
     min_abs_beta : float, default=1e-9
         Deprecated and ignored by Rust backend (kept for API compatibility).
     seed : int, optional
@@ -523,7 +597,7 @@ def BayesA(
         rate0,
         s0_b,
         df0_e,
-        s0_e,
+        prior_ss_e,
         min_abs_beta,
         seed,
     )
@@ -543,7 +617,7 @@ def BayesB(
     rate0: Optional[float] = None,
     s0_b: Optional[float] = None,
     df0_e: float = 5.0,
-    s0_e: Optional[float] = None,
+    prior_ss_e: Optional[float] = None,
     seed: Optional[int] = None,
 ) -> Tuple[
     np.ndarray,
@@ -597,8 +671,9 @@ def BayesB(
         Prior scale for marker effects; if None, computed from data.
     df0_e : float, default=5.0
         Prior degrees of freedom for residual variance.
-    s0_e : float, optional
-        Prior scale for residual variance; if None, derived from data.
+    prior_ss_e : float, optional
+        Residual prior sum-of-squares ``nu_0 * S_0^2``; if None, derived from
+        data. This is not ``S_0^2`` alone.
     seed : int, optional
         RNG seed for reproducibility.
 
@@ -654,7 +729,7 @@ def BayesB(
         counts,
         pi,
         df0_e,
-        s0_e,
+        prior_ss_e,
         seed,
     )
 
@@ -672,7 +747,7 @@ def BayesC(
     df0_b: float = 5.0,
     s0_b: Optional[float] = None,
     df0_e: float = 5.0,
-    s0_e: Optional[float] = None,
+    prior_ss_e: Optional[float] = None,
     seed: Optional[int] = None,
 ) -> Tuple[
     np.ndarray,
@@ -722,8 +797,9 @@ def BayesC(
         Prior scale for marker effects; if None, computed from data.
     df0_e : float, default=5.0
         Prior degrees of freedom for residual variance.
-    s0_e : float, optional
-        Prior scale for residual variance; if None, derived from data.
+    prior_ss_e : float, optional
+        Residual prior sum-of-squares ``nu_0 * S_0^2``; if None, derived from
+        data. This is not ``S_0^2`` alone.
     seed : int, optional
         RNG seed for reproducibility.
 
@@ -777,8 +853,92 @@ def BayesC(
         counts,
         pi,
         df0_e,
-        s0_e,
+        prior_ss_e,
         seed,
+    )
+
+
+def BayesR(
+    y: np.ndarray,
+    M: np.ndarray,
+    X: Optional[np.ndarray] = None,
+    n_iter: int = 3000,
+    burnin: int = 1000,
+    r2: float = 0.5,
+    pi: Optional[np.ndarray] = None,
+    gamma: Optional[np.ndarray] = None,
+    df0_lambda: float = 1.0,
+    s0_lambda2: float = 1.0,
+    df0_e: float = 5.0,
+    prior_ss_e: Optional[float] = None,
+    seed: Optional[int] = None,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    float,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    int,
+    int,
+    int,
+]:
+    """Fit the four-component BayesR mixture model.
+
+    The default prior is ``pi=(.90,.06,.03,.01)`` and
+    ``gamma=(0,.01,.1,1)``.  ``pi`` and ``gamma`` are function-level
+    parameters; the GS CLI keeps these defaults and does not expose separate
+    command-line flags.
+
+    ``prior_ss_e`` is the residual prior sum-of-squares ``nu_0 * S_0^2``;
+    it is not ``S_0^2`` alone.
+
+    Returns ``(beta, alpha, varbeta, vare, h2, varh2, pip,
+    component_prob, pi_mean, sigma_lambda2, rhat_h2, actual_iterations,
+    convergence_iteration, posterior_samples)``.
+    ``component_prob`` has shape ``(n_markers, 4)`` and uses Rao--Blackwell
+    probabilities averaged over the retained posterior samples.
+    """
+    y_arr = _as_1d_f64(y, "y")
+    m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
+    x_arr = None
+    if X is not None:
+        x_arr = _as_2d_f64(X, "X", y_arr.shape[0], allow_1d=True)
+    result = _call_bayesr(
+        y_arr,
+        m_arr,
+        x_arr,
+        n_iter,
+        burnin,
+        r2,
+        df0_e,
+        prior_ss_e,
+        pi,
+        gamma,
+        df0_lambda,
+        s0_lambda2,
+        seed,
+    )
+    return (
+        np.ascontiguousarray(result["beta"], dtype=np.float64).reshape(-1),
+        np.ascontiguousarray(result["alpha"], dtype=np.float64).reshape(-1),
+        np.ascontiguousarray(result["varbeta"], dtype=np.float64).reshape(-1),
+        float(result["vare"]),
+        float(result["h2_mean"]),
+        float(result["var_h2"]),
+        np.ascontiguousarray(result["pip"], dtype=np.float64).reshape(-1),
+        np.ascontiguousarray(result["component_prob"], dtype=np.float32),
+        np.ascontiguousarray(result["pi"], dtype=np.float64).reshape(-1),
+        float(result["sigma_lambda2"]),
+        float(result["rhat_h2"]),
+        int(result["actual_iterations"]),
+        int(result["convergence_iteration"]),
+        int(result["posterior_samples"]),
     )
 
 
@@ -788,17 +948,18 @@ class BAYES:
         y: np.ndarray,
         M: np.ndarray,
         cov: np.ndarray | None = None,
-        method: typing.Literal["BayesA", "BayesB", "BayesC"] = "BayesA",
+        method: typing.Literal["BayesA", "BayesB", "BayesC", "BayesR"] = "BayesA",
         n_iter: Optional[int] = None,
         burnin: Optional[int] = None,
         r2: Optional[float] = None,
         prob_in: float = 0.5,
         counts: float = 5.0,
-        pi: Optional[float] = None,
+        pi: Optional[float | np.ndarray] = None,
+        gamma: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
     ):
         """
-        Bayesian genomic prediction using BayesA/B/C with minimal hyperparameters.
+        Bayesian genomic prediction using BayesA/B/C/R with minimal hyperparameters.
 
         Parameters
         ----------
@@ -808,7 +969,7 @@ class BAYES:
             Marker matrix of shape (m, n) with genotypes coded as 0/1/2.
         cov : np.ndarray, optional
             Fixed-effect design matrix of shape (n, p).
-        method : {"BayesA","BayesB","BayesC"}
+        method : {"BayesA","BayesB","BayesC","BayesR"}
             Bayesian model to fit.
         r2 : float, optional
             Proportion of variance explained by markers. If None, estimated
@@ -817,9 +978,12 @@ class BAYES:
             Prior inclusion probability (BayesB/BayesC).
         counts : float
             Prior strength for inclusion probability (BayesB/BayesC).
-        pi : float, optional
-            Fixed marker inclusion probability for BayesB/BayesC. If omitted,
-            the sampler updates the inclusion probability from active markers.
+        pi : float or array-like, optional
+            Fixed marker inclusion probability for BayesB/BayesC. For BayesR,
+            this is the four-component initial mixture prior and is updated
+            by the Dirichlet step. If omitted, BayesR uses ``(.90,.06,.03,.01)``.
+        gamma : array-like, optional
+            BayesR component variance multipliers. Defaults to ``(0,.01,.1,1)``.
 
         Attributes
         ----------
@@ -851,6 +1015,7 @@ class BAYES:
             "BayesA": BayesA,
             "BayesB": BayesB,
             "BayesC": BayesC,
+            "BayesR": BayesR,
         }
         if method not in method_map:
             raise ValueError(f"Unsupported Bayes method: {method}")
@@ -883,6 +1048,9 @@ class BAYES:
         self.pve: float | None = None
         self.varpve: float | None = None
         self.pip_hat: np.ndarray | None = None
+        self.component_prob_hat: np.ndarray | None = None
+        self.pi_hat: np.ndarray | None = None
+        self.sigma_lambda2_hat: float | None = None
         self.rhat_h2: float = float("nan")
         self.rhat: float = float("nan")
         self.rhat_max_iterations: int = int(n_iter)
@@ -900,27 +1068,65 @@ class BAYES:
             n_iter=n_iter,
             burnin=burnin,
             r2=float(r2),
-            prob_in=prob_in,
-            counts=counts,
             seed=seed,
         )
+        if method != "BayesR":
+            method_kwargs["prob_in"] = prob_in
+            method_kwargs["counts"] = counts
         if method in {"BayesB", "BayesC"}:
             method_kwargs["pi"] = pi
-        beta, alpha, varbeta, varep, h2_mean, varh2, *diag = method_map[method](
-            y,
-            M,
-            X,
-            **method_kwargs,
-        )
+        if method == "BayesR":
+            method_kwargs["pi"] = pi
+            method_kwargs["gamma"] = gamma
+            (
+                beta,
+                alpha,
+                varbeta,
+                varep,
+                h2_mean,
+                varh2,
+                pip,
+                component_prob,
+                pi_mean,
+                sigma_lambda2,
+                rhat_h2,
+                actual_iterations,
+                convergence_iteration,
+                posterior_samples,
+            ) = method_map[method](y, M, X, **method_kwargs)
+            self.component_prob_hat = np.ascontiguousarray(
+                np.asarray(component_prob, dtype=np.float32), dtype=np.float32
+            )
+            self.pi_hat = np.ascontiguousarray(
+                np.asarray(pi_mean, dtype=np.float64).reshape(-1), dtype=np.float64
+            )
+            self.sigma_lambda2_hat = float(sigma_lambda2)
+            diag = []
+        else:
+            beta, alpha, varbeta, varep, h2_mean, varh2, *diag = method_map[method](
+                y,
+                M,
+                X,
+                **method_kwargs,
+            )
         self.beta_hat = beta.reshape(-1, 1);self.varbeta_hat = varbeta
         self.alpha_hat = alpha.reshape(-1, 1)
         self.varep_hat = float(varep)
         self.pve = float(h2_mean);self.varpve = float(varh2)
-        diagnostics = _parse_bayes_diagnostics(
-            method,
-            diag,
-            int(self.beta_hat.size),
-        )
+        if method == "BayesR":
+            diagnostics = {
+                "pip": np.ascontiguousarray(np.asarray(pip, dtype=np.float64).reshape(-1)),
+                "rhat_h2": float(rhat_h2),
+                "actual_iterations": int(actual_iterations),
+                "convergence_iteration": int(convergence_iteration),
+                "posterior_samples": int(posterior_samples),
+            }
+        else:
+            diagnostics = _parse_bayes_diagnostics(
+                method,
+                diag,
+                int(self.beta_hat.size),
+            )
         pip = diagnostics["pip"]
         if isinstance(pip, np.ndarray):
             self.pip_hat = np.ascontiguousarray(pip.reshape(-1, 1), dtype=np.float64)
@@ -952,6 +1158,7 @@ class BAYES:
 bayesA = BayesA
 bayesB = BayesB
 bayesC = BayesC
+bayesR = BayesR
 __all__ = [
     "BAYES_MCMC_DEFAULTS",
     "BAYES_POSTERIOR_SAMPLE_TARGET",
@@ -959,8 +1166,10 @@ __all__ = [
     "BayesA",
     "BayesB",
     "BayesC",
+    "BayesR",
     "BAYES",
     "bayesA",
     "bayesB",
     "bayesC",
+    "bayesR",
 ]

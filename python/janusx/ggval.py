@@ -44,6 +44,11 @@ TEXT_EFFECT_HEADERS = {
     "BayesA": ["chr", "pos", "snp", "beta"],
     "BayesB": ["chr", "pos", "snp", "beta", "pip"],
     "BayesC": ["chr", "pos", "snp", "beta", "pip"],
+    "BayesR": [
+        "chr", "pos", "snp", "beta", "pip",
+        "component_prob_0", "component_prob_1",
+        "component_prob_2", "component_prob_3",
+    ],
 }
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 

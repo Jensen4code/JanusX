@@ -14,7 +14,7 @@ Use these modules as the main public surface:
 | `janusx.assoc` | GWAS-style wrappers and file-mode orchestration | mirrors `jx gwas` |
 | `janusx.gs` | GS-style wrappers and result objects | mirrors `jx gs` |
 | `janusx.pyBLUP` | direct in-memory association, GRM, BLUP, and ML kernels | lower-level than `assoc` / `gs` |
-| `janusx.pyBLUP.bayes` | `BayesA`, `BayesB`, `BayesC`, `BAYES` | Bayesian GS imports live here, not at `janusx.pyBLUP` top level |
+| `janusx.pyBLUP.bayes` | `BayesA`, `BayesB`, `BayesC`, `BayesR`, `BAYES` | Bayesian GS imports live here, not at `janusx.pyBLUP` top level |
 | `janusx.fastpop` | RSVD, ancestry decomposition, CVerror | mirrors `jx fastpop` |
 | `janusx.garfield.logreg` | logical conjunction search on binary features | lightweight Python-facing GARFIELD entry |
 | `janusx.gtools` | GFF/BED readers and region queries | annotation-centric helpers |
@@ -244,24 +244,29 @@ This layer is best when you already have in-memory matrices and want to bypass f
 
 ```python
 from janusx.pyBLUP import BLUP, MLGS
-from janusx.pyBLUP.bayes import BayesA, BayesB, BayesC, BAYES
+from janusx.pyBLUP.bayes import BayesA, BayesB, BayesC, BayesR, BAYES
 ```
 
 Use:
 
 - `BLUP` for direct mixed-model prediction on in-memory matrices
 - `MLGS` for ML-based GS in Python
-- `BayesA`, `BayesB`, `BayesC`, or `BAYES` for Bayesian GS. Pass `pi=` to
-  `BayesB`/`BayesC` to keep the marker inclusion probability fixed.
+- `BayesA`, `BayesB`, `BayesC`, `BayesR`, or `BAYES` for Bayesian GS. Pass
+  `pi=` to `BayesB`/`BayesC` to keep the marker inclusion probability fixed.
+  `BayesR` exposes its four-component `pi` and `gamma` priors at the Python
+  function layer; the CLI intentionally keeps the documented defaults.
 
 Bayesian sampling uses a unified default of a 3000-iteration R-hat monitoring
-limit (stability threshold 1.2). Once R-hat converges, the monitoring summary
+limit (stability threshold 1.10). Once R-hat converges, the monitoring summary
 is discarded and the next 1000 iterations are retained as posterior samples.
 If convergence is not reached by the limit, the following 1000 iterations are
 used as a fallback posterior window, so the maximum chain length is 4000.
 The public Python wrappers keep `burnin` as a compatibility argument but it no
 longer controls a second burn-in stage; thinning is fixed at one for production
 GS.
+
+The residual-variance prior argument is named `prior_ss_e` and represents the
+inverse-chi-square prior sum-of-squares term `nu_0 * S_0^2`, not `S_0^2` alone.
 
 The Bayesian imports live in `janusx.pyBLUP.bayes`, not in `janusx.pyBLUP` top-level exports.
 

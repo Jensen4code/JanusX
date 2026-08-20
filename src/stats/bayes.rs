@@ -6,6 +6,10 @@
 //!
 //! `y = X alpha + Z' beta + e,  e ~ N(0, sigma_e^2 I)`.
 //!
+//! The residual inverse-chi-square prior uses `prior_ss_e = nu_0 * S_0^2` as
+//! its sum-of-squares parameter. Consequently, each update has the form
+//! `(RSS + prior_ss_e) / chi2(n + nu_0)`; `prior_ss_e` is not `S_0^2` alone.
+//!
 //! The three maintained priors are:
 //!
 //! - `BayesA`: each marker has its own variance,
@@ -126,11 +130,13 @@ fn posterior_keep_iters(n_iter: usize, burnin: usize, thin: usize) -> Vec<i64> {
 // from the retained posterior h2 samples.  The two consecutive halves are
 // treated as two chains; this is useful for detecting a persistent drift in the
 // scalar variance component while keeping the production kernels streaming.
+// Keep the early-stop criterion aligned with the GS user-facing contract.
+// Keep the conventional conservative convergence cutoff for split-chain R-hat.
 const BAYES_RHAT_THRESHOLD: f64 = 1.10;
 const BAYES_RHAT_MIN_KEEP: usize = 500;
 const BAYES_RHAT_CHECK_EVERY: usize = 50;
 const BAYES_RHAT_STABLE_CHECKS: usize = 3;
-const BAYES_POSTERIOR_SAMPLES: usize = 1000;
+pub(crate) const BAYES_POSTERIOR_SAMPLES: usize = 1000;
 
 #[derive(Debug, Default)]
 struct BayesRhatState {
@@ -201,7 +207,7 @@ impl BayesRhatState {
 /// samples are retained. If the monitoring phase reaches `n_iter` without
 /// convergence, the same posterior collection phase starts as a fallback.
 #[derive(Debug)]
-struct BayesSamplingController {
+pub(crate) struct BayesSamplingController {
     n_iter: usize,
     thin: usize,
     actual_iterations: usize,
@@ -212,7 +218,7 @@ struct BayesSamplingController {
 }
 
 impl BayesSamplingController {
-    fn new(n_iter: usize, _burnin: usize, thin: usize) -> Self {
+    pub(crate) fn new(n_iter: usize, _burnin: usize, thin: usize) -> Self {
         let thin = thin.max(1);
         let target_keep = BAYES_POSTERIOR_SAMPLES / thin + 1;
         Self {
@@ -227,7 +233,7 @@ impl BayesSamplingController {
     }
 
     #[inline]
-    fn should_run(&self) -> bool {
+    pub(crate) fn should_run(&self) -> bool {
         if self.collecting_posterior {
             self.posterior_samples < BAYES_POSTERIOR_SAMPLES
         } else {
@@ -243,7 +249,7 @@ impl BayesSamplingController {
 
     /// Advance one MCMC iteration and report whether its summary is retained.
     #[inline]
-    fn begin_iteration(&mut self) -> bool {
+    pub(crate) fn begin_iteration(&mut self) -> bool {
         self.actual_iterations += 1;
         let it = self.actual_iterations - 1;
         it % self.thin == 0
@@ -253,7 +259,7 @@ impl BayesSamplingController {
     /// must be cleared before the next iteration starts formal posterior
     /// collection.
     #[inline]
-    fn observe(&mut self, h2: f64) -> bool {
+    pub(crate) fn observe(&mut self, h2: f64) -> bool {
         if self.collecting_posterior {
             self.posterior_samples += 1;
             let _ = self.rhat_state.observe(h2);
@@ -283,13 +289,23 @@ impl BayesSamplingController {
     }
 
     #[inline]
-    fn posterior_samples(&self) -> usize {
+    pub(crate) fn posterior_samples(&self) -> usize {
         self.posterior_samples
     }
 
     #[inline]
-    fn rhat_value(&self) -> f64 {
+    pub(crate) fn rhat_value(&self) -> f64 {
         self.rhat_state.value()
+    }
+
+    #[inline]
+    pub(crate) fn actual_iterations(&self) -> usize {
+        self.actual_iterations
+    }
+
+    #[inline]
+    pub(crate) fn convergence_iteration(&self) -> usize {
+        self.convergence_iteration
     }
 }
 
@@ -526,7 +542,7 @@ fn row_major_xtx_f64(x: &[f64], n: usize, q: usize, xtx_out: &mut [f64]) {
 }
 
 #[inline]
-fn ddot_f64(x: &[f64], y: &[f64]) -> f64 {
+pub(crate) fn ddot_f64(x: &[f64], y: &[f64]) -> f64 {
     debug_assert_eq!(x.len(), y.len());
     if x.is_empty() {
         return 0.0_f64;
@@ -552,7 +568,7 @@ fn ddot_f64(x: &[f64], y: &[f64]) -> f64 {
 }
 
 #[inline]
-fn daxpy_inplace_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
+pub(crate) fn daxpy_inplace_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
     debug_assert_eq!(x.len(), y.len());
     if alpha == 0.0_f64 || x.is_empty() {
         return;
@@ -579,7 +595,7 @@ fn daxpy_inplace_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_alpha_gauss_seidel_blas(
+pub(crate) fn update_alpha_gauss_seidel_blas(
     x: &[f64],
     n: usize,
     q: usize,
@@ -627,11 +643,11 @@ fn update_alpha_gauss_seidel_blas(
     }
 }
 
-struct PackedByteLut {
+pub(crate) struct PackedByteLut {
     code4: [[u8; 4]; 256],
 }
 
-fn packed_byte_lut() -> &'static PackedByteLut {
+pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
     static LUT: OnceLock<PackedByteLut> = OnceLock::new();
     LUT.get_or_init(|| {
         let mut code4 = [[0u8; 4]; 256];
@@ -643,6 +659,12 @@ fn packed_byte_lut() -> &'static PackedByteLut {
         }
         PackedByteLut { code4 }
     })
+}
+
+impl PackedByteLut {
+    pub(crate) fn code4(&self) -> &[[u8; 4]; 256] {
+        &self.code4
+    }
 }
 
 fn parse_env_truthy(raw: &str) -> Option<bool> {
@@ -660,7 +682,7 @@ fn parse_env_truthy(raw: &str) -> Option<bool> {
 }
 
 #[inline]
-fn bayes_packed_block_rows(n: usize, p: usize) -> usize {
+pub(crate) fn bayes_packed_block_rows(n: usize, p: usize) -> usize {
     if n == 0 || p == 0 {
         return 1;
     }
@@ -707,7 +729,7 @@ fn bayes_packed_predecode_max_mb() -> usize {
 }
 
 #[inline]
-fn bayes_packed_blas_threads() -> usize {
+pub(crate) fn bayes_packed_blas_threads() -> usize {
     // Default policy stays "BLAS single-thread + Rayon parallel decode".
     // Env override for experiments:
     //   JX_BAYES_PACKED_BLAS_THREADS=4  -> force BLAS 4 threads in Bayes packed kernels
@@ -748,7 +770,7 @@ fn bayes_stream_window_mb(n_samples: usize, block_rows: usize) -> usize {
     target_bytes.div_ceil(1024 * 1024).max(1)
 }
 
-enum BayesPackedSource<'a> {
+pub(crate) enum BayesPackedSource<'a> {
     Resident {
         packed_flat: &'a [u8],
         bytes_per_snp: usize,
@@ -756,7 +778,210 @@ enum BayesPackedSource<'a> {
     Windowed(WindowedBedMatrix),
 }
 
-fn build_bayes_source<'a>(
+/// Common marker access contract used by every Bayesian marker sampler.
+///
+/// Marker rows are returned in standardized f64 form.  The statistical
+/// kernels only depend on this small interface, so resident packed BED,
+/// windowed BED, and dense inputs can share the same sampler implementation.
+pub(crate) trait BayesMarkerBackend {
+    fn n_samples(&self) -> usize;
+    fn n_markers(&self) -> usize;
+    fn block_rows(&self) -> usize;
+    fn fill_block(
+        &mut self,
+        row_start: usize,
+        row_end: usize,
+        out_block: &mut [f64],
+        n: usize,
+    ) -> Result<(), String>;
+}
+
+/// Dense marker backend used by the in-memory Bayes entry points.
+pub(crate) struct DenseBayesBackend<'a> {
+    matrix: &'a [f64],
+    n: usize,
+    p: usize,
+    block_rows: usize,
+}
+
+impl<'a> DenseBayesBackend<'a> {
+    pub(crate) fn new(matrix: &'a [f64], n: usize, p: usize) -> Result<Self, String> {
+        if matrix.len() != p.saturating_mul(n) {
+            return Err("Bayes dense genotype dimensions are incompatible".to_string());
+        }
+        Ok(Self {
+            matrix,
+            n,
+            p,
+            block_rows: p.min(2048).max(1),
+        })
+    }
+}
+
+impl BayesMarkerBackend for DenseBayesBackend<'_> {
+    fn n_samples(&self) -> usize {
+        self.n
+    }
+
+    fn n_markers(&self) -> usize {
+        self.p
+    }
+
+    fn block_rows(&self) -> usize {
+        self.block_rows
+    }
+
+    fn fill_block(
+        &mut self,
+        row_start: usize,
+        row_end: usize,
+        out_block: &mut [f64],
+        n: usize,
+    ) -> Result<(), String> {
+        if row_start > row_end || row_end > self.p || n != self.n {
+            return Err("Bayes dense block bounds are invalid".to_string());
+        }
+        let expected = (row_end - row_start).saturating_mul(n);
+        if out_block.len() != expected {
+            return Err("Bayes dense block buffer has an invalid length".to_string());
+        }
+        out_block.copy_from_slice(&self.matrix[row_start * n..row_end * n]);
+        Ok(())
+    }
+}
+
+/// Shared packed/stream BED backend.
+///
+/// This owns all source-specific state (row/sample mapping, decode scratch,
+/// thread pool and source window).  Any future decode policy such as
+/// double-buffering therefore belongs here and automatically applies to all
+/// Bayes models that consume this backend.
+pub(crate) struct PackedBayesBackend<'a, 'source> {
+    source: &'a mut BayesPackedSource<'source>,
+    n_samples_total: usize,
+    p: usize,
+    row_flip: &'a [bool],
+    row_mean: &'a [f32],
+    row_inv_sd: &'a [f32],
+    packed_row_indices: Option<&'a [usize]>,
+    sample_indices: &'a [usize],
+    full_sample_fast: bool,
+    block_rows: usize,
+    pool: Option<&'a Arc<rayon::ThreadPool>>,
+    scratch_f32: Vec<f32>,
+}
+
+impl<'a, 'source> PackedBayesBackend<'a, 'source> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        source: &'a mut BayesPackedSource<'source>,
+        n_samples_total: usize,
+        p: usize,
+        row_flip: &'a [bool],
+        row_mean: &'a [f32],
+        row_inv_sd: &'a [f32],
+        packed_row_indices: Option<&'a [usize]>,
+        sample_indices: &'a [usize],
+        block_rows: Option<usize>,
+        pool: Option<&'a Arc<rayon::ThreadPool>>,
+    ) -> Result<Self, String> {
+        if p == 0 {
+            return Err("Bayes packed genotype has no markers".to_string());
+        }
+        if row_flip.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
+            return Err("Bayes packed row metadata length mismatch".to_string());
+        }
+        if let Some(indices) = packed_row_indices {
+            if indices.len() != p {
+                return Err("Bayes packed source-row index length mismatch".to_string());
+            }
+        }
+        if sample_indices.is_empty() || sample_indices.iter().any(|&i| i >= n_samples_total) {
+            return Err("Bayes packed sample indices are invalid".to_string());
+        }
+        let resolved_block_rows = block_rows
+            .unwrap_or_else(|| bayes_packed_block_rows(sample_indices.len(), p))
+            .max(1)
+            .min(p);
+        Ok(Self {
+            source,
+            n_samples_total,
+            p,
+            row_flip,
+            row_mean,
+            row_inv_sd,
+            packed_row_indices,
+            sample_indices,
+            full_sample_fast: is_identity_indices(sample_indices, n_samples_total),
+            block_rows: resolved_block_rows,
+            pool,
+            scratch_f32: Vec::new(),
+        })
+    }
+
+    /// Materialize a resident packed source only when the common predecode
+    /// policy allows it.  Windowed BED sources always remain streamed.
+    pub(crate) fn maybe_predecode_dense_f64(&mut self) -> Result<Option<Vec<f64>>, String> {
+        maybe_predecode_source_dense_f64(
+            &mut self.source,
+            self.n_samples_total,
+            self.row_flip,
+            self.row_mean,
+            self.row_inv_sd,
+            self.sample_indices,
+            self.sample_indices.len(),
+            self.p,
+            self.packed_row_indices,
+            packed_byte_lut().code4(),
+            self.pool,
+        )
+    }
+}
+
+impl BayesMarkerBackend for PackedBayesBackend<'_, '_> {
+    fn n_samples(&self) -> usize {
+        self.sample_indices.len()
+    }
+
+    fn n_markers(&self) -> usize {
+        self.p
+    }
+
+    fn block_rows(&self) -> usize {
+        self.block_rows
+    }
+
+    fn fill_block(
+        &mut self,
+        row_start: usize,
+        row_end: usize,
+        out_block: &mut [f64],
+        n: usize,
+    ) -> Result<(), String> {
+        if row_start > row_end || row_end > self.p || n != self.sample_indices.len() {
+            return Err("Bayes packed block bounds are invalid".to_string());
+        }
+        decode_source_block_standardized_into(
+            &mut self.source,
+            self.n_samples_total,
+            row_start,
+            row_end,
+            self.sample_indices,
+            self.full_sample_fast,
+            self.packed_row_indices,
+            self.row_flip,
+            self.row_mean,
+            self.row_inv_sd,
+            packed_byte_lut().code4(),
+            out_block,
+            n,
+            self.pool,
+            &mut self.scratch_f32,
+        )
+    }
+}
+
+pub(crate) fn build_bayes_source<'a>(
     resident_packed_flat: Option<&'a [u8]>,
     prefix: &str,
     n_samples: usize,
@@ -780,7 +1005,7 @@ fn build_bayes_source<'a>(
 }
 
 #[inline]
-fn decode_source_block_standardized_into(
+pub(crate) fn decode_source_block_standardized_into(
     source: &mut BayesPackedSource<'_>,
     n_samples: usize,
     row_start: usize,
@@ -877,47 +1102,6 @@ fn decode_source_block_standardized_into(
     Ok(())
 }
 
-#[inline]
-fn decode_packed_block_standardized_into(
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
-    n_samples: usize,
-    row_start: usize,
-    row_end: usize,
-    sample_idx: &[usize],
-    full_sample_fast: bool,
-    row_flip: &[bool],
-    row_mean: &[f32],
-    row_inv_sd: &[f32],
-    code4_lut: &[[u8; 4]; 256],
-    out_block: &mut [f64],
-    n: usize,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-    scratch_f32: &mut Vec<f32>,
-) -> Result<(), String> {
-    let mut source = BayesPackedSource::Resident {
-        packed_flat,
-        bytes_per_snp,
-    };
-    decode_source_block_standardized_into(
-        &mut source,
-        n_samples,
-        row_start,
-        row_end,
-        sample_idx,
-        full_sample_fast,
-        None,
-        row_flip,
-        row_mean,
-        row_inv_sd,
-        code4_lut,
-        out_block,
-        n,
-        pool,
-        scratch_f32,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn maybe_predecode_source_dense_f64(
     source: &mut BayesPackedSource<'_>,
@@ -966,7 +1150,7 @@ fn maybe_predecode_source_dense_f64(
     Ok(Some(dense_f64))
 }
 
-fn genetic_variance_from_residual(
+pub(crate) fn genetic_variance_from_residual(
     y: &[f64],
     r: &[f64],
     x: &[f64],
@@ -1057,7 +1241,7 @@ fn bayesb_core_impl(
     counts: f64,
     fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
 ) -> Result<
     (
@@ -1161,12 +1345,12 @@ fn bayesb_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -1306,7 +1490,7 @@ fn bayesb_core_impl(
             prob_in = rng.sample(beta_dist);
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesB var_e became non-finite or non-positive".to_string());
@@ -1404,7 +1588,7 @@ fn bayesc_core_impl(
     counts: f64,
     fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
 ) -> Result<
     (
@@ -1506,12 +1690,12 @@ fn bayesc_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -1639,7 +1823,7 @@ fn bayesc_core_impl(
             prob_in = rng.sample(beta_dist);
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesC var_e became non-finite or non-positive".to_string());
@@ -1736,7 +1920,7 @@ fn bayesa_core_impl(
     rate0_opt: Option<f64>,
     s0_b_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     _min_abs_beta: f64,
     seed: Option<u64>,
 ) -> Result<
@@ -1842,12 +2026,12 @@ fn bayesa_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -1935,7 +2119,7 @@ fn bayesa_core_impl(
             return Err("BayesA S became non-finite or non-positive".to_string());
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesA var_e became non-finite or non-positive".to_string());
@@ -2025,9 +2209,10 @@ fn bayesa_packed_core_impl(
     rate0_opt: Option<f64>,
     s0_b_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     _min_abs_beta: f64,
     seed: Option<u64>,
+    backend_block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<
     (
@@ -2058,23 +2243,38 @@ fn bayesa_packed_core_impl(
         return Err("row metadata length mismatch with packed rows".to_string());
     }
 
-    let code4_lut = &packed_byte_lut().code4;
-    if let Some(m_dense) = maybe_predecode_source_dense_f64(
+    let mut backend = PackedBayesBackend::new(
         source,
         n_samples,
+        p,
         row_flip,
         row_mean,
         row_inv_sd,
-        sample_idx,
-        n,
-        p,
         packed_row_indices,
-        code4_lut,
+        sample_idx,
+        backend_block_rows,
         pool,
-    )? {
+    )?;
+    if let Some(m_dense) = backend.maybe_predecode_dense_f64()? {
         return bayesa_core_impl(
-            y, &m_dense, x, n, p, q, n_iter, burnin, thin, r2, df0_b, shape0, rate0_opt, s0_b_opt,
-            df0_e, s0_e_opt, 0.0, seed,
+            y,
+            &m_dense,
+            x,
+            n,
+            p,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_b,
+            shape0,
+            rate0_opt,
+            s0_b_opt,
+            df0_e,
+            prior_ss_e_opt,
+            0.0,
+            seed,
         );
     }
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
@@ -2091,32 +2291,14 @@ fn bayesa_packed_core_impl(
         }
     };
 
-    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let block_rows = bayes_packed_block_rows(n, p);
+    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
     let mut m_block = vec![0.0_f64; block_rows * n];
-    let mut scratch_decode_f32 = vec![0.0_f32; block_rows * n];
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_source_block_standardized_into(
-            source,
-            n_samples,
-            st,
-            ed,
-            sample_idx,
-            full_sample_fast,
-            packed_row_indices,
-            row_flip,
-            row_mean,
-            row_inv_sd,
-            code4_lut,
-            &mut m_block[..br * n],
-            n,
-            pool,
-            &mut scratch_decode_f32,
-        )?;
+        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -2180,12 +2362,12 @@ fn bayesa_packed_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -2240,23 +2422,7 @@ fn bayesa_packed_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_source_block_standardized_into(
-                source,
-                n_samples,
-                st,
-                ed,
-                sample_idx,
-                full_sample_fast,
-                packed_row_indices,
-                row_flip,
-                row_mean,
-                row_inv_sd,
-                code4_lut,
-                &mut m_block[..br * n],
-                n,
-                pool,
-                &mut scratch_decode_f32,
-            )?;
+            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
@@ -2294,7 +2460,7 @@ fn bayesa_packed_core_impl(
             return Err("BayesA packed S became non-finite or non-positive".to_string());
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesA packed var_e became non-finite or non-positive".to_string());
@@ -2387,8 +2553,9 @@ fn bayesb_packed_core_impl(
     counts: f64,
     fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
+    backend_block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<
     (
@@ -2429,20 +2596,19 @@ fn bayesb_packed_core_impl(
         return Err("row metadata length mismatch with packed rows".to_string());
     }
 
-    let code4_lut = &packed_byte_lut().code4;
-    if let Some(m_dense) = maybe_predecode_source_dense_f64(
+    let mut backend = PackedBayesBackend::new(
         source,
         n_samples,
+        p,
         row_flip,
         row_mean,
         row_inv_sd,
-        sample_idx,
-        n,
-        p,
         packed_row_indices,
-        code4_lut,
+        sample_idx,
+        backend_block_rows,
         pool,
-    )? {
+    )?;
+    if let Some(m_dense) = backend.maybe_predecode_dense_f64()? {
         return bayesb_core_impl(
             y,
             &m_dense,
@@ -2462,7 +2628,7 @@ fn bayesb_packed_core_impl(
             counts,
             fixed_prob_in_opt,
             df0_e,
-            s0_e_opt,
+            prior_ss_e_opt,
             seed,
         );
     }
@@ -2480,32 +2646,14 @@ fn bayesb_packed_core_impl(
         }
     };
 
-    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let block_rows = bayes_packed_block_rows(n, p);
+    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
     let mut m_block = vec![0.0_f64; block_rows * n];
-    let mut scratch_decode_f32 = vec![0.0_f32; block_rows * n];
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_source_block_standardized_into(
-            source,
-            n_samples,
-            st,
-            ed,
-            sample_idx,
-            full_sample_fast,
-            packed_row_indices,
-            row_flip,
-            row_mean,
-            row_inv_sd,
-            code4_lut,
-            &mut m_block[..br * n],
-            n,
-            pool,
-            &mut scratch_decode_f32,
-        )?;
+        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -2558,12 +2706,12 @@ fn bayesb_packed_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -2627,23 +2775,7 @@ fn bayesb_packed_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_source_block_standardized_into(
-                source,
-                n_samples,
-                st,
-                ed,
-                sample_idx,
-                full_sample_fast,
-                packed_row_indices,
-                row_flip,
-                row_mean,
-                row_inv_sd,
-                code4_lut,
-                &mut m_block[..br * n],
-                n,
-                pool,
-                &mut scratch_decode_f32,
-            )?;
+            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
@@ -2728,7 +2860,7 @@ fn bayesb_packed_core_impl(
             prob_in = rng.sample(beta_dist);
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesB packed var_e became non-finite or non-positive".to_string());
@@ -2833,8 +2965,9 @@ fn bayesc_packed_core_impl(
     counts: f64,
     fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
+    backend_block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<
     (
@@ -2875,20 +3008,19 @@ fn bayesc_packed_core_impl(
         return Err("row metadata length mismatch with packed rows".to_string());
     }
 
-    let code4_lut = &packed_byte_lut().code4;
-    if let Some(m_dense) = maybe_predecode_source_dense_f64(
+    let mut backend = PackedBayesBackend::new(
         source,
         n_samples,
+        p,
         row_flip,
         row_mean,
         row_inv_sd,
-        sample_idx,
-        n,
-        p,
         packed_row_indices,
-        code4_lut,
+        sample_idx,
+        backend_block_rows,
         pool,
-    )? {
+    )?;
+    if let Some(m_dense) = backend.maybe_predecode_dense_f64()? {
         return bayesc_core_impl(
             y,
             &m_dense,
@@ -2906,7 +3038,7 @@ fn bayesc_packed_core_impl(
             counts,
             fixed_prob_in_opt,
             df0_e,
-            s0_e_opt,
+            prior_ss_e_opt,
             seed,
         );
     }
@@ -2924,32 +3056,14 @@ fn bayesc_packed_core_impl(
         }
     };
 
-    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let block_rows = bayes_packed_block_rows(n, p);
+    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
     let mut m_block = vec![0.0_f64; block_rows * n];
-    let mut scratch_decode_f32 = vec![0.0_f32; block_rows * n];
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_source_block_standardized_into(
-            source,
-            n_samples,
-            st,
-            ed,
-            sample_idx,
-            full_sample_fast,
-            packed_row_indices,
-            row_flip,
-            row_mean,
-            row_inv_sd,
-            code4_lut,
-            &mut m_block[..br * n],
-            n,
-            pool,
-            &mut scratch_decode_f32,
-        )?;
+        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -3000,12 +3114,12 @@ fn bayesc_packed_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -3068,23 +3182,7 @@ fn bayesc_packed_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_source_block_standardized_into(
-                source,
-                n_samples,
-                st,
-                ed,
-                sample_idx,
-                full_sample_fast,
-                packed_row_indices,
-                row_flip,
-                row_mean,
-                row_inv_sd,
-                code4_lut,
-                &mut m_block[..br * n],
-                n,
-                pool,
-                &mut scratch_decode_f32,
-            )?;
+            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
@@ -3154,7 +3252,7 @@ fn bayesc_packed_core_impl(
             prob_in = rng.sample(beta_dist);
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesC packed var_e became non-finite or non-positive".to_string());
@@ -3249,7 +3347,7 @@ fn bayesc_packed_core_impl(
     rate0 = None,
     s0_b = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     min_abs_beta = 1e-9,
     seed = None
 ))]
@@ -3267,7 +3365,7 @@ pub fn bayesa(
     rate0: Option<f64>,
     s0_b: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     min_abs_beta: f64,
     seed: Option<u64>,
 ) -> PyResult<(
@@ -3351,7 +3449,7 @@ pub fn bayesa(
             rate0,
             s0_b,
             df0_e,
-            s0_e,
+            prior_ss_e,
             min_abs_beta,
             seed,
         )
@@ -3407,7 +3505,7 @@ pub fn bayesa(
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     seed = None
 ))]
 pub fn bayesb(
@@ -3427,7 +3525,7 @@ pub fn bayesb(
     counts: f64,
     fixed_pi: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     seed: Option<u64>,
 ) -> PyResult<(
     Py<PyArray1<f64>>,
@@ -3516,7 +3614,7 @@ pub fn bayesb(
             counts,
             fixed_pi,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
         )
     });
@@ -3575,7 +3673,7 @@ pub fn bayesb(
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     seed = None
 ))]
 pub fn bayesc(
@@ -3593,7 +3691,7 @@ pub fn bayesc(
     counts: f64,
     fixed_pi: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     seed: Option<u64>,
 ) -> PyResult<(
     Py<PyArray1<f64>>,
@@ -3632,9 +3730,9 @@ pub fn bayesc(
             return Err(PyValueError::new_err("s0_b must be > 0"));
         }
     }
-    if let Some(v) = s0_e {
+    if let Some(v) = prior_ss_e {
         if v <= 0.0 {
-            return Err(PyValueError::new_err("s0_e must be > 0"));
+            return Err(PyValueError::new_err("prior_ss_e must be > 0"));
         }
     }
 
@@ -3687,7 +3785,7 @@ pub fn bayesc(
             counts,
             fixed_pi,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
         )
     });
@@ -3750,7 +3848,7 @@ pub fn bayesc(
     rate0 = None,
     s0_b = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     min_abs_beta = 1e-9,
     threads = 0,
     seed = None
@@ -3775,7 +3873,7 @@ pub fn bayesa_packed(
     rate0: Option<f64>,
     s0_b: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     min_abs_beta: f64,
     threads: usize,
     seed: Option<u64>,
@@ -3921,9 +4019,10 @@ pub fn bayesa_packed(
             rate0,
             s0_b,
             df0_e,
-            s0_e,
+            prior_ss_e,
             min_abs_beta,
             seed,
+            None,
             pool_ref,
         )
     });
@@ -3984,7 +4083,7 @@ pub fn bayesa_packed(
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     threads = 0,
     seed = None
 ))]
@@ -4011,7 +4110,7 @@ pub fn bayesb_packed(
     counts: f64,
     fixed_pi: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     threads: usize,
     seed: Option<u64>,
 ) -> PyResult<(
@@ -4162,8 +4261,9 @@ pub fn bayesb_packed(
             counts,
             fixed_pi,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
+            None,
             pool_ref,
         )
     });
@@ -4228,7 +4328,7 @@ pub fn bayesb_packed(
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     threads = 0,
     seed = None
 ))]
@@ -4253,7 +4353,7 @@ pub fn bayesc_packed(
     counts: f64,
     fixed_pi: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     threads: usize,
     seed: Option<u64>,
 ) -> PyResult<(
@@ -4293,9 +4393,9 @@ pub fn bayesc_packed(
             return Err(PyValueError::new_err("s0_b must be > 0"));
         }
     }
-    if let Some(v) = s0_e {
+    if let Some(v) = prior_ss_e {
         if v <= 0.0 {
-            return Err(PyValueError::new_err("s0_e must be > 0"));
+            return Err(PyValueError::new_err("prior_ss_e must be > 0"));
         }
     }
     if n_samples == 0 {
@@ -4409,8 +4509,9 @@ pub fn bayesc_packed(
             counts,
             fixed_pi,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
+            None,
             pool_ref,
         )
     });
@@ -4474,7 +4575,7 @@ pub fn bayesc_packed(
     rate0 = None,
     s0_b = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     min_abs_beta = 1e-9,
     threads = 0,
     seed = None,
@@ -4502,7 +4603,7 @@ pub fn bayesa_stream_bed(
     rate0: Option<f64>,
     s0_b: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     min_abs_beta: f64,
     threads: usize,
     seed: Option<u64>,
@@ -4640,9 +4741,10 @@ pub fn bayesa_stream_bed(
             rate0,
             s0_b,
             df0_e,
-            s0_e,
+            prior_ss_e,
             min_abs_beta,
             seed,
+            Some(block_rows),
             pool_ref,
         )
     });
@@ -4704,7 +4806,7 @@ pub fn bayesa_stream_bed(
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     threads = 0,
     seed = None,
     block_rows = None,
@@ -4734,7 +4836,7 @@ pub fn bayesb_stream_bed(
     counts: f64,
     fixed_pi: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     threads: usize,
     seed: Option<u64>,
     block_rows: Option<usize>,
@@ -4877,8 +4979,9 @@ pub fn bayesb_stream_bed(
             counts,
             fixed_pi,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
+            Some(block_rows),
             pool_ref,
         )
     });
@@ -4944,7 +5047,7 @@ pub fn bayesb_stream_bed(
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     threads = 0,
     seed = None,
     block_rows = None,
@@ -4972,7 +5075,7 @@ pub fn bayesc_stream_bed(
     counts: f64,
     fixed_pi: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     threads: usize,
     seed: Option<u64>,
     block_rows: Option<usize>,
@@ -5014,9 +5117,9 @@ pub fn bayesc_stream_bed(
             return Err(PyValueError::new_err("s0_b must be > 0"));
         }
     }
-    if let Some(v) = s0_e {
+    if let Some(v) = prior_ss_e {
         if v <= 0.0 {
-            return Err(PyValueError::new_err("s0_e must be > 0"));
+            return Err(PyValueError::new_err("prior_ss_e must be > 0"));
         }
     }
     if n_samples == 0 {
@@ -5120,8 +5223,9 @@ pub fn bayesc_stream_bed(
             counts,
             fixed_pi,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
+            Some(block_rows),
             pool_ref,
         )
     });
@@ -5188,7 +5292,7 @@ fn bayesa_packed_trace_core_impl(
     rate0_opt: Option<f64>,
     s0_b_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
     trace_snp_indices: &[usize],
     pool: Option<&Arc<rayon::ThreadPool>>,
@@ -5207,8 +5311,24 @@ fn bayesa_packed_trace_core_impl(
         return Err("row metadata length mismatch with packed rows".to_string());
     }
 
-    let code4_lut = &packed_byte_lut().code4;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
+
+    let mut source = BayesPackedSource::Resident {
+        packed_flat,
+        bytes_per_snp,
+    };
+    let mut backend = PackedBayesBackend::new(
+        &mut source,
+        n_samples,
+        p,
+        row_flip,
+        row_mean,
+        row_inv_sd,
+        None,
+        sample_idx,
+        None,
+        pool,
+    )?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -5222,32 +5342,14 @@ fn bayesa_packed_trace_core_impl(
         }
     };
 
-    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let block_rows = bayes_packed_block_rows(n, p);
+    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
     let mut m_block = vec![0.0_f64; block_rows * n];
-    let mut scratch_decode_f32 = vec![0.0_f32; block_rows * n];
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_packed_block_standardized_into(
-            packed_flat,
-            bytes_per_snp,
-            n_samples,
-            st,
-            ed,
-            sample_idx,
-            full_sample_fast,
-            row_flip,
-            row_mean,
-            row_inv_sd,
-            code4_lut,
-            &mut m_block[..br * n],
-            n,
-            pool,
-            &mut scratch_decode_f32,
-        )?;
+        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -5311,12 +5413,12 @@ fn bayesa_packed_trace_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -5383,23 +5485,7 @@ fn bayesa_packed_trace_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_packed_block_standardized_into(
-                packed_flat,
-                bytes_per_snp,
-                n_samples,
-                st,
-                ed,
-                sample_idx,
-                full_sample_fast,
-                row_flip,
-                row_mean,
-                row_inv_sd,
-                code4_lut,
-                &mut m_block[..br * n],
-                n,
-                pool,
-                &mut scratch_decode_f32,
-            )?;
+            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
@@ -5437,7 +5523,7 @@ fn bayesa_packed_trace_core_impl(
             return Err("BayesA packed S became non-finite or non-positive".to_string());
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesA packed var_e became non-finite or non-positive".to_string());
@@ -5541,7 +5627,7 @@ fn bayesb_packed_trace_core_impl(
     counts: f64,
     fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
     trace_snp_indices: &[usize],
     pool: Option<&Arc<rayon::ThreadPool>>,
@@ -5567,8 +5653,24 @@ fn bayesb_packed_trace_core_impl(
         return Err("row metadata length mismatch with packed rows".to_string());
     }
 
-    let code4_lut = &packed_byte_lut().code4;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
+
+    let mut source = BayesPackedSource::Resident {
+        packed_flat,
+        bytes_per_snp,
+    };
+    let mut backend = PackedBayesBackend::new(
+        &mut source,
+        n_samples,
+        p,
+        row_flip,
+        row_mean,
+        row_inv_sd,
+        None,
+        sample_idx,
+        None,
+        pool,
+    )?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -5582,32 +5684,14 @@ fn bayesb_packed_trace_core_impl(
         }
     };
 
-    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let block_rows = bayes_packed_block_rows(n, p);
+    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
     let mut m_block = vec![0.0_f64; block_rows * n];
-    let mut scratch_decode_f32 = vec![0.0_f32; block_rows * n];
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_packed_block_standardized_into(
-            packed_flat,
-            bytes_per_snp,
-            n_samples,
-            st,
-            ed,
-            sample_idx,
-            full_sample_fast,
-            row_flip,
-            row_mean,
-            row_inv_sd,
-            code4_lut,
-            &mut m_block[..br * n],
-            n,
-            pool,
-            &mut scratch_decode_f32,
-        )?;
+        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -5660,12 +5744,12 @@ fn bayesb_packed_trace_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -5740,23 +5824,7 @@ fn bayesb_packed_trace_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_packed_block_standardized_into(
-                packed_flat,
-                bytes_per_snp,
-                n_samples,
-                st,
-                ed,
-                sample_idx,
-                full_sample_fast,
-                row_flip,
-                row_mean,
-                row_inv_sd,
-                code4_lut,
-                &mut m_block[..br * n],
-                n,
-                pool,
-                &mut scratch_decode_f32,
-            )?;
+            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
@@ -5839,7 +5907,7 @@ fn bayesb_packed_trace_core_impl(
             prob_in = rng.sample(beta_dist);
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesB packed var_e became non-finite or non-positive".to_string());
@@ -5949,7 +6017,7 @@ fn bayesc_packed_trace_core_impl(
     counts: f64,
     fixed_prob_in_opt: Option<f64>,
     df0_e: f64,
-    s0_e_opt: Option<f64>,
+    prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
     trace_snp_indices: &[usize],
     pool: Option<&Arc<rayon::ThreadPool>>,
@@ -5975,8 +6043,24 @@ fn bayesc_packed_trace_core_impl(
         return Err("row metadata length mismatch with packed rows".to_string());
     }
 
-    let code4_lut = &packed_byte_lut().code4;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
+
+    let mut source = BayesPackedSource::Resident {
+        packed_flat,
+        bytes_per_snp,
+    };
+    let mut backend = PackedBayesBackend::new(
+        &mut source,
+        n_samples,
+        p,
+        row_flip,
+        row_mean,
+        row_inv_sd,
+        None,
+        sample_idx,
+        None,
+        pool,
+    )?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -5990,32 +6074,14 @@ fn bayesc_packed_trace_core_impl(
         }
     };
 
-    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let block_rows = bayes_packed_block_rows(n, p);
+    let block_rows = backend.block_rows();
     let mut x2 = vec![0.0; p];
     let mut mean_x = vec![0.0; p];
     let mut m_block = vec![0.0_f64; block_rows * n];
-    let mut scratch_decode_f32 = vec![0.0_f32; block_rows * n];
     for st in (0..p).step_by(block_rows) {
         let ed = (st + block_rows).min(p);
         let br = ed - st;
-        decode_packed_block_standardized_into(
-            packed_flat,
-            bytes_per_snp,
-            n_samples,
-            st,
-            ed,
-            sample_idx,
-            full_sample_fast,
-            row_flip,
-            row_mean,
-            row_inv_sd,
-            code4_lut,
-            &mut m_block[..br * n],
-            n,
-            pool,
-            &mut scratch_decode_f32,
-        )?;
+        backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
         for off in 0..br {
             let row = &m_block[off * n..(off + 1) * n];
             let mut s = 0.0;
@@ -6066,12 +6132,12 @@ fn bayesc_packed_trace_core_impl(
         return Err("varE must be positive; check R2".to_string());
     }
 
-    let s0_e = match s0_e_opt {
+    let prior_ss_e = match prior_ss_e_opt {
         Some(v) => v,
         None => var_e * (df0_e + 2.0),
     };
-    if s0_e <= 0.0 {
-        return Err("S0_e must be positive".to_string());
+    if prior_ss_e <= 0.0 {
+        return Err("prior_ss_e must be positive".to_string());
     }
 
     let mut beta = vec![0.0; p];
@@ -6145,23 +6211,7 @@ fn bayesc_packed_trace_core_impl(
         for st in (0..p).step_by(block_rows) {
             let ed = (st + block_rows).min(p);
             let br = ed - st;
-            decode_packed_block_standardized_into(
-                packed_flat,
-                bytes_per_snp,
-                n_samples,
-                st,
-                ed,
-                sample_idx,
-                full_sample_fast,
-                row_flip,
-                row_mean,
-                row_inv_sd,
-                code4_lut,
-                &mut m_block[..br * n],
-                n,
-                pool,
-                &mut scratch_decode_f32,
-            )?;
+            backend.fill_block(st, ed, &mut m_block[..br * n], n)?;
             for off in 0..br {
                 let j = st + off;
                 let m_row = &m_block[off * n..(off + 1) * n];
@@ -6229,7 +6279,7 @@ fn bayesc_packed_trace_core_impl(
             prob_in = rng.sample(beta_dist);
         }
 
-        let ss_e = ddot_f64(&r, &r) + s0_e;
+        let ss_e = ddot_f64(&r, &r) + prior_ss_e;
         var_e = ss_e / rng.sample(chi_e);
         if !(var_e.is_finite() && var_e > 0.0) {
             return Err("BayesC packed var_e became non-finite or non-positive".to_string());
@@ -6334,7 +6384,7 @@ fn bayesc_packed_trace_core_impl(
     rate0 = None,
     s0_b = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     min_abs_beta = 1e-9,
     trace_snp_indices = None,
     threads = 0,
@@ -6360,7 +6410,7 @@ pub fn bayesa_packed_trace<'py>(
     rate0: Option<f64>,
     s0_b: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     min_abs_beta: f64,
     trace_snp_indices: Option<PyReadonlyArray1<i64>>,
     threads: usize,
@@ -6493,7 +6543,7 @@ pub fn bayesa_packed_trace<'py>(
             rate0,
             s0_b,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
             &trace_idx,
             pool_ref,
@@ -6528,7 +6578,7 @@ pub fn bayesa_packed_trace<'py>(
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     trace_snp_indices = None,
     threads = 0,
     seed = None
@@ -6556,7 +6606,7 @@ pub fn bayesb_packed_trace<'py>(
     counts: f64,
     fixed_pi: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     trace_snp_indices: Option<PyReadonlyArray1<i64>>,
     threads: usize,
     seed: Option<u64>,
@@ -6692,7 +6742,7 @@ pub fn bayesb_packed_trace<'py>(
             counts,
             fixed_pi,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
             &trace_idx,
             pool_ref,
@@ -6725,7 +6775,7 @@ pub fn bayesb_packed_trace<'py>(
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
-    s0_e = None,
+    prior_ss_e = None,
     trace_snp_indices = None,
     threads = 0,
     seed = None
@@ -6751,7 +6801,7 @@ pub fn bayesc_packed_trace<'py>(
     counts: f64,
     fixed_pi: Option<f64>,
     df0_e: f64,
-    s0_e: Option<f64>,
+    prior_ss_e: Option<f64>,
     trace_snp_indices: Option<PyReadonlyArray1<i64>>,
     threads: usize,
     seed: Option<u64>,
@@ -6779,9 +6829,9 @@ pub fn bayesc_packed_trace<'py>(
             return Err(PyValueError::new_err("s0_b must be > 0"));
         }
     }
-    if let Some(v) = s0_e {
+    if let Some(v) = prior_ss_e {
         if v <= 0.0 {
-            return Err(PyValueError::new_err("s0_e must be > 0"));
+            return Err(PyValueError::new_err("prior_ss_e must be > 0"));
         }
     }
     if n_samples == 0 {
@@ -6892,7 +6942,7 @@ pub fn bayesc_packed_trace<'py>(
             counts,
             fixed_pi,
             df0_e,
-            s0_e,
+            prior_ss_e,
             seed,
             &trace_idx,
             pool_ref,
@@ -6901,5 +6951,47 @@ pub fn bayesc_packed_trace<'py>(
     match result {
         Ok(res) => packed_trace_result_to_pydict(py, res),
         Err(msg) => Err(PyValueError::new_err(msg)),
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn dense_backend_reads_requested_marker_block() {
+        let matrix = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut backend = DenseBayesBackend::new(&matrix, 4, 2).expect("valid dense backend");
+        assert_eq!(backend.n_samples(), 4);
+        assert_eq!(backend.n_markers(), 2);
+        assert_eq!(backend.block_rows(), 2);
+
+        let mut block = vec![0.0_f64; 4];
+        backend
+            .fill_block(1, 2, &mut block, 4)
+            .expect("valid dense block");
+        assert_eq!(block, vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn packed_backend_rejects_incomplete_row_metadata() {
+        let packed = [0_u8; 2];
+        let mut source = BayesPackedSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp: 1,
+        };
+        let result = PackedBayesBackend::new(
+            &mut source,
+            4,
+            2,
+            &[false],
+            &[0.0, 0.0],
+            &[1.0, 1.0],
+            None,
+            &[0, 1],
+            None,
+            None,
+        );
+        assert!(result.is_err());
     }
 }

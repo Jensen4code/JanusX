@@ -148,13 +148,19 @@ jx reml -p example/rice6048.reml.tsv -n 3 -c year,loc -rc block -k rice.cGRM.npy
 Current GS model groups:
 
 - kernel models: `-GBLUP`, `-rrBLUP`
-- Bayesian models: `-BayesA`, `-BayesB`, `-BayesC`
+- Bayesian models: `-BayesA`, `-BayesB`, `-BayesC`, `-BayesR`
 
 `-BayesB` and `-BayesC` optionally accept a fixed marker inclusion
 probability, for example `-BayesB 0.05`. Without a numeric argument the
 inclusion probability is estimated during sampling.
 
-Bayesian GS uses a 3000-iteration R-hat upper limit (stability threshold 1.2).
+`-BayesR` uses the four-component mixture prior
+`pi=(0.90,0.06,0.03,0.01)` and `gamma=(0,0.01,0.1,1)`. These two priors are
+available through the Python `BayesR` function, but are intentionally not
+separate CLI options. With `-save-model`, the effect table includes `pip` and
+`component_prob_0` through `component_prob_3`.
+
+Bayesian GS uses a 3000-iteration R-hat upper limit (stability threshold 1.10).
 After R-hat converges, the next 1000 iterations are retained as posterior
 samples. If it does not converge by the limit, the following 1000 iterations
 form a fallback posterior window (maximum 4000 iterations). Production

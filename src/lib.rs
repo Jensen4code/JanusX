@@ -19,6 +19,8 @@ mod admixture;
 mod algwas;
 #[path = "stats/bayes.rs"]
 mod bayes;
+#[path = "stats/bayesr.rs"]
+mod bayesr;
 #[path = "stats/bsa.rs"]
 mod bsa;
 #[path = "stats/bstats.rs"]
@@ -189,6 +191,7 @@ use bayes::{
     bayesb_packed_trace, bayesb_stream_bed, bayesc, bayesc_packed, bayesc_packed_trace,
     bayesc_stream_bed,
 };
+use bayesr::{bayesr as bayesr_fn, bayesr_packed, bayesr_stream_bed};
 use binwriter::Bin01StreamWriter;
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
 use blas::{
@@ -982,6 +985,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayesa_stream_bed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb_stream_bed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesc_stream_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesr_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesr_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesr_stream_bed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa_packed_trace, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb_packed_trace, m)?)?;
     m.add_function(wrap_pyfunction!(bayesc_packed_trace, m)?)?;

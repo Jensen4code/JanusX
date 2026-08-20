@@ -11,6 +11,7 @@ Supported models
   - BayesA : Bayesian marker effect model (via pyBLUP.bayes)
   - BayesB : Bayesian variable selection model (via pyBLUP.bayes)
   - BayesC : Bayesian variable selection model with shared variance (via pyBLUP.bayes)
+  - BayesR : Four-component Bayesian mixture model (via pyBLUP.bayes)
   - RF     : Random forest regression with GS-oriented inner tuning
   - ET     : Extra-trees regression with GS-oriented inner tuning
   - GBDT   : Histogram gradient boosting regression with inner tuning
@@ -250,6 +251,34 @@ _ML_METHOD_MAP: dict[str, str] = {
     "SVM": "svm",
     "ENET": "enet",
 }
+
+
+@dataclass(frozen=True)
+class _BayesNativeSpec:
+    """Shared native entry-point metadata for every Bayesian model."""
+
+    stream_name: str
+    resident_name: str
+    supports_fixed_pi: bool = False
+
+
+_BAYES_NATIVE_SPECS: dict[str, _BayesNativeSpec] = {
+    "BayesA": _BayesNativeSpec("bayesa_stream_bed", "bayesa_packed"),
+    "BayesB": _BayesNativeSpec("bayesb_stream_bed", "bayesb_packed", True),
+    "BayesC": _BayesNativeSpec("bayesc_stream_bed", "bayesc_packed", True),
+    "BayesR": _BayesNativeSpec("bayesr_stream_bed", "bayesr_packed"),
+}
+
+
+def _bayes_native_spec(method: str) -> _BayesNativeSpec:
+    """Return the single native backend specification for a Bayes model."""
+    try:
+        return _BAYES_NATIVE_SPECS[str(method).strip()]
+    except KeyError as exc:
+        supported = ", ".join(_BAYES_NATIVE_SPECS)
+        raise ValueError(f"Unsupported Bayes method {method!r}; use {supported}.") from exc
+
+
 _HASH_KERNEL_QC_SAMPLE_N = 2000
 _HASH_KERNEL_QC_MIN_N = 64
 _RRBLUP_AUTO_PCG_MIN_N = 10_000
@@ -1043,7 +1072,7 @@ def _methods_need_raw_additive_dense(methods: list[str]) -> bool:
 
 def _methods_need_rrblup_standardization(methods: list[str]) -> bool:
     return any(
-        (str(m) in {"rrBLUP", "BayesA", "BayesB", "BayesC"})
+        (str(m) in {"rrBLUP", "BayesA", "BayesB", "BayesC", "BayesR"})
         or _is_blup_method(str(m))
         for m in methods
     )
@@ -1103,7 +1132,7 @@ def _is_binary_jxmodel_artifact_supported(method: str) -> bool:
 
 def _is_text_effect_jxmodel_supported(method: str) -> bool:
     m = str(method).strip()
-    return bool(_is_blup_method(m) or (m in {"BayesA", "BayesB", "BayesC"}))
+    return bool(_is_blup_method(m) or (m in {"BayesA", "BayesB", "BayesC", "BayesR"}))
 
 
 def _is_effect_export_supported(method: str) -> bool:
@@ -1112,7 +1141,7 @@ def _is_effect_export_supported(method: str) -> bool:
         _is_blup_method(m)
         or _is_gblup_method(m)
         or (m == "rrBLUP")
-        or (m in {"BayesA", "BayesB", "BayesC"})
+        or (m in {"BayesA", "BayesB", "BayesC", "BayesR"})
         or (m in _ML_METHOD_MAP)
     )
 
@@ -1157,7 +1186,7 @@ def _resolve_effect_export_method(
 
 
 def _known_jxmodel_methods() -> set[str]:
-    return _GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesC"} | set(_ML_METHOD_MAP.keys())
+    return _GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesC", "BayesR"} | set(_ML_METHOD_MAP.keys())
 
 
 def _parse_jxmodel_method_from_name(path_like: str) -> str | None:
@@ -1685,7 +1714,7 @@ def _extract_pip_vector_from_model_state(
             continue
         if int(vec.size) <= 0:
             continue
-        if method in {"bayesb", "bayesc"}:
+        if method in {"bayesb", "bayesc", "bayesr"}:
             # PIP is marker-wise: it must align with beta and every value is
             # a probability.  Reject stale/old states that stored a scalar
             # diagnostic such as n_active_mean in this field.
@@ -1697,6 +1726,39 @@ def _extract_pip_vector_from_model_state(
                 continue
         return np.ascontiguousarray(vec, dtype=np.float64), f"model_state.{key}"
     return None, invalid_source or "no_pip_in_model_state"
+
+
+def _extract_bayesr_component_prob_from_model_state(
+    model_state: dict[str, typing.Any],
+) -> tuple[np.ndarray | None, str]:
+    """Return BayesR's marker-by-component Rao--Blackwell probabilities."""
+    method = str(model_state.get("method", "")).strip().lower()
+    if method != "bayesr":
+        return None, "not_bayesr"
+    raw = model_state.get("component_prob", None)
+    if raw is None:
+        return None, "no_component_prob_in_model_state"
+    try:
+        arr = np.asarray(raw, dtype=np.float64)
+    except Exception:
+        return None, "invalid_model_state.component_prob_type"
+    if arr.ndim != 2 or int(arr.shape[1]) != 4:
+        return None, "invalid_model_state.component_prob_shape"
+    try:
+        beta_len = int(
+            np.asarray(model_state.get("beta", None), dtype=np.float64)
+            .reshape(-1)
+            .size
+        )
+    except Exception:
+        beta_len = 0
+    if beta_len > 0 and int(arr.shape[0]) != beta_len:
+        return None, "invalid_model_state.component_prob_length"
+    if not np.all(np.isfinite(arr)) or np.any(arr < 0.0) or np.any(arr > 1.0):
+        return None, "invalid_model_state.component_prob_range"
+    if not np.allclose(np.sum(arr, axis=1), 1.0, atol=2e-3, rtol=2e-3):
+        return None, "invalid_model_state.component_prob_not_normalized"
+    return np.ascontiguousarray(arr, dtype=np.float64), "model_state.component_prob"
 
 
 def _attach_effect_export_hints_to_model_state(
@@ -1976,6 +2038,9 @@ def _build_method_effect_table(
     notes: list[str] = []
     beta_vec, beta_source, effect_kind = _extract_effect_vector_from_model_state(model_state)
     pip_vec, pip_source = _extract_pip_vector_from_model_state(model_state)
+    component_prob, component_prob_source = _extract_bayesr_component_prob_from_model_state(
+        model_state
+    )
     beta_len = 0 if beta_vec is None else int(beta_vec.shape[0])
     pip_len = 0 if pip_vec is None else int(pip_vec.shape[0])
 
@@ -2082,6 +2147,7 @@ def _build_method_effect_table(
     snp = np.array([f"SNP{i + 1}" for i in range(n_rows)], dtype=object)
     effect_values = np.full((n_rows,), np.nan, dtype=np.float64)
     pip_values = np.full((n_rows,), np.nan, dtype=np.float64)
+    component_prob_values = np.full((n_rows, 4), np.nan, dtype=np.float64)
 
     if int(chrom_meta.shape[0]) > 0 and n_rows > 0:
         use_n = min(n_rows, int(chrom_meta.shape[0]))
@@ -2100,6 +2166,13 @@ def _build_method_effect_table(
         pip_values[:use_n] = np.asarray(pip_vec[:use_n], dtype=np.float64)
         if int(pip_vec.shape[0]) != n_rows:
             notes.append(f"pip rows={int(pip_vec.shape[0])}, effect rows={int(n_rows)}")
+    if component_prob is not None and n_rows > 0:
+        use_n = min(n_rows, int(component_prob.shape[0]))
+        component_prob_values[:use_n, :] = component_prob[:use_n, :]
+        if int(component_prob.shape[0]) != n_rows:
+            notes.append(
+                f"component_prob rows={int(component_prob.shape[0])}, effect rows={int(n_rows)}"
+            )
     for note in list(model_state.get("export_conversion_notes", []) or []):
         n = str(note).strip()
         if n != "":
@@ -2124,6 +2197,9 @@ def _build_method_effect_table(
     }
     if pip_vec is not None:
         table_dict["pip"] = pip_values
+    if component_prob is not None:
+        for component_idx in range(4):
+            table_dict[f"component_prob_{component_idx}"] = component_prob_values[:, component_idx]
     table = pd.DataFrame(table_dict)
     alpha_meta: float | None = None
     try:
@@ -2143,6 +2219,11 @@ def _build_method_effect_table(
         "pip_source": str(pip_source),
         "pip_available": bool(pip_vec is not None),
         "pip_non_nan_rows": int(np.sum(np.isfinite(pip_values))),
+        "component_prob_source": str(component_prob_source),
+        "component_prob_available": bool(component_prob is not None),
+        "component_prob_non_nan_rows": int(
+            np.sum(np.all(np.isfinite(component_prob_values), axis=1))
+        ),
         "beta_scale": (
             str(model_state.get("export_scale", "raw_012")).strip()
             if (not bool(model_state.get("standardized", True)))
@@ -3068,7 +3149,7 @@ def _resolve_gs_auto_decode_memory_gb(
 
     for method_name in methods:
         method_key = str(method_name)
-        if method_key in {"BayesA", "BayesB", "BayesC"}:
+        if method_key in {"BayesA", "BayesB", "BayesC", "BayesR"}:
             _push_candidate(
                 _memory_gb_for_target_decode_shape(
                     n_total,
@@ -8586,7 +8667,7 @@ def GSapi(
     Y: np.ndarray,
     Xtrain: typing.Any,
     Xtest: typing.Any,
-    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesC", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
+    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesC", "BayesR", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
     n_jobs: int = 1,
     seed: int = 42,
@@ -8618,7 +8699,7 @@ def GSapi(
         Genotype matrix for training individuals, shape (m_markers, n_train).
     Xtest : np.ndarray
         Genotype matrix for test individuals, shape (m_markers, n_test).
-    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesC', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET'}
+    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesC', 'BayesR', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET'}
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
@@ -8651,6 +8732,8 @@ def GSapi(
     bayes_pi : float, optional
         Fixed marker inclusion probability for BayesB/BayesC. If omitted,
         the sampler estimates the inclusion probability from active markers.
+        BayesR keeps its four-component prior at the function layer; the CLI
+        uses the default ``pi=(.90,.06,.03,.01)`` and ``gamma=(0,.01,.1,1)``.
     bayes_runtime_state : dict, optional
         Mutable state sink for Bayes diagnostics (e.g. resolved `r2` source/value).
     bayes_auto_cfg : dict, optional
@@ -11298,7 +11381,7 @@ def GSapi(
             )
         return pred_train, pred_test, model.pve
 
-    if method in ("BayesA", "BayesB", "BayesC"):
+    if method in ("BayesA", "BayesB", "BayesC", "BayesR"):
         resolved_bayes_r2: float | None = None
         if bayes_auto_r2 is not None:
             try:
@@ -11379,16 +11462,9 @@ def GSapi(
                 max(1, int(packed_train.get("__bayes_stream_window_mb__", 1)))
             )
 
-            packed_stream_func_name = {
-                "BayesA": "bayesa_stream_bed",
-                "BayesB": "bayesb_stream_bed",
-                "BayesC": "bayesc_stream_bed",
-            }.get(str(method))
-            packed_resident_func_name = {
-                "BayesA": "bayesa_packed",
-                "BayesB": "bayesb_packed",
-                "BayesC": "bayesc_packed",
-            }.get(str(method))
+            bayes_native_spec = _bayes_native_spec(str(method))
+            packed_stream_func_name = bayes_native_spec.stream_name
+            packed_resident_func_name = bayes_native_spec.resident_name
             use_packed_resident_native = bool(
                 (_jxrs is not None)
                 and (packed_resident_func_name is not None)
@@ -11463,7 +11539,7 @@ def GSapi(
                     packed_kwargs["block_rows"] = int(bayes_stream_block_rows)
                     packed_kwargs["mmap_window_mb"] = int(bayes_stream_window_mb)
                     packed_fit_fn = getattr(_jxrs, str(packed_stream_func_name))
-                if str(method) in {"BayesB", "BayesC"}:
+                if bayes_native_spec.supports_fixed_pi:
                     packed_kwargs["prob_in"] = 0.5
                     packed_kwargs["counts"] = 5.0
                     if bayes_pi is not None:
@@ -11483,7 +11559,35 @@ def GSapi(
                         packed_threads_compat_fallback = True
                     else:
                         raise
-                if str(method) == "BayesC":
+                bayes_component_prob: np.ndarray | None = None
+                bayes_pi_mean: np.ndarray | None = None
+                bayes_sigma_lambda2 = float("nan")
+                if str(method) == "BayesR":
+                    if not isinstance(packed_fit_ret, typing.Mapping):
+                        raise RuntimeError("Native BayesR returned an invalid result mapping.")
+                    bayes_map = typing.cast(typing.Mapping[str, typing.Any], packed_fit_ret)
+                    beta_raw = bayes_map["beta"]
+                    alpha_raw = bayes_map["alpha"]
+                    h2_mean = float(bayes_map["h2_mean"])
+                    bayes_pip = np.ascontiguousarray(
+                        np.asarray(bayes_map["pip"], dtype=np.float64).reshape(-1),
+                        dtype=np.float64,
+                    )
+                    bayes_component_prob = np.ascontiguousarray(
+                        np.asarray(bayes_map["component_prob"], dtype=np.float32),
+                        dtype=np.float32,
+                    )
+                    bayes_pi_mean = np.ascontiguousarray(
+                        np.asarray(bayes_map["pi"], dtype=np.float64).reshape(-1),
+                        dtype=np.float64,
+                    )
+                    bayes_sigma_lambda2 = float(bayes_map["sigma_lambda2"])
+                    bayes_rhat = float(bayes_map["rhat_h2"])
+                    bayes_actual_iterations = int(bayes_map["actual_iterations"])
+                    bayes_convergence_iteration = int(bayes_map["convergence_iteration"])
+                    bayes_posterior_samples = int(bayes_map["posterior_samples"])
+                    diag_tail = []
+                elif str(method) == "BayesC":
                     beta_raw, alpha_raw, _varb_mean, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
                 else:
                     beta_raw, alpha_raw, _varb, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
@@ -11492,20 +11596,21 @@ def GSapi(
                 bayes_beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
                 bayes_alpha = np.ascontiguousarray(np.asarray(alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
                 bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
-                bayes_diagnostics = _parse_bayes_diagnostics(
-                    str(method),
-                    diag_tail,
-                    int(np.asarray(beta_raw).size),
-                )
-                bayes_pip = typing.cast(np.ndarray | None, bayes_diagnostics["pip"])
-                bayes_rhat = float(bayes_diagnostics["rhat_h2"])
-                bayes_actual_iterations = int(bayes_diagnostics["actual_iterations"])
-                bayes_convergence_iteration = int(
-                    bayes_diagnostics["convergence_iteration"]
-                )
-                bayes_posterior_samples = int(
-                    bayes_diagnostics["posterior_samples"]
-                )
+                if str(method) != "BayesR":
+                    bayes_diagnostics = _parse_bayes_diagnostics(
+                        str(method),
+                        diag_tail,
+                        int(np.asarray(beta_raw).size),
+                    )
+                    bayes_pip = typing.cast(np.ndarray | None, bayes_diagnostics["pip"])
+                    bayes_rhat = float(bayes_diagnostics["rhat_h2"])
+                    bayes_actual_iterations = int(bayes_diagnostics["actual_iterations"])
+                    bayes_convergence_iteration = int(
+                        bayes_diagnostics["convergence_iteration"]
+                    )
+                    bayes_posterior_samples = int(
+                        bayes_diagnostics["posterior_samples"]
+                    )
 
                 if bayes_runtime_state is not None:
                     bayes_runtime_state["r2_used"] = float(r2_used)
@@ -11521,6 +11626,18 @@ def GSapi(
                     if str(method) in {"BayesB", "BayesC"} and len(diag_tail) >= 2:
                         bayes_runtime_state["prob_in_mean"] = float(diag_tail[0])
                         bayes_runtime_state["n_active_mean"] = float(diag_tail[1])
+                    if str(method) == "BayesR":
+                        bayes_runtime_state["pi_mean"] = (
+                            None
+                            if bayes_pi_mean is None
+                            else np.asarray(bayes_pi_mean, dtype=np.float64).copy()
+                        )
+                        bayes_runtime_state["sigma_lambda2"] = float(bayes_sigma_lambda2)
+                        bayes_runtime_state["component_prob"] = (
+                            None
+                            if bayes_component_prob is None
+                            else np.asarray(bayes_component_prob, dtype=np.float32).copy()
+                        )
                     bayes_runtime_state["rhat_h2"] = float(bayes_rhat)
                     bayes_runtime_state["rhat"] = float(bayes_rhat)
                     bayes_runtime_state["rhat_max_iterations"] = int(bayes_n_iter)
@@ -11601,6 +11718,18 @@ def GSapi(
                             np.asarray(bayes_pip, dtype=np.float64).reshape(-1),
                             dtype=np.float64,
                         )
+                    if str(method) == "BayesR":
+                        if bayes_component_prob is not None:
+                            model_state["component_prob"] = np.ascontiguousarray(
+                                np.asarray(bayes_component_prob, dtype=np.float32),
+                                dtype=np.float32,
+                            )
+                        if bayes_pi_mean is not None:
+                            model_state["pi"] = np.ascontiguousarray(
+                                np.asarray(bayes_pi_mean, dtype=np.float64).reshape(-1),
+                                dtype=np.float64,
+                            )
+                        model_state["sigma_lambda2"] = float(bayes_sigma_lambda2)
                     model_state["rhat_h2"] = float(bayes_rhat)
                     model_state["rhat"] = float(bayes_rhat)
                     model_state["rhat_max_iterations"] = int(bayes_n_iter)
@@ -11680,6 +11809,19 @@ def GSapi(
             bayes_runtime_state["posterior_samples"] = int(
                 getattr(model, "posterior_samples", 0)
             )
+            if method == "BayesR":
+                bayes_runtime_state["pi_mean"] = np.ascontiguousarray(
+                    np.asarray(getattr(model, "pi_hat", np.zeros(4)), dtype=np.float64).reshape(-1),
+                    dtype=np.float64,
+                )
+                bayes_runtime_state["sigma_lambda2"] = float(
+                    getattr(model, "sigma_lambda2_hat", np.nan)
+                )
+                bayes_runtime_state["component_prob"] = (
+                    None
+                    if getattr(model, "component_prob_hat", None) is None
+                    else np.asarray(model.component_prob_hat, dtype=np.float32).copy()
+                )
         if need_train_pred:
             if train_pred_idx is None:
                 train_pred = model.predict(Xtrain)
@@ -11711,6 +11853,20 @@ def GSapi(
                 model_state["pip"] = np.ascontiguousarray(
                     np.asarray(pip_hat, dtype=np.float64).reshape(-1),
                     dtype=np.float64,
+                )
+            if method == "BayesR":
+                component_prob_hat = getattr(model, "component_prob_hat", None)
+                if component_prob_hat is not None:
+                    model_state["component_prob"] = np.ascontiguousarray(
+                        np.asarray(component_prob_hat, dtype=np.float32), dtype=np.float32
+                    )
+                pi_hat = getattr(model, "pi_hat", None)
+                if pi_hat is not None:
+                    model_state["pi"] = np.ascontiguousarray(
+                        np.asarray(pi_hat, dtype=np.float64).reshape(-1), dtype=np.float64
+                    )
+                model_state["sigma_lambda2"] = float(
+                    getattr(model, "sigma_lambda2_hat", np.nan)
                 )
             model_state["rhat_h2"] = float(getattr(model, "rhat_h2", np.nan))
             model_state["rhat"] = float(getattr(model, "rhat", np.nan))
@@ -11898,8 +12054,9 @@ def _run_method_task(
         "BayesA",
         "BayesB",
         "BayesC",
+        "BayesR",
     }
-    bayes_methods = {"BayesA", "BayesB", "BayesC"}
+    bayes_methods = {"BayesA", "BayesB", "BayesC", "BayesR"}
     bayes_cfg_base = dict(bayes_auto_r2_cfg or {})
     bayes_cv_reuse_enabled = bool(
         method in bayes_methods
@@ -12843,7 +13000,7 @@ def _run_method_task(
                         pp.setdefault("phase_label", f"fold {_fold_id}/{_cv_total}")
                         rrblup_progress_hook(str(event), pp)
                     rr_progress_call = _fold_rr_progress
-                if method in {"BayesA", "BayesB", "BayesC"}:
+                if method in {"BayesA", "BayesB", "BayesC", "BayesR"}:
                     if bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2):
                         bayes_r2_call = float(bayes_cv_shared_r2)
                         bayes_r2_cache_key = bayes_cv_shared_key
@@ -12880,7 +13037,7 @@ def _run_method_task(
                 )
                 if _is_gblup_method(str(method)) and gblup_state_call is not None:
                     _append_gblup_vc_row(int(fold_id), dict(gblup_state_call))
-                if method in {"BayesA", "BayesB", "BayesC"} and bayes_state_call is not None:
+                if method in {"BayesA", "BayesB", "BayesC", "BayesR"} and bayes_state_call is not None:
                     r2_used = float(bayes_state_call.get("r2_used", np.nan))
                     if np.isfinite(r2_used):
                         bayes_r2_rows.append(float(r2_used))
@@ -13656,7 +13813,7 @@ def _run_method_task(
                     pp.setdefault("phase_label", "final")
                     rrblup_progress_hook(str(event), pp)
                 rr_progress_final = _final_rr_progress
-        if method in {"BayesA", "BayesB", "BayesC"}:
+        if method in {"BayesA", "BayesB", "BayesC", "BayesR"}:
             if bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2):
                 bayes_r2_final_key = bayes_cv_shared_key
                 bayes_r2_final_call = float(bayes_cv_shared_r2)
@@ -13704,7 +13861,7 @@ def _run_method_task(
             model_state_final = dict(model_state_call)
         if _is_gblup_method(str(method)) and gblup_state_final is not None:
             gblup_final_state = dict(gblup_state_final)
-        if method in {"BayesA", "BayesB", "BayesC"} and bayes_state_final is not None:
+        if method in {"BayesA", "BayesB", "BayesC", "BayesR"} and bayes_state_final is not None:
             bayes_final_sampling_metadata_seen = bool(
                 "actual_iterations" in bayes_state_final
                 or "posterior_samples" in bayes_state_final
@@ -13858,19 +14015,19 @@ def _run_method_task(
         if ml_tuning_cache is not None:
             pve_final = float(ml_tuning_cache.get("pve", np.nan))
     if (
-        method in {"BayesA", "BayesB", "BayesC"}
+        method in {"BayesA", "BayesB", "BayesC", "BayesR"}
         and (not np.isfinite(bayes_r2_final))
         and len(bayes_r2_rows) > 0
     ):
         bayes_r2_final = float(np.nanmean(np.asarray(bayes_r2_rows, dtype=np.float64)))
     if (
-        method in {"BayesA", "BayesB", "BayesC"}
+        method in {"BayesA", "BayesB", "BayesC", "BayesR"}
         and (not np.isfinite(bayes_rhat_final))
         and len(bayes_rhat_rows) > 0
     ):
         bayes_rhat_final = float(np.nanmean(np.asarray(bayes_rhat_rows, dtype=np.float64)))
     if (
-        method in {"BayesA", "BayesB", "BayesC"}
+        method in {"BayesA", "BayesB", "BayesC", "BayesR"}
         and (not bayes_final_sampling_metadata_seen)
         and bayes_actual_iterations_final <= 0
         and len(bayes_actual_iterations_rows) > 0
@@ -13879,7 +14036,7 @@ def _run_method_task(
             np.asarray(bayes_actual_iterations_rows, dtype=np.float64)
         ))))
     if (
-        method in {"BayesA", "BayesB", "BayesC"}
+        method in {"BayesA", "BayesB", "BayesC", "BayesR"}
         and (not bayes_final_sampling_metadata_seen)
         and bayes_convergence_iteration_final <= 0
         and len(bayes_convergence_iteration_rows) > 0
@@ -13892,7 +14049,7 @@ def _run_method_task(
         if positive_iterations:
             bayes_convergence_iteration_final = int(min(positive_iterations))
     if (
-        method in {"BayesA", "BayesB", "BayesC"}
+        method in {"BayesA", "BayesB", "BayesC", "BayesR"}
         and (not bayes_final_sampling_metadata_seen)
         and bayes_posterior_samples_final <= 0
         and len(bayes_posterior_samples_rows) > 0
@@ -13903,7 +14060,7 @@ def _run_method_task(
                 np.asarray(positive_samples, dtype=np.float64)
             ))))
     if (
-        method in {"BayesA", "BayesB", "BayesC"}
+        method in {"BayesA", "BayesB", "BayesC", "BayesR"}
         and (bayes_r2_source_final == "")
         and bayes_cv_reuse_enabled
         and np.isfinite(bayes_cv_shared_r2)
@@ -14633,7 +14790,7 @@ def _run_methods_parallel(
                     rows.append(("PVE(pheno-scale)", f"{pve_exact:.3f}"))
             return rows
 
-        if m in {"BayesA", "BayesB", "BayesC"}:
+        if m in {"BayesA", "BayesB", "BayesC", "BayesR"}:
             r2_blup = float(result.get("bayes_r2_final", np.nan))
             r2_src = str(result.get("bayes_r2_source_final", "")).strip()
             r2_n_used = int(max(0, int(result.get("bayes_r2_n_used_final", 0) or 0)))
@@ -18987,6 +19144,12 @@ def parse_args(argv: typing.Optional[list[str]] = None):
              "(e.g. -BayesC 0.05). Without PI, estimate it from active markers.",
     )
     model_group.add_argument(
+        "-BayesR", "--BayesR",
+        action="store_true",
+        default=False,
+        help="Use the four-component BayesR mixture model with default pi/gamma priors.",
+    )
+    model_group.add_argument(
         "-RF", "--RF",
         action="store_true",
         default=False,
@@ -19804,6 +19967,7 @@ def _run_gs_pipeline_impl(
 
     bayes_b_enabled, bayes_b_pi = _resolve_bayes_cli_value("BayesB")
     bayes_c_enabled, bayes_c_pi = _resolve_bayes_cli_value("BayesC")
+    bayes_r_enabled = bool(getattr(args, "BayesR", False))
     bayes_pi_by_method: dict[str, float | None] = {
         "BayesB": bayes_b_pi,
         "BayesC": bayes_c_pi,
@@ -19989,7 +20153,12 @@ def _run_gs_pipeline_impl(
     )
     blup_requested = bool(args.BLUP)
     pcg_requested = bool(blup_requested and (rr_solver_mode == "pcg"))
-    bayes_requested = bool(bool(args.BayesA) or bayes_b_enabled or bayes_c_enabled)
+    bayes_requested = bool(
+        bool(args.BayesA)
+        or bayes_b_enabled
+        or bayes_c_enabled
+        or bayes_r_enabled
+    )
     packed_model_requested = bool(
         blup_requested or bayes_requested
     )
@@ -20113,6 +20282,8 @@ def _run_gs_pipeline_impl(
         methods.append("BayesB")
     if bayes_c_enabled:
         methods.append("BayesC")
+    if bayes_r_enabled:
+        methods.append("BayesR")
     if args.RF:
         methods.append("RF")
     if args.ET:
@@ -20160,7 +20331,7 @@ def _run_gs_pipeline_impl(
     if len(methods) == 0:
         logger.error(
             "No model selected. Use "
-            "--BLUP/--BayesA/--BayesB/--BayesC/--RF/--ET/--GBDT/--XGB/--SVM/--ENET "
+            "--BLUP/--BayesA/--BayesB/--BayesC/--BayesR/--RF/--ET/--GBDT/--XGB/--SVM/--ENET "
             "or provide --model with discoverable *.jxmodel files."
         )
         raise SystemExit(1)
@@ -20320,7 +20491,7 @@ def _run_gs_pipeline_impl(
                 detail = f"solver={solver_txt}"
             elif str(m) in {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}:
                 detail = "compact tuning=on"
-            elif str(m) in {"BayesA", "BayesB", "BayesC"}:
+            elif str(m) in {"BayesA", "BayesB", "BayesC", "BayesR"}:
                 detail = "bayesian marker model"
             model_rows.append((f"{i}. {_method_display_name(str(m))}", detail))
         memory_cfg = _format_gs_memory_cfg(
@@ -20676,7 +20847,7 @@ def _run_gs_pipeline_impl(
         getattr(args, "ldprune_spec", None),
     )
     bayes_requested = bool(
-        any(str(m) in {"BayesA", "BayesB", "BayesC"} for m in methods)
+        any(str(m) in {"BayesA", "BayesB", "BayesC", "BayesR"} for m in methods)
     )
     stream_meta_method_set = {
         _GBLUP_METHOD_ADD,
@@ -20687,6 +20858,7 @@ def _run_gs_pipeline_impl(
         "BayesA",
         "BayesB",
         "BayesC",
+        "BayesR",
     }
     ml_requested = bool(any(m in ml_methods for m in methods))
     packed_meta_only_main_requested = bool(
@@ -22632,7 +22804,7 @@ def _run_gs_pipeline_impl(
                         rows.append(("PVE(pheno-scale)", f"{pve_exact:.3f}"))
                     return rows
 
-                if m in {"BayesA", "BayesB", "BayesC"}:
+                if m in {"BayesA", "BayesB", "BayesC", "BayesR"}:
                     if m in {"BayesB", "BayesC"}:
                         rows.append(("prob_in/counts", "0.5/5.0"))
                     rhat = _detail_float_or_nan(res_obj.get("bayes_rhat_final", np.nan))

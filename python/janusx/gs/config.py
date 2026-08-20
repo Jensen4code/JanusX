@@ -53,6 +53,7 @@ class GsConfig:
     bayesa: bool = False
     bayesb: bool | float = False
     bayesc: bool | float = False
+    bayesr: bool = False
     rf: bool = False
     et: bool = False
     gbdt: bool = False
@@ -102,6 +103,7 @@ class GsConfig:
         n += int(bool(self.bayesa))
         n += int(self.bayesb is not False and self.bayesb is not None)
         n += int(self.bayesc is not False and self.bayesc is not None)
+        n += int(bool(self.bayesr))
         n += int(bool(self.rf))
         n += int(bool(self.et))
         n += int(bool(self.gbdt))
@@ -149,6 +151,8 @@ class GsConfig:
             argv.append("-BayesC")
             if self.bayesc is not True:
                 argv.append(str(float(self.bayesc)))
+        if bool(self.bayesr):
+            argv.append("-BayesR")
         if bool(self.rf):
             argv.append("-RF")
         if bool(self.et):
