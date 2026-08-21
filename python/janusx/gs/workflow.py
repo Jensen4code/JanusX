@@ -115,6 +115,7 @@ from janusx.pyBLUP.kfold import KFold as _LocalKFold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import (
     BAYES,
+    BAYES_DEFAULT_PROB_IN,
     _parse_bayes_diagnostics,
     _resolve_bayes_chain_count,
     bayes_mcmc_defaults as _bayes_mcmc_defaults,
@@ -269,6 +270,8 @@ _BAYES_NATIVE_SPECS: dict[str, _BayesNativeSpec] = {
     "BayesC": _BayesNativeSpec("bayesc_stream_bed", "bayesc_packed", True),
     "BayesR": _BayesNativeSpec("bayesr_stream_bed", "bayesr_packed"),
 }
+
+_BAYES_DEFAULT_COUNTS = 5.0
 
 
 def _bayes_native_spec(method: str) -> _BayesNativeSpec:
@@ -983,6 +986,34 @@ def _packed_ctx_dom_af(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
 
 def _packed_ctx_is_lazy_full(packed_ctx: dict[str, typing.Any]) -> bool:
     return str(packed_ctx.get("packed_filter_mode", "")).strip().lower() == "lazy_full"
+
+
+def _packed_bayes_resident_metadata_matches(
+    packed_payload: np.ndarray | None,
+    active_row_idx: np.ndarray,
+    row_flip: np.ndarray,
+    maf: np.ndarray,
+    row_mean: np.ndarray,
+    row_inv_sd: np.ndarray,
+) -> bool:
+    """Return whether resident packed rows are aligned with active metadata.
+
+    Resident native kernels have no row-index indirection: every metadata
+    vector must describe the rows in the resident payload in the same order.
+    A ``lazy_full`` context can retain the full packed payload while its
+    metadata has already been filtered to active rows, so selecting resident
+    in that case would either fail a native length check or address the wrong
+    marker rows.  The stream backend is the safe fallback whenever the row
+    counts do not agree.
+    """
+    if packed_payload is None:
+        return False
+    payload = np.asarray(packed_payload)
+    if payload.ndim != 2:
+        return False
+    payload_rows = int(payload.shape[0])
+    arrays = (active_row_idx, row_flip, maf, row_mean, row_inv_sd)
+    return all(int(np.asarray(array).reshape(-1).size) == payload_rows for array in arrays)
 
 
 def _packed_ctx_prefers_metadata_stream(
@@ -8979,10 +9010,11 @@ def GSapi(
         Optional precomputed BLUP phenotype-scale PVE used as Bayes `r2` prior. When omitted,
         Bayes models estimate it internally from BLUP.
     bayes_pi : float, optional
-        Fixed marker inclusion probability for BayesB/BayesC. If omitted,
-        the sampler estimates the inclusion probability from active markers.
-        BayesR keeps its four-component prior at the function layer; the CLI
-        uses the default ``pi=(.90,.06,.03,.01)`` and ``gamma=(0,.01,.1,1)``.
+        Fixed marker inclusion probability for BayesB/BayesC. BayesB always
+        fixes pi (default ``0.05`` when omitted); BayesC estimates it from
+        active markers when omitted. BayesR keeps its four-component prior at
+        the function layer; the CLI uses the default
+        ``pi=(.95,.03,.01,.01)`` and ``gamma=(0,.01,.1,1)``.
     bayes_runtime_state : dict, optional
         Mutable state sink for Bayes diagnostics (e.g. resolved `r2` source/value).
     bayes_auto_cfg : dict, optional
@@ -11717,10 +11749,18 @@ def GSapi(
             bayes_native_spec = _bayes_native_spec(str(method))
             packed_stream_func_name = bayes_native_spec.stream_name
             packed_resident_func_name = bayes_native_spec.resident_name
+            resident_metadata_matches = _packed_bayes_resident_metadata_matches(
+                packed_payload_arg,
+                active_row_idx,
+                row_flip,
+                maf,
+                row_mean,
+                row_inv_sd,
+            )
             use_packed_resident_native = bool(
                 (_jxrs is not None)
                 and (packed_resident_func_name is not None)
-                and (packed_payload_arg is not None)
+                and resident_metadata_matches
                 and hasattr(_jxrs, str(packed_resident_func_name))
             )
             use_packed_stream_native = bool(
@@ -11794,9 +11834,18 @@ def GSapi(
                     packed_kwargs["mmap_window_mb"] = int(bayes_stream_window_mb)
                     packed_fit_fn = getattr(_jxrs, str(packed_stream_func_name))
                 if bayes_native_spec.supports_fixed_pi:
-                    packed_kwargs["prob_in"] = 0.5
-                    packed_kwargs["counts"] = 5.0
-                    if bayes_pi is not None:
+                    packed_kwargs["prob_in"] = float(BAYES_DEFAULT_PROB_IN)
+                    packed_kwargs["counts"] = float(_BAYES_DEFAULT_COUNTS)
+                    # BayesB has a fixed inclusion prior in every backend.
+                    # BayesC keeps its historical behavior: update pi unless
+                    # the caller explicitly supplies a fixed value.
+                    if str(method) == "BayesB":
+                        packed_kwargs["fixed_pi"] = float(
+                            BAYES_DEFAULT_PROB_IN
+                            if bayes_pi is None
+                            else bayes_pi
+                        )
+                    elif bayes_pi is not None:
                         packed_kwargs["fixed_pi"] = float(bayes_pi)
                 if str(method) == "BayesA":
                     packed_kwargs["min_abs_beta"] = 1e-9
@@ -11821,6 +11870,8 @@ def GSapi(
                 bayes_component_prob: np.ndarray | None = None
                 bayes_pi_mean: np.ndarray | None = None
                 bayes_sigma_lambda2 = float("nan")
+                bayes_rhat_metrics: dict[str, float] = {}
+                bayes_rhat_h2 = float("nan")
                 if str(method) == "BayesR":
                     if not isinstance(packed_fit_ret, typing.Mapping):
                         raise RuntimeError("Native BayesR returned an invalid result mapping.")
@@ -11841,7 +11892,17 @@ def GSapi(
                         dtype=np.float64,
                     )
                     bayes_sigma_lambda2 = float(bayes_map["sigma_lambda2"])
-                    bayes_rhat = float(bayes_map["rhat_h2"])
+                    raw_rhat_metrics = bayes_map.get("rhat_metrics", {})
+                    if isinstance(raw_rhat_metrics, typing.Mapping):
+                        bayes_rhat_metrics = {
+                            str(key): float(value)
+                            for key, value in raw_rhat_metrics.items()
+                            if str(key) != "rhat_max"
+                        }
+                    bayes_rhat_h2 = float(bayes_map.get("rhat_h2", np.nan))
+                    bayes_rhat = float(
+                        bayes_map.get("rhat_max", bayes_map.get("rhat_h2", np.nan))
+                    )
                     bayes_actual_iterations = int(bayes_map["actual_iterations"])
                     bayes_convergence_iteration = int(bayes_map["convergence_iteration"])
                     bayes_posterior_samples = int(bayes_map["posterior_samples"])
@@ -11862,7 +11923,14 @@ def GSapi(
                         int(np.asarray(beta_raw).size),
                     )
                     bayes_pip = typing.cast(np.ndarray | None, bayes_diagnostics["pip"])
-                    bayes_rhat = float(bayes_diagnostics["rhat_h2"])
+                    bayes_rhat_metrics = dict(
+                        typing.cast(
+                            typing.Mapping[str, float],
+                            bayes_diagnostics.get("rhat_metrics", {}),
+                        )
+                    )
+                    bayes_rhat_h2 = float(bayes_diagnostics["rhat_h2"])
+                    bayes_rhat = float(bayes_diagnostics["rhat_max"])
                     bayes_actual_iterations = int(bayes_diagnostics["actual_iterations"])
                     bayes_convergence_iteration = int(
                         bayes_diagnostics["convergence_iteration"]
@@ -11872,6 +11940,12 @@ def GSapi(
                     )
 
                 if bayes_runtime_state is not None:
+                    bayes_runtime_state["prob_in_prior"] = float(
+                        BAYES_DEFAULT_PROB_IN if bayes_pi is None else bayes_pi
+                    )
+                    bayes_runtime_state["prob_in_counts"] = float(
+                        _BAYES_DEFAULT_COUNTS
+                    )
                     bayes_runtime_state["r2_used"] = float(r2_used)
                     bayes_runtime_state["r2_blup"] = float(r2_blup)
                     bayes_runtime_state["r2_source"] = str(r2_source)
@@ -11911,8 +11985,9 @@ def GSapi(
                             if bayes_component_prob is None
                             else np.asarray(bayes_component_prob, dtype=np.float32).copy()
                         )
-                    bayes_runtime_state["rhat_h2"] = float(bayes_rhat)
+                    bayes_runtime_state["rhat_h2"] = float(bayes_rhat_h2)
                     bayes_runtime_state["rhat"] = float(bayes_rhat)
+                    bayes_runtime_state["rhat_metrics"] = dict(bayes_rhat_metrics)
                     bayes_runtime_state["rhat_max_iterations"] = int(bayes_n_iter)
                     bayes_runtime_state["posterior_sample_target"] = int(
                         bayes_posterior_target
@@ -12003,8 +12078,9 @@ def GSapi(
                                 dtype=np.float64,
                             )
                         model_state["sigma_lambda2"] = float(bayes_sigma_lambda2)
-                    model_state["rhat_h2"] = float(bayes_rhat)
+                    model_state["rhat_h2"] = float(bayes_rhat_h2)
                     model_state["rhat"] = float(bayes_rhat)
+                    model_state["rhat_metrics"] = dict(bayes_rhat_metrics)
                     model_state["rhat_max_iterations"] = int(bayes_n_iter)
                     model_state["posterior_sample_target"] = int(
                         bayes_posterior_target
@@ -12071,6 +12147,10 @@ def GSapi(
         )
         pve = model.pve
         if bayes_runtime_state is not None:
+            bayes_runtime_state["prob_in_prior"] = float(
+                BAYES_DEFAULT_PROB_IN if bayes_pi is None else bayes_pi
+            )
+            bayes_runtime_state["prob_in_counts"] = float(_BAYES_DEFAULT_COUNTS)
             bayes_runtime_state["r2_used"] = float(getattr(model, "r2_used", np.nan))
             model_r2_blup = float(getattr(model, "r2_blup", np.nan))
             if np.isfinite(model_r2_blup):
@@ -12086,9 +12166,13 @@ def GSapi(
             bayes_runtime_state["r2_n_used"] = int(r2_n_used)
             bayes_runtime_state["r2_n_total"] = int(r2_n_total)
             bayes_runtime_state["threads_requested"] = int(max(1, int(n_jobs)))
-            model_rhat = float(getattr(model, "rhat_h2", getattr(model, "rhat", np.nan)))
-            bayes_runtime_state["rhat_h2"] = model_rhat
+            model_rhat_h2 = float(getattr(model, "rhat_h2", np.nan))
+            model_rhat = float(getattr(model, "rhat_max", getattr(model, "rhat", model_rhat_h2)))
+            bayes_runtime_state["rhat_h2"] = model_rhat_h2
             bayes_runtime_state["rhat"] = model_rhat
+            bayes_runtime_state["rhat_metrics"] = dict(
+                getattr(model, "rhat_metrics", {}) or {}
+            )
             bayes_runtime_state["rhat_max_iterations"] = int(
                 getattr(model, "rhat_max_iterations", 0)
             )
@@ -12176,7 +12260,12 @@ def GSapi(
                     getattr(model, "sigma_lambda2_hat", np.nan)
                 )
             model_state["rhat_h2"] = float(getattr(model, "rhat_h2", np.nan))
-            model_state["rhat"] = float(getattr(model, "rhat", np.nan))
+            model_state["rhat"] = float(
+                getattr(model, "rhat_max", getattr(model, "rhat", np.nan))
+            )
+            model_state["rhat_metrics"] = dict(
+                getattr(model, "rhat_metrics", {}) or {}
+            )
             model_state["rhat_max_iterations"] = int(
                 getattr(model, "rhat_max_iterations", 0)
             )
@@ -12344,11 +12433,17 @@ def _run_method_task(
     gblup_final_state: dict[str, typing.Any] | None = None
     bayes_r2_rows: list[float] = []
     bayes_rhat_rows: list[float] = []
+    bayes_rhat_metrics_rows: list[dict[str, float]] = []
+    # Keep the per-fold maximum R-hat for diagnostics.  CV diagnostics are
+    # written to the log only as ``Rhat_cv<N>``; the final training R-hat is
+    # retained internally for convergence state but is not displayed.
+    bayes_rhat_cv_rows: list[dict[str, float | int]] = []
     bayes_actual_iterations_rows: list[int] = []
     bayes_convergence_iteration_rows: list[int] = []
     bayes_posterior_samples_rows: list[int] = []
     bayes_r2_final = float("nan")
     bayes_rhat_final = float("nan")
+    bayes_rhat_metrics_final: dict[str, float] = {}
     bayes_actual_iterations_final = 0
     bayes_convergence_iteration_final = 0
     bayes_posterior_samples_final = 0
@@ -13371,11 +13466,26 @@ def _run_method_task(
                             bayes_auto_r2_cache[bayes_r2_cache_key] = float(r2_used)
                     rhat_call = float(
                         bayes_state_call.get(
-                            "rhat_h2", bayes_state_call.get("rhat", np.nan)
+                            "rhat", bayes_state_call.get("rhat_h2", np.nan)
                         )
                     )
                     if np.isfinite(rhat_call):
                         bayes_rhat_rows.append(float(rhat_call))
+                    bayes_rhat_cv_rows.append(
+                        {
+                            "fold": int(fold_id),
+                            "rhat": float(rhat_call),
+                        }
+                    )
+                    raw_rhat_metrics_call = bayes_state_call.get("rhat_metrics", {})
+                    if isinstance(raw_rhat_metrics_call, typing.Mapping):
+                        bayes_rhat_metrics_rows.append(
+                            {
+                                str(key): float(value)
+                                for key, value in raw_rhat_metrics_call.items()
+                                if str(key) != "rhat_max"
+                            }
+                        )
                     try:
                         actual_call = int(bayes_state_call.get("actual_iterations", 0) or 0)
                     except Exception:
@@ -14215,11 +14325,18 @@ def _run_method_task(
                     bayes_auto_r2_cache[bayes_r2_final_key] = float(r2_used_final)
             rhat_final_call = float(
                 bayes_state_final.get(
-                    "rhat_h2", bayes_state_final.get("rhat", np.nan)
+                    "rhat", bayes_state_final.get("rhat_h2", np.nan)
                 )
             )
             if np.isfinite(rhat_final_call):
                 bayes_rhat_final = float(rhat_final_call)
+            raw_rhat_metrics_final = bayes_state_final.get("rhat_metrics", {})
+            if isinstance(raw_rhat_metrics_final, typing.Mapping):
+                bayes_rhat_metrics_final = {
+                    str(key): float(value)
+                    for key, value in raw_rhat_metrics_final.items()
+                    if str(key) != "rhat_max"
+                }
             try:
                 bayes_actual_iterations_final = int(
                     bayes_state_final.get("actual_iterations", 0) or 0
@@ -14351,6 +14468,37 @@ def _run_method_task(
         bayes_rhat_final = float(np.nanmean(np.asarray(bayes_rhat_rows, dtype=np.float64)))
     if (
         method in {"BayesA", "BayesB", "BayesC", "BayesR"}
+        and not bayes_rhat_metrics_final
+        and bayes_rhat_metrics_rows
+    ):
+        metric_names = sorted(
+            {name for mapping in bayes_rhat_metrics_rows for name in mapping}
+        )
+        bayes_rhat_metrics_final = {
+            name: float(
+                np.nanmean(
+                    np.asarray(
+                        [mapping[name] for mapping in bayes_rhat_metrics_rows if name in mapping],
+                        dtype=np.float64,
+                    )
+                )
+            )
+            for name in metric_names
+        }
+    # The scalar mapping is the authoritative convergence diagnostic.  Keep
+    # the legacy h2/max fallback for old extensions, but whenever metrics are
+    # available recompute the final maximum so fold aggregation cannot
+    # accidentally regress to h2-only R-hat.
+    if method in {"BayesA", "BayesB", "BayesC", "BayesR"} and bayes_rhat_metrics_final:
+        metric_values = [
+            float(value)
+            for value in bayes_rhat_metrics_final.values()
+            if not np.isnan(float(value))
+        ]
+        if len(metric_values) == len(bayes_rhat_metrics_final):
+            bayes_rhat_final = float(max(metric_values))
+    if (
+        method in {"BayesA", "BayesB", "BayesC", "BayesR"}
         and (not bayes_final_sampling_metadata_seen)
         and bayes_actual_iterations_final <= 0
         and len(bayes_actual_iterations_rows) > 0
@@ -14430,6 +14578,9 @@ def _run_method_task(
         "pve_final": float(pve_final),
         "bayes_r2_final": float(bayes_r2_final),
         "bayes_rhat_final": float(bayes_rhat_final),
+        "bayes_rhat_metrics_final": dict(bayes_rhat_metrics_final),
+        "bayes_rhat_h2_final": float(bayes_rhat_metrics_final.get("h2", np.nan)),
+        "bayes_rhat_cv_rows": [dict(row) for row in bayes_rhat_cv_rows],
         "bayes_actual_iterations_final": int(bayes_actual_iterations_final),
         "bayes_convergence_iteration_final": int(bayes_convergence_iteration_final),
         "bayes_posterior_samples_final": int(bayes_posterior_samples_final),
@@ -14447,6 +14598,12 @@ def _run_method_task(
         ),
         "bayes_posterior_samples_total": int(
             _bayes_meta_state.get("posterior_samples_total", 0) or 0
+        ),
+        "bayes_prob_in_prior_final": float(
+            _bayes_meta_state.get("prob_in_prior", BAYES_DEFAULT_PROB_IN)
+        ),
+        "bayes_prob_in_counts_final": float(
+            _bayes_meta_state.get("prob_in_counts", _BAYES_DEFAULT_COUNTS)
         ),
         "bayes_r2_source_final": str(bayes_r2_source_final),
         "bayes_r2_n_used_final": int(bayes_r2_n_used_final),
@@ -15149,15 +15306,32 @@ def _run_methods_parallel(
             else:
                 rows.append(("r2", "NA"))
             if m in {"BayesB", "BayesC"}:
-                rows.append(("prob_in/counts", "0.5/5.0"))
-            rhat = float(result.get("bayes_rhat_final", np.nan))
-            if not np.isfinite(rhat):
+                prob_in_prior = float(
+                    result.get("bayes_prob_in_prior_final", BAYES_DEFAULT_PROB_IN)
+                )
+                prob_in_counts = float(
+                    result.get("bayes_prob_in_counts_final", _BAYES_DEFAULT_COUNTS)
+                )
+                rows.append(
+                    (
+                        "prob_in/counts",
+                        f"{prob_in_prior:g}/{prob_in_counts:.1f}",
+                    )
+                )
+            rhat_metrics = result.get("bayes_rhat_metrics_final", {})
+            if not isinstance(rhat_metrics, typing.Mapping) or not rhat_metrics:
                 state_obj = result.get("model_state", None)
                 if isinstance(state_obj, typing.Mapping):
-                    rhat = float(
-                        state_obj.get("rhat_h2", state_obj.get("rhat", np.nan))
+                    rhat_metrics = state_obj.get("rhat_metrics", {})
+            if isinstance(rhat_metrics, typing.Mapping) and rhat_metrics:
+                for metric_name, metric_value in rhat_metrics.items():
+                    metric_value = float(metric_value)
+                    rows.append(
+                        (
+                            f"Rhat({metric_name})",
+                            f"{metric_value:.3f}" if np.isfinite(metric_value) else "NA",
+                        )
                     )
-            rows.append(("Rhat(h2)", f"{rhat:.3f}" if np.isfinite(rhat) else "NA"))
             actual_iterations = int(result.get("bayes_actual_iterations_final", 0) or 0)
             convergence_iteration = int(
                 result.get("bayes_convergence_iteration_final", 0) or 0
@@ -23189,15 +23363,36 @@ def _run_gs_pipeline_impl(
 
                 if m in {"BayesA", "BayesB", "BayesC", "BayesR"}:
                     if m in {"BayesB", "BayesC"}:
-                        rows.append(("prob_in/counts", "0.5/5.0"))
-                    rhat = _detail_float_or_nan(res_obj.get("bayes_rhat_final", np.nan))
-                    if not np.isfinite(rhat):
+                        prob_in_prior = float(
+                            res_obj.get(
+                                "bayes_prob_in_prior_final", BAYES_DEFAULT_PROB_IN
+                            )
+                        )
+                        prob_in_counts = float(
+                            res_obj.get(
+                                "bayes_prob_in_counts_final", _BAYES_DEFAULT_COUNTS
+                            )
+                        )
+                        rows.append(
+                            (
+                                "prob_in/counts",
+                                f"{prob_in_prior:g}/{prob_in_counts:.1f}",
+                            )
+                        )
+                    rhat_metrics = res_obj.get("bayes_rhat_metrics_final", {})
+                    if not isinstance(rhat_metrics, typing.Mapping) or not rhat_metrics:
                         state_obj = res_obj.get("model_state", None)
                         if isinstance(state_obj, typing.Mapping):
-                            rhat = _detail_float_or_nan(
-                                state_obj.get("rhat_h2", state_obj.get("rhat", np.nan))
+                            rhat_metrics = state_obj.get("rhat_metrics", {})
+                    if isinstance(rhat_metrics, typing.Mapping) and rhat_metrics:
+                        for metric_name, metric_value in rhat_metrics.items():
+                            metric_value = _detail_float_or_nan(metric_value)
+                            rows.append(
+                                (
+                                    f"Rhat({metric_name})",
+                                    f"{metric_value:.3f}" if np.isfinite(metric_value) else "NA",
+                                )
                             )
-                    rows.append(("Rhat(h2)", f"{rhat:.3f}" if np.isfinite(rhat) else "NA"))
                     actual_iterations = int(
                         res_obj.get("bayes_actual_iterations_final", 0) or 0
                     )
@@ -23352,6 +23547,31 @@ def _run_gs_pipeline_impl(
                             if (m_eff > 0 and n_eff > m_eff)
                             else "GRMreml"
                         )
+            if m_key in {"BayesA", "BayesB", "BayesC", "BayesR"}:
+                cv_rhat_rows_raw = res_obj.get("bayes_rhat_cv_rows", [])
+                if isinstance(cv_rhat_rows_raw, (list, tuple)):
+                    cv_rhat_rows: list[tuple[int, float]] = []
+                    for cv_row in cv_rhat_rows_raw:
+                        if not isinstance(cv_row, typing.Mapping):
+                            continue
+                        try:
+                            fold_value = int(cv_row.get("fold", 0) or 0)
+                            rhat_value = float(cv_row.get("rhat", np.nan))
+                        except Exception:
+                            continue
+                        if fold_value > 0:
+                            cv_rhat_rows.append((fold_value, rhat_value))
+                    if cv_rhat_rows:
+                        cv_rhat_rows.sort(key=lambda item: item[0])
+                        cv_key_width = max(
+                            len(f"Rhat_cv{fold_value}")
+                            for fold_value, _ in cv_rhat_rows
+                        )
+                        for fold_value, rhat_value in cv_rhat_rows:
+                            label = f"Rhat_cv{fold_value}"
+                            value = f"{rhat_value:.3f}" if np.isfinite(rhat_value) else "NA"
+                            _log_file_only(f"{label:<{cv_key_width}}  {value}")
+
             gs_output.emit_method_detail_lines(
                 logger,
                 cv_mode=cv_mode_row,

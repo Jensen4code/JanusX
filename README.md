@@ -106,9 +106,10 @@ jx postgwas -i a.tsv b.tsv c.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha
 # n>15,000 & m≤15,000 rrBLUP
 # n>15,000 & m>15,000 rrBLUP with PCG (Jacobi)
 jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BLUP -o test -cv 5
-# Bayesian methods (BayesR uses pi=(0.90,0.06,0.03,0.01), gamma=(0,0.01,0.1,1))
+# Bayesian methods (BayesR in JanusX-2.0.0 uses pi=(0.95,0.03,0.01,0.01), gamma=(0,0.01,0.1,1))
 jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BayesA -BayesB -BayesC -BayesR -o test -cv 5
-# Append a value to BayesB/BayesC to fix the marker inclusion probability:
+# BayesB fixes pi at 0.05 by default; append a value to override it. BayesC
+# estimates pi unless a value is supplied:
 # jx gs ... -BayesB 0.05 -BayesC 0.10
 ```
 

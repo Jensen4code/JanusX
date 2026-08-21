@@ -150,12 +150,14 @@ Current GS model groups:
 - kernel models: `-GBLUP`, `-rrBLUP`
 - Bayesian models: `-BayesA`, `-BayesB`, `-BayesC`, `-BayesR`
 
-`-BayesB` and `-BayesC` optionally accept a fixed marker inclusion
-probability, for example `-BayesB 0.05`. Without a numeric argument the
-inclusion probability is estimated during sampling.
+`-BayesB` and `-BayesC` optionally accept a marker inclusion probability, for
+example `-BayesB 0.05`. BayesB uses a fixed `pi=0.05` when no numeric
+argument is given; a numeric argument overrides that fixed value. BayesC
+estimates the inclusion probability during sampling when no numeric argument
+is given.
 
 `-BayesR` uses the four-component mixture prior
-`pi=(0.90,0.06,0.03,0.01)` and `gamma=(0,0.01,0.1,1)`. These two priors are
+`pi=(0.95,0.03,0.01,0.01)` and `gamma=(0,0.01,0.1,1)`. These two priors are
 available through the Python `BayesR` function, but are intentionally not
 separate CLI options. With `-save-model`, the effect table includes `pip` and
 `component_prob_0` through `component_prob_3`.

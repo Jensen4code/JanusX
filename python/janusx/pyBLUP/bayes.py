@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections.abc import Mapping
 from typing import Optional, Tuple
 import typing
 import warnings
@@ -14,6 +15,12 @@ from janusx.pyBLUP.mlm import BLUP
 
 _BAYESA_MIN_ABS_BETA_WARNED = False
 BAYES_POSTERIOR_SAMPLE_TARGET = 1000
+# BayesB/BayesC use the inclusion-probability convention: `prob_in` is the
+# probability that a marker has a non-zero effect.  BayesB keeps this prior
+# fixed; BayesC uses it as the starting value when pi is not fixed explicitly.
+# Five percent matches the standard GCTB starting value and avoids treating
+# half of a genome-wide SNP panel as active by default.
+BAYES_DEFAULT_PROB_IN = 0.05
 
 def _resolve_bayes_chain_count(chains: int, threads: int) -> int:
     """Resolve the native chain cap (at most half of the worker budget)."""
@@ -70,11 +77,11 @@ def _parse_bayes_diagnostics(
 ) -> dict[str, object]:
     """Parse legacy and current native Bayes diagnostic tails.
 
-    The current BayesA kernel appends ``rhat, actual_iterations,
-    convergence_iteration, posterior_samples``. BayesB/BayesC retain a
-    12-element Rust ABI (PyO3 tuple support is limited to 12 items), while the
-    Python wrappers append the fixed posterior count. The parser also accepts
-    older installed extensions and avoids the p==1 scalar PIP ambiguity.
+    The native kernels append a flat R-hat mapping after the legacy scalar
+    diagnostics.  BayesB/BayesC still receive the fixed posterior count from
+    the Python compatibility wrapper, so the mapping can occur immediately
+    before that count.  Older installed extensions without the mapping remain
+    supported.
     """
     tail = list(diag)
     pip_item: object | None = None
@@ -82,6 +89,14 @@ def _parse_bayes_diagnostics(
     actual_item: object | None = None
     convergence_item: object | None = None
     posterior_item: object | None = None
+    rhat_metrics_obj: Mapping[object, object] | None = None
+    # New native tuples place the mapping after the legacy diagnostics.  The
+    # B/C Python compatibility wrapper appends posterior_samples afterwards,
+    # hence accept either final or penultimate position.
+    for index in (len(tail) - 1, len(tail) - 2):
+        if index >= 0 and isinstance(tail[index], Mapping):
+            rhat_metrics_obj = typing.cast(Mapping[object, object], tail.pop(index))
+            break
     method_key = str(method).strip().lower()
     if method_key in {"bayesb", "bayesc"}:
         if len(tail) >= 7:
@@ -115,6 +130,25 @@ def _parse_bayes_diagnostics(
         except Exception:
             pip = None
     rhat = _scalar_from_native(rhat_item)
+    rhat_metrics: dict[str, float] = {}
+    if rhat_metrics_obj is not None:
+        for key, value in rhat_metrics_obj.items():
+            if str(key) == "rhat_max":
+                continue
+            parsed = _scalar_from_native(value)
+            if parsed is not None:
+                rhat_metrics[str(key)] = float(parsed)
+        mapped_h2 = rhat_metrics.get("h2")
+        if mapped_h2 is not None:
+            rhat = mapped_h2
+    mapped_max = None
+    if rhat_metrics_obj is not None:
+        mapped_max = _scalar_from_native(rhat_metrics_obj.get("rhat_max"))
+    if mapped_max is None and rhat_metrics:
+        mapped_max = max(rhat_metrics.values())
+    rhat_max = float(mapped_max) if mapped_max is not None else (
+        float(rhat) if rhat is not None else float("nan")
+    )
     actual = _scalar_from_native(actual_item, integer=True)
     convergence = _scalar_from_native(convergence_item, integer=True)
     posterior = _scalar_from_native(posterior_item, integer=True)
@@ -126,6 +160,8 @@ def _parse_bayes_diagnostics(
     return {
         "pip": pip,
         "rhat_h2": float(rhat) if rhat is not None else float("nan"),
+        "rhat_metrics": rhat_metrics,
+        "rhat_max": rhat_max,
         "actual_iterations": int(actual) if actual is not None else 0,
         "convergence_iteration": int(convergence) if convergence is not None else 0,
         "posterior_samples": posterior_count,
@@ -157,6 +193,8 @@ def _as_2d_f64(
         raise ValueError(f"{name} must be a 2D array")
     if out.shape[0] != n_rows:
         raise ValueError(f"{name} rows must match len(y)")
+    if out.shape[1] == 0:
+        raise ValueError(f"{name} must have at least one column")
     return np.ascontiguousarray(out)
 
 def _as_2d_marker_mxn(arr: np.ndarray, name: str, n_cols: int) -> np.ndarray:
@@ -211,6 +249,7 @@ def _call_bayesa(
     int,
     int,
     int,
+    Mapping[str, float],
 ]:
     n_iter = int(n_iter)
     burnin = int(burnin)
@@ -263,7 +302,22 @@ def _call_bayesa(
         chains=int(chains),
         threads=int(threads),
     )
-    return typing.cast(Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, int, int, int], result)
+    return typing.cast(
+        Tuple[
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            float,
+            float,
+            float,
+            float,
+            int,
+            int,
+            int,
+            Mapping[str, float],
+        ],
+        result,
+    )
 
 
 def _call_bayesb(
@@ -299,6 +353,7 @@ def _call_bayesb(
     int,
     int,
     int,
+    Mapping[str, float],
 ]:
     n_iter = int(n_iter)
     burnin = int(burnin)
@@ -326,7 +381,11 @@ def _call_bayesb(
         if seed < 0:
             raise ValueError("seed must be >= 0")
 
-    fixed_pi = _validate_fixed_pi(pi)
+    # BayesB always uses a fixed inclusion probability.  Keep ``pi`` as an
+    # optional compatibility override, but when it is omitted pin the native
+    # sampler to the validated ``prob_in`` prior instead of allowing the
+    # Gibbs loop to update it from the active-marker count.
+    fixed_pi = _validate_fixed_pi(prob_in if pi is None else pi)
     native_result = _bayesb(
         y=y,
         m=m,
@@ -349,8 +408,8 @@ def _call_bayesb(
         threads=int(threads),
     )
     native_result = typing.cast(tuple[object, ...], native_result)
-    # The native B/C ABI remains a 12-item tuple for PyO3 compatibility;
-    # expose the fixed posterior count at the Python API boundary.
+    # Keep the fixed posterior count at the Python API boundary.  The native
+    # tuple already carries the scalar R-hat mapping as its final item.
     return (*native_result, BAYES_POSTERIOR_SAMPLE_TARGET)
 
 
@@ -385,6 +444,7 @@ def _call_bayesc(
     int,
     int,
     int,
+    Mapping[str, float],
 ]:
     n_iter = int(n_iter)
     burnin = int(burnin)
@@ -474,7 +534,7 @@ def _call_bayesr(
             raise ValueError(f"BayesR {name} must contain exactly four finite values")
         return arr
 
-    pi_arr = _prior(pi, (0.90, 0.06, 0.03, 0.01), "pi")
+    pi_arr = _prior(pi, (0.95, 0.03, 0.01, 0.01), "pi")
     gamma_arr = _prior(gamma, (0.0, 0.01, 0.1, 1.0), "gamma")
     if np.any(pi_arr <= 0.0):
         raise ValueError("BayesR pi values must be > 0")
@@ -534,6 +594,7 @@ def BayesA(
     int,
     int,
     int,
+    Mapping[str, float],
 ]:
     """
     Python interface for the Rust BayesA kernel (PyO3).
@@ -612,6 +673,9 @@ def BayesA(
         0 when the fallback window was used.
     posterior_samples : int
         Number of posterior samples retained (normally exactly 1000).
+    rhat_metrics : Mapping[str, float]
+        Split-chain R-hat for every monitored scalar (for example ``h2``,
+        ``var_g``, ``var_e`` and model-specific hyperparameters).
     Raises
     ------
     ValueError
@@ -655,7 +719,7 @@ def BayesB(
     n_iter: int = 10000,
     burnin: int = 1000,
     r2: float = 0.5,
-    prob_in: float = 0.5,
+    prob_in: float = BAYES_DEFAULT_PROB_IN,
     counts: float = 5.0,
     pi: Optional[float] = None,
     df0_b: float = 5.0,
@@ -681,6 +745,7 @@ def BayesB(
     int,
     int,
     int,
+    Mapping[str, float],
 ]:
     """
     Python interface for the Rust BayesB kernel (PyO3).
@@ -702,13 +767,13 @@ def BayesB(
         Deprecated compatibility argument; ignored by the production sampler.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
-    prob_in : float, default=0.5
+    prob_in : float, default=0.05
         Prior inclusion probability for markers.
     counts : float, default=5.0
         Prior strength for inclusion probability.
     pi : float, optional
-        Fixed marker inclusion probability. If omitted, the sampler updates
-        the inclusion probability from the active-marker counts.
+        Fixed marker inclusion probability. If omitted, BayesB fixes it to
+        ``prob_in`` (default ``0.05``); it is never updated by the sampler.
     df0_b : float, default=5.0
         Prior degrees of freedom for marker effects.
     shape0 : float, default=1.1
@@ -760,6 +825,9 @@ def BayesB(
         0 when the fallback window was used.
     posterior_samples : int
         Number of posterior samples retained (normally exactly 1000).
+    rhat_metrics : Mapping[str, float]
+        Split-chain R-hat for every monitored scalar; convergence is based on
+        the maximum value across this mapping.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
@@ -796,8 +864,8 @@ def BayesC(
     n_iter: int = 10000,
     burnin: int = 1000,
     r2: float = 0.5,
-    prob_in: float = 0.5,
-    counts: float = 10.0,
+    prob_in: float = BAYES_DEFAULT_PROB_IN,
+    counts: float = 5.0,
     pi: Optional[float] = None,
     df0_b: float = 5.0,
     s0_b: Optional[float] = None,
@@ -820,6 +888,7 @@ def BayesC(
     int,
     int,
     int,
+    Mapping[str, float],
 ]:
     """
     Python interface for the Rust BayesC kernel (PyO3).
@@ -841,9 +910,9 @@ def BayesC(
         Deprecated compatibility argument; ignored by the production sampler.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
-    prob_in : float, default=0.5
+    prob_in : float, default=0.05
         Prior inclusion probability for markers.
-    counts : float, default=10.0
+    counts : float, default=5.0
         Prior strength for inclusion probability.
     pi : float, optional
         Fixed marker inclusion probability. If omitted, the sampler updates
@@ -895,6 +964,9 @@ def BayesC(
         0 when the fallback window was used.
     posterior_samples : int
         Number of posterior samples retained (normally exactly 1000).
+    rhat_metrics : Mapping[str, float]
+        Split-chain R-hat for every monitored scalar; convergence is based on
+        the maximum value across this mapping.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
@@ -953,10 +1025,11 @@ def BayesR(
     int,
     int,
     int,
+    Mapping[str, float],
 ]:
     """Fit the four-component BayesR mixture model.
 
-    The default prior is ``pi=(.90,.06,.03,.01)`` and
+    The default prior is ``pi=(.95,.03,.01,.01)`` and
     ``gamma=(0,.01,.1,1)``.  ``pi`` and ``gamma`` are function-level
     parameters; the GS CLI keeps these defaults and does not expose separate
     command-line flags.
@@ -966,7 +1039,7 @@ def BayesR(
 
     Returns ``(beta, alpha, varbeta, vare, h2, varh2, pip,
     component_prob, pi_mean, sigma_lambda2, rhat_h2, actual_iterations,
-    convergence_iteration, posterior_samples)``.
+    convergence_iteration, posterior_samples, rhat_metrics)``.
     ``component_prob`` has shape ``(n_markers, 4)`` and uses Rao--Blackwell
     probabilities averaged over the retained posterior samples.
         ``chains`` independent chains are scheduled and aggregated in Rust.
@@ -1008,6 +1081,7 @@ def BayesR(
         int(result["actual_iterations"]),
         int(result["convergence_iteration"]),
         int(result["posterior_samples"]),
+        dict(typing.cast(Mapping[object, object], result.get("rhat_metrics", {}))),
     )
 
 
@@ -1021,7 +1095,7 @@ class BAYES:
         n_iter: Optional[int] = None,
         burnin: Optional[int] = None,
         r2: Optional[float] = None,
-        prob_in: float = 0.5,
+        prob_in: float = BAYES_DEFAULT_PROB_IN,
         counts: float = 5.0,
         pi: Optional[float | np.ndarray] = None,
         gamma: Optional[np.ndarray] = None,
@@ -1046,13 +1120,15 @@ class BAYES:
             Proportion of variance explained by markers. If None, estimated
             via GBLUP (BLUP with kinship=1).
         prob_in : float
-            Prior inclusion probability (BayesB/BayesC).
+            Fixed BayesB inclusion probability and starting BayesC prior.
         counts : float
-            Prior strength for inclusion probability (BayesB/BayesC).
+            Dirichlet/Beta prior strength used only when BayesC updates pi.
         pi : float or array-like, optional
-            Fixed marker inclusion probability for BayesB/BayesC. For BayesR,
-            this is the four-component initial mixture prior and is updated
-            by the Dirichlet step. If omitted, BayesR uses ``(.90,.06,.03,.01)``.
+            Fixed marker inclusion probability for BayesB. For BayesC, it is
+            fixed only when supplied; otherwise the sampler updates it. For
+            BayesR, this is the four-component initial mixture prior and is
+            updated by the Dirichlet step. If omitted, BayesR uses
+            ``(.95,.03,.01,.01)``.
         gamma : array-like, optional
             BayesR component variance multipliers. Defaults to ``(0,.01,.1,1)``.
         chains : int, default=1
@@ -1130,6 +1206,8 @@ class BAYES:
         self.pi_hat: np.ndarray | None = None
         self.sigma_lambda2_hat: float | None = None
         self.rhat_h2: float = float("nan")
+        self.rhat_metrics: dict[str, float] = {}
+        self.rhat_max: float = float("nan")
         self.rhat: float = float("nan")
         self.rhat_max_iterations: int = int(n_iter)
         self.posterior_sample_target: int = BAYES_POSTERIOR_SAMPLE_TARGET
@@ -1178,6 +1256,7 @@ class BAYES:
                 actual_iterations,
                 convergence_iteration,
                 posterior_samples,
+                rhat_metrics,
             ) = method_map[method](y, M, X, **method_kwargs)
             self.component_prob_hat = np.ascontiguousarray(
                 np.asarray(component_prob, dtype=np.float32), dtype=np.float32
@@ -1202,6 +1281,14 @@ class BAYES:
             diagnostics = {
                 "pip": np.ascontiguousarray(np.asarray(pip, dtype=np.float64).reshape(-1)),
                 "rhat_h2": float(rhat_h2),
+                "rhat_metrics": {
+                    str(key): float(value)
+                    for key, value in dict(rhat_metrics).items()
+                    if str(key) != "rhat_max" and _scalar_from_native(value) is not None
+                },
+                "rhat_max": float(
+                    dict(rhat_metrics).get("rhat_max", float(rhat_h2))
+                ),
                 "actual_iterations": int(actual_iterations),
                 "convergence_iteration": int(convergence_iteration),
                 "posterior_samples": int(posterior_samples),
@@ -1216,11 +1303,17 @@ class BAYES:
         if isinstance(pip, np.ndarray):
             self.pip_hat = np.ascontiguousarray(pip.reshape(-1, 1), dtype=np.float64)
         self.rhat_h2 = float(diagnostics["rhat_h2"])
+        self.rhat_metrics = {
+            str(key): float(value)
+            for key, value in typing.cast(Mapping[str, object], diagnostics.get("rhat_metrics", {})).items()
+            if _scalar_from_native(value) is not None
+        }
+        self.rhat_max = float(diagnostics.get("rhat_max", self.rhat_h2))
         self.actual_iterations = int(diagnostics["actual_iterations"])
         self.convergence_iteration = int(diagnostics["convergence_iteration"])
         self.posterior_samples = int(diagnostics["posterior_samples"])
         self.posterior_samples_total = int(self.posterior_samples * self.chains_effective)
-        self.rhat = float(self.rhat_h2)
+        self.rhat = float(self.rhat_max)
         
     def predict(self,M:np.ndarray,cov:np.ndarray=None):
         """

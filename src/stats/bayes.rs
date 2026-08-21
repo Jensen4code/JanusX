@@ -35,11 +35,9 @@
 //! retain explicit thinning for diagnostic plots.
 
 use numpy::ndarray::Array2;
-use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
-};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyAny, PyDict};
+use pyo3::types::{PyAny, PyDict, PyFloat, PyInt, PyTuple};
 use pyo3::{prelude::*, BoundObject};
 use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng, TryRngCore};
@@ -242,9 +240,9 @@ fn posterior_keep_iters(n_iter: usize, burnin: usize, thin: usize) -> Vec<i64> {
 
 // A single MCMC chain does not support the classical multi-chain Gelman--Rubin
 // diagnostic.  We therefore report the standard split-chain R-hat calculated
-// from the retained posterior h2 samples.  The two consecutive halves are
-// treated as two chains; this is useful for detecting a persistent drift in the
-// scalar variance component while keeping the production kernels streaming.
+// from each retained scalar monitor (h2, variance components, and model
+// hyperparameters).  The two consecutive halves are treated as two chains;
+// convergence uses the maximum finite scalar R-hat.
 // Keep the early-stop criterion aligned with the GS user-facing contract.
 // Keep the conventional conservative convergence cutoff for split-chain R-hat.
 const BAYES_RHAT_THRESHOLD: f64 = 1.10;
@@ -252,6 +250,71 @@ const BAYES_RHAT_MIN_KEEP: usize = 500;
 const BAYES_RHAT_CHECK_EVERY: usize = 50;
 const BAYES_RHAT_STABLE_CHECKS: usize = 3;
 pub(crate) const BAYES_POSTERIOR_SAMPLES: usize = 1000;
+
+// BayesA/B use marker-specific latent variances.  Their mean `var_b` is an
+// auxiliary prior state (and for BayesB also includes inactive-marker draws),
+// so monitoring it makes convergence spuriously fail without reflecting the
+// stability of the fitted genetic/residual components.  BayesC has one shared
+// slab variance, so its `var_b` remains a meaningful global monitor.
+pub(crate) const BAYES_RHAT_A_NAMES: &[&str] = &["h2", "var_g", "var_e"];
+pub(crate) const BAYES_RHAT_B_NAMES: &[&str] = &["h2", "var_g", "var_e", "prob_in", "n_active"];
+pub(crate) const BAYES_RHAT_C_NAMES: &[&str] =
+    &["h2", "var_g", "var_e", "var_b", "prob_in", "n_active"];
+pub(crate) const BAYES_RHAT_R_NAMES: &[&str] = &[
+    "h2",
+    "var_g",
+    "var_e",
+    "sigma_lambda2",
+    "pi0",
+    "pi1",
+    "pi2",
+    "pi3",
+    "n_active",
+];
+
+#[inline]
+pub(crate) fn finite_rhat_max(values: &[f64]) -> f64 {
+    // A positive infinite R-hat is a useful diagnostic (zero within-chain
+    // variance with a non-zero between-chain shift) and must remain the
+    // maximum rather than being hidden as NaN.  NaN and negative values are
+    // invalid monitor outputs and invalidate the aggregate statistic.
+    if values.is_empty() || values.iter().any(|value| value.is_nan() || *value < 0.0) {
+        return f64::NAN;
+    }
+    values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Convert the native scalar R-hat vector to a Python mapping.  The mapping
+/// is intentionally flat so callers can print `Rhat(h2)`, `Rhat(var_g)`, …
+/// without knowing the model-specific tuple layout.  `rhat_max` is the
+/// convergence statistic used by the controller; the individual entries are
+/// retained for diagnostics and backwards-compatible `rhat_h2` handling.
+pub(crate) fn rhat_metrics_to_py<'py>(
+    py: Python<'py>,
+    names: &[&str],
+    values: &[f64],
+) -> PyResult<Py<PyAny>> {
+    let mapping = PyDict::new(py);
+    mapping.set_item("rhat_max", finite_rhat_max(values))?;
+    for (name, value) in names.iter().zip(values.iter()) {
+        mapping.set_item(*name, *value)?;
+    }
+    Ok(mapping.into_any().unbind())
+}
+
+fn py_tuple_from_items<'py>(py: Python<'py>, items: Vec<Py<PyAny>>) -> PyResult<Py<PyTuple>> {
+    Ok(PyTuple::new(py, items)?.unbind())
+}
+
+#[inline]
+fn py_float_item(py: Python<'_>, value: f64) -> Py<PyAny> {
+    PyFloat::new(py, value).into_any().unbind()
+}
+
+#[inline]
+fn py_usize_item(py: Python<'_>, value: usize) -> Py<PyAny> {
+    PyInt::new(py, value as u64).into_any().unbind()
+}
 
 /// Resolve the native multi-chain budget. Chains are capped at half of the
 /// requested worker budget so marker decoding/BLAS work still has room to run;
@@ -419,55 +482,84 @@ pub(crate) fn aggregate_bayes_h2(
     (mean, var.max(0.0), rhat)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BayesRhatState {
     // Prefix sums let us evaluate the two split-chain moments in O(1) at
     // each check.  Keeping the prefix moments rather than rescanning all
     // retained samples avoids O(n_iter^2) work for long, non-converging runs.
-    h2_sum: Vec<f64>,
-    h2_sq_sum: Vec<f64>,
+    names: &'static [&'static str],
+    sum: Vec<Vec<f64>>,
+    sq_sum: Vec<Vec<f64>>,
+    valid: Vec<bool>,
     stable_checks: usize,
 }
 
 impl BayesRhatState {
-    fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(names: &'static [&'static str], capacity: usize) -> Self {
         Self {
-            h2_sum: {
-                let mut values = Vec::with_capacity(capacity + 1);
-                values.push(0.0);
-                values
-            },
-            h2_sq_sum: {
-                let mut values = Vec::with_capacity(capacity + 1);
-                values.push(0.0);
-                values
-            },
+            names,
+            sum: names
+                .iter()
+                .map(|_| {
+                    let mut values = Vec::with_capacity(capacity + 1);
+                    values.push(0.0);
+                    values
+                })
+                .collect(),
+            sq_sum: names
+                .iter()
+                .map(|_| {
+                    let mut values = Vec::with_capacity(capacity + 1);
+                    values.push(0.0);
+                    values
+                })
+                .collect(),
+            valid: vec![true; names.len()],
             stable_checks: 0,
         }
     }
 
     #[inline]
     fn reset(&mut self) {
-        self.h2_sum.clear();
-        self.h2_sum.push(0.0);
-        self.h2_sq_sum.clear();
-        self.h2_sq_sum.push(0.0);
+        for values in &mut self.sum {
+            values.clear();
+            values.push(0.0);
+        }
+        for values in &mut self.sq_sum {
+            values.clear();
+            values.push(0.0);
+        }
+        self.valid.fill(true);
         self.stable_checks = 0;
     }
 
     #[inline]
-    fn observe(&mut self, h2: f64) -> bool {
-        if h2.is_finite() {
-            let sum = *self.h2_sum.last().unwrap_or(&0.0);
-            let sq_sum = *self.h2_sq_sum.last().unwrap_or(&0.0);
-            self.h2_sum.push(sum + h2);
-            self.h2_sq_sum.push(sq_sum + h2 * h2);
+    fn observe(&mut self, values: &[f64]) -> bool {
+        if values.len() != self.names.len() {
+            self.valid.fill(false);
+            return false;
         }
-        let n = self.h2_sum.len().saturating_sub(1);
+        for (index, value) in values.iter().copied().enumerate() {
+            let sum = *self.sum[index].last().unwrap_or(&0.0);
+            let sq_sum = *self.sq_sum[index].last().unwrap_or(&0.0);
+            if value.is_finite() {
+                self.sum[index].push(sum + value);
+                self.sq_sum[index].push(sq_sum + value * value);
+            } else {
+                self.valid[index] = false;
+                self.sum[index].push(sum);
+                self.sq_sum[index].push(sq_sum);
+            }
+        }
+        let n = self
+            .sum
+            .first()
+            .map(|values| values.len().saturating_sub(1))
+            .unwrap_or(0);
         if n < BAYES_RHAT_MIN_KEEP || n % BAYES_RHAT_CHECK_EVERY != 0 {
             return false;
         }
-        let rhat = split_rhat_from_prefix(&self.h2_sum, &self.h2_sq_sum);
+        let rhat = self.rhat_max();
         if rhat.is_finite() && rhat < BAYES_RHAT_THRESHOLD {
             self.stable_checks += 1;
         } else {
@@ -478,7 +570,28 @@ impl BayesRhatState {
 
     #[inline]
     fn value(&self) -> f64 {
-        split_rhat_from_prefix(&self.h2_sum, &self.h2_sq_sum)
+        self.values().first().copied().unwrap_or(f64::NAN)
+    }
+
+    #[inline]
+    fn values(&self) -> Vec<f64> {
+        self.sum
+            .iter()
+            .zip(self.sq_sum.iter())
+            .zip(self.valid.iter())
+            .map(|((sum, sq_sum), valid)| {
+                if *valid {
+                    split_rhat_from_prefix(sum, sq_sum)
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect()
+    }
+
+    #[inline]
+    fn rhat_max(&self) -> f64 {
+        finite_rhat_max(&self.values())
     }
 }
 
@@ -499,7 +612,12 @@ pub(crate) struct BayesSamplingController {
 }
 
 impl BayesSamplingController {
-    pub(crate) fn new(n_iter: usize, _burnin: usize, thin: usize) -> Self {
+    pub(crate) fn new(
+        n_iter: usize,
+        _burnin: usize,
+        thin: usize,
+        rhat_names: &'static [&'static str],
+    ) -> Self {
         let thin = thin.max(1);
         let target_keep = BAYES_POSTERIOR_SAMPLES / thin + 1;
         Self {
@@ -507,7 +625,7 @@ impl BayesSamplingController {
             thin,
             actual_iterations: 0,
             posterior_samples: 0,
-            rhat_state: BayesRhatState::with_capacity(target_keep + 1),
+            rhat_state: BayesRhatState::with_capacity(rhat_names, target_keep + 1),
             convergence_iteration: 0,
             collecting_posterior: false,
         }
@@ -540,14 +658,14 @@ impl BayesSamplingController {
     /// must be cleared before the next iteration starts formal posterior
     /// collection.
     #[inline]
-    pub(crate) fn observe(&mut self, h2: f64) -> bool {
+    pub(crate) fn observe(&mut self, values: &[f64]) -> bool {
         if self.collecting_posterior {
             self.posterior_samples += 1;
-            let _ = self.rhat_state.observe(h2);
+            let _ = self.rhat_state.observe(values);
             return false;
         }
 
-        if self.rhat_state.observe(h2) {
+        if self.rhat_state.observe(values) {
             self.collecting_posterior = true;
             self.convergence_iteration = self.actual_iterations;
             self.posterior_samples = 0;
@@ -580,6 +698,16 @@ impl BayesSamplingController {
     }
 
     #[inline]
+    pub(crate) fn rhat_values(&self) -> Vec<f64> {
+        self.rhat_state.values()
+    }
+
+    #[inline]
+    pub(crate) fn rhat_max(&self) -> f64 {
+        self.rhat_state.rhat_max()
+    }
+
+    #[inline]
     pub(crate) fn actual_iterations(&self) -> usize {
         self.actual_iterations
     }
@@ -591,12 +719,13 @@ impl BayesSamplingController {
 }
 
 /// Synchronized controller used by the native multi-chain kernels. Every
-/// chain contributes one h² value at the same iteration, so convergence can
-/// be decided from the between-chain Gelman--Rubin statistic before posterior
-/// accumulators are enabled. Only the scalar h² moments are retained; marker
-/// blocks and all model state remain in the caller's chain states.
+/// chain contributes a vector of scalar monitors at the same iteration, so
+/// convergence can be decided from the maximum between-chain Gelman--Rubin
+/// statistic before posterior accumulators are enabled. Marker blocks and all
+/// model state remain in the caller's chain states.
 #[derive(Debug)]
 pub(crate) struct BayesMultiChainController {
+    rhat_names: &'static [&'static str],
     n_iter: usize,
     thin: usize,
     chains: usize,
@@ -606,18 +735,26 @@ pub(crate) struct BayesMultiChainController {
     collecting_posterior: bool,
     stable_checks: usize,
     monitor_n: usize,
-    monitor_sum: Vec<f64>,
-    monitor_sq_sum: Vec<f64>,
-    posterior_sum: Vec<f64>,
-    posterior_sq_sum: Vec<f64>,
+    monitor_valid: Vec<bool>,
+    monitor_sum: Vec<Vec<f64>>,
+    monitor_sq_sum: Vec<Vec<f64>>,
+    posterior_valid: Vec<bool>,
+    posterior_sum: Vec<Vec<f64>>,
+    posterior_sq_sum: Vec<Vec<f64>>,
 }
 
 impl BayesMultiChainController {
-    pub(crate) fn new(chains: usize, n_iter: usize, thin: usize) -> Result<Self, String> {
+    pub(crate) fn new(
+        chains: usize,
+        n_iter: usize,
+        thin: usize,
+        rhat_names: &'static [&'static str],
+    ) -> Result<Self, String> {
         if chains == 0 {
             return Err("native multi-chain controller requires at least one chain".to_string());
         }
         Ok(Self {
+            rhat_names,
             n_iter,
             thin: thin.max(1),
             chains,
@@ -627,10 +764,12 @@ impl BayesMultiChainController {
             collecting_posterior: false,
             stable_checks: 0,
             monitor_n: 0,
-            monitor_sum: vec![0.0; chains],
-            monitor_sq_sum: vec![0.0; chains],
-            posterior_sum: vec![0.0; chains],
-            posterior_sq_sum: vec![0.0; chains],
+            monitor_valid: vec![true; rhat_names.len()],
+            monitor_sum: vec![vec![0.0; chains]; rhat_names.len()],
+            monitor_sq_sum: vec![vec![0.0; chains]; rhat_names.len()],
+            posterior_valid: vec![true; rhat_names.len()],
+            posterior_sum: vec![vec![0.0; chains]; rhat_names.len()],
+            posterior_sq_sum: vec![vec![0.0; chains]; rhat_names.len()],
         })
     }
 
@@ -657,8 +796,13 @@ impl BayesMultiChainController {
     }
 
     fn reset_accumulators(&mut self) {
-        self.posterior_sum.fill(0.0);
-        self.posterior_sq_sum.fill(0.0);
+        for values in &mut self.posterior_sum {
+            values.fill(0.0);
+        }
+        for values in &mut self.posterior_sq_sum {
+            values.fill(0.0);
+        }
+        self.posterior_valid.fill(true);
         self.posterior_samples = 0;
     }
 
@@ -672,67 +816,57 @@ impl BayesMultiChainController {
         if self.monitor_n < BAYES_RHAT_MIN_KEEP {
             return f64::NAN;
         }
-        let n = self.monitor_n as f64;
-        let means = self
-            .monitor_sum
-            .iter()
-            .map(|value| *value / n)
-            .collect::<Vec<_>>();
-        let within = self
+        let values = self
             .monitor_sum
             .iter()
             .zip(self.monitor_sq_sum.iter())
-            .map(|(sum, sq_sum)| ((sq_sum - sum * sum / n) / (n - 1.0)).max(0.0))
-            .sum::<f64>()
-            / self.chains as f64;
-        let mean = means.iter().sum::<f64>() / self.chains as f64;
-        let between = n * means
-            .iter()
-            .map(|value| (value - mean) * (value - mean))
-            .sum::<f64>()
-            / (self.chains.saturating_sub(1).max(1) as f64);
-        if !within.is_finite() || !between.is_finite() {
-            return f64::NAN;
-        }
-        if within <= f64::MIN_POSITIVE {
-            return if between <= f64::MIN_POSITIVE {
-                1.0
-            } else {
-                f64::INFINITY
-            };
-        }
-        let variance_hat = ((self.monitor_n - 1) as f64 / self.monitor_n as f64) * within
-            + between / self.monitor_n as f64;
-        if variance_hat.is_finite() && variance_hat >= 0.0 {
-            (variance_hat / within).sqrt().max(1.0)
-        } else {
-            f64::NAN
-        }
+            .zip(self.monitor_valid.iter())
+            .map(|((sum, sq_sum), valid)| {
+                if *valid {
+                    multi_chain_rhat_from_moments(sum, sq_sum, self.monitor_n)
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect::<Vec<_>>();
+        finite_rhat_max(&values)
     }
 
     /// Observe one synchronized retained sample. Returns true when model
     /// accumulators must be cleared before the next iteration.
-    pub(crate) fn observe(&mut self, h2: &[f64], retained: bool) -> Result<bool, String> {
+    pub(crate) fn observe(&mut self, values: &[Vec<f64>], retained: bool) -> Result<bool, String> {
         if !retained {
             return Ok(false);
         }
-        if h2.len() != self.chains {
-            return Err("native multi-chain h2 length mismatch".to_string());
+        if values.len() != self.chains
+            || values
+                .iter()
+                .any(|value| value.len() != self.rhat_names.len())
+        {
+            return Err("native multi-chain R-hat metric dimensions mismatch".to_string());
         }
         if self.collecting_posterior {
-            for (index, value) in h2.iter().copied().enumerate() {
-                if value.is_finite() {
-                    self.posterior_sum[index] += value;
-                    self.posterior_sq_sum[index] += value * value;
+            for (chain, chain_values) in values.iter().enumerate() {
+                for (metric, value) in chain_values.iter().copied().enumerate() {
+                    if value.is_finite() {
+                        self.posterior_sum[metric][chain] += value;
+                        self.posterior_sq_sum[metric][chain] += value * value;
+                    } else {
+                        self.posterior_valid[metric] = false;
+                    }
                 }
             }
             self.posterior_samples += 1;
             return Ok(false);
         }
-        for (index, value) in h2.iter().copied().enumerate() {
-            if value.is_finite() {
-                self.monitor_sum[index] += value;
-                self.monitor_sq_sum[index] += value * value;
+        for (chain, chain_values) in values.iter().enumerate() {
+            for (metric, value) in chain_values.iter().copied().enumerate() {
+                if value.is_finite() {
+                    self.monitor_sum[metric][chain] += value;
+                    self.monitor_sq_sum[metric][chain] += value * value;
+                } else {
+                    self.monitor_valid[metric] = false;
+                }
             }
         }
         self.monitor_n += 1;
@@ -760,20 +894,43 @@ impl BayesMultiChainController {
     }
 
     pub(crate) fn posterior_h2_summary(&self) -> (f64, f64, f64) {
+        self.posterior_metric_summary(0)
+    }
+
+    fn posterior_metric_summary(&self, metric: usize) -> (f64, f64, f64) {
+        if metric >= self.rhat_names.len() {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        }
         let n = self.posterior_samples.max(1) as f64;
-        let means = self
-            .posterior_sum
+        let means = self.posterior_sum[metric]
             .iter()
             .map(|value| *value / n)
             .collect::<Vec<_>>();
-        let vars = self
-            .posterior_sum
+        let vars = self.posterior_sum[metric]
             .iter()
-            .zip(self.posterior_sq_sum.iter())
+            .zip(self.posterior_sq_sum[metric].iter())
             .map(|(sum, sq_sum)| (sq_sum / n - (sum / n) * (sum / n)).max(0.0))
             .collect::<Vec<_>>();
+        if !self.posterior_valid[metric] {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        }
         let rhats = vec![f64::NAN; self.chains];
         aggregate_bayes_h2(&means, &vars, &rhats, self.posterior_samples)
+    }
+
+    pub(crate) fn posterior_rhat_values(&self) -> Vec<f64> {
+        self.posterior_sum
+            .iter()
+            .zip(self.posterior_sq_sum.iter())
+            .zip(self.posterior_valid.iter())
+            .map(|((sum, sq_sum), valid)| {
+                if *valid {
+                    multi_chain_rhat_from_moments(sum, sq_sum, self.posterior_samples)
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect()
     }
 
     #[inline]
@@ -784,6 +941,43 @@ impl BayesMultiChainController {
     #[inline]
     pub(crate) fn convergence_iteration(&self) -> usize {
         self.convergence_iteration
+    }
+}
+
+fn multi_chain_rhat_from_moments(sum: &[f64], sq_sum: &[f64], n: usize) -> f64 {
+    if sum.len() != sq_sum.len() || sum.is_empty() || n < 2 {
+        return f64::NAN;
+    }
+    let n_f = n as f64;
+    let means = sum.iter().map(|value| *value / n_f).collect::<Vec<_>>();
+    let within = sum
+        .iter()
+        .zip(sq_sum.iter())
+        .map(|(sum, sq_sum)| ((sq_sum - sum * sum / n_f) / (n_f - 1.0)).max(0.0))
+        .sum::<f64>()
+        / sum.len() as f64;
+    let mean = means.iter().sum::<f64>() / means.len() as f64;
+    let between = n_f
+        * means
+            .iter()
+            .map(|value| (value - mean) * (value - mean))
+            .sum::<f64>()
+        / (means.len().saturating_sub(1).max(1) as f64);
+    if !within.is_finite() || !between.is_finite() {
+        return f64::NAN;
+    }
+    if within <= f64::MIN_POSITIVE {
+        return if between <= f64::MIN_POSITIVE {
+            1.0
+        } else {
+            f64::INFINITY
+        };
+    }
+    let variance_hat = ((n - 1) as f64 / n_f) * within + between / n_f;
+    if variance_hat.is_finite() && variance_hat >= 0.0 {
+        (variance_hat / within).sqrt().max(1.0)
+    } else {
+        f64::NAN
     }
 }
 
@@ -2428,24 +2622,7 @@ fn bayesb_core_impl(
     df0_e: f64,
     prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
-) -> Result<
-    (
-        Vec<f64>,
-        Vec<f64>,
-        Vec<f64>,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        Vec<f64>,
-        f64,
-        usize,
-        usize,
-        usize,
-    ),
-    String,
-> {
+) -> Result<BayesBCResult, String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -2461,7 +2638,7 @@ fn bayesb_core_impl(
     if m.len() != n * p {
         return Err("M has incompatible dimensions".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
 
@@ -2567,7 +2744,7 @@ fn bayesb_core_impl(
     let mut h2_sq_sum = 0.0;
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
-    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin, BAYES_RHAT_B_NAMES);
     let var_b_fixed = 1e10_f64;
 
     let chi_b_active = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
@@ -2696,7 +2873,8 @@ fn bayesb_core_impl(
             h2_sq_sum += h2 * h2;
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
-            if schedule.observe(h2) {
+            let rhat_metrics = [h2, var_g, var_e, prob_in, mrk_in];
+            if schedule.observe(&rhat_metrics) {
                 beta_sum.fill(0.0);
                 pip_sum.fill(0.0);
                 varb_sum.fill(0.0);
@@ -2733,6 +2911,7 @@ fn bayesb_core_impl(
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
     let rhat_h2 = schedule.rhat_value();
+    let rhat_metrics = schedule.rhat_values();
     let actual_iterations = schedule.actual_iterations;
     let convergence_iteration = schedule.convergence_iteration;
     let posterior_samples = schedule.posterior_samples();
@@ -2751,6 +2930,7 @@ fn bayesb_core_impl(
         actual_iterations,
         convergence_iteration,
         posterior_samples,
+        rhat_metrics,
     ))
 }
 
@@ -2773,24 +2953,7 @@ fn bayesc_core_impl(
     df0_e: f64,
     prior_ss_e_opt: Option<f64>,
     seed: Option<u64>,
-) -> Result<
-    (
-        Vec<f64>,
-        Vec<f64>,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        Vec<f64>,
-        f64,
-        usize,
-        usize,
-        usize,
-    ),
-    String,
-> {
+) -> Result<BayesCResult, String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -2806,7 +2969,7 @@ fn bayesc_core_impl(
     if m.len() != n * p {
         return Err("M has incompatible dimensions".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
 
@@ -2911,7 +3074,7 @@ fn bayesc_core_impl(
     let mut h2_sq_sum = 0.0;
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
-    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin, BAYES_RHAT_C_NAMES);
     let var_b_fixed = 1e10_f64;
     let mut chi_b_cache: HashMap<usize, ChiSquared<f64>> = HashMap::new();
 
@@ -3027,7 +3190,8 @@ fn bayesc_core_impl(
             h2_sq_sum += h2 * h2;
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
-            if schedule.observe(h2) {
+            let rhat_metrics = [h2, var_g, var_e, var_b, prob_in, mrk_in];
+            if schedule.observe(&rhat_metrics) {
                 beta_sum.fill(0.0);
                 pip_sum.fill(0.0);
                 alpha_sum.fill(0.0);
@@ -3064,6 +3228,7 @@ fn bayesc_core_impl(
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
     let rhat_h2 = schedule.rhat_value();
+    let rhat_metrics = schedule.rhat_values();
     let actual_iterations = schedule.actual_iterations;
     let convergence_iteration = schedule.convergence_iteration;
     let posterior_samples = schedule.posterior_samples();
@@ -3082,6 +3247,7 @@ fn bayesc_core_impl(
         actual_iterations,
         convergence_iteration,
         posterior_samples,
+        rhat_metrics,
     ))
 }
 
@@ -3104,21 +3270,7 @@ fn bayesa_core_impl(
     prior_ss_e_opt: Option<f64>,
     _min_abs_beta: f64,
     seed: Option<u64>,
-) -> Result<
-    (
-        Vec<f64>,
-        Vec<f64>,
-        Vec<f64>,
-        f64,
-        f64,
-        f64,
-        f64,
-        usize,
-        usize,
-        usize,
-    ),
-    String,
-> {
+) -> Result<BayesAResult, String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -3127,7 +3279,7 @@ fn bayesa_core_impl(
     if m.len() != n * p {
         return Err("M has incompatible dimensions".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
 
@@ -3238,7 +3390,7 @@ fn bayesa_core_impl(
     let mut var_e_sum = 0.0;
     let mut h2_sum = 0.0;
     let mut h2_sq_sum = 0.0;
-    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin, BAYES_RHAT_A_NAMES);
     let var_b_fixed = 1e10_f64;
 
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
@@ -3321,7 +3473,8 @@ fn bayesa_core_impl(
             let h2 = var_g / (var_g + var_e);
             h2_sum += h2;
             h2_sq_sum += h2 * h2;
-            if schedule.observe(h2) {
+            let rhat_metrics = [h2, var_g, var_e];
+            if schedule.observe(&rhat_metrics) {
                 beta_sum.fill(0.0);
                 varb_sum.fill(0.0);
                 alpha_sum.fill(0.0);
@@ -3352,6 +3505,7 @@ fn bayesa_core_impl(
         var_h2 = 0.0;
     }
     let rhat_h2 = schedule.rhat_value();
+    let rhat_metrics = schedule.rhat_values();
     let actual_iterations = schedule.actual_iterations;
     let convergence_iteration = schedule.convergence_iteration;
     let posterior_samples = schedule.posterior_samples();
@@ -3366,6 +3520,7 @@ fn bayesa_core_impl(
         actual_iterations,
         convergence_iteration,
         posterior_samples,
+        rhat_metrics,
     ))
 }
 
@@ -3380,6 +3535,7 @@ type BayesAResult = (
     usize,
     usize,
     usize,
+    Vec<f64>,
 );
 
 type BayesBCResult = (
@@ -3396,6 +3552,7 @@ type BayesBCResult = (
     usize,
     usize,
     usize,
+    Vec<f64>,
 );
 
 type BayesCResult = (
@@ -3412,6 +3569,7 @@ type BayesCResult = (
     usize,
     usize,
     usize,
+    Vec<f64>,
 );
 
 fn average_f64_vectors(values: &[Vec<f64>]) -> Vec<f64> {
@@ -3436,6 +3594,12 @@ fn aggregate_bayes_a_results(results: &[BayesAResult]) -> BayesAResult {
     let h2_vars = results.iter().map(|value| value.5).collect::<Vec<_>>();
     let rhats = results.iter().map(|value| value.6).collect::<Vec<_>>();
     let n_post = results.iter().map(|value| value.9).min().unwrap_or(0);
+    let rhat_metrics = average_f64_vectors(
+        &results
+            .iter()
+            .map(|value| value.10.clone())
+            .collect::<Vec<_>>(),
+    );
     let (h2_mean, var_h2, rhat) = aggregate_bayes_h2(&h2_means, &h2_vars, &rhats, n_post);
     let actual_iterations = results.iter().map(|value| value.7).max().unwrap_or(0);
     let convergence_values = results.iter().map(|value| value.8).collect::<Vec<_>>();
@@ -3470,6 +3634,7 @@ fn aggregate_bayes_a_results(results: &[BayesAResult]) -> BayesAResult {
         actual_iterations,
         convergence_iteration,
         n_post,
+        rhat_metrics,
     )
 }
 
@@ -3478,6 +3643,12 @@ fn aggregate_bayes_bc_results(results: &[BayesBCResult]) -> BayesBCResult {
     let h2_vars = results.iter().map(|value| value.5).collect::<Vec<_>>();
     let rhats = results.iter().map(|value| value.9).collect::<Vec<_>>();
     let n_post = results.iter().map(|value| value.12).min().unwrap_or(0);
+    let rhat_metrics = average_f64_vectors(
+        &results
+            .iter()
+            .map(|value| value.13.clone())
+            .collect::<Vec<_>>(),
+    );
     let (h2_mean, var_h2, rhat) = aggregate_bayes_h2(&h2_means, &h2_vars, &rhats, n_post);
     let actual_iterations = results.iter().map(|value| value.10).max().unwrap_or(0);
     let convergence_values = results.iter().map(|value| value.11).collect::<Vec<_>>();
@@ -3520,6 +3691,7 @@ fn aggregate_bayes_bc_results(results: &[BayesBCResult]) -> BayesBCResult {
         actual_iterations,
         convergence_iteration,
         n_post,
+        rhat_metrics,
     )
 }
 
@@ -3528,6 +3700,12 @@ fn aggregate_bayes_c_results(results: &[BayesCResult]) -> BayesCResult {
     let h2_vars = results.iter().map(|value| value.5).collect::<Vec<_>>();
     let rhats = results.iter().map(|value| value.9).collect::<Vec<_>>();
     let n_post = results.iter().map(|value| value.12).min().unwrap_or(0);
+    let rhat_metrics = average_f64_vectors(
+        &results
+            .iter()
+            .map(|value| value.13.clone())
+            .collect::<Vec<_>>(),
+    );
     let (h2_mean, var_h2, rhat) = aggregate_bayes_h2(&h2_means, &h2_vars, &rhats, n_post);
     let actual_iterations = results.iter().map(|value| value.10).max().unwrap_or(0);
     let convergence_values = results.iter().map(|value| value.11).collect::<Vec<_>>();
@@ -3565,6 +3743,7 @@ fn aggregate_bayes_c_results(results: &[BayesCResult]) -> BayesCResult {
         actual_iterations,
         convergence_iteration,
         n_post,
+        rhat_metrics,
     )
 }
 
@@ -3736,7 +3915,7 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
         .into_iter()
         .map(|chain_seed| BayesAChainState::new(y, p, q, s0_b, df0_b, initial_var_e, chain_seed))
         .collect::<Vec<_>>();
-    let mut controller = BayesMultiChainController::new(chains, n_iter, thin)?;
+    let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_A_NAMES)?;
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|error| error.to_string())?;
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
     let var_b_fixed = 1.0e10_f64;
@@ -3785,7 +3964,7 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
             Ok(())
         })?;
 
-        let h2 = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
+        let metrics = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
             copy_f32_to_f64(&state.marker_residual, &mut state.residual);
             for j in 0..p {
                 state.var_b[j] = bayes_positive_floor(
@@ -3813,9 +3992,9 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
                 }
                 state.var_e_sum += state.var_e;
             }
-            Ok(h2_value)
+            Ok(vec![h2_value, var_g, state.var_e])
         })?;
-        if controller.observe(&h2, retained)? {
+        if controller.observe(&metrics, retained)? {
             bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
                 state.clear_posterior();
             });
@@ -3839,6 +4018,7 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
         .collect::<Vec<_>>();
     let vare = states.iter().map(|state| state.var_e_sum).sum::<f64>() * scale;
     let (h2_mean, var_h2, rhat_h2) = controller.posterior_h2_summary();
+    let rhat_metrics = controller.posterior_rhat_values();
     Ok((
         beta,
         alpha,
@@ -3850,6 +4030,7 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
         controller.actual_iterations(),
         controller.convergence_iteration(),
         n_keep,
+        rhat_metrics,
     ))
 }
 
@@ -4011,7 +4192,7 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
             )
         })
         .collect::<Vec<_>>();
-    let mut controller = BayesMultiChainController::new(chains, n_iter, thin)?;
+    let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_B_NAMES)?;
     let chi_b_active = ChiSquared::new(df0_b + 1.0).map_err(|error| error.to_string())?;
     let chi_b_inactive = ChiSquared::new(df0_b).map_err(|error| error.to_string())?;
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
@@ -4087,7 +4268,7 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
             })
         })?;
 
-        let h2 = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
+        let metrics = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
             copy_f32_to_f64(&state.marker_residual, &mut state.residual);
             let mut n_active = 0usize;
             for j in 0..p {
@@ -4137,9 +4318,9 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
                 state.prob_in_sum += state.prob_in;
                 state.n_active_sum += mrk_in;
             }
-            Ok(h2_value)
+            Ok(vec![h2_value, var_g, state.var_e, state.prob_in, mrk_in])
         })?;
-        if controller.observe(&h2, retained)? {
+        if controller.observe(&metrics, retained)? {
             bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
                 state.clear_posterior();
             });
@@ -4165,6 +4346,7 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
         .map(|k| states.iter().map(|state| state.alpha_sum[k]).sum::<f64>() * scale)
         .collect::<Vec<_>>();
     let (h2_mean, var_h2, rhat_h2) = controller.posterior_h2_summary();
+    let rhat_metrics = controller.posterior_rhat_values();
     Ok((
         beta,
         alpha,
@@ -4179,6 +4361,7 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
         controller.actual_iterations(),
         controller.convergence_iteration(),
         n_keep,
+        rhat_metrics,
     ))
 }
 
@@ -4319,7 +4502,7 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
             BayesCChainState::new(y, p, q, s0_b, initial_var_e, prob_in_base, chain_seed)
         })
         .collect::<Vec<_>>();
-    let mut controller = BayesMultiChainController::new(chains, n_iter, thin)?;
+    let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_C_NAMES)?;
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
     let var_b_fixed = 1.0e10_f64;
 
@@ -4392,7 +4575,7 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
                 Ok(())
             })
         })?;
-        let h2 = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
+        let metrics = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
             copy_f32_to_f64(&state.marker_residual, &mut state.residual);
             let mut active = 0usize;
             let mut ss_b = 0.0;
@@ -4434,9 +4617,16 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
                 state.prob_in_sum += state.prob_in;
                 state.n_active_sum += active as f64;
             }
-            Ok(h2_value)
+            Ok(vec![
+                h2_value,
+                var_g,
+                state.var_e,
+                state.var_b,
+                state.prob_in,
+                active as f64,
+            ])
         })?;
-        if controller.observe(&h2, retained)? {
+        if controller.observe(&metrics, retained)? {
             bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
                 state.clear_posterior();
             });
@@ -4459,6 +4649,7 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
         .map(|k| states.iter().map(|state| state.alpha_sum[k]).sum::<f64>() * scale)
         .collect::<Vec<_>>();
     let (h2_mean, var_h2, rhat_h2) = controller.posterior_h2_summary();
+    let rhat_metrics = controller.posterior_rhat_values();
     Ok((
         beta,
         alpha,
@@ -4473,6 +4664,7 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
         controller.actual_iterations(),
         controller.convergence_iteration(),
         n_keep,
+        rhat_metrics,
     ))
 }
 
@@ -4734,21 +4926,7 @@ fn bayesa_packed_core_impl(
     seed: Option<u64>,
     backend_block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<
-    (
-        Vec<f64>,
-        Vec<f64>,
-        Vec<f64>,
-        f64,
-        f64,
-        f64,
-        f64,
-        usize,
-        usize,
-        usize,
-    ),
-    String,
-> {
+) -> Result<BayesAResult, String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -4756,7 +4934,7 @@ fn bayesa_packed_core_impl(
     if y.len() != n {
         return Err("y length mismatch with sample_indices".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
@@ -4910,7 +5088,7 @@ fn bayesa_packed_core_impl(
     let mut var_e_sum = 0.0;
     let mut h2_sum = 0.0;
     let mut h2_sq_sum = 0.0;
-    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin, BAYES_RHAT_A_NAMES);
     let var_b_fixed = 1e10_f64;
 
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
@@ -4997,7 +5175,8 @@ fn bayesa_packed_core_impl(
             let h2 = var_g / (var_g + var_e);
             h2_sum += h2;
             h2_sq_sum += h2 * h2;
-            if schedule.observe(h2) {
+            let rhat_metrics = [h2, var_g, var_e];
+            if schedule.observe(&rhat_metrics) {
                 beta_sum.fill(0.0);
                 varb_sum.fill(0.0);
                 alpha_sum.fill(0.0);
@@ -5028,6 +5207,7 @@ fn bayesa_packed_core_impl(
         var_h2 = 0.0;
     }
     let rhat_h2 = schedule.rhat_value();
+    let rhat_metrics = schedule.rhat_values();
     let actual_iterations = schedule.actual_iterations;
     let convergence_iteration = schedule.convergence_iteration;
     let posterior_samples = schedule.posterior_samples();
@@ -5042,6 +5222,7 @@ fn bayesa_packed_core_impl(
         actual_iterations,
         convergence_iteration,
         posterior_samples,
+        rhat_metrics,
     ))
 }
 
@@ -5075,24 +5256,7 @@ fn bayesb_packed_core_impl(
     seed: Option<u64>,
     backend_block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<
-    (
-        Vec<f64>,
-        Vec<f64>,
-        Vec<f64>,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        Vec<f64>,
-        f64,
-        usize,
-        usize,
-        usize,
-    ),
-    String,
-> {
+) -> Result<BayesBCResult, String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -5107,7 +5271,7 @@ fn bayesb_packed_core_impl(
     if y.len() != n {
         return Err("y length mismatch with sample_indices".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
@@ -5258,7 +5422,7 @@ fn bayesb_packed_core_impl(
     let mut h2_sq_sum = 0.0;
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
-    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin, BAYES_RHAT_B_NAMES);
     let var_b_fixed = 1e10_f64;
 
     let chi_b_active = ChiSquared::new(df0_b + 1.0).map_err(|e| e.to_string())?;
@@ -5396,7 +5560,8 @@ fn bayesb_packed_core_impl(
             h2_sq_sum += h2 * h2;
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
-            if schedule.observe(h2) {
+            let rhat_metrics = [h2, var_g, var_e, prob_in, mrk_in];
+            if schedule.observe(&rhat_metrics) {
                 beta_sum.fill(0.0);
                 pip_sum.fill(0.0);
                 varb_sum.fill(0.0);
@@ -5433,6 +5598,7 @@ fn bayesb_packed_core_impl(
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
     let rhat_h2 = schedule.rhat_value();
+    let rhat_metrics = schedule.rhat_values();
     let actual_iterations = schedule.actual_iterations;
     let convergence_iteration = schedule.convergence_iteration;
     let posterior_samples = schedule.posterior_samples();
@@ -5451,6 +5617,7 @@ fn bayesb_packed_core_impl(
         actual_iterations,
         convergence_iteration,
         posterior_samples,
+        rhat_metrics,
     ))
 }
 
@@ -5482,24 +5649,7 @@ fn bayesc_packed_core_impl(
     seed: Option<u64>,
     backend_block_rows: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<
-    (
-        Vec<f64>,
-        Vec<f64>,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        Vec<f64>,
-        f64,
-        usize,
-        usize,
-        usize,
-    ),
-    String,
-> {
+) -> Result<BayesCResult, String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -5514,7 +5664,7 @@ fn bayesc_packed_core_impl(
     if y.len() != n {
         return Err("y length mismatch with sample_indices".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
@@ -5661,7 +5811,7 @@ fn bayesc_packed_core_impl(
     let mut h2_sq_sum = 0.0;
     let mut prob_in_sum = 0.0;
     let mut n_active_sum = 0.0;
-    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin, BAYES_RHAT_C_NAMES);
     let var_b_fixed = 1e10_f64;
 
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
@@ -5783,7 +5933,8 @@ fn bayesc_packed_core_impl(
             h2_sq_sum += h2 * h2;
             prob_in_sum += prob_in;
             n_active_sum += mrk_in;
-            if schedule.observe(h2) {
+            let rhat_metrics = [h2, var_g, var_e, var_b, prob_in, mrk_in];
+            if schedule.observe(&rhat_metrics) {
                 beta_sum.fill(0.0);
                 pip_sum.fill(0.0);
                 alpha_sum.fill(0.0);
@@ -5820,6 +5971,7 @@ fn bayesc_packed_core_impl(
     let prob_in_mean = prob_in_sum * inv_keep;
     let n_active_mean = n_active_sum * inv_keep;
     let rhat_h2 = schedule.rhat_value();
+    let rhat_metrics = schedule.rhat_values();
     let actual_iterations = schedule.actual_iterations;
     let convergence_iteration = schedule.convergence_iteration;
     let posterior_samples = schedule.posterior_samples();
@@ -5838,6 +5990,7 @@ fn bayesc_packed_core_impl(
         actual_iterations,
         convergence_iteration,
         posterior_samples,
+        rhat_metrics,
     ))
 }
 
@@ -6282,18 +6435,7 @@ pub fn bayesa(
     seed: Option<u64>,
     chains: usize,
     threads: usize,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    usize,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -6380,22 +6522,25 @@ pub fn bayesa(
             actual_iterations,
             convergence_iteration,
             posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_py,
-                vare,
-                h2_mean,
-                var_h2,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-                posterior_samples,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_A_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    varb.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    py_usize_item(py, posterior_samples),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -6414,7 +6559,7 @@ pub fn bayesa(
     shape0 = 1.1,
     rate0 = None,
     s0_b = None,
-    prob_in = 0.5,
+    prob_in = 0.05,
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
@@ -6444,20 +6589,7 @@ pub fn bayesb(
     seed: Option<u64>,
     chains: usize,
     threads: usize,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    Py<PyArray1<f64>>,
-    f64,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -6479,6 +6611,11 @@ pub fn bayesb(
     if counts < 0.0 {
         return Err(PyValueError::new_err("counts must be >= 0"));
     }
+
+    // BayesB uses a fixed inclusion prior.  ``fixed_pi`` remains an
+    // explicit override for callers, while the public API default pins it
+    // to ``prob_in`` instead of enabling the Gibbs pi update.
+    let fixed_pi = fixed_pi.or(Some(prob_in));
 
     let y_vec: Cow<'_, [f64]> = match y.as_slice() {
         Ok(s) => Cow::Borrowed(s),
@@ -6550,25 +6687,27 @@ pub fn bayesb(
             actual_iterations,
             convergence_iteration,
             _posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            let pip_py = pip.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_py,
-                vare,
-                h2_mean,
-                var_h2,
-                prob_in_mean,
-                n_active_mean,
-                pip_py,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_B_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    varb.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, prob_in_mean),
+                    py_float_item(py, n_active_mean),
+                    pip.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -6585,8 +6724,8 @@ pub fn bayesb(
     r2 = 0.5,
     df0_b = 5.0,
     s0_b = None,
-    prob_in = 0.5,
-    counts = 10.0,
+    prob_in = 0.05,
+    counts = 5.0,
     fixed_pi = None,
     df0_e = 5.0,
     prior_ss_e = None,
@@ -6613,20 +6752,7 @@ pub fn bayesc(
     seed: Option<u64>,
     chains: usize,
     threads: usize,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    Py<PyArray1<f64>>,
-    f64,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -6724,24 +6850,27 @@ pub fn bayesc(
             actual_iterations,
             convergence_iteration,
             _posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let pip_py = pip.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_mean,
-                vare,
-                h2_mean,
-                var_h2,
-                prob_in_mean,
-                n_active_mean,
-                pip_py,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_C_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, varb_mean),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, prob_in_mean),
+                    py_float_item(py, n_active_mean),
+                    pip.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -6800,18 +6929,7 @@ pub fn bayesa_packed(
     chains: usize,
     seed: Option<u64>,
     block_rows: Option<usize>,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    usize,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -6964,22 +7082,25 @@ pub fn bayesa_packed(
             actual_iterations,
             convergence_iteration,
             posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_py,
-                vare,
-                h2_mean,
-                var_h2,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-                posterior_samples,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_A_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    varb.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    py_usize_item(py, posterior_samples),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -7004,7 +7125,7 @@ pub fn bayesa_packed(
     shape0 = 1.1,
     rate0 = None,
     s0_b = None,
-    prob_in = 0.5,
+    prob_in = 0.05,
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
@@ -7042,20 +7163,10 @@ pub fn bayesb_packed(
     chains: usize,
     seed: Option<u64>,
     block_rows: Option<usize>,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    Py<PyArray1<f64>>,
-    f64,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
+    // BayesB always fixes pi; an omitted override means use the prior
+    // inclusion probability supplied in ``prob_in``.
+    let fixed_pi = fixed_pi.or(Some(prob_in));
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -7214,25 +7325,27 @@ pub fn bayesb_packed(
             actual_iterations,
             convergence_iteration,
             _posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            let pip_py = pip.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_py,
-                vare,
-                h2_mean,
-                var_h2,
-                prob_in_mean,
-                n_active_mean,
-                pip_py,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_B_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    varb.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, prob_in_mean),
+                    py_float_item(py, n_active_mean),
+                    pip.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -7255,8 +7368,8 @@ pub fn bayesb_packed(
     r2 = 0.5,
     df0_b = 5.0,
     s0_b = None,
-    prob_in = 0.5,
-    counts = 10.0,
+    prob_in = 0.05,
+    counts = 5.0,
     fixed_pi = None,
     df0_e = 5.0,
     prior_ss_e = None,
@@ -7291,20 +7404,7 @@ pub fn bayesc_packed(
     chains: usize,
     seed: Option<u64>,
     block_rows: Option<usize>,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    Py<PyArray1<f64>>,
-    f64,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -7468,24 +7568,27 @@ pub fn bayesc_packed(
             actual_iterations,
             convergence_iteration,
             _posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let pip_py = pip.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_mean,
-                vare,
-                h2_mean,
-                var_h2,
-                prob_in_mean,
-                n_active_mean,
-                pip_py,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_C_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, varb_mean),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, prob_in_mean),
+                    py_float_item(py, n_active_mean),
+                    pip.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -7548,18 +7651,7 @@ pub fn bayesa_stream_bed(
     seed: Option<u64>,
     block_rows: Option<usize>,
     mmap_window_mb: Option<usize>,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    usize,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -7702,22 +7794,25 @@ pub fn bayesa_stream_bed(
             actual_iterations,
             convergence_iteration,
             posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_py,
-                vare,
-                h2_mean,
-                var_h2,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-                posterior_samples,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_A_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    varb.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    py_usize_item(py, posterior_samples),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -7743,7 +7838,7 @@ pub fn bayesa_stream_bed(
     shape0 = 1.1,
     rate0 = None,
     s0_b = None,
-    prob_in = 0.5,
+    prob_in = 0.05,
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
@@ -7784,20 +7879,10 @@ pub fn bayesb_stream_bed(
     seed: Option<u64>,
     block_rows: Option<usize>,
     mmap_window_mb: Option<usize>,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    Py<PyArray1<f64>>,
-    f64,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
+    // Keep streamed BED behavior identical to dense and resident packed
+    // BayesB: pi is a fixed prior, never a sampled state variable.
+    let fixed_pi = fixed_pi.or(Some(prob_in));
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -7946,25 +8031,27 @@ pub fn bayesb_stream_bed(
             actual_iterations,
             convergence_iteration,
             _posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let varb_py = varb.into_pyarray(py).into_bound().unbind();
-            let pip_py = pip.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_py,
-                vare,
-                h2_mean,
-                var_h2,
-                prob_in_mean,
-                n_active_mean,
-                pip_py,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_B_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    varb.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, prob_in_mean),
+                    py_float_item(py, n_active_mean),
+                    pip.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -7988,8 +8075,8 @@ pub fn bayesb_stream_bed(
     r2 = 0.5,
     df0_b = 5.0,
     s0_b = None,
-    prob_in = 0.5,
-    counts = 10.0,
+    prob_in = 0.05,
+    counts = 5.0,
     fixed_pi = None,
     df0_e = 5.0,
     prior_ss_e = None,
@@ -8027,20 +8114,7 @@ pub fn bayesc_stream_bed(
     seed: Option<u64>,
     block_rows: Option<usize>,
     mmap_window_mb: Option<usize>,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    Py<PyArray1<f64>>,
-    f64,
-    usize,
-    usize,
-)> {
+) -> PyResult<Py<PyTuple>> {
     if n_iter == 0 {
         return Err(PyValueError::new_err("n_iter must be > 0"));
     }
@@ -8194,24 +8268,27 @@ pub fn bayesc_stream_bed(
             actual_iterations,
             convergence_iteration,
             _posterior_samples,
+            rhat_metrics,
         )) => {
-            let beta_py = beta.into_pyarray(py).into_bound().unbind();
-            let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            let pip_py = pip.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_mean,
-                vare,
-                h2_mean,
-                var_h2,
-                prob_in_mean,
-                n_active_mean,
-                pip_py,
-                rhat_h2,
-                actual_iterations,
-                convergence_iteration,
-            ))
+            let rhat_py = rhat_metrics_to_py(py, BAYES_RHAT_C_NAMES, &rhat_metrics)?;
+            py_tuple_from_items(
+                py,
+                vec![
+                    beta.into_pyarray(py).into_bound().into_any().unbind(),
+                    alpha.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, varb_mean),
+                    py_float_item(py, vare),
+                    py_float_item(py, h2_mean),
+                    py_float_item(py, var_h2),
+                    py_float_item(py, prob_in_mean),
+                    py_float_item(py, n_active_mean),
+                    pip.into_pyarray(py).into_bound().into_any().unbind(),
+                    py_float_item(py, rhat_h2),
+                    py_usize_item(py, actual_iterations),
+                    py_usize_item(py, convergence_iteration),
+                    rhat_py,
+                ],
+            )
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }
@@ -8254,7 +8331,7 @@ fn bayesa_packed_trace_core_impl(
     if y.len() != n {
         return Err("y length mismatch with sample_indices".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
@@ -8595,7 +8672,7 @@ fn bayesb_packed_trace_core_impl(
     if y.len() != n {
         return Err("y length mismatch with sample_indices".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
@@ -8982,7 +9059,7 @@ fn bayesc_packed_trace_core_impl(
     if y.len() != n {
         return Err("y length mismatch with sample_indices".to_string());
     }
-    if x.len() != n * q {
+    if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
@@ -9519,7 +9596,7 @@ pub fn bayesa_packed_trace<'py>(
     shape0 = 1.1,
     rate0 = None,
     s0_b = None,
-    prob_in = 0.5,
+    prob_in = 0.05,
     counts = 10.0,
     fixed_pi = None,
     df0_e = 5.0,
@@ -9558,6 +9635,8 @@ pub fn bayesb_packed_trace<'py>(
     seed: Option<u64>,
     block_rows: Option<usize>,
 ) -> PyResult<Bound<'py, PyDict>> {
+    // The trace entry point follows the same fixed-pi BayesB contract.
+    let fixed_pi = fixed_pi.or(Some(prob_in));
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
     }
@@ -9719,8 +9798,8 @@ pub fn bayesb_packed_trace<'py>(
     r2 = 0.5,
     df0_b = 5.0,
     s0_b = None,
-    prob_in = 0.5,
-    counts = 10.0,
+    prob_in = 0.05,
+    counts = 5.0,
     fixed_pi = None,
     df0_e = 5.0,
     prior_ss_e = None,
@@ -9933,18 +10012,47 @@ mod backend_tests {
 
     #[test]
     fn native_chain_controller_does_not_converge_on_shifted_constant_chains() {
-        let mut controller = BayesMultiChainController::new(2, 2000, 1).unwrap();
+        let mut controller =
+            BayesMultiChainController::new(2, 2000, 1, BAYES_RHAT_A_NAMES).unwrap();
         let mut started = false;
         for _ in 0..650 {
             assert!(controller.should_run());
             let retained = controller.begin_iteration();
-            if controller.observe(&[0.1, 0.9], retained).unwrap() {
+            if controller
+                .observe(&[vec![0.1, 0.2, 0.3], vec![0.9, 0.8, 0.7]], retained)
+                .unwrap()
+            {
                 started = true;
                 break;
             }
         }
         assert!(!started);
         assert!(!controller.collecting_posterior());
+    }
+
+    #[test]
+    fn rhat_controller_reports_each_metric_and_uses_their_maximum() {
+        let mut controller = BayesSamplingController::new(2000, 1, 1, BAYES_RHAT_A_NAMES);
+        for iteration in 0..1500 {
+            assert!(controller.should_run());
+            let retained = controller.begin_iteration();
+            if retained {
+                let drift = iteration as f64 / 1000.0;
+                let _ = controller.observe(&[0.5, drift, 0.2]);
+            }
+        }
+        let values = controller.rhat_values();
+        assert_eq!(values.len(), BAYES_RHAT_A_NAMES.len());
+        assert!(values[1] > values[0]);
+        if values.iter().all(|value| value.is_finite()) {
+            assert_eq!(controller.rhat_max(), finite_rhat_max(&values));
+        } else if values.iter().any(|value| *value == f64::INFINITY) {
+            assert_eq!(controller.rhat_max(), f64::INFINITY);
+        } else {
+            assert!(controller.rhat_max().is_nan());
+        }
+        assert_eq!(finite_rhat_max(&[1.01, f64::INFINITY]), f64::INFINITY);
+        assert!(finite_rhat_max(&[1.01, f64::NAN]).is_nan());
     }
 
     #[test]

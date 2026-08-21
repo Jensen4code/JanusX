@@ -18,10 +18,11 @@ use crate::bayes::{
     aggregate_bayes_h2, array2_to_f32_input, bayes_chain_for_each_mut, bayes_chain_seeds,
     bayes_chain_try_for_each_mut, bayes_chain_try_map_mut, bayes_marker_update_f32_result,
     bayes_packed_blas_threads, bayes_packed_block_rows, build_bayes_chain_pool, copy_f32_to_f64,
-    copy_f64_to_f32, ddot_f64, duplicate_bayes_source, effective_bayes_chains,
-    genetic_variance_from_residual, marker_sufficient_stats, update_alpha_gauss_seidel_blas,
-    BayesMarkerBackend, BayesMultiChainController, BayesPackedSource, BayesSamplingController,
-    DenseBayesBackend, PackedBayesBackend, BAYES_POSTERIOR_SAMPLES,
+    copy_f64_to_f32, ddot_f64, duplicate_bayes_source, effective_bayes_chains, finite_rhat_max,
+    genetic_variance_from_residual, marker_sufficient_stats, rhat_metrics_to_py,
+    update_alpha_gauss_seidel_blas, BayesMarkerBackend, BayesMultiChainController,
+    BayesPackedSource, BayesSamplingController, DenseBayesBackend, PackedBayesBackend,
+    BAYES_POSTERIOR_SAMPLES, BAYES_RHAT_R_NAMES,
 };
 use crate::blas::OpenBlasThreadGuard;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
@@ -121,8 +122,7 @@ fn normalize_component_log_weights_unchecked(
     q
 }
 
-#[cfg(test)]
-fn normalize_component_log_weights(
+fn normalize_component_log_weights_checked(
     log_weights: &[f64],
 ) -> Result<[f64; BAYESR_COMPONENTS], String> {
     if log_weights.len() != BAYESR_COMPONENTS || !log_weights.iter().all(|v| v.is_finite()) {
@@ -134,6 +134,9 @@ fn normalize_component_log_weights(
     let total: f64 = q.iter().sum();
     if !(total.is_finite() && total > 0.0) {
         return Err("BayesR component weights are not normalizable".to_string());
+    }
+    if !q.iter().all(|value| value.is_finite() && *value >= 0.0) {
+        return Err("BayesR component probabilities are not finite and non-negative".to_string());
     }
     Ok(q)
 }
@@ -163,6 +166,7 @@ struct BayesRResult {
     pi: Vec<f64>,
     sigma_lambda2: f64,
     rhat_h2: f64,
+    rhat_metrics: Vec<f64>,
     actual_iterations: usize,
     convergence_iteration: usize,
     posterior_samples: usize,
@@ -319,7 +323,7 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     let mut pi_sum = [0.0_f64; BAYESR_COMPONENTS];
     let mut h2_sum = 0.0_f64;
     let mut h2_sq_sum = 0.0_f64;
-    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin);
+    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin, BAYES_RHAT_R_NAMES);
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
 
     while schedule.should_run() {
@@ -371,7 +375,7 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
                         }
                         let log_weights =
                             component_log_weights_unchecked(&log_pi, &tau2, u, x2[j], var_e);
-                        q_component = normalize_component_log_weights_unchecked(&log_weights);
+                        q_component = normalize_component_log_weights_checked(&log_weights)?;
                         let selected = sample_component(&q_component, &mut rng);
                         component[j] = selected;
                         if selected == 0 {
@@ -450,7 +454,18 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
             let h2 = var_g / (var_g + var_e);
             h2_sum += h2;
             h2_sq_sum += h2 * h2;
-            if schedule.observe(h2) {
+            let rhat_metrics = [
+                h2,
+                var_g,
+                var_e,
+                sigma_lambda2,
+                pi[0],
+                pi[1],
+                pi[2],
+                pi[3],
+                active_count as f64,
+            ];
+            if schedule.observe(&rhat_metrics) {
                 beta_sum.fill(0.0);
                 beta_second_sum.fill(0.0);
                 pip_sum.fill(0.0);
@@ -503,6 +518,7 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
         pi: pi_mean,
         sigma_lambda2: sigma_lambda2_sum * inv_keep,
         rhat_h2: schedule.rhat_value(),
+        rhat_metrics: schedule.rhat_values(),
         actual_iterations: schedule.actual_iterations(),
         convergence_iteration: schedule.convergence_iteration(),
         posterior_samples: n_keep,
@@ -690,7 +706,7 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
             BayesRChainState::new(y, p, q, pi_base, s0_lambda2, initial_var_e, chain_seed)
         })
         .collect::<Vec<_>>();
-    let mut controller = BayesMultiChainController::new(chains, n_iter, thin)?;
+    let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_R_NAMES)?;
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
 
     while controller.should_run() {
@@ -747,7 +763,7 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
                                 x2[j],
                                 state.var_e,
                             );
-                            q_component = normalize_component_log_weights_unchecked(&log_weights);
+                            q_component = normalize_component_log_weights_checked(&log_weights)?;
                             let selected = sample_component(&q_component, &mut state.rng);
                             state.component[j] = selected;
                             if selected == 0 {
@@ -779,7 +795,7 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
             copy_f32_to_f64(&state.marker_residual, &mut state.residual);
         });
 
-        let h2 = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
+        let metrics = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
             let mut active_count = 0usize;
             let mut scaled_sum = 0.0_f64;
             let mut component_counts = [0usize; BAYESR_COMPONENTS];
@@ -835,9 +851,19 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
                 state.var_e_sum += state.var_e;
                 state.sigma_lambda2_sum += state.sigma_lambda2;
             }
-            Ok(h2_value)
+            Ok(vec![
+                h2_value,
+                var_g,
+                state.var_e,
+                state.sigma_lambda2,
+                state.pi[0],
+                state.pi[1],
+                state.pi[2],
+                state.pi[3],
+                active_count as f64,
+            ])
         })?;
-        if controller.observe(&h2, retained)? {
+        if controller.observe(&metrics, retained)? {
             bayes_chain_for_each_mut(&mut states, chain_pool, |state: &mut BayesRChainState| {
                 state.clear_posterior();
             });
@@ -885,6 +911,7 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
         .map(|k| states.iter().map(|state| state.pi_sum[k]).sum::<f64>() * scale)
         .collect::<Vec<_>>();
     let (h2_mean, var_h2, rhat_h2) = controller.posterior_h2_summary();
+    let rhat_metrics = controller.posterior_rhat_values();
     Ok(BayesRResult {
         beta,
         alpha,
@@ -897,6 +924,7 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
         pi,
         sigma_lambda2,
         rhat_h2,
+        rhat_metrics,
         actual_iterations: controller.actual_iterations(),
         convergence_iteration: controller.convergence_iteration(),
         posterior_samples: n_keep,
@@ -947,6 +975,12 @@ fn aggregate_bayesr_results(results: &[BayesRResult]) -> BayesRResult {
         .iter()
         .map(|value| value.rhat_h2)
         .collect::<Vec<_>>();
+    let rhat_metrics = average_bayesr_f64(
+        &results
+            .iter()
+            .map(|value| value.rhat_metrics.clone())
+            .collect::<Vec<_>>(),
+    );
     let n_post = results
         .iter()
         .map(|value| value.posterior_samples)
@@ -1000,6 +1034,7 @@ fn aggregate_bayesr_results(results: &[BayesRResult]) -> BayesRResult {
         sigma_lambda2: results.iter().map(|value| value.sigma_lambda2).sum::<f64>()
             / results.len() as f64,
         rhat_h2,
+        rhat_metrics,
         actual_iterations: results
             .iter()
             .map(|value| value.actual_iterations)
@@ -1211,7 +1246,7 @@ fn bayesr_packed_multi_core_impl<'a>(
     Ok(aggregate_bayesr_results(&results))
 }
 
-const BAYESR_DEFAULT_PI: [f64; BAYESR_COMPONENTS] = [0.90, 0.06, 0.03, 0.01];
+const BAYESR_DEFAULT_PI: [f64; BAYESR_COMPONENTS] = [0.95, 0.03, 0.01, 0.01];
 const BAYESR_DEFAULT_GAMMA: [f64; BAYESR_COMPONENTS] = [0.0, 0.01, 0.1, 1.0];
 
 fn array1_to_vec(arr: &PyReadonlyArray1<f64>) -> Vec<f64> {
@@ -1305,6 +1340,9 @@ fn bayesr_result_to_pydict<'py>(
     out.set_item("pi", pi)?;
     out.set_item("sigma_lambda2", result.sigma_lambda2)?;
     out.set_item("rhat_h2", result.rhat_h2)?;
+    let rhat_metrics = rhat_metrics_to_py(py, BAYES_RHAT_R_NAMES, &result.rhat_metrics)?;
+    out.set_item("rhat_metrics", rhat_metrics)?;
+    out.set_item("rhat_max", finite_rhat_max(&result.rhat_metrics))?;
     out.set_item("actual_iterations", result.actual_iterations)?;
     out.set_item("convergence_iteration", result.convergence_iteration)?;
     out.set_item("posterior_samples", result.posterior_samples)?;
@@ -1359,21 +1397,7 @@ pub fn bayesr<'py>(
         return Err(PyValueError::new_err("BayesR M cols must match len(y)"));
     }
     let m_slice = m_input.as_slice();
-    let (x_vec, q) = match x.as_ref() {
-        Some(arr) => {
-            let shape = arr.shape();
-            if shape.len() != 2 || shape[0] != y_vec.len() {
-                return Err(PyValueError::new_err("BayesR X rows must match len(y)"));
-            }
-            let values = if let Ok(slice) = arr.as_slice() {
-                slice.to_vec()
-            } else {
-                array2_to_vec(arr)
-            };
-            (values, shape[1])
-        }
-        None => (vec![1.0; y_vec.len()], 1usize),
-    };
+    let (x_vec, q) = parse_covariates(x.as_ref(), y_vec.len())?;
     let pi_vec = parse_bayesr_prior(pi.as_ref(), &BAYESR_DEFAULT_PI, "pi")?;
     let gamma_vec = parse_bayesr_prior(gamma.as_ref(), &BAYESR_DEFAULT_GAMMA, "gamma")?;
     let result = py.detach(|| {
@@ -1760,7 +1784,7 @@ pub fn bayesr_stream_bed<'py>(
 mod tests {
     #[test]
     fn component_log_weights_match_closed_form() {
-        let pi: [f64; 4] = [0.90, 0.06, 0.03, 0.01];
+        let pi: [f64; 4] = [0.95, 0.03, 0.01, 0.01];
         let gamma: [f64; 4] = [0.0, 0.01, 0.1, 1.0];
         let got = super::component_log_weights(&pi, &gamma, 2.5, 3.0, 1.7, 0.8)
             .expect("valid BayesR component parameters");
@@ -1784,8 +1808,8 @@ mod tests {
     #[test]
     fn component_probabilities_are_normalized_and_pip_is_one_minus_spike() {
         let log_weights: [f64; 4] = [0.2_f64.ln(), 0.3_f64.ln(), 0.1_f64.ln(), 0.4_f64.ln()];
-        let q =
-            super::normalize_component_log_weights(&log_weights).expect("finite component weights");
+        let q = super::normalize_component_log_weights_checked(&log_weights)
+            .expect("finite component weights");
         let total: f64 = q.iter().sum();
         assert!((total - 1.0).abs() < 1e-12);
         assert!((1.0 - q[0] - (q[1] + q[2] + q[3])).abs() < 1e-12);
@@ -1793,13 +1817,32 @@ mod tests {
     }
 
     #[test]
+    fn component_probabilities_reject_nonfinite_weights_before_sampling() {
+        assert!(
+            super::normalize_component_log_weights_checked(&[f64::INFINITY, 0.0, 0.0, 0.0,])
+                .is_err()
+        );
+        assert!(
+            super::normalize_component_log_weights_checked(&[f64::NAN, 0.0, 0.0, 0.0,]).is_err()
+        );
+        assert!(super::normalize_component_log_weights_checked(&[
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn bayesr_prior_validation_requires_four_components_and_zero_spike() {
         assert!(
-            super::validate_bayesr_prior(&[0.9, 0.06, 0.03, 0.01], &[0.0, 0.01, 0.1, 1.0]).is_ok()
+            super::validate_bayesr_prior(&[0.95, 0.03, 0.01, 0.01], &[0.0, 0.01, 0.1, 1.0]).is_ok()
         );
         assert!(super::validate_bayesr_prior(&[0.9, 0.1], &[0.0, 1.0]).is_err());
         assert!(
-            super::validate_bayesr_prior(&[0.9, 0.06, 0.03, 0.01], &[0.1, 0.01, 0.1, 1.0]).is_err()
+            super::validate_bayesr_prior(&[0.95, 0.03, 0.01, 0.01], &[0.1, 0.01, 0.1, 1.0])
+                .is_err()
         );
     }
 
@@ -1821,7 +1864,7 @@ mod tests {
             0.5,
             5.0,
             None,
-            &[0.90, 0.06, 0.03, 0.01],
+            &[0.95, 0.03, 0.01, 0.01],
             &[0.0, 0.01, 0.1, 1.0],
             1.0,
             1.0,
