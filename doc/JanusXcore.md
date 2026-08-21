@@ -256,11 +256,11 @@ Use:
   `BayesR` exposes its four-component `pi` and `gamma` priors at the Python
   function layer; the CLI intentionally keeps the documented defaults.
 
-Bayesian sampling uses a unified default of a 3000-iteration R-hat monitoring
+Bayesian sampling uses a unified default of a 10000-iteration R-hat monitoring
 limit (stability threshold 1.10). Once R-hat converges, the monitoring summary
 is discarded and the next 1000 iterations are retained as posterior samples.
 If convergence is not reached by the limit, the following 1000 iterations are
-used as a fallback posterior window, so the maximum chain length is 4000.
+used as a fallback posterior window, so the maximum chain length is 11000.
 The public Python wrappers keep `burnin` as a compatibility argument but it no
 longer controls a second burn-in stage; thinning is fixed at one for production
 GS.

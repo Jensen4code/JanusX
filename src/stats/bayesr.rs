@@ -15,11 +15,13 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::bayes::{
-    array2_to_f32_input, bayes_marker_update_f32_result, bayes_packed_blas_threads,
-    bayes_packed_block_rows, copy_f32_to_f64, copy_f64_to_f32, ddot_f64,
-    genetic_variance_from_residual, update_alpha_gauss_seidel_blas, BayesMarkerBackend,
-    BayesPackedSource, BayesSamplingController, DenseBayesBackend, PackedBayesBackend,
-    BAYES_POSTERIOR_SAMPLES,
+    aggregate_bayes_h2, array2_to_f32_input, bayes_chain_for_each_mut, bayes_chain_seeds,
+    bayes_chain_try_for_each_mut, bayes_chain_try_map_mut, bayes_marker_update_f32_result,
+    bayes_packed_blas_threads, bayes_packed_block_rows, build_bayes_chain_pool, copy_f32_to_f64,
+    copy_f64_to_f32, ddot_f64, duplicate_bayes_source, effective_bayes_chains,
+    genetic_variance_from_residual, marker_sufficient_stats, update_alpha_gauss_seidel_blas,
+    BayesMarkerBackend, BayesMultiChainController, BayesPackedSource, BayesSamplingController,
+    DenseBayesBackend, PackedBayesBackend, BAYES_POSTERIOR_SAMPLES,
 };
 use crate::blas::OpenBlasThreadGuard;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
@@ -507,6 +509,708 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     })
 }
 
+/// Per-chain state for the native BayesR controller.  The genotype backend is
+/// deliberately not part of this structure: all chains consume the same
+/// decoded marker block while their Markov states and random streams remain
+/// independent.
+struct BayesRChainState {
+    rng: StdRng,
+    beta: Vec<f64>,
+    component: Vec<usize>,
+    alpha: Vec<f64>,
+    residual: Vec<f64>,
+    marker_residual: Vec<f32>,
+    alpha_xtr: Vec<f64>,
+    alpha_delta: Vec<f64>,
+    alpha_tmp_n: Vec<f64>,
+    pi: [f64; BAYESR_COMPONENTS],
+    sigma_lambda2: f64,
+    var_e: f64,
+    beta_sum: Vec<f64>,
+    beta_second_sum: Vec<f64>,
+    pip_sum: Vec<f64>,
+    component_sum: Vec<f32>,
+    alpha_sum: Vec<f64>,
+    var_e_sum: f64,
+    sigma_lambda2_sum: f64,
+    pi_sum: [f64; BAYESR_COMPONENTS],
+}
+
+impl BayesRChainState {
+    fn new(
+        y: &[f64],
+        p: usize,
+        q: usize,
+        pi: [f64; BAYESR_COMPONENTS],
+        sigma_lambda2: f64,
+        var_e: f64,
+        seed: Option<u64>,
+    ) -> Self {
+        let rng = match seed {
+            Some(value) => StdRng::seed_from_u64(value),
+            None => {
+                let mut seed_bytes = [0u8; 32];
+                if OsRng.try_fill_bytes(&mut seed_bytes).is_err() {
+                    seed_bytes = [42u8; 32];
+                }
+                StdRng::from_seed(seed_bytes)
+            }
+        };
+        Self {
+            rng,
+            beta: vec![0.0; p],
+            component: vec![0; p],
+            alpha: vec![0.0; q],
+            residual: y.to_vec(),
+            marker_residual: vec![0.0; y.len()],
+            alpha_xtr: vec![0.0; q],
+            alpha_delta: vec![0.0; q],
+            alpha_tmp_n: vec![0.0; y.len()],
+            pi,
+            sigma_lambda2,
+            var_e,
+            beta_sum: vec![0.0; p],
+            beta_second_sum: vec![0.0; p],
+            pip_sum: vec![0.0; p],
+            component_sum: vec![0.0; p.saturating_mul(BAYESR_COMPONENTS)],
+            alpha_sum: vec![0.0; q],
+            var_e_sum: 0.0,
+            sigma_lambda2_sum: 0.0,
+            pi_sum: [0.0; BAYESR_COMPONENTS],
+        }
+    }
+
+    fn clear_posterior(&mut self) {
+        self.beta_sum.fill(0.0);
+        self.beta_second_sum.fill(0.0);
+        self.pip_sum.fill(0.0);
+        self.component_sum.fill(0.0);
+        self.alpha_sum.fill(0.0);
+        self.var_e_sum = 0.0;
+        self.sigma_lambda2_sum = 0.0;
+        self.pi_sum = [0.0; BAYESR_COMPONENTS];
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
+    backend: &mut B,
+    y: &[f64],
+    x: &[f64],
+    q: usize,
+    n_iter: usize,
+    _burnin: usize,
+    thin: usize,
+    r2: f64,
+    df0_e: f64,
+    prior_ss_e_opt: Option<f64>,
+    pi_init: &[f64],
+    gamma: &[f64],
+    df0_lambda: f64,
+    s0_lambda2: f64,
+    seed: Option<u64>,
+    chains: usize,
+    chain_pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<BayesRResult, String> {
+    let n = backend.n_samples();
+    let p = backend.n_markers();
+    if n <= 1 || y.len() != n {
+        return Err("BayesR phenotype/genotype dimensions are incompatible".to_string());
+    }
+    if q == 0 || x.len() != n.saturating_mul(q) {
+        return Err("BayesR covariate dimensions are incompatible".to_string());
+    }
+    if n_iter == 0 || thin == 0 {
+        return Err("BayesR n_iter must be > 0 and thin must be >= 1".to_string());
+    }
+    if !(r2.is_finite() && r2 > 0.0 && r2 < 1.0) {
+        return Err("BayesR r2 must be finite and in (0, 1)".to_string());
+    }
+    if !(df0_e.is_finite() && df0_e > 0.0) {
+        return Err("BayesR df0_e must be finite and > 0".to_string());
+    }
+    if !(df0_lambda.is_finite() && df0_lambda > 0.0) {
+        return Err("BayesR df0_lambda must be finite and > 0".to_string());
+    }
+    if !(s0_lambda2.is_finite() && s0_lambda2 > 0.0) {
+        return Err("BayesR s0_lambda2 must be finite and > 0".to_string());
+    }
+    validate_bayesr_prior(pi_init, gamma)?;
+
+    let (x2, _mean_x, msx) = marker_sufficient_stats(backend, n, p)?;
+    if !(msx.is_finite() && msx > 0.0) {
+        return Err("BayesR marker mean square must be positive".to_string());
+    }
+    let y_mean = y.iter().sum::<f64>() / n as f64;
+    let var_y = y
+        .iter()
+        .map(|value| {
+            let delta = *value - y_mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / (n - 1) as f64;
+    if !(var_y.is_finite() && var_y > 0.0) {
+        return Err("BayesR phenotype variance must be positive".to_string());
+    }
+
+    let pi_total = pi_init.iter().sum::<f64>();
+    let pi_base = [
+        pi_init[0] / pi_total,
+        pi_init[1] / pi_total,
+        pi_init[2] / pi_total,
+        pi_init[3] / pi_total,
+    ];
+    let initial_var_e = var_y * (1.0 - r2);
+    if !(initial_var_e.is_finite() && initial_var_e > 0.0) {
+        return Err("BayesR initial residual variance must be positive".to_string());
+    }
+    let prior_ss_e = prior_ss_e_opt.unwrap_or(initial_var_e * (df0_e + 2.0));
+    if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
+        return Err("BayesR prior_ss_e must be finite and > 0 (nu_0 * S_0^2)".to_string());
+    }
+
+    let mut x2_x = vec![0.0_f64; q];
+    let mut xtx = vec![0.0_f64; q * q];
+    for i in 0..n {
+        for a in 0..q {
+            let xa = x[i * q + a];
+            x2_x[a] += xa * xa;
+            for b in 0..q {
+                xtx[a * q + b] += xa * x[i * q + b];
+            }
+        }
+    }
+
+    let gamma_array = [gamma[0], gamma[1], gamma[2], gamma[3]];
+    let seeds = bayes_chain_seeds(seed, chains);
+    let mut states = seeds
+        .into_iter()
+        .map(|chain_seed| {
+            BayesRChainState::new(y, p, q, pi_base, s0_lambda2, initial_var_e, chain_seed)
+        })
+        .collect::<Vec<_>>();
+    let mut controller = BayesMultiChainController::new(chains, n_iter, thin)?;
+    let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
+
+    while controller.should_run() {
+        let retained = controller.begin_iteration();
+        let collect = controller.collecting_posterior();
+        bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
+            let inv_var_e = 1.0 / state.var_e;
+            update_alpha_gauss_seidel_blas(
+                x,
+                n,
+                q,
+                inv_var_e,
+                1.0e-10,
+                &x2_x,
+                &xtx,
+                &mut state.alpha,
+                &mut state.residual,
+                &mut state.alpha_xtr,
+                &mut state.alpha_delta,
+                &mut state.alpha_tmp_n,
+                &mut state.rng,
+            );
+            copy_f64_to_f32(&state.residual, &mut state.marker_residual);
+        });
+
+        backend.for_each_block(|row_start, row_end, marker_block| {
+            bayes_chain_try_for_each_mut(&mut states, chain_pool, |state| {
+                let mut log_pi = [0.0_f64; BAYESR_COMPONENTS];
+                let mut tau2 = [0.0_f64; BAYESR_COMPONENTS];
+                for k in 0..BAYESR_COMPONENTS {
+                    log_pi[k] = state.pi[k].ln();
+                    tau2[k] = gamma_array[k] * state.sigma_lambda2;
+                }
+                let inv_var_e = 1.0 / state.var_e;
+                for offset in 0..(row_end - row_start) {
+                    let j = row_start + offset;
+                    let marker = &marker_block[offset * n..(offset + 1) * n];
+                    let old_beta = state.beta[j];
+                    let mut q_component = [0.0_f64; BAYESR_COMPONENTS];
+                    let (_, new_beta) = bayes_marker_update_f32_result(
+                        &mut state.marker_residual,
+                        marker,
+                        old_beta,
+                        x2[j],
+                        |u| {
+                            if !u.is_finite() {
+                                return Err("BayesR marker sufficient statistics must be finite"
+                                    .to_string());
+                            }
+                            let log_weights = component_log_weights_unchecked(
+                                &log_pi,
+                                &tau2,
+                                u,
+                                x2[j],
+                                state.var_e,
+                            );
+                            q_component = normalize_component_log_weights_unchecked(&log_weights);
+                            let selected = sample_component(&q_component, &mut state.rng);
+                            state.component[j] = selected;
+                            if selected == 0 {
+                                Ok(0.0)
+                            } else {
+                                let precision = x2[j] * inv_var_e + 1.0 / tau2[selected];
+                                let posterior_var = 1.0 / precision;
+                                let posterior_mean = posterior_var * u * inv_var_e;
+                                let z: f64 = state.rng.sample(StandardNormal);
+                                Ok(posterior_mean + posterior_var.sqrt() * z)
+                            }
+                        },
+                    )?;
+                    state.beta[j] = new_beta;
+                    if collect && retained {
+                        state.beta_sum[j] += new_beta;
+                        state.beta_second_sum[j] += new_beta * new_beta;
+                        state.pip_sum[j] += 1.0 - q_component[0];
+                        for k in 0..BAYESR_COMPONENTS {
+                            state.component_sum[j * BAYESR_COMPONENTS + k] += q_component[k] as f32;
+                        }
+                    }
+                }
+                Ok(())
+            })
+        })?;
+
+        bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
+            copy_f32_to_f64(&state.marker_residual, &mut state.residual);
+        });
+
+        let h2 = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
+            let mut active_count = 0usize;
+            let mut scaled_sum = 0.0_f64;
+            let mut component_counts = [0usize; BAYESR_COMPONENTS];
+            for j in 0..p {
+                let selected = state.component[j];
+                component_counts[selected] += 1;
+                if selected > 0 {
+                    active_count += 1;
+                    scaled_sum += state.beta[j] * state.beta[j] / gamma_array[selected];
+                }
+            }
+            let lambda_df = df0_lambda + active_count as f64;
+            let lambda_numerator = df0_lambda * s0_lambda2 + scaled_sum;
+            state.sigma_lambda2 = lambda_numerator
+                / state
+                    .rng
+                    .sample(ChiSquared::new(lambda_df).map_err(|error| error.to_string())?);
+            if !(state.sigma_lambda2.is_finite() && state.sigma_lambda2 > 0.0) {
+                return Err("BayesR sigma_lambda2 became non-finite or non-positive".to_string());
+            }
+
+            let mut dirichlet_draw = [0.0_f64; BAYESR_COMPONENTS];
+            let mut dirichlet_total = 0.0_f64;
+            for k in 0..BAYESR_COMPONENTS {
+                let shape = 1.0 + component_counts[k] as f64;
+                let draw = state
+                    .rng
+                    .sample(Gamma::new(shape, 1.0).map_err(|error| error.to_string())?);
+                dirichlet_draw[k] = draw;
+                dirichlet_total += draw;
+            }
+            for k in 0..BAYESR_COMPONENTS {
+                state.pi[k] = dirichlet_draw[k] / dirichlet_total;
+            }
+
+            state.var_e =
+                (ddot_f64(&state.residual, &state.residual) + prior_ss_e) / state.rng.sample(chi_e);
+            if !(state.var_e.is_finite() && state.var_e > 0.0) {
+                return Err(
+                    "BayesR residual variance became non-finite or non-positive".to_string()
+                );
+            }
+            let var_g = genetic_variance_from_residual(y, &state.residual, x, &state.alpha, n, q);
+            let h2_value = var_g / (var_g + state.var_e);
+
+            if collect && retained {
+                for k in 0..BAYESR_COMPONENTS {
+                    state.pi_sum[k] += state.pi[k];
+                }
+                for k in 0..q {
+                    state.alpha_sum[k] += state.alpha[k];
+                }
+                state.var_e_sum += state.var_e;
+                state.sigma_lambda2_sum += state.sigma_lambda2;
+            }
+            Ok(h2_value)
+        })?;
+        if controller.observe(&h2, retained)? {
+            bayes_chain_for_each_mut(&mut states, chain_pool, |state: &mut BayesRChainState| {
+                state.clear_posterior();
+            });
+        }
+    }
+
+    let n_keep = controller.posterior_samples();
+    if n_keep != BAYES_POSTERIOR_SAMPLES {
+        return Err(format!(
+            "BayesR retained {n_keep} posterior samples; expected {BAYES_POSTERIOR_SAMPLES}"
+        ));
+    }
+    let scale = 1.0 / (n_keep * chains) as f64;
+    let mut beta = vec![0.0_f64; p];
+    let mut varbeta = vec![0.0_f64; p];
+    let mut pip = vec![0.0_f64; p];
+    let mut component_prob = vec![0.0_f32; p.saturating_mul(BAYESR_COMPONENTS)];
+    for j in 0..p {
+        let sum_beta = states.iter().map(|state| state.beta_sum[j]).sum::<f64>();
+        let sum_second = states
+            .iter()
+            .map(|state| state.beta_second_sum[j])
+            .sum::<f64>();
+        beta[j] = sum_beta * scale;
+        varbeta[j] = (sum_second * scale - beta[j] * beta[j]).max(0.0);
+        pip[j] = states.iter().map(|state| state.pip_sum[j]).sum::<f64>() * scale;
+        for k in 0..BAYESR_COMPONENTS {
+            component_prob[j * BAYESR_COMPONENTS + k] = states
+                .iter()
+                .map(|state| state.component_sum[j * BAYESR_COMPONENTS + k])
+                .sum::<f32>()
+                * scale as f32;
+        }
+    }
+    let alpha = (0..q)
+        .map(|k| states.iter().map(|state| state.alpha_sum[k]).sum::<f64>() * scale)
+        .collect::<Vec<_>>();
+    let vare = states.iter().map(|state| state.var_e_sum).sum::<f64>() * scale;
+    let sigma_lambda2 = states
+        .iter()
+        .map(|state| state.sigma_lambda2_sum)
+        .sum::<f64>()
+        * scale;
+    let pi = (0..BAYESR_COMPONENTS)
+        .map(|k| states.iter().map(|state| state.pi_sum[k]).sum::<f64>() * scale)
+        .collect::<Vec<_>>();
+    let (h2_mean, var_h2, rhat_h2) = controller.posterior_h2_summary();
+    Ok(BayesRResult {
+        beta,
+        alpha,
+        varbeta,
+        vare,
+        h2_mean,
+        var_h2,
+        pip,
+        component_prob,
+        pi,
+        sigma_lambda2,
+        rhat_h2,
+        actual_iterations: controller.actual_iterations(),
+        convergence_iteration: controller.convergence_iteration(),
+        posterior_samples: n_keep,
+    })
+}
+
+fn average_bayesr_f64(values: &[Vec<f64>]) -> Vec<f64> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut output = values[0].clone();
+    for value in values.iter().skip(1) {
+        for (dst, src) in output.iter_mut().zip(value.iter()) {
+            *dst += *src;
+        }
+    }
+    let scale = 1.0 / values.len() as f64;
+    for value in &mut output {
+        *value *= scale;
+    }
+    output
+}
+
+fn average_bayesr_f32(values: &[Vec<f32>]) -> Vec<f32> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut output = values[0].clone();
+    for value in values.iter().skip(1) {
+        for (dst, src) in output.iter_mut().zip(value.iter()) {
+            *dst += *src;
+        }
+    }
+    let scale = 1.0 / values.len() as f32;
+    for value in &mut output {
+        *value *= scale;
+    }
+    output
+}
+
+fn aggregate_bayesr_results(results: &[BayesRResult]) -> BayesRResult {
+    let h2_means = results
+        .iter()
+        .map(|value| value.h2_mean)
+        .collect::<Vec<_>>();
+    let h2_vars = results.iter().map(|value| value.var_h2).collect::<Vec<_>>();
+    let rhats = results
+        .iter()
+        .map(|value| value.rhat_h2)
+        .collect::<Vec<_>>();
+    let n_post = results
+        .iter()
+        .map(|value| value.posterior_samples)
+        .min()
+        .unwrap_or(0);
+    let (h2_mean, var_h2, rhat_h2) = aggregate_bayes_h2(&h2_means, &h2_vars, &rhats, n_post);
+    let convergence_values = results
+        .iter()
+        .map(|value| value.convergence_iteration)
+        .collect::<Vec<_>>();
+    BayesRResult {
+        beta: average_bayesr_f64(
+            &results
+                .iter()
+                .map(|value| value.beta.clone())
+                .collect::<Vec<_>>(),
+        ),
+        alpha: average_bayesr_f64(
+            &results
+                .iter()
+                .map(|value| value.alpha.clone())
+                .collect::<Vec<_>>(),
+        ),
+        varbeta: average_bayesr_f64(
+            &results
+                .iter()
+                .map(|value| value.varbeta.clone())
+                .collect::<Vec<_>>(),
+        ),
+        vare: results.iter().map(|value| value.vare).sum::<f64>() / results.len() as f64,
+        h2_mean,
+        var_h2,
+        pip: average_bayesr_f64(
+            &results
+                .iter()
+                .map(|value| value.pip.clone())
+                .collect::<Vec<_>>(),
+        ),
+        component_prob: average_bayesr_f32(
+            &results
+                .iter()
+                .map(|value| value.component_prob.clone())
+                .collect::<Vec<_>>(),
+        ),
+        pi: average_bayesr_f64(
+            &results
+                .iter()
+                .map(|value| value.pi.clone())
+                .collect::<Vec<_>>(),
+        ),
+        sigma_lambda2: results.iter().map(|value| value.sigma_lambda2).sum::<f64>()
+            / results.len() as f64,
+        rhat_h2,
+        actual_iterations: results
+            .iter()
+            .map(|value| value.actual_iterations)
+            .max()
+            .unwrap_or(0),
+        convergence_iteration: if convergence_values.iter().all(|value| *value > 0) {
+            convergence_values.iter().copied().max().unwrap_or(0)
+        } else {
+            0
+        },
+        posterior_samples: n_post,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bayesr_dense_multi_core_impl(
+    m: &[f32],
+    y: &[f64],
+    x: &[f64],
+    q: usize,
+    n_iter: usize,
+    burnin: usize,
+    thin: usize,
+    r2: f64,
+    df0_e: f64,
+    prior_ss_e: Option<f64>,
+    pi_init: &[f64],
+    gamma: &[f64],
+    df0_lambda: f64,
+    s0_lambda2: f64,
+    seed: Option<u64>,
+    chains: usize,
+    threads: usize,
+) -> Result<BayesRResult, String> {
+    let effective = effective_bayes_chains(chains, threads)?;
+    if effective > 1 {
+        let n = y.len();
+        let p = m
+            .len()
+            .checked_div(n)
+            .ok_or_else(|| "BayesR M has incompatible dimensions".to_string())?;
+        let mut backend = DenseBayesBackend::new(m, n, p)?;
+        let chain_pool = build_bayes_chain_pool(threads)?;
+        return bayesr_lockstep_core_impl(
+            &mut backend,
+            y,
+            x,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_e,
+            prior_ss_e,
+            pi_init,
+            gamma,
+            df0_lambda,
+            s0_lambda2,
+            seed,
+            effective,
+            chain_pool.as_ref(),
+        );
+    }
+    let seeds = bayes_chain_seeds(seed, effective);
+    let n = y.len();
+    let p = m
+        .len()
+        .checked_div(n)
+        .ok_or_else(|| "BayesR M has incompatible dimensions".to_string())?;
+    let mut results = Vec::with_capacity(effective);
+    for chain_seed in seeds {
+        let mut backend = DenseBayesBackend::new(m, n, p)?;
+        results.push(bayesr_core_impl(
+            &mut backend,
+            y,
+            x,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_e,
+            prior_ss_e,
+            pi_init,
+            gamma,
+            df0_lambda,
+            s0_lambda2,
+            chain_seed,
+        )?);
+    }
+    Ok(aggregate_bayesr_results(&results))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bayesr_packed_multi_core_impl<'a>(
+    source: &mut BayesPackedSource<'a>,
+    n_samples_total: usize,
+    y: &[f64],
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    packed_row_indices: Option<&[usize]>,
+    sample_indices: &[usize],
+    x: &[f64],
+    q: usize,
+    n_iter: usize,
+    burnin: usize,
+    thin: usize,
+    r2: f64,
+    df0_e: f64,
+    prior_ss_e: Option<f64>,
+    pi_init: &[f64],
+    gamma: &[f64],
+    df0_lambda: f64,
+    s0_lambda2: f64,
+    seed: Option<u64>,
+    block_rows: Option<usize>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    chains: usize,
+    threads: usize,
+) -> Result<BayesRResult, String> {
+    let effective = effective_bayes_chains(chains, threads)?;
+    if effective > 1 {
+        let mut backend = PackedBayesBackend::new(
+            source,
+            n_samples_total,
+            row_flip.len(),
+            row_flip,
+            row_mean,
+            row_inv_sd,
+            packed_row_indices,
+            sample_indices,
+            block_rows,
+            pool,
+        )?;
+        if let Some(m_dense) = backend.maybe_predecode_dense_f32()? {
+            let mut dense_backend =
+                DenseBayesBackend::new(&m_dense, sample_indices.len(), row_flip.len())?;
+            return bayesr_lockstep_core_impl(
+                &mut dense_backend,
+                y,
+                x,
+                q,
+                n_iter,
+                burnin,
+                thin,
+                r2,
+                df0_e,
+                prior_ss_e,
+                pi_init,
+                gamma,
+                df0_lambda,
+                s0_lambda2,
+                seed,
+                effective,
+                pool,
+            );
+        }
+        return bayesr_lockstep_core_impl(
+            &mut backend,
+            y,
+            x,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_e,
+            prior_ss_e,
+            pi_init,
+            gamma,
+            df0_lambda,
+            s0_lambda2,
+            seed,
+            effective,
+            pool,
+        );
+    }
+    let seeds = bayes_chain_seeds(seed, effective);
+    let mut results = Vec::with_capacity(effective);
+    for chain_seed in seeds {
+        let mut chain_source = duplicate_bayes_source(source)?;
+        results.push(bayesr_packed_core_impl(
+            &mut chain_source,
+            n_samples_total,
+            y,
+            row_flip,
+            row_mean,
+            row_inv_sd,
+            packed_row_indices,
+            sample_indices,
+            x,
+            q,
+            n_iter,
+            burnin,
+            thin,
+            r2,
+            df0_e,
+            prior_ss_e,
+            pi_init,
+            gamma,
+            df0_lambda,
+            s0_lambda2,
+            chain_seed,
+            block_rows,
+            pool,
+        )?);
+    }
+    Ok(aggregate_bayesr_results(&results))
+}
+
 const BAYESR_DEFAULT_PI: [f64; BAYESR_COMPONENTS] = [0.90, 0.06, 0.03, 0.01];
 const BAYESR_DEFAULT_GAMMA: [f64; BAYESR_COMPONENTS] = [0.0, 0.01, 0.1, 1.0];
 
@@ -612,7 +1316,7 @@ fn bayesr_result_to_pydict<'py>(
     y,
     m,
     x = None,
-    n_iter = 3000,
+    n_iter = 10000,
     burnin = 1000,
     thin = 1,
     r2 = 0.5,
@@ -622,7 +1326,9 @@ fn bayesr_result_to_pydict<'py>(
     gamma = None,
     df0_lambda = 1.0,
     s0_lambda2 = 1.0,
-    seed = None
+    seed = None,
+    chains = 1,
+    threads = 1
 ))]
 pub fn bayesr<'py>(
     py: Python<'py>,
@@ -640,6 +1346,8 @@ pub fn bayesr<'py>(
     df0_lambda: f64,
     s0_lambda2: f64,
     seed: Option<u64>,
+    chains: usize,
+    threads: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     let y_vec = if let Ok(slice) = y.as_slice() {
         slice.to_vec()
@@ -650,7 +1358,6 @@ pub fn bayesr<'py>(
     if m_input.cols() != y_vec.len() {
         return Err(PyValueError::new_err("BayesR M cols must match len(y)"));
     }
-    let m_rows = m_input.rows();
     let m_slice = m_input.as_slice();
     let (x_vec, q) = match x.as_ref() {
         Some(arr) => {
@@ -670,23 +1377,9 @@ pub fn bayesr<'py>(
     let pi_vec = parse_bayesr_prior(pi.as_ref(), &BAYESR_DEFAULT_PI, "pi")?;
     let gamma_vec = parse_bayesr_prior(gamma.as_ref(), &BAYESR_DEFAULT_GAMMA, "gamma")?;
     let result = py.detach(|| {
-        let mut backend = DenseBayesBackend::new(m_slice, y_vec.len(), m_rows)?;
-        bayesr_core_impl(
-            &mut backend,
-            &y_vec,
-            &x_vec,
-            q,
-            n_iter,
-            burnin,
-            thin,
-            r2,
-            df0_e,
-            prior_ss_e,
-            &pi_vec,
-            &gamma_vec,
-            df0_lambda,
-            s0_lambda2,
-            seed,
+        bayesr_dense_multi_core_impl(
+            m_slice, &y_vec, &x_vec, q, n_iter, burnin, thin, r2, df0_e, prior_ss_e, &pi_vec,
+            &gamma_vec, df0_lambda, s0_lambda2, seed, chains, threads,
         )
     });
     match result {
@@ -788,7 +1481,7 @@ fn bayesr_packed_core_impl<'a>(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 3000,
+    n_iter = 10000,
     burnin = 1000,
     thin = 1,
     r2 = 0.5,
@@ -799,6 +1492,7 @@ fn bayesr_packed_core_impl<'a>(
     df0_lambda = 1.0,
     s0_lambda2 = 1.0,
     threads = 0,
+    chains = 1,
     seed = None,
     block_rows = None
 ))]
@@ -824,6 +1518,7 @@ pub fn bayesr_packed<'py>(
     df0_lambda: f64,
     s0_lambda2: f64,
     threads: usize,
+    chains: usize,
     seed: Option<u64>,
     block_rows: Option<usize>,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -883,7 +1578,7 @@ pub fn bayesr_packed<'py>(
             packed_flat: packed_flat.as_ref(),
             bytes_per_snp: n_samples.div_ceil(4),
         };
-        bayesr_packed_core_impl(
+        bayesr_packed_multi_core_impl(
             &mut source,
             n_samples,
             &y_vec,
@@ -907,6 +1602,8 @@ pub fn bayesr_packed<'py>(
             seed,
             block_rows,
             pool,
+            chains,
+            threads,
         )
     });
     match result {
@@ -927,7 +1624,7 @@ pub fn bayesr_packed<'py>(
     row_inv_sd,
     sample_indices,
     x = None,
-    n_iter = 3000,
+    n_iter = 10000,
     burnin = 1000,
     thin = 1,
     r2 = 0.5,
@@ -938,6 +1635,7 @@ pub fn bayesr_packed<'py>(
     df0_lambda = 1.0,
     s0_lambda2 = 1.0,
     threads = 0,
+    chains = 1,
     seed = None,
     block_rows = None,
     mmap_window_mb = None
@@ -965,6 +1663,7 @@ pub fn bayesr_stream_bed<'py>(
     df0_lambda: f64,
     s0_lambda2: f64,
     threads: usize,
+    chains: usize,
     seed: Option<u64>,
     block_rows: Option<usize>,
     mmap_window_mb: Option<usize>,
@@ -1023,7 +1722,7 @@ pub fn bayesr_stream_bed<'py>(
             parse_index_vec_i64_value_error(row_indices_raw.as_slice(), n_source, "row_indices")
                 .map_err(|error| error.to_string())?;
         let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
-        bayesr_packed_core_impl(
+        bayesr_packed_multi_core_impl(
             &mut source,
             n_samples,
             &y_vec,
@@ -1047,6 +1746,8 @@ pub fn bayesr_stream_bed<'py>(
             seed,
             Some(rows),
             pool,
+            chains,
+            threads,
         )
     });
     match result {
@@ -1100,5 +1801,41 @@ mod tests {
         assert!(
             super::validate_bayesr_prior(&[0.9, 0.06, 0.03, 0.01], &[0.1, 0.01, 0.1, 1.0]).is_err()
         );
+    }
+
+    #[test]
+    fn native_lockstep_bayesr_keeps_independent_chain_state() {
+        let y = [0.2, -0.4, 0.1, 0.7, -0.1, 0.5];
+        let m = [
+            0.0_f32, 1.0, 2.0, 1.0, 0.0, 2.0, 2.0, 0.0, 1.0, 1.0, 2.0, 0.0,
+        ];
+        let x = [1.0_f64; 6];
+        let result = super::bayesr_dense_multi_core_impl(
+            &m,
+            &y,
+            &x,
+            1,
+            1,
+            0,
+            1,
+            0.5,
+            5.0,
+            None,
+            &[0.90, 0.06, 0.03, 0.01],
+            &[0.0, 0.01, 0.1, 1.0],
+            1.0,
+            1.0,
+            Some(17),
+            2,
+            4,
+        )
+        .expect("native BayesR lockstep should finish its posterior window");
+        assert_eq!(result.posterior_samples, 1000);
+        assert_eq!(result.actual_iterations, 1001);
+        assert_eq!(result.convergence_iteration, 0);
+        for probabilities in result.component_prob.chunks_exact(4) {
+            let total = probabilities.iter().map(|value| *value as f64).sum::<f64>();
+            assert!((total - 1.0).abs() < 2e-5, "component sum={total}");
+        }
     }
 }

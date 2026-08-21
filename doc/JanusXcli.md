@@ -160,10 +160,10 @@ available through the Python `BayesR` function, but are intentionally not
 separate CLI options. With `-save-model`, the effect table includes `pip` and
 `component_prob_0` through `component_prob_3`.
 
-Bayesian GS uses a 3000-iteration R-hat upper limit (stability threshold 1.10).
+Bayesian GS uses a 10000-iteration R-hat upper limit (stability threshold 1.10).
 After R-hat converges, the next 1000 iterations are retained as posterior
 samples. If it does not converge by the limit, the following 1000 iterations
-form a fallback posterior window (maximum 4000 iterations). Production
+form a fallback posterior window (maximum 11000 iterations). Production
 sampling does not expose a thinning option.
 - ML models: `-RF`, `-ET`, `-GBDT`, `-XGB`, `-SVM`, `-ENET`
 

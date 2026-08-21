@@ -15,18 +15,30 @@ from janusx.pyBLUP.mlm import BLUP
 _BAYESA_MIN_ABS_BETA_WARNED = False
 BAYES_POSTERIOR_SAMPLE_TARGET = 1000
 
-# Production GS defaults. The first value is the hard upper bound for the
-# R-hat monitoring phase; the second is the fixed posterior sample target.
+def _resolve_bayes_chain_count(chains: int, threads: int) -> int:
+    """Resolve the native chain cap (at most half of the worker budget)."""
+    try:
+        requested = int(chains)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("chains must be a positive integer") from exc
+    if requested <= 0:
+        raise ValueError("chains must be > 0")
+    try:
+        thread_budget = max(1, int(threads))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("threads must be a non-negative integer") from exc
+    return min(requested, max(1, thread_budget // 2))
+
+
 BAYES_MCMC_DEFAULTS: dict[str, tuple[int, int]] = {
-    "BayesA": (3000, 1000),
-    "BayesB": (3000, 1000),
-    "BayesC": (3000, 1000),
-    "BayesR": (3000, 1000),
+    "BayesA": (10000, 1000),
+    "BayesB": (10000, 1000),
+    "BayesC": (10000, 1000),
+    "BayesR": (10000, 1000),
 }
 
 
 def bayes_mcmc_defaults(method: str) -> tuple[int, int]:
-    """Return ``(rhat_max_iter, posterior_samples)`` defaults."""
     key = str(method).strip()
     try:
         return BAYES_MCMC_DEFAULTS[key]
@@ -186,6 +198,8 @@ def _call_bayesa(
     prior_ss_e: Optional[float],
     min_abs_beta: float,
     seed: Optional[int],
+    chains: int = 1,
+    threads: int = 1,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -230,7 +244,7 @@ def _call_bayesa(
         )
         _BAYESA_MIN_ABS_BETA_WARNED = True
 
-    return _bayesa(
+    result = _bayesa(
         y=y,
         m=m,
         x=x,
@@ -246,7 +260,10 @@ def _call_bayesa(
         prior_ss_e=prior_ss_e,
         min_abs_beta=float(min_abs_beta),
         seed=seed,
+        chains=int(chains),
+        threads=int(threads),
     )
+    return typing.cast(Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, int, int, int], result)
 
 
 def _call_bayesb(
@@ -266,6 +283,8 @@ def _call_bayesb(
     df0_e: float,
     prior_ss_e: Optional[float],
     seed: Optional[int],
+    chains: int = 1,
+    threads: int = 1,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -326,7 +345,10 @@ def _call_bayesb(
         df0_e=float(df0_e),
         prior_ss_e=prior_ss_e,
         seed=seed,
+        chains=int(chains),
+        threads=int(threads),
     )
+    native_result = typing.cast(tuple[object, ...], native_result)
     # The native B/C ABI remains a 12-item tuple for PyO3 compatibility;
     # expose the fixed posterior count at the Python API boundary.
     return (*native_result, BAYES_POSTERIOR_SAMPLE_TARGET)
@@ -347,6 +369,8 @@ def _call_bayesc(
     df0_e: float,
     prior_ss_e: Optional[float],
     seed: Optional[int],
+    chains: int = 1,
+    threads: int = 1,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -401,7 +425,10 @@ def _call_bayesc(
         df0_e=float(df0_e),
         prior_ss_e=prior_ss_e,
         seed=seed,
+        chains=int(chains),
+        threads=int(threads),
     )
+    native_result = typing.cast(tuple[object, ...], native_result)
     return (*native_result, BAYES_POSTERIOR_SAMPLE_TARGET)
 
 
@@ -419,6 +446,8 @@ def _call_bayesr(
     df0_lambda: float,
     s0_lambda2: float,
     seed: Optional[int],
+    chains: int = 1,
+    threads: int = 1,
 ) -> dict[str, object]:
     n_iter = int(n_iter)
     burnin = int(burnin)
@@ -452,7 +481,7 @@ def _call_bayesr(
     if abs(float(gamma_arr[0])) > 1e-15 or np.any(gamma_arr[1:] <= 0.0):
         raise ValueError("BayesR gamma must start with 0 and have positive non-spike values")
 
-    return dict(
+    result = dict(
         _bayesr(
             y=y,
             m=m,
@@ -468,15 +497,18 @@ def _call_bayesr(
             df0_lambda=float(df0_lambda),
             s0_lambda2=float(s0_lambda2),
             seed=seed,
+            chains=int(chains),
+            threads=int(threads),
         )
     )
+    return typing.cast(dict[str, object], result)
 
 
 def BayesA(
     y: np.ndarray,
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
-    n_iter: int = 3000,
+    n_iter: int = 10000,
     burnin: int = 1000,
     r2: float = 0.5,
     prob_in: float = 0.5,
@@ -489,6 +521,8 @@ def BayesA(
     prior_ss_e: Optional[float] = None,
     min_abs_beta: float = 1e-9,
     seed: Optional[int] = None,
+    chains: int = 1,
+    threads: int = 1,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -518,7 +552,7 @@ def BayesA(
         Covariate matrix. 1D inputs are treated as a single covariate.
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
-    n_iter : int, default=3000
+    n_iter : int, default=10000
         Maximum iterations used for R-hat monitoring. After convergence, the
         sampler collects exactly 1000 posterior samples; without convergence,
         it collects a fallback 1000 samples after this limit.
@@ -548,6 +582,11 @@ def BayesA(
         Deprecated and ignored by Rust backend (kept for API compatibility).
     seed : int, optional
         RNG seed for reproducibility.
+    chains : int, default=1
+        Number of independent chains. The effective count is capped at
+        ``max(1, threads // 2)``.
+    threads : int, default=1
+        CPU budget used by the native multi-chain scheduler.
 
     Returns
     -------
@@ -605,13 +644,15 @@ def BayesA(
         prior_ss_e,
         min_abs_beta,
         seed,
+        chains,
+        threads,
     )
 
 def BayesB(
     y: np.ndarray,
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
-    n_iter: int = 3000,
+    n_iter: int = 10000,
     burnin: int = 1000,
     r2: float = 0.5,
     prob_in: float = 0.5,
@@ -624,6 +665,8 @@ def BayesB(
     df0_e: float = 5.0,
     prior_ss_e: Optional[float] = None,
     seed: Optional[int] = None,
+    chains: int = 1,
+    threads: int = 1,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -652,7 +695,7 @@ def BayesB(
         Covariate matrix. 1D inputs are treated as a single covariate.
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
-    n_iter : int, default=3000
+    n_iter : int, default=10000
         Maximum iterations used for R-hat monitoring, followed by a fixed
         1000-sample posterior window.
     burnin : int, default=1000
@@ -681,6 +724,11 @@ def BayesB(
         data. This is not ``S_0^2`` alone.
     seed : int, optional
         RNG seed for reproducibility.
+    chains : int, default=1
+        Number of independent chains. The effective count is capped at
+        ``max(1, threads // 2)``.
+    threads : int, default=1
+        CPU budget used by the native multi-chain scheduler.
 
     Returns
     -------
@@ -736,6 +784,8 @@ def BayesB(
         df0_e,
         prior_ss_e,
         seed,
+        chains,
+        threads,
     )
 
 
@@ -743,7 +793,7 @@ def BayesC(
     y: np.ndarray,
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
-    n_iter: int = 3000,
+    n_iter: int = 10000,
     burnin: int = 1000,
     r2: float = 0.5,
     prob_in: float = 0.5,
@@ -754,6 +804,8 @@ def BayesC(
     df0_e: float = 5.0,
     prior_ss_e: Optional[float] = None,
     seed: Optional[int] = None,
+    chains: int = 1,
+    threads: int = 1,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -782,7 +834,7 @@ def BayesC(
         Covariate matrix. 1D inputs are treated as a single covariate.
         Include a column of ones here if you want an intercept term. If X is
         None, the Rust backend uses an intercept-only design.
-    n_iter : int, default=3000
+    n_iter : int, default=10000
         Maximum iterations used for R-hat monitoring, followed by a fixed
         1000-sample posterior window.
     burnin : int, default=1000
@@ -807,6 +859,11 @@ def BayesC(
         data. This is not ``S_0^2`` alone.
     seed : int, optional
         RNG seed for reproducibility.
+    chains : int, default=1
+        Number of independent chains. The effective count is capped at
+        ``max(1, threads // 2)``.
+    threads : int, default=1
+        CPU budget used by the native multi-chain scheduler.
 
     Returns
     -------
@@ -860,6 +917,8 @@ def BayesC(
         df0_e,
         prior_ss_e,
         seed,
+        chains,
+        threads,
     )
 
 
@@ -867,7 +926,7 @@ def BayesR(
     y: np.ndarray,
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
-    n_iter: int = 3000,
+    n_iter: int = 10000,
     burnin: int = 1000,
     r2: float = 0.5,
     pi: Optional[np.ndarray] = None,
@@ -877,6 +936,8 @@ def BayesR(
     df0_e: float = 5.0,
     prior_ss_e: Optional[float] = None,
     seed: Optional[int] = None,
+    chains: int = 1,
+    threads: int = 1,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -908,6 +969,7 @@ def BayesR(
     convergence_iteration, posterior_samples)``.
     ``component_prob`` has shape ``(n_markers, 4)`` and uses Rao--Blackwell
     probabilities averaged over the retained posterior samples.
+        ``chains`` independent chains are scheduled and aggregated in Rust.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
@@ -928,6 +990,8 @@ def BayesR(
         df0_lambda,
         s0_lambda2,
         seed,
+        chains,
+        threads,
     )
     return (
         np.ascontiguousarray(result["beta"], dtype=np.float64).reshape(-1),
@@ -962,6 +1026,8 @@ class BAYES:
         pi: Optional[float | np.ndarray] = None,
         gamma: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
+        chains: int = 1,
+        threads: int = 1,
     ):
         """
         Bayesian genomic prediction using BayesA/B/C/R with minimal hyperparameters.
@@ -989,6 +1055,11 @@ class BAYES:
             by the Dirichlet step. If omitted, BayesR uses ``(.90,.06,.03,.01)``.
         gamma : array-like, optional
             BayesR component variance multipliers. Defaults to ``(0,.01,.1,1)``.
+        chains : int, default=1
+            Number of independent chains. The effective count is capped at
+            ``max(1, threads // 2)``.
+        threads : int, default=1
+        CPU budget used by the native multi-chain scheduler.
 
         Attributes
         ----------
@@ -1024,6 +1095,8 @@ class BAYES:
         }
         if method not in method_map:
             raise ValueError(f"Unsupported Bayes method: {method}")
+        requested_chains = int(chains)
+        effective_chains = _resolve_bayes_chain_count(requested_chains, threads)
         default_n_iter, default_posterior_samples = bayes_mcmc_defaults(method)
         if n_iter is None:
             n_iter = int(default_n_iter)
@@ -1063,6 +1136,11 @@ class BAYES:
         self.actual_iterations: int = 0
         self.convergence_iteration: int = 0
         self.posterior_samples: int = 0
+        self.threads_requested: int = max(1, int(threads))
+        self.chains_requested: int = int(requested_chains)
+        self.chains_effective: int = int(effective_chains)
+        self.threads_per_chain: int = max(1, int(max(1, int(threads)) // effective_chains))
+        self.posterior_samples_total: int = 0
         self.r2_used: float | None = float(r2)
         self.r2_blup: float | None = (
             float(r2_blup_pheno_scale) if r2_blup_pheno_scale is not None else float("nan")
@@ -1074,6 +1152,8 @@ class BAYES:
             burnin=burnin,
             r2=float(r2),
             seed=seed,
+            chains=requested_chains,
+            threads=max(1, int(threads)),
         )
         if method != "BayesR":
             method_kwargs["prob_in"] = prob_in
@@ -1139,6 +1219,7 @@ class BAYES:
         self.actual_iterations = int(diagnostics["actual_iterations"])
         self.convergence_iteration = int(diagnostics["convergence_iteration"])
         self.posterior_samples = int(diagnostics["posterior_samples"])
+        self.posterior_samples_total = int(self.posterior_samples * self.chains_effective)
         self.rhat = float(self.rhat_h2)
         
     def predict(self,M:np.ndarray,cov:np.ndarray=None):

@@ -116,6 +116,7 @@ from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import (
     BAYES,
     _parse_bayes_diagnostics,
+    _resolve_bayes_chain_count,
     bayes_mcmc_defaults as _bayes_mcmc_defaults,
 )
 from janusx.pyBLUP.ml import (
@@ -8933,6 +8934,7 @@ def GSapi(
     bayes_pi: float | None = None,
     bayes_runtime_state: dict[str, typing.Any] | None = None,
     bayes_auto_cfg: dict[str, typing.Any] | None = None,
+    bayes_chains: int = 1,
     model_state: dict[str, typing.Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
@@ -8986,6 +8988,9 @@ def GSapi(
     bayes_auto_cfg : dict, optional
         Bayes auto-r2 configuration. Supports optional BLUP subsampling on
         large sample sizes to reduce memory usage.
+    bayes_chains : int, optional
+        Number of independent Bayesian chains. The effective count is capped
+        at ``max(1, n_jobs // 2)`` and scheduled inside one native call.
     model_state : dict, optional
         Mutable sink for exporting a lightweight fitted-model artifact.
 
@@ -11772,7 +11777,8 @@ def GSapi(
                     "burnin": int(bayes_posterior_target),
                     "r2": float(r2_used),
                     "threads": int(max(0, int(n_jobs))),
-                    "seed": None,
+                    "chains": int(max(1, int(bayes_chains))),
+                    "seed": (int(seed) if int(bayes_chains) > 1 else None),
                 }
                 if use_packed_resident_native:
                     packed_kwargs["packed"] = typing.cast(np.ndarray, packed_payload_arg)
@@ -11796,17 +11802,22 @@ def GSapi(
                     packed_kwargs["min_abs_beta"] = 1e-9
 
                 packed_threads_compat_fallback = False
-                try:
-                    packed_fit_ret = packed_fit_fn(**packed_kwargs)
-                except TypeError as e:
-                    msg = str(e)
-                    if "unexpected keyword argument 'threads'" in msg:
-                        packed_kwargs_retry = dict(packed_kwargs)
-                        packed_kwargs_retry.pop("threads", None)
-                        packed_fit_ret = packed_fit_fn(**packed_kwargs_retry)
-                        packed_threads_compat_fallback = True
-                    else:
-                        raise
+                packed_fit_ret = packed_fit_fn(**packed_kwargs)
+                requested_chains = int(max(1, int(bayes_chains)))
+                thread_budget = int(max(1, int(n_jobs)))
+                effective_chains = _resolve_bayes_chain_count(
+                    requested_chains, thread_budget
+                )
+                threads_per_chain = max(1, thread_budget // effective_chains)
+                bayes_chain_meta = {
+                    "chains_requested": requested_chains,
+                    "chains_effective": effective_chains,
+                    "threads_requested": thread_budget,
+                    "threads_per_chain": threads_per_chain,
+                    "posterior_samples_total": int(
+                        bayes_posterior_target * effective_chains
+                    ),
+                }
                 bayes_component_prob: np.ndarray | None = None
                 bayes_pi_mean: np.ndarray | None = None
                 bayes_sigma_lambda2 = float("nan")
@@ -11866,9 +11877,23 @@ def GSapi(
                     bayes_runtime_state["r2_source"] = str(r2_source)
                     bayes_runtime_state["r2_n_used"] = int(r2_n_used)
                     bayes_runtime_state["r2_n_total"] = int(r2_n_total)
-                    bayes_runtime_state["threads_requested"] = int(max(0, int(n_jobs)))
+                    bayes_runtime_state["threads_requested"] = int(
+                        bayes_chain_meta.get("threads_requested", max(1, int(n_jobs)))
+                    )
                     bayes_runtime_state["threads_compat_fallback"] = bool(
                         packed_threads_compat_fallback
+                    )
+                    bayes_runtime_state["chains_requested"] = int(
+                        bayes_chain_meta.get("chains_requested", 1)
+                    )
+                    bayes_runtime_state["chains_effective"] = int(
+                        bayes_chain_meta.get("chains_effective", 1)
+                    )
+                    bayes_runtime_state["threads_per_chain"] = int(
+                        bayes_chain_meta.get("threads_per_chain", max(1, int(n_jobs)))
+                    )
+                    bayes_runtime_state["posterior_samples_total"] = int(
+                        bayes_chain_meta.get("posterior_samples_total", 0)
                     )
                     bayes_runtime_state["packed_backend"] = str(packed_backend)
                     if str(method) in {"BayesB", "BayesC"} and len(diag_tail) >= 2:
@@ -11991,6 +12016,21 @@ def GSapi(
                     model_state["posterior_samples"] = int(
                         bayes_posterior_samples
                     )
+                    model_state["chains_requested"] = int(
+                        bayes_chain_meta.get("chains_requested", 1)
+                    )
+                    model_state["chains_effective"] = int(
+                        bayes_chain_meta.get("chains_effective", 1)
+                    )
+                    model_state["threads_requested"] = int(
+                        bayes_chain_meta.get("threads_requested", max(1, int(n_jobs)))
+                    )
+                    model_state["threads_per_chain"] = int(
+                        bayes_chain_meta.get("threads_per_chain", max(1, int(n_jobs)))
+                    )
+                    model_state["posterior_samples_total"] = int(
+                        bayes_chain_meta.get("posterior_samples_total", 0)
+                    )
                 return (
                     np.asarray(train_pred, dtype=float).reshape(-1, 1),
                     np.asarray(test_pred, dtype=float).reshape(-1, 1),
@@ -12022,6 +12062,12 @@ def GSapi(
             method=method,
             r2=resolved_bayes_r2,
             pi=bayes_pi,
+            # Keep the historical OS-random single-chain behavior. An
+            # explicit multi-chain run derives stable chain seeds from GS's
+            # seed value and shares the requested thread budget.
+            seed=(int(seed) if int(bayes_chains) > 1 else None),
+            chains=int(max(1, int(bayes_chains))),
+            threads=int(max(1, int(n_jobs))),
         )
         pve = model.pve
         if bayes_runtime_state is not None:
@@ -12039,6 +12085,7 @@ def GSapi(
             )
             bayes_runtime_state["r2_n_used"] = int(r2_n_used)
             bayes_runtime_state["r2_n_total"] = int(r2_n_total)
+            bayes_runtime_state["threads_requested"] = int(max(1, int(n_jobs)))
             model_rhat = float(getattr(model, "rhat_h2", getattr(model, "rhat", np.nan)))
             bayes_runtime_state["rhat_h2"] = model_rhat
             bayes_runtime_state["rhat"] = model_rhat
@@ -12056,6 +12103,18 @@ def GSapi(
             )
             bayes_runtime_state["posterior_samples"] = int(
                 getattr(model, "posterior_samples", 0)
+            )
+            bayes_runtime_state["chains_requested"] = int(
+                getattr(model, "chains_requested", max(1, int(bayes_chains)))
+            )
+            bayes_runtime_state["chains_effective"] = int(
+                getattr(model, "chains_effective", max(1, int(bayes_chains)))
+            )
+            bayes_runtime_state["threads_per_chain"] = int(
+                getattr(model, "threads_per_chain", max(1, int(n_jobs)))
+            )
+            bayes_runtime_state["posterior_samples_total"] = int(
+                getattr(model, "posterior_samples_total", 0)
             )
             if method == "BayesR":
                 bayes_runtime_state["pi_mean"] = np.ascontiguousarray(
@@ -12130,6 +12189,19 @@ def GSapi(
             )
             model_state["posterior_samples"] = int(
                 getattr(model, "posterior_samples", 0)
+            )
+            model_state["chains_requested"] = int(
+                getattr(model, "chains_requested", max(1, int(bayes_chains)))
+            )
+            model_state["chains_effective"] = int(
+                getattr(model, "chains_effective", max(1, int(bayes_chains)))
+            )
+            model_state["threads_requested"] = int(max(1, int(n_jobs)))
+            model_state["threads_per_chain"] = int(
+                getattr(model, "threads_per_chain", max(1, int(n_jobs)))
+            )
+            model_state["posterior_samples_total"] = int(
+                getattr(model, "posterior_samples_total", 0)
             )
         return (
             np.asarray(train_pred, dtype=float).reshape(-1, 1),
@@ -12233,6 +12305,7 @@ def _run_method_task(
     bayes_auto_r2_cache: dict[str, float] | None = None,
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
     bayes_pi: float | None = None,
+    bayes_chains: int = 1,
     save_model_artifact: bool = False,
     stage_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
 ) -> dict[str, typing.Any]:
@@ -13282,6 +13355,7 @@ def _run_method_task(
                     bayes_pi=bayes_pi,
                     bayes_runtime_state=bayes_state_call,
                     bayes_auto_cfg=bayes_auto_r2_cfg,
+                    bayes_chains=bayes_chains,
                 )
                 if _is_gblup_method(str(method)) and gblup_state_call is not None:
                     _append_gblup_vc_row(int(fold_id), dict(gblup_state_call))
@@ -14100,6 +14174,7 @@ def _run_method_task(
                 bayes_pi=bayes_pi,
                 bayes_runtime_state=bayes_state_final,
             bayes_auto_cfg=bayes_auto_r2_cfg,
+            bayes_chains=bayes_chains,
             model_state=model_state_call,
         )
         _emit_stage("fit_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_fit_stage)))
@@ -14324,6 +14399,9 @@ def _run_method_task(
             bayes_r2_n_total_final = int(bayes_cv_shared_n_total)
     _elapsed_total = float(max(0.0, time.time() - _t_method_begin))
     _cv_elapsed, _fit_elapsed, _predict_elapsed = _stage_elapsed_metrics(_elapsed_total)
+    _bayes_meta_state = dict(bayes_state_final or {})
+    if not _bayes_meta_state and isinstance(model_state_final, dict):
+        _bayes_meta_state = dict(model_state_final)
     return {
         "method": method,
         "method_display": _method_display_name(method),
@@ -14355,6 +14433,21 @@ def _run_method_task(
         "bayes_actual_iterations_final": int(bayes_actual_iterations_final),
         "bayes_convergence_iteration_final": int(bayes_convergence_iteration_final),
         "bayes_posterior_samples_final": int(bayes_posterior_samples_final),
+        "bayes_chains_requested": int(
+            _bayes_meta_state.get("chains_requested", max(1, int(bayes_chains)))
+        ),
+        "bayes_chains_effective": int(
+            _bayes_meta_state.get("chains_effective", max(1, int(bayes_chains)))
+        ),
+        "bayes_threads_requested": int(
+            _bayes_meta_state.get("threads_requested", max(1, int(n_jobs)))
+        ),
+        "bayes_threads_per_chain": int(
+            _bayes_meta_state.get("threads_per_chain", max(1, int(n_jobs)))
+        ),
+        "bayes_posterior_samples_total": int(
+            _bayes_meta_state.get("posterior_samples_total", 0) or 0
+        ),
         "bayes_r2_source_final": str(bayes_r2_source_final),
         "bayes_r2_n_used_final": int(bayes_r2_n_used_final),
         "bayes_r2_n_total_final": int(bayes_r2_n_total_final),
@@ -14731,6 +14824,7 @@ def _run_methods_parallel(
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
     bayes_pi_by_method: dict[str, float | None] | None = None,
+    bayes_chains: int = 1,
     save_model_artifact: bool = False,
     emit_cv_progress_bar: bool = True,
     emit_method_summary: bool = True,
@@ -15094,6 +15188,33 @@ def _run_methods_parallel(
                 )
             )
             rows.append(("actual_iterations", str(actual_iterations) if actual_iterations > 0 else "NA"))
+            chains_effective = int(result.get("bayes_chains_effective", 1) or 1)
+            chains_requested = int(
+                result.get("bayes_chains_requested", chains_effective) or chains_effective
+            )
+            if chains_effective > 1 or chains_requested > 1:
+                threads_per_chain = int(
+                    result.get("bayes_threads_per_chain", 1) or 1
+                )
+                threads_requested = int(
+                    result.get(
+                        "bayes_threads_requested",
+                        max(1, threads_per_chain * chains_effective),
+                    )
+                    or 1
+                )
+                posterior_total = int(
+                    result.get("bayes_posterior_samples_total", 0) or 0
+                )
+                rows.append(
+                    (
+                        "chains",
+                        f"{chains_requested}->{chains_effective} (pool={threads_requested}, "
+                        f"active={chains_effective}, budget/chain={threads_per_chain})",
+                    )
+                )
+                if posterior_total > 0:
+                    rows.append(("posterior_samples_total", str(posterior_total)))
             return rows
 
         if m in _ML_METHOD_MAP:
@@ -15256,6 +15377,60 @@ def _run_methods_parallel(
     # and keep runtime behavior consistent.
     method_parallel_jobs = 1
     bayes_auto_r2_cache_shared: dict[str, float] = {}
+
+    def _submit_method_task(
+        executor: cf.ProcessPoolExecutor,
+        method_name: str,
+        *,
+        progress_queue: typing.Any = None,
+    ) -> cf.Future[dict[str, typing.Any]]:
+        """Submit a method task with the full keyword-safe runtime contract.
+
+        The process-pool branches used to pass a stale positional argument list
+        that omitted ``seed`` and several optional hooks.  Keeping this in one
+        place ensures the hidden Bayes chain setting is honored identically in
+        no-progress, Rich, and tqdm execution modes.
+        """
+        bayes_pi_task = (
+            None
+            if bayes_pi_by_method is None
+            else bayes_pi_by_method.get(str(method_name))
+        )
+        return executor.submit(
+            _run_method_task,
+            str(method_name),
+            train_pheno,
+            train_snp,
+            test_snp,
+            train_snp_add,
+            test_snp_add,
+            train_snp_ml,
+            test_snp_ml,
+            pca_dec,
+            cv_splits,
+            model_n_jobs,
+            int(seed),
+            strict_cv,
+            force_fast,
+            packed_ctx=packed_ctx,
+            train_sample_indices=train_sample_indices,
+            test_sample_indices=test_sample_indices,
+            train_sample_ids=train_sample_ids,
+            progress_queue=progress_queue,
+            progress_hook=None,
+            search_progress_hook=None,
+            rrblup_progress_hook=None,
+            limit_predtrain=limit_predtrain,
+            rrblup_solver=rrblup_solver,
+            rrblup_adamw_cfg=rrblup_adamw_cfg,
+            bayes_auto_r2_cache=None,
+            bayes_auto_r2_cfg=bayes_auto_r2_cfg,
+            bayes_pi=bayes_pi_task,
+            bayes_chains=bayes_chains,
+            save_model_artifact=save_model_artifact,
+            stage_hook=None,
+        )
+
     train_snp_runtime = train_snp
     test_snp_runtime = test_snp
     train_snp_add_runtime = train_snp_add
@@ -16284,6 +16459,7 @@ def _run_methods_parallel(
                             if bayes_pi_by_method is None
                             else bayes_pi_by_method.get(str(m))
                         ),
+                        bayes_chains=bayes_chains,
                         save_model_artifact=save_model_artifact,
                         stage_hook=_stage_hook,
                     )
@@ -17256,6 +17432,7 @@ def _run_methods_parallel(
                             if bayes_pi_by_method is None
                             else bayes_pi_by_method.get(str(m))
                         ),
+                        bayes_chains=bayes_chains,
                         save_model_artifact=save_model_artifact,
                         stage_hook=_stage_hook,
                     )
@@ -17345,31 +17522,7 @@ def _run_methods_parallel(
         method_start_ts = {m: time.monotonic() for m in methods}
         with cf.ProcessPoolExecutor(max_workers=method_parallel_jobs) as ex:
             future_map = {
-                ex.submit(
-                    _run_method_task,
-                    m,
-                    train_pheno,
-                    train_snp,
-                    test_snp,
-                    train_snp_add,
-                    test_snp_add,
-                    train_snp_ml,
-                    test_snp_ml,
-                    pca_dec,
-                    cv_splits,
-                    model_n_jobs,
-                    strict_cv,
-                    force_fast,
-                    packed_ctx,
-                    train_sample_indices,
-                    test_sample_indices,
-                    None,
-                    None,
-                    None,
-                    limit_predtrain,
-                    rrblup_solver,
-                    rrblup_adamw_cfg,
-                ): m
+                _submit_method_task(ex, m): m
                 for m in methods
             }
             for fut in cf.as_completed(list(future_map.keys())):
@@ -17457,31 +17610,7 @@ def _run_methods_parallel(
             try:
                 with cf.ProcessPoolExecutor(max_workers=method_parallel_jobs) as ex:
                     future_map = {
-                        ex.submit(
-                            _run_method_task,
-                            m,
-                            train_pheno,
-                            train_snp,
-                            test_snp,
-                            train_snp_add,
-                            test_snp_add,
-                            train_snp_ml,
-                            test_snp_ml,
-                            pca_dec,
-                            cv_splits,
-                            model_n_jobs,
-                            strict_cv,
-                            force_fast,
-                            packed_ctx,
-                            train_sample_indices,
-                            test_sample_indices,
-                            prog_q,
-                            None,
-                            None,
-                            limit_predtrain,
-                            rrblup_solver,
-                            rrblup_adamw_cfg,
-                        ): m
+                        _submit_method_task(ex, m, progress_queue=prog_q): m
                         for m in methods
                     }
                     while len(future_map) > 0:
@@ -17586,31 +17715,7 @@ def _run_methods_parallel(
         try:
             with cf.ProcessPoolExecutor(max_workers=method_parallel_jobs) as ex:
                 future_map = {
-                    ex.submit(
-                        _run_method_task,
-                        m,
-                        train_pheno,
-                        train_snp,
-                        test_snp,
-                        train_snp_add,
-                        test_snp_add,
-                        train_snp_ml,
-                        test_snp_ml,
-                        pca_dec,
-                        cv_splits,
-                        model_n_jobs,
-                        strict_cv,
-                        force_fast,
-                        packed_ctx,
-                        train_sample_indices,
-                        test_sample_indices,
-                        prog_q,
-                        None,
-                        None,
-                        limit_predtrain,
-                        rrblup_solver,
-                        rrblup_adamw_cfg,
-                    ): m
+                    _submit_method_task(ex, m, progress_queue=prog_q): m
                     for m in methods
                 }
                 while len(future_map) > 0:
@@ -17666,31 +17771,7 @@ def _run_methods_parallel(
     else:
         with cf.ProcessPoolExecutor(max_workers=method_parallel_jobs) as ex:
             future_map = {
-                ex.submit(
-                    _run_method_task,
-                    m,
-                    train_pheno,
-                    train_snp,
-                    test_snp,
-                    train_snp_add,
-                    test_snp_add,
-                    train_snp_ml,
-                    test_snp_ml,
-                    pca_dec,
-                    cv_splits,
-                    model_n_jobs,
-                    strict_cv,
-                    force_fast,
-                    packed_ctx,
-                    train_sample_indices,
-                    test_sample_indices,
-                    None,
-                    None,
-                    None,
-                    limit_predtrain,
-                    rrblup_solver,
-                    rrblup_adamw_cfg,
-                ): m
+                _submit_method_task(ex, m): m
                 for m in methods
             }
             for fut in cf.as_completed(list(future_map.keys())):
@@ -19924,6 +20005,15 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         het_default=1.0,
     )
     add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
+    optional_group.add_argument(
+        "-chains", "--chains",
+        type=int,
+        default=1,
+        help=(
+            "Run this many independent Bayesian chains; effective count is capped by threads/2."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
     add_common_memory_arg(
         optional_group,
         default=None,
@@ -20021,6 +20111,8 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         parser.error(str(e))
     if int(args.rrblup_batch_threads) < 0:
         parser.error("--rrblup-batch-threads must be >= 0.")
+    if int(args.chains) <= 0:
+        parser.error("--chains must be > 0.")
     if args.rrblup_snp_block_size is None:
         # Default mini-batch logic: use batch-size as the primary memory knob.
         args.rrblup_snp_block_size = int(args.rrblup_batch_size)
@@ -23146,6 +23238,34 @@ def _run_gs_pipeline_impl(
                             str(actual_iterations) if actual_iterations > 0 else "NA",
                         )
                     )
+                    chains_effective = int(res_obj.get("bayes_chains_effective", 1) or 1)
+                    chains_requested = int(
+                        res_obj.get("bayes_chains_requested", chains_effective)
+                        or chains_effective
+                    )
+                    if chains_effective > 1 or chains_requested > 1:
+                        threads_per_chain = int(
+                            res_obj.get("bayes_threads_per_chain", 1) or 1
+                        )
+                        threads_requested = int(
+                            res_obj.get(
+                                "bayes_threads_requested",
+                                max(1, threads_per_chain * chains_effective),
+                            )
+                            or 1
+                        )
+                        posterior_total = int(
+                            res_obj.get("bayes_posterior_samples_total", 0) or 0
+                        )
+                        rows.append(
+                            (
+                                "chains",
+                                f"{chains_requested}->{chains_effective} (pool={threads_requested}, "
+                                f"active={chains_effective}, budget/chain={threads_per_chain})",
+                            )
+                        )
+                        if posterior_total > 0:
+                            rows.append(("posterior_samples_total", str(posterior_total)))
                     return rows
 
                 return rows
@@ -23678,6 +23798,7 @@ def _run_gs_pipeline_impl(
                 rrblup_adamw_cfg=rrblup_adamw_cfg,
                 bayes_auto_r2_cfg=bayes_auto_r2_cfg,
                 bayes_pi_by_method=bayes_pi_by_method,
+                bayes_chains=int(getattr(args, "chains", 1)),
                 save_model_artifact=bool(args.save_model),
                 emit_cv_progress_bar=True,
                 emit_method_summary=False,
