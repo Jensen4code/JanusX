@@ -308,13 +308,11 @@ use reml::{
 };
 use rrblup::{
     rrblup_exact_snp_fit_prepared, rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_packed,
-    rrblup_exact_snp_prepare_bed_from_meta, rrblup_exact_snp_prepare_packed, rrblup_pcg_bed,
-    RrblupExactSnpCache,
+    rrblup_exact_snp_prepare_bed_from_meta, rrblup_pcg_bed, RrblupExactSnpCache,
 };
 use rrblupc::{
     rrblupc_exact_snp_fit_prepared, rrblupc_exact_snp_fit_prepared_bed, rrblupc_exact_snp_packed,
-    rrblupc_exact_snp_prepare_bed_from_meta, rrblupc_exact_snp_prepare_packed, rrblupc_pcg_bed,
-    RrblupCenteredExactSnpCache,
+    rrblupc_exact_snp_prepare_bed_from_meta, rrblupc_pcg_bed, RrblupCenteredExactSnpCache,
 };
 use rsvd::py_rsvd_packed_subset;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
@@ -881,13 +879,11 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(susie_rss_f64, m)?)?;
     m.add_function(wrap_pyfunction!(king::king_unrelated_set_from_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_packed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_bed_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_packed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblupc_pcg_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(rrblupc_exact_snp_prepare_packed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblupc_exact_snp_fit_prepared, m)?)?;
     m.add_function(wrap_pyfunction!(
         rrblupc_exact_snp_prepare_bed_from_meta,

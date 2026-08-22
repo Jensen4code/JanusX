@@ -24,10 +24,6 @@ class BlupDispatch:
     threshold_n: int
     threshold_m: int
 
-    @property
-    def requires_resident_packed(self) -> bool:
-        return False
-
 
 def is_blup_method(method: str) -> bool:
     return str(method).strip().upper() == BLUP_METHOD

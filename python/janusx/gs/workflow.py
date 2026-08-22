@@ -1450,47 +1450,6 @@ def _select_top_method_for_trait(
     return best_method, scores
 
 
-def _normalize_gblup_kernel_token(token: str) -> str:
-    t = str(token).strip().lower()
-    if t in {"a", "add", "additive"}:
-        return "a"
-    if t in {"d", "dom", "dominance"}:
-        return "d"
-    if t in {"ad", "da", "adddom", "add+dom", "additive+dominance", "both"}:
-        return "ad"
-    raise ValueError(
-        f"Invalid -GBLUP kernel token: {token!r}. "
-        "Allowed: a, d, ad."
-    )
-
-
-def _parse_gblup_kernel_modes(raw: list[list[str]] | None) -> list[str]:
-    if raw is None:
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for group in raw:
-        vals = [str(x).strip() for x in (group or []) if str(x).strip() != ""]
-        if len(vals) == 0:
-            vals = ["a"]
-        for tok in vals:
-            mode = _normalize_gblup_kernel_token(tok)
-            if mode in seen:
-                continue
-            seen.add(mode)
-            out.append(mode)
-    return out
-
-
-def _gblup_mode_to_method(mode: str) -> str:
-    m = str(mode).strip().lower()
-    if m == "d":
-        return _GBLUP_METHOD_DOM
-    if m == "ad":
-        return _GBLUP_METHOD_AD
-    return _GBLUP_METHOD_ADD
-
-
 def _methods_need_additive_dense(methods: list[str]) -> bool:
     return any(
         _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
@@ -2672,27 +2631,6 @@ def _build_method_effect_table(
     return table, meta
 
 
-def _write_method_effect_tsv(
-    *,
-    out_path: str,
-    model_state: dict[str, typing.Any],
-    packed_ctx: dict[str, typing.Any] | None,
-    genotype_prefix_hint: str | None,
-    fallback_marker_count: int | None,
-) -> dict[str, typing.Any]:
-    table, meta = _build_method_effect_table(
-        model_state=model_state,
-        packed_ctx=packed_ctx,
-        genotype_prefix_hint=genotype_prefix_hint,
-        fallback_marker_count=fallback_marker_count,
-    )
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    table.to_csv(str(out_path), sep="\t", index=False, float_format="%.6g")
-    out = dict(meta)
-    out["effect_file"] = str(out_path)
-    return out
-
-
 def _sanitize_artifact_token(token: str) -> str:
     s = str(token).strip()
     if s == "":
@@ -2700,114 +2638,6 @@ def _sanitize_artifact_token(token: str) -> str:
     s = re.sub(r"[\\/:*?\"<>|\s]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("._")
     return s or "NA"
-
-
-def _reindex_effect_table(
-    table: pd.DataFrame | None,
-    n_rows: int,
-) -> pd.DataFrame:
-    if n_rows <= 0:
-        return pd.DataFrame(
-            {
-                "chrom": np.zeros((0,), dtype=object),
-                "pos": np.zeros((0,), dtype=np.int64),
-                "allele0": np.zeros((0,), dtype=object),
-                "allele1": np.zeros((0,), dtype=object),
-                "maf": np.zeros((0,), dtype=np.float64),
-            }
-        )
-
-    chrom = np.full((n_rows,), ".", dtype=object)
-    pos = np.full((n_rows,), -1, dtype=np.int64)
-    allele0 = np.full((n_rows,), "N", dtype=object)
-    allele1 = np.full((n_rows,), "N", dtype=object)
-    maf = np.full((n_rows,), np.nan, dtype=np.float64)
-    if table is not None and int(table.shape[0]) > 0:
-        t = table
-        use_n = min(n_rows, int(t.shape[0]))
-        if "chrom" in t.columns:
-            chrom[:use_n] = np.asarray(t["chrom"], dtype=object).reshape(-1)[:use_n]
-        if "pos" in t.columns:
-            pos[:use_n] = np.asarray(t["pos"], dtype=np.int64).reshape(-1)[:use_n]
-        if "allele0" in t.columns:
-            allele0[:use_n] = np.asarray(t["allele0"], dtype=object).reshape(-1)[:use_n]
-        if "allele1" in t.columns:
-            allele1[:use_n] = np.asarray(t["allele1"], dtype=object).reshape(-1)[:use_n]
-        if "maf" in t.columns:
-            maf[:use_n] = np.asarray(t["maf"], dtype=np.float64).reshape(-1)[:use_n]
-    return pd.DataFrame(
-        {
-            "chrom": chrom,
-            "pos": pos,
-            "allele0": allele0,
-            "allele1": allele1,
-            "maf": maf,
-        }
-    )
-
-
-def _resolve_effect_col_from_table(tb: pd.DataFrame | None) -> str | None:
-    if tb is None:
-        return None
-    for c in ("signed_beta", "kernel_projection", "importance", "attribution", "beta"):
-        if c in tb.columns:
-            return str(c)
-    return None
-
-
-def _build_trait_merged_effect_table(
-    *,
-    method_tables: dict[str, pd.DataFrame],
-    method_order: list[str],
-    method_display_map: dict[str, str],
-) -> pd.DataFrame:
-    n_rows = 0
-    for _k, _tb in method_tables.items():
-        n_rows = max(n_rows, int(_tb.shape[0]))
-    if n_rows <= 0:
-        n_rows = 1
-
-    best_key = ""
-    best_score = -1
-    for k, tb in method_tables.items():
-        if int(tb.shape[0]) <= 0:
-            continue
-        score = 0
-        if "chrom" in tb.columns:
-            chrom_v = np.asarray(tb["chrom"], dtype=object).reshape(-1)
-            score += int(np.sum(chrom_v != "."))
-        if "pos" in tb.columns:
-            pos_v = np.asarray(tb["pos"], dtype=np.int64).reshape(-1)
-            score += int(np.sum(pos_v >= 0))
-        if "maf" in tb.columns:
-            maf_v = np.asarray(tb["maf"], dtype=np.float64).reshape(-1)
-            score += int(np.sum(np.isfinite(maf_v)))
-        if score > best_score:
-            best_key = str(k)
-            best_score = int(score)
-
-    base_table = _reindex_effect_table(method_tables.get(best_key, None), n_rows)
-    used_cols: set[str] = set(base_table.columns.tolist())
-    for method in list(method_order):
-        m_key = str(method)
-        disp_raw = str(method_display_map.get(m_key, m_key))
-        col = disp_raw if disp_raw != "" else m_key
-        if col in used_cols:
-            i = 2
-            while f"{col}_{i}" in used_cols:
-                i += 1
-            col = f"{col}_{i}"
-        used_cols.add(col)
-
-        beta_full = np.full((n_rows,), np.nan, dtype=np.float64)
-        tb = method_tables.get(m_key, None)
-        eff_col = _resolve_effect_col_from_table(tb)
-        if tb is not None and eff_col is not None:
-            beta_vec = np.asarray(tb[eff_col], dtype=np.float64).reshape(-1)
-            use_n = min(n_rows, int(beta_vec.shape[0]))
-            beta_full[:use_n] = beta_vec[:use_n]
-        base_table[col] = beta_full
-    return base_table
 
 
 def _json_safe(value: typing.Any) -> typing.Any:
@@ -3393,25 +3223,6 @@ def _format_gs_models_executed(methods: typing.Sequence[str]) -> str:
     return ", ".join(names) if len(names) > 0 else "None"
 
 
-def _ordered_gs_summary_rows(
-    rows: list[dict[str, typing.Any]],
-) -> list[dict[str, typing.Any]]:
-    return sorted(
-        [dict(r) for r in rows],
-        key=lambda r: (str(r.get("trait", "")), str(r.get("model", ""))),
-    )
-
-
-def _format_gs_summary_metric(value: object, fmt: str) -> str:
-    try:
-        num = float(value)
-    except Exception:
-        return "NA"
-    if not np.isfinite(num):
-        return "NA"
-    return format(num, fmt)
-
-
 def _emit_gs_trait_header(
     logger: logging.Logger,
     *,
@@ -3441,93 +3252,6 @@ def _emit_gs_trait_header(
         f"CV={cv_text} | TOP={'on' if bool(top_enabled) else 'off'}",
     )
     _emit_report_kv(report_logger, "Trait Models", _format_gs_models_executed(methods))
-
-
-def _emit_gs_summary_legacy(
-    logger: logging.Logger,
-    rows: list[dict[str, typing.Any]],
-) -> None:
-    if len(rows) == 0:
-        return
-    rule = "=" * _gs_terminal_rule_width(_SECTION_WIDTH, logger=logger)
-    logger.info("")
-    logger.info(rule)
-    logger.info("Summary")
-    logger.info(rule)
-    headers = ["trait", "model", "ntrain", "ntest", "r2", "pear", "time(s)"]
-    out_rows: list[list[str]] = []
-    for row in _ordered_gs_summary_rows(rows):
-        out_rows.append(
-            [
-                str(row.get("trait", "")),
-                str(row.get("model", "")),
-                f"{int(row.get('n_train', 0))}",
-                f"{int(row.get('n_test', 0))}",
-                _format_gs_summary_metric(row.get("r2_cv_mean", np.nan), ".3f"),
-                _format_gs_summary_metric(row.get("pearsonr_cv_mean", np.nan), ".3f"),
-                _format_gs_summary_metric(row.get("time_cv_mean_sec", np.nan), ".1f"),
-            ]
-        )
-    widths = [len(h) for h in headers]
-    for row in out_rows:
-        for i, value in enumerate(row):
-            widths[i] = max(widths[i], len(value))
-    logger.info("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
-    for row in out_rows:
-        logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
-
-
-def _emit_gs_summary(
-    logger: logging.Logger,
-    rows: list[dict[str, typing.Any]],
-) -> None:
-    if len(rows) == 0:
-        return
-    report_logger = _gs_report_logger(logger)
-    _emit_report_major_section(report_logger, "Summary Report")
-    headers = [
-        "Trait",
-        "Model",
-        "N_Train",
-        "N_Test",
-        "Pearsonr",
-        "Spearmanr",
-        "R2",
-        "MSE",
-        "MAE",
-        "PVE(ph)",
-        "Time(s)",
-    ]
-    out_rows: list[list[str]] = []
-    for row in _ordered_gs_summary_rows(rows):
-        out_rows.append(
-            [
-                str(row.get("trait", "")),
-                str(row.get("model", "")),
-                f"{int(row.get('n_train', 0))}",
-                f"{int(row.get('n_test', 0))}",
-                _format_gs_summary_metric(row.get("pearsonr_cv_mean", np.nan), ".3f"),
-                _format_gs_summary_metric(row.get("spearmanr_cv_mean", np.nan), ".3f"),
-                _format_gs_summary_metric(row.get("r2_cv_mean", np.nan), ".3f"),
-                _format_gs_summary_metric(row.get("mse_cv_mean", np.nan), ".4g"),
-                _format_gs_summary_metric(row.get("mae_cv_mean", np.nan), ".4g"),
-                _format_gs_summary_metric(row.get("pve_final", np.nan), ".3f"),
-                _format_gs_summary_metric(row.get("time_cv_mean_sec", np.nan), ".1f"),
-            ]
-        )
-    widths = [len(h) for h in headers]
-    for row in out_rows:
-        for i, value in enumerate(row):
-            widths[i] = max(widths[i], len(value))
-    report_logger.info("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
-    for row in out_rows:
-        report_logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
-    report_logger.info(_REPORT_SUBRULE)
-
-    if _gs_terminal_rich(logger):
-        stream_logger = _gs_stream_logger(logger)
-        if stream_logger is not None:
-            _emit_gs_summary_legacy(stream_logger, rows)
 
 
 def _estimate_gs_train_size_for_dispatch(
@@ -3668,7 +3392,7 @@ def _resolve_gs_auto_decode_memory_gb(
                     cfg=rrblup_cfg,
                 )
             ).strip().lower()
-            if solver_use in {"pcg", "adamw"}:
+            if solver_use == "pcg":
                 _push_candidate(
                     _memory_gb_for_target_decode_shape(
                         n_total,
@@ -3804,23 +3528,6 @@ def _release_shared_gblup_full_grm_cache(
                 )
     if debug and (logger is not None):
         logger.info("[GS-DEBUG] shared GBLUP full-GRM cache released")
-
-
-def _sum_unique_ndarray_nbytes(values: typing.Iterable[typing.Any]) -> int:
-    seen: set[int] = set()
-    total = 0
-    for obj in values:
-        if not isinstance(obj, np.ndarray):
-            continue
-        oid = id(obj)
-        if oid in seen:
-            continue
-        seen.add(oid)
-        try:
-            total += int(obj.nbytes)
-        except Exception:
-            continue
-    return int(max(0, total))
 
 
 def _estimate_gblup_stream_reserve_bytes(
@@ -5709,7 +5416,7 @@ def _resolve_rrblup_solver(
     cfg: dict[str, typing.Any] | None,
 ) -> str:
     mode = str(solver).strip().lower()
-    if mode not in {"exact", "adamw", "pcg", "auto"}:
+    if mode not in {"exact", "pcg", "auto"}:
         mode = "auto"
     if mode != "auto":
         return mode
@@ -5938,18 +5645,6 @@ def _rrblup_lambda_auto_vc_terms(
         float(lambda_equation_rrblup),
         float(lambda_equation_vc),
     )
-
-
-def _rrblup_m_effective_from_maf(
-    maf: np.ndarray | typing.Sequence[typing.Any],
-    std_eps: float,
-) -> int:
-    maf_arr = np.asarray(maf, dtype=np.float64).reshape(-1)
-    if int(maf_arr.size) == 0:
-        return 0
-    p = np.clip(maf_arr, 0.0, 0.5)
-    var = 2.0 * p * (1.0 - p)
-    return int(np.count_nonzero(np.isfinite(var) & (var > float(std_eps))))
 
 
 def _estimate_rrblup_lambda_subsample_reml(
@@ -6798,40 +6493,6 @@ def _estimate_rrblup_lambda_subsample_reml(
             "m_effective_vc": int(m_effective),
         }
 
-    def _recover_lambda_from_model(model: typing.Any) -> tuple[float, float, float]:
-        sigma_g2 = float("nan")
-        sigma_e2 = float("nan")
-        lambda_k = float("nan")
-        try:
-            rtv_invr = float(getattr(model, "rTV_invr", np.nan))
-            n_model = int(getattr(model, "n", n_train))
-            p_model = int(getattr(model, "p", 1))
-            n_eff_model = int(max(1, n_model - p_model))
-            svals = np.asarray(getattr(model, "S", []), dtype=float).reshape(-1)
-            v_inv = np.asarray(getattr(model, "V_inv", []), dtype=float).reshape(-1)
-            if svals.size > 0 and v_inv.size == svals.size:
-                eps_v = float(np.finfo(np.float64).eps)
-                valid = np.isfinite(svals) & np.isfinite(v_inv) & (v_inv > eps_v)
-                if np.any(valid):
-                    lam_cand = (1.0 / v_inv[valid]) - svals[valid]
-                    lam_cand = lam_cand[np.isfinite(lam_cand) & (lam_cand >= 0.0)]
-                    if lam_cand.size > 0:
-                        lambda_k = float(np.median(lam_cand))
-            if np.isfinite(rtv_invr) and rtv_invr > 0.0:
-                sigma_g2 = float(rtv_invr / float(max(1, n_eff_model)))
-                if np.isfinite(lambda_k) and lambda_k >= 0.0:
-                    sigma_e2 = float(lambda_k * sigma_g2)
-            if (
-                (not np.isfinite(lambda_k))
-                and np.isfinite(sigma_g2)
-                and np.isfinite(sigma_e2)
-                and sigma_g2 > 0.0
-            ):
-                lambda_k = float(sigma_e2 / sigma_g2)
-        except Exception:
-            pass
-        return float(lambda_k), float(sigma_g2), float(sigma_e2)
-
     def _fit_full_fast_reml() -> dict[str, float]:
         if can_use_rust_gblup:
             fit_fast, _evd_backend = _run_rust_reml(
@@ -7301,104 +6962,6 @@ def _estimate_bayes_auto_r2_from_blup(
     r2 = float(np.median(np.asarray(vals, dtype=np.float64)))
     return r2, f"blup_subsample(n={int(n_sub)},rep={len(vals)}/{int(repeats)})", int(n_sub), int(n_total)
 
-
-def _build_rrblup_adamw_grid(
-    cfg: dict[str, typing.Any] | None,
-) -> list[tuple[float, float]]:
-    cfg_use = cfg or {}
-    lam0 = float(cfg_use.get("lambda_value", 1.0))
-    lr0 = float(cfg_use.get("lr", 1e-2))
-    if (not np.isfinite(lam0)) or lam0 < 0.0:
-        lam0 = 1.0
-    if (not np.isfinite(lr0)) or lr0 <= 0.0:
-        lr0 = 1e-2
-    grid_size = int(max(1, min(4, int(cfg_use.get("grid_size", 4)))))
-    lam_anchor = float(max(lam0, 1e-8))
-    cands = [
-        (lam_anchor, lr0),
-        (lam_anchor * 0.5, lr0),
-        (lam_anchor * 2.0, lr0),
-        (lam_anchor * 4.0, lr0),
-    ]
-    out: list[tuple[float, float]] = []
-    seen: set[tuple[float, float]] = set()
-    for lam, lr in cands:
-        lam_use = float(max(0.0, lam))
-        lr_use = float(max(np.finfo(np.float32).eps, lr))
-        key = (float(f"{lam_use:.12g}"), float(f"{lr_use:.12g}"))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((lam_use, lr_use))
-        if len(out) >= grid_size:
-            break
-    if len(out) == 0:
-        out = [(float(max(0.0, lam0)), float(max(np.finfo(np.float32).eps, lr0)))]
-    return out
-
-
-def _build_rrblup_validation_indices(
-    *,
-    n_train: int,
-    cfg: dict[str, typing.Any] | None,
-) -> np.ndarray | None:
-    cfg_use = cfg or {}
-    n = int(max(0, int(n_train)))
-    if n <= 0:
-        return None
-    val_frac = float(cfg_use.get("es_val_frac", 0.1))
-    val_frac = min(0.45, max(0.0, val_frac))
-    val_min = int(max(1, int(cfg_use.get("es_val_min", 64))))
-    min_train = int(max(8, int(cfg_use.get("es_min_train", 128))))
-    if n <= min_train:
-        return None
-    if val_frac <= 0.0 and val_min <= 0:
-        return None
-    val_n = int(round(float(n) * float(val_frac)))
-    val_n = max(val_min, val_n)
-    val_n = min(val_n, max(1, n - min_train))
-    if val_n <= 0 or val_n >= n:
-        return None
-    seed = int(cfg_use.get("seed", 42))
-    grid_seed = int(cfg_use.get("grid_seed", seed))
-    rng = np.random.default_rng(grid_seed + 7919)
-    idx = np.ascontiguousarray(rng.permutation(n)[:val_n], dtype=np.int64)
-    idx.sort()
-    return idx
-
-
-def _adamw_update_inplace_f32(
-    *,
-    param: np.ndarray,
-    grad: np.ndarray,
-    m1: np.ndarray,
-    m2: np.ndarray,
-    step: int,
-    lr: float,
-    beta1: float,
-    beta2: float,
-    eps: float,
-    weight_decay: float,
-) -> None:
-    if int(step) <= 0:
-        raise ValueError("AdamW step must be > 0.")
-    grad32 = np.asarray(grad, dtype=np.float32)
-    m1 *= np.float32(beta1)
-    m1 += np.float32(1.0 - beta1) * grad32
-    m2 *= np.float32(beta2)
-    m2 += np.float32(1.0 - beta2) * (grad32 * grad32)
-
-    b1_corr = 1.0 - (float(beta1) ** float(step))
-    b2_corr = 1.0 - (float(beta2) ** float(step))
-    if b1_corr <= 0.0 or b2_corr <= 0.0:
-        return
-    m_hat = m1 / np.float32(b1_corr)
-    v_hat = m2 / np.float32(b2_corr)
-    denom = np.sqrt(v_hat, dtype=np.float32) + np.float32(eps)
-    param -= np.float32(lr) * (m_hat / denom)
-    if float(weight_decay) > 0.0:
-        decay = max(0.0, 1.0 - float(lr) * float(weight_decay))
-        param *= np.float32(decay)
 
 
 def _ensure_packed_row_flip_cached(
@@ -7970,72 +7533,6 @@ def _ensure_packed_rrblup_operator_stats_cached(
     )
 
 
-def _decode_packed_subset_to_dense_standardized(
-    *,
-    packed_ctx: dict[str, typing.Any],
-    sample_indices: np.ndarray,
-    row_mean: np.ndarray,
-    row_inv_sd: np.ndarray,
-    row_block_size: int = 2048,
-    out_dtype: typing.Any = np.float32,
-) -> np.ndarray:
-    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
-        raise RuntimeError(
-            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
-        )
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
-    m = int(active_row_idx.shape[0])
-    n_samples = int(packed_ctx["n_samples"])
-    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
-    n_out = int(sidx.shape[0])
-    dtype_out = np.dtype(out_dtype)
-    if dtype_out != np.dtype(np.float64):
-        dtype_out = np.dtype(np.float32)
-    out = np.empty((m, n_out), dtype=dtype_out)
-    blk_step = int(max(1, int(row_block_size)))
-    for st in range(0, m, blk_step):
-        ed = min(st + blk_step, m)
-        ridx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
-        ridx_decode, row_flip, maf, _ridx = _resolve_packed_decode_rows_and_metadata(
-            packed_ctx,
-            ridx,
-        )
-        blk = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
-            packed,
-            int(n_samples),
-            ridx_decode,
-            row_flip,
-            maf,
-            sidx,
-        )
-        x = np.ascontiguousarray(np.asarray(blk, dtype=dtype_out), dtype=dtype_out)
-        row_mean_active = _packed_ctx_select_active_metadata(
-            row_mean,
-            active_row_idx,
-            dtype=dtype_out,
-            name="row_mean",
-        )
-        row_inv_sd_active = _packed_ctx_select_active_metadata(
-            row_inv_sd,
-            active_row_idx,
-            dtype=dtype_out,
-            name="row_inv_sd",
-        )
-        mu = np.ascontiguousarray(
-            np.asarray(row_mean_active[st:ed], dtype=dtype_out).reshape(-1, 1),
-            dtype=dtype_out,
-        )
-        inv_sd = np.ascontiguousarray(
-            np.asarray(row_inv_sd_active[st:ed], dtype=dtype_out).reshape(-1, 1),
-            dtype=dtype_out,
-        )
-        x -= mu
-        x *= inv_sd
-        out[st:ed, :] = x
-    return np.ascontiguousarray(out, dtype=dtype_out)
-
-
 def _predict_rrblup_dense_from_beta(
     *,
     X: np.ndarray,
@@ -8250,640 +7747,6 @@ def _predict_bayes_packed_raw_from_effects(
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
 
 
-def _fit_rrblup_adamw_cpu(
-    *,
-    y: np.ndarray,
-    Xtrain: typing.Any,
-    is_packed_input: bool,
-    packed_train_indices: np.ndarray | None,
-    cfg: dict[str, typing.Any] | None,
-    progress_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
-) -> dict[str, typing.Any]:
-    cfg_use = cfg or {}
-    y_vec = np.asarray(y, dtype=np.float32).reshape(-1)
-    n_train = int(y_vec.shape[0])
-    if n_train <= 0:
-        raise ValueError("rrBLUP AdamW training requires at least one sample.")
-    if is_packed_input:
-        raise ValueError(
-            "rrBLUP-AdamW packed genotype path has been removed; use the streaming "
-            "rrBLUP-PCG or exact backend."
-        )
-
-    lambda_value = float(cfg_use.get("lambda_value", 1.0))
-    lambda_scale = str(cfg_use.get("lambda_scale", "equation")).strip().lower()
-    lr = float(cfg_use.get("lr", 1e-2))
-    epochs = int(max(1, int(cfg_use.get("epochs", 60))))
-    batch_size = int(max(1, int(cfg_use.get("batch_size", 1024))))
-    snp_block_size = int(max(1, int(cfg_use.get("snp_block_size", 2048))))
-    beta1 = float(cfg_use.get("beta1", 0.9))
-    beta2 = float(cfg_use.get("beta2", 0.999))
-    eps = float(cfg_use.get("eps", 1e-8))
-    seed = int(cfg_use.get("seed", 42))
-    log_every = int(max(0, int(cfg_use.get("log_every", 0))))
-    sample_chunk_size = int(max(1, int(cfg_use.get("sample_chunk_size", 4096))))
-    batch_threads_cfg = int(max(0, int(cfg_use.get("batch_threads", 0))))
-    std_eps = float(max(np.finfo(np.float32).eps, float(cfg_use.get("std_eps", 1e-12))))
-    early_stop_patience = int(max(0, int(cfg_use.get("early_stop_patience", 0))))
-    early_stop_warmup = int(max(1, int(cfg_use.get("early_stop_warmup", 5))))
-    early_stop_min_delta = float(max(0.0, float(cfg_use.get("early_stop_min_delta", 1e-5))))
-    exclude_val_from_train = bool(_cfg_truthy(cfg_use.get("exclude_val_from_train", False), default=False))
-    # Dense AdamW sample-batch threading:
-    # - 0 (default): auto, only enable when BLAS threads are not already > 1.
-    # - >0: explicit worker count for sample-sharded batch execution.
-    total_threads_hint = int(
-        max(
-            1,
-            int(_parse_nonnegative_int(os.getenv("JX_THREADS", "").strip()) or 1),
-        )
-    )
-    blas_threads_hint = int(
-        max(
-            0,
-            int(_parse_nonnegative_int(os.getenv("JX_MLM_BLAS_THREADS", "").strip()) or 0),
-        )
-    )
-
-    if lambda_value < 0.0 or (not np.isfinite(lambda_value)):
-        raise ValueError(f"rrBLUP lambda must be finite and >= 0, got {lambda_value!r}.")
-    if lambda_scale not in {"equation", "mean-loss"}:
-        raise ValueError(
-            f"rrBLUP lambda_scale must be one of {{'equation', 'mean-loss'}}, got {lambda_scale!r}."
-        )
-    if (not np.isfinite(lr)) or lr <= 0.0:
-        raise ValueError(f"rrBLUP learning rate must be > 0, got {lr!r}.")
-    if (not np.isfinite(beta1)) or (not np.isfinite(beta2)):
-        raise ValueError("rrBLUP beta1/beta2 must be finite.")
-    if beta1 < 0.0 or beta1 >= 1.0 or beta2 < 0.0 or beta2 >= 1.0:
-        raise ValueError("rrBLUP beta1/beta2 must be in [0,1).")
-    if (not np.isfinite(eps)) or eps <= 0.0:
-        raise ValueError(f"rrBLUP eps must be > 0, got {eps!r}.")
-
-    lambda_effective = (
-        (lambda_value / float(max(1, n_train)))
-        if lambda_scale == "equation"
-        else lambda_value
-    )
-    lambda_equation = (
-        lambda_value
-        if lambda_scale == "equation"
-        else (lambda_value * float(max(1, n_train)))
-    )
-
-    row_mean: np.ndarray | None = None
-    row_inv_sd: np.ndarray | None = None
-    row_mean64: np.ndarray | None = None
-    row_inv_sd64: np.ndarray | None = None
-    train_abs_idx: np.ndarray | None = None
-    X_dense: np.ndarray | None = None
-    m_snp: int
-    m_effective: int
-    packed_maf: np.ndarray | None = None
-    packed_row_flip: np.ndarray | None = None
-    packed_n_samples = 0
-    use_packed_malpha_grad = False
-    packed_malpha_block_rows = 0
-    packed_malpha_threads = 0
-
-    if is_packed_input:
-        packed_ctx = typing.cast(dict[str, typing.Any], Xtrain)
-        packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-        maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-        if packed.ndim != 2:
-            raise ValueError("Packed rrBLUP input must have 2D packed SNP matrix.")
-        m_snp = int(packed.shape[0])
-        if int(maf.shape[0]) != m_snp:
-            raise ValueError("Packed rrBLUP input mismatch: maf length != packed SNP rows.")
-        n_samples = int(packed_ctx["n_samples"])
-        if packed_train_indices is None:
-            if int(n_samples) != n_train:
-                raise ValueError(
-                    "Packed rrBLUP requires train sample indices when train size differs from packed n_samples."
-                )
-            train_abs_idx = np.ascontiguousarray(np.arange(n_samples, dtype=np.int64))
-        else:
-            train_abs_idx = np.ascontiguousarray(
-                np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
-                dtype=np.int64,
-            )
-            if int(train_abs_idx.shape[0]) != n_train:
-                raise ValueError(
-                    f"Packed rrBLUP train index length mismatch: got {train_abs_idx.shape[0]}, expected {n_train}."
-                )
-            if np.any(train_abs_idx < 0) or np.any(train_abs_idx >= int(n_samples)):
-                raise ValueError("Packed rrBLUP train sample indices are out of range.")
-        _ensure_packed_row_flip_cached(packed_ctx)
-        row_mean = np.ascontiguousarray((2.0 * maf).astype(np.float32, copy=False))
-        var = np.asarray(2.0 * maf * (1.0 - maf), dtype=np.float32)
-        row_inv_sd = np.zeros_like(var, dtype=np.float32)
-        good = var > np.float32(std_eps)
-        row_inv_sd[good] = np.asarray(1.0 / np.sqrt(var[good], dtype=np.float32), dtype=np.float32)
-        row_mean64 = np.ascontiguousarray(np.asarray(row_mean, dtype=np.float64), dtype=np.float64)
-        row_inv_sd64 = np.ascontiguousarray(np.asarray(row_inv_sd, dtype=np.float64), dtype=np.float64)
-        packed_maf = np.ascontiguousarray(maf, dtype=np.float32)
-        packed_row_flip = np.ascontiguousarray(
-            np.asarray(_ensure_packed_row_flip_cached(packed_ctx), dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
-        packed_n_samples = int(n_samples)
-        # Packed AdamW fast gradient path can be enabled explicitly via env.
-        # Keep default conservative (off) to prioritize numerical stability.
-        use_packed_malpha_grad = bool(
-            (_jxrs is not None)
-            and hasattr(_jxrs, "packed_malpha_f64")
-            and _env_truthy("JX_RRBLUP_ADAM_PACKED_MALPHA", "0")
-        )
-        packed_malpha_block_rows = int(max(1, min(4096, int(snp_block_size), int(m_snp))))
-        rust_threads_raw = _parse_nonnegative_int(os.getenv("JX_MLM_RUST_THREADS", "").strip())
-        packed_malpha_threads = int(0 if rust_threads_raw is None else rust_threads_raw)
-        m_effective = int(np.count_nonzero(good))
-    else:
-        X_dense = np.asarray(Xtrain, dtype=np.float32)
-        if X_dense.ndim != 2:
-            raise ValueError(f"Dense rrBLUP input must be 2D, got shape={X_dense.shape}.")
-        m_snp = int(X_dense.shape[0])
-        if int(X_dense.shape[1]) != n_train:
-            raise ValueError(
-                f"Dense rrBLUP input sample mismatch: Xtrain n={X_dense.shape[1]}, y n={n_train}."
-            )
-        m_effective = int(m_snp)
-
-    if is_packed_input:
-        dense_batch_threads = 1
-    elif batch_threads_cfg > 0:
-        dense_batch_threads = int(max(1, int(batch_threads_cfg)))
-    else:
-        # Auto policy: if BLAS is already multithreaded, avoid nested oversubscription.
-        dense_batch_threads = int(total_threads_hint if blas_threads_hint <= 1 else 1)
-
-    val_idx_raw = cfg_use.get("val_indices_local", None)
-    val_loc: np.ndarray | None = None
-    if val_idx_raw is not None:
-        try:
-            v = np.asarray(val_idx_raw, dtype=np.int64).reshape(-1)
-            if int(v.size) > 0:
-                v = v[(v >= 0) & (v < n_train)]
-                if int(v.size) > 0:
-                    val_loc = np.unique(np.ascontiguousarray(v, dtype=np.int64))
-        except Exception:
-            val_loc = None
-
-    if (
-        val_loc is not None
-        and exclude_val_from_train
-        and int(val_loc.size) > 0
-        and int(val_loc.size) < n_train
-    ):
-        opt_mask = np.ones((n_train,), dtype=np.bool_)
-        opt_mask[val_loc] = False
-        opt_loc = np.ascontiguousarray(np.flatnonzero(opt_mask), dtype=np.int64)
-    else:
-        opt_loc = np.ascontiguousarray(np.arange(n_train, dtype=np.int64))
-    n_opt = int(opt_loc.size)
-    if n_opt <= 0:
-        raise ValueError("rrBLUP AdamW has zero optimization samples after validation split.")
-    opt_is_full = bool(n_opt == n_train)
-
-    beta = np.zeros((m_snp,), dtype=np.float32)
-    alpha = np.zeros((1,), dtype=np.float32)
-    m_alpha = np.zeros_like(alpha, dtype=np.float32)
-    v_alpha = np.zeros_like(alpha, dtype=np.float32)
-    m_beta = np.zeros_like(beta, dtype=np.float32)
-    v_beta = np.zeros_like(beta, dtype=np.float32)
-    step_alpha = 0
-    step_beta = 0
-    row_blocks = _iter_row_blocks(m_snp, snp_block_size)
-    rng = np.random.default_rng(seed)
-    full_batch_mode = bool(batch_size >= n_opt)
-    full_loc = np.ascontiguousarray(opt_loc, dtype=np.int64)
-    y_full = np.ascontiguousarray(y_vec[opt_loc], dtype=np.float32)
-    dense_full_batch_t: np.ndarray | None = None
-    if (not is_packed_input) and full_batch_mode:
-        assert X_dense is not None
-        if opt_is_full:
-            dense_full_batch_t = np.ascontiguousarray(X_dense.T, dtype=np.float32)
-        else:
-            dense_full_batch_t = np.ascontiguousarray(
-                np.take(X_dense, full_loc, axis=1).T,
-                dtype=np.float32,
-            )
-    dense_batch_pool: cf.ThreadPoolExecutor | None = None
-    if (not is_packed_input) and int(dense_batch_threads) > 1:
-        dense_batch_pool = cf.ThreadPoolExecutor(max_workers=int(dense_batch_threads))
-
-    def _batch_shard_ranges(batch_n: int, workers: int) -> list[tuple[int, int]]:
-        n = int(max(0, int(batch_n)))
-        k = int(max(1, int(workers)))
-        if n <= 0:
-            return []
-        if k > n:
-            k = n
-        base = n // k
-        rem = n % k
-        st = 0
-        out: list[tuple[int, int]] = []
-        for i in range(k):
-            step = int(base + (1 if i < rem else 0))
-            ed = st + step
-            if ed > st:
-                out.append((st, ed))
-            st = ed
-        return out
-
-    use_val_monitor = bool((val_loc is not None) and (int(val_loc.size) > 0))
-    use_early_stop = bool(use_val_monitor and (early_stop_patience > 0))
-    best_val_loss = np.inf
-    best_epoch = 0
-    best_alpha = float(alpha[0])
-    best_beta: np.ndarray | None = None
-    bad_epochs = 0
-    epochs_ran = 0
-    stopped_early = False
-
-    def _emit_progress(event: str, **payload: typing.Any) -> None:
-        if progress_hook is None:
-            return
-        try:
-            progress_hook(str(event), dict(payload))
-        except Exception:
-            return
-
-    def _compute_val_mse() -> float:
-        if (val_loc is None) or int(val_loc.size) <= 0:
-            return float("nan")
-        y_val = np.asarray(y_vec[val_loc], dtype=np.float32)
-        if is_packed_input:
-            assert train_abs_idx is not None
-            assert row_mean is not None
-            assert row_inv_sd is not None
-            pred_val = _predict_rrblup_packed_from_beta(
-                packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
-                sample_indices=np.ascontiguousarray(train_abs_idx[val_loc], dtype=np.int64),
-                alpha=float(alpha[0]),
-                beta=beta,
-                row_mean=row_mean,
-                row_inv_sd=row_inv_sd,
-                snp_block_size=snp_block_size,
-                sample_chunk_size=sample_chunk_size,
-            )
-        else:
-            assert X_dense is not None
-            pred_val = _predict_rrblup_dense_from_beta(
-                X=np.ascontiguousarray(np.take(X_dense, val_loc, axis=1), dtype=np.float32),
-                alpha=float(alpha[0]),
-                beta=beta,
-                snp_block_size=snp_block_size,
-            )
-        pv = np.asarray(pred_val, dtype=np.float32).reshape(-1)
-        if int(pv.size) != int(y_val.size):
-            return float("nan")
-        diff = np.asarray(pv - y_val, dtype=np.float32)
-        return float(np.mean(diff * diff, dtype=np.float64))
-
-    _emit_progress(
-        "adam_start",
-        total=int(epochs),
-        use_val_monitor=bool(use_val_monitor),
-        use_early_stop=bool(use_early_stop),
-        val_samples=int(0 if val_loc is None else int(val_loc.size)),
-        opt_samples=int(max(1, n_opt)),
-    )
-
-    try:
-        for ep in range(epochs):
-            order = (
-                full_loc
-                if full_batch_mode
-                else np.ascontiguousarray(rng.permutation(full_loc), dtype=np.int64)
-            )
-            loss_sum = 0.0
-            batch_ct = 0
-            batch_stride = n_opt if full_batch_mode else batch_size
-            for b_st in range(0, n_opt, batch_stride):
-                b_ed = min(b_st + batch_size, n_opt)
-                if full_batch_mode:
-                    loc = full_loc
-                else:
-                    loc = np.ascontiguousarray(order[b_st:b_ed], dtype=np.int64)
-                bs = int(loc.shape[0])
-                if bs <= 0:
-                    continue
-                yb = y_full if full_batch_mode else np.ascontiguousarray(y_vec[loc], dtype=np.float32)
-                x_batch_t: np.ndarray | None = None
-                resid: np.ndarray | None = None
-                grad_beta_dense: np.ndarray | None = None
-                sum_resid_dense: float | None = None
-                pred = np.full((bs,), alpha[0], dtype=np.float32)
-
-                if is_packed_input:
-                    assert train_abs_idx is not None
-                    assert row_mean is not None
-                    assert row_inv_sd is not None
-                    abs_idx = (
-                        train_abs_idx
-                        if (full_batch_mode and opt_is_full)
-                        else np.ascontiguousarray(train_abs_idx[loc], dtype=np.int64)
-                    )
-                    for st, ed, ridx in row_blocks:
-                        x = _decode_packed_block_standardized(
-                            packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
-                            row_idx=ridx,
-                            sample_indices=abs_idx,
-                            row_mean=row_mean,
-                            row_inv_sd=row_inv_sd,
-                        )
-                        pred += np.asarray(x.T @ beta[st:ed], dtype=np.float32).reshape(-1)
-                    resid = np.asarray(pred - yb, dtype=np.float32)
-                    loss_sum += float(np.mean(resid * resid, dtype=np.float64))
-                    batch_ct += 1
-                else:
-                    assert X_dense is not None
-                    use_sharded_dense = bool(
-                        dense_batch_pool is not None
-                        and int(dense_batch_threads) > 1
-                        and int(bs) >= int(dense_batch_threads)
-                    )
-                    if use_sharded_dense:
-                        def _dense_shard_job(local_st: int, local_ed: int) -> tuple[float, float, np.ndarray]:
-                            if full_batch_mode and dense_full_batch_t is not None:
-                                x_sub = np.ascontiguousarray(
-                                    dense_full_batch_t[local_st:local_ed],
-                                    dtype=np.float32,
-                                )
-                            else:
-                                loc_sub = np.ascontiguousarray(
-                                    loc[local_st:local_ed],
-                                    dtype=np.int64,
-                                )
-                                x_sub = np.ascontiguousarray(
-                                    np.take(X_dense, loc_sub, axis=1).T,
-                                    dtype=np.float32,
-                                )
-                            y_sub = np.ascontiguousarray(
-                                yb[local_st:local_ed],
-                                dtype=np.float32,
-                            )
-                            pred_sub = np.asarray(x_sub @ beta, dtype=np.float32).reshape(-1)
-                            pred_sub += np.float32(alpha[0])
-                            resid_sub = np.asarray(pred_sub - y_sub, dtype=np.float32).reshape(-1)
-                            resid64 = np.asarray(resid_sub, dtype=np.float64)
-                            sq_sum = float(np.sum(resid64 * resid64, dtype=np.float64))
-                            res_sum = float(np.sum(resid64, dtype=np.float64))
-                            grad_sub = np.asarray(x_sub.T @ resid_sub, dtype=np.float64).reshape(-1)
-                            return sq_sum, res_sum, grad_sub
-
-                        shard_ranges = _batch_shard_ranges(int(bs), int(dense_batch_threads))
-                        grad_acc = np.zeros((m_snp,), dtype=np.float64)
-                        sq_sum_acc = 0.0
-                        res_sum_acc = 0.0
-                        futures = [
-                            dense_batch_pool.submit(_dense_shard_job, int(st), int(ed))
-                            for st, ed in shard_ranges
-                        ]
-                        for fut in futures:
-                            sq_part, res_part, grad_part = fut.result()
-                            sq_sum_acc += float(sq_part)
-                            res_sum_acc += float(res_part)
-                            grad_acc += np.asarray(grad_part, dtype=np.float64).reshape(-1)
-                        loss_sum += float(sq_sum_acc / float(max(1, bs)))
-                        batch_ct += 1
-                        sum_resid_dense = float(res_sum_acc)
-                        grad_beta_dense = np.ascontiguousarray(
-                            np.asarray(grad_acc / float(max(1, bs)), dtype=np.float32).reshape(-1),
-                            dtype=np.float32,
-                        )
-                    else:
-                        # Dense mini-batch optimization:
-                        # cache sample-batch matrix once and use BLAS for both
-                        # prediction and gradient.
-                        if full_batch_mode and dense_full_batch_t is not None:
-                            x_batch_t = dense_full_batch_t
-                        else:
-                            x_batch_t = np.ascontiguousarray(
-                                np.take(X_dense, loc, axis=1).T,
-                                dtype=np.float32,
-                            )
-                        pred = np.asarray(x_batch_t @ beta, dtype=np.float32).reshape(-1)
-                        pred += np.float32(alpha[0])
-                        resid = np.asarray(pred - yb, dtype=np.float32)
-                        loss_sum += float(np.mean(resid * resid, dtype=np.float64))
-                        batch_ct += 1
-
-                step_alpha += 1
-                if sum_resid_dense is not None:
-                    grad_alpha = np.asarray([float(sum_resid_dense / float(max(1, bs)))], dtype=np.float32)
-                else:
-                    assert resid is not None
-                    grad_alpha = np.asarray([float(np.mean(resid, dtype=np.float64))], dtype=np.float32)
-                _adamw_update_inplace_f32(
-                    param=alpha,
-                    grad=grad_alpha,
-                    m1=m_alpha,
-                    m2=v_alpha,
-                    step=step_alpha,
-                    lr=lr,
-                    beta1=beta1,
-                    beta2=beta2,
-                    eps=eps,
-                    weight_decay=0.0,
-                )
-
-                step_beta += 1
-                inv_bs = np.float32(1.0 / float(bs))
-                if is_packed_input:
-                    assert resid is not None
-                    assert train_abs_idx is not None
-                    assert row_mean is not None
-                    assert row_inv_sd is not None
-                    assert row_mean64 is not None
-                    assert row_inv_sd64 is not None
-                    assert packed_maf is not None
-                    assert packed_row_flip is not None
-                    abs_idx = (
-                        train_abs_idx
-                        if (full_batch_mode and opt_is_full)
-                        else np.ascontiguousarray(train_abs_idx[loc], dtype=np.int64)
-                    )
-                    used_fast_grad = False
-                    if use_packed_malpha_grad:
-                        try:
-                            resid64 = np.ascontiguousarray(
-                                np.asarray(resid, dtype=np.float64).reshape(-1),
-                                dtype=np.float64,
-                            )
-                            m_alpha_raw = _jxrs.packed_malpha_f64(  # type: ignore[union-attr]
-                                typing.cast(dict[str, typing.Any], Xtrain)["packed"],
-                                int(packed_n_samples),
-                                packed_row_flip,
-                                packed_maf,
-                                np.ascontiguousarray(abs_idx, dtype=np.int64),
-                                resid64,
-                                block_rows=int(packed_malpha_block_rows),
-                                threads=int(packed_malpha_threads),
-                            )
-                            m_alpha_vec = np.ascontiguousarray(
-                                np.asarray(m_alpha_raw, dtype=np.float64).reshape(-1),
-                                dtype=np.float64,
-                            )
-                            if int(m_alpha_vec.shape[0]) != int(m_snp):
-                                raise RuntimeError(
-                                    "packed_malpha_f64 length mismatch: "
-                                    f"got {m_alpha_vec.shape[0]}, expected {m_snp}"
-                                )
-                            sum_resid = float(np.sum(resid64, dtype=np.float64))
-                            grad_all = (
-                                (m_alpha_vec - (row_mean64 * sum_resid))
-                                * row_inv_sd64
-                                * float(inv_bs)
-                            )
-                            grad_all_f32 = np.ascontiguousarray(
-                                np.asarray(grad_all, dtype=np.float32).reshape(-1),
-                                dtype=np.float32,
-                            )
-                            _adamw_update_inplace_f32(
-                                param=beta,
-                                grad=grad_all_f32,
-                                m1=m_beta,
-                                m2=v_beta,
-                                step=step_beta,
-                                lr=lr,
-                                beta1=beta1,
-                                beta2=beta2,
-                                eps=eps,
-                                weight_decay=float(lambda_effective),
-                            )
-                            used_fast_grad = True
-                        except Exception:
-                            use_packed_malpha_grad = False
-                    if not used_fast_grad:
-                        for st, ed, ridx in row_blocks:
-                            x = _decode_packed_block_standardized(
-                                packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
-                                row_idx=ridx,
-                                sample_indices=abs_idx,
-                                row_mean=row_mean,
-                                row_inv_sd=row_inv_sd,
-                            )
-                            grad_beta = np.asarray((x @ resid) * inv_bs, dtype=np.float32).reshape(-1)
-                            _adamw_update_inplace_f32(
-                                param=beta[st:ed],
-                                grad=grad_beta,
-                                m1=m_beta[st:ed],
-                                m2=v_beta[st:ed],
-                                step=step_beta,
-                                lr=lr,
-                                beta1=beta1,
-                                beta2=beta2,
-                                eps=eps,
-                                weight_decay=float(lambda_effective),
-                            )
-                else:
-                    if grad_beta_dense is None:
-                        assert x_batch_t is not None
-                        assert resid is not None
-                        grad_beta_dense = np.asarray(
-                            (x_batch_t.T @ resid) * inv_bs,
-                            dtype=np.float32,
-                        ).reshape(-1)
-                    _adamw_update_inplace_f32(
-                        param=beta,
-                        grad=grad_beta_dense,
-                        m1=m_beta,
-                        m2=v_beta,
-                        step=step_beta,
-                        lr=lr,
-                        beta1=beta1,
-                        beta2=beta2,
-                        eps=eps,
-                        weight_decay=float(lambda_effective),
-                    )
-
-            epochs_ran = ep + 1
-            mean_loss = (loss_sum / float(max(1, batch_ct)))
-            val_mse = _compute_val_mse() if use_val_monitor else float("nan")
-            _emit_progress(
-                "adam_epoch",
-                epoch=int(ep + 1),
-                total=int(epochs),
-                train_mse=float(mean_loss),
-                val_mse=float(val_mse),
-                best_epoch=int(max(0, int(best_epoch))),
-                best_val_loss=float(best_val_loss),
-            )
-            if use_val_monitor and np.isfinite(val_mse):
-                improved = (best_epoch <= 0) or (val_mse < (best_val_loss - early_stop_min_delta))
-                if improved:
-                    best_val_loss = float(val_mse)
-                    best_epoch = ep + 1
-                    best_alpha = float(alpha[0])
-                    best_beta = np.ascontiguousarray(beta.copy(), dtype=np.float32)
-                    bad_epochs = 0
-                else:
-                    bad_epochs += 1
-                if use_early_stop and (ep + 1) >= early_stop_warmup and bad_epochs >= early_stop_patience:
-                    if _GS_DEBUG_STAGE:
-                        print(
-                            f"[GS-DEBUG] rrBLUP-AdamW early-stop at epoch={ep + 1}, "
-                            f"best_epoch={best_epoch}, best_val_mse={best_val_loss:.6g}",
-                            flush=True,
-                        )
-                    stopped_early = True
-                    break
-
-            if _GS_DEBUG_STAGE and log_every > 0 and ((ep + 1) % log_every == 0):
-                if np.isfinite(val_mse):
-                    print(
-                        f"[GS-DEBUG] rrBLUP-AdamW epoch={ep + 1}/{epochs} "
-                        f"train_mse={mean_loss:.6g} val_mse={float(val_mse):.6g}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[GS-DEBUG] rrBLUP-AdamW epoch={ep + 1}/{epochs} train_mse={mean_loss:.6g}",
-                        flush=True,
-                    )
-    finally:
-        if dense_batch_pool is not None:
-            dense_batch_pool.shutdown(wait=True)
-
-    if use_val_monitor and (best_beta is not None) and (best_epoch > 0):
-        alpha[0] = np.float32(best_alpha)
-        beta[:] = np.asarray(best_beta, dtype=np.float32)
-    else:
-        best_epoch = max(1, int(epochs_ran))
-        if not np.isfinite(best_val_loss):
-            best_val_loss = float("nan")
-
-    _emit_progress(
-        "adam_end",
-        epochs_ran=int(max(1, int(epochs_ran))),
-        total=int(epochs),
-        best_epoch=int(max(1, int(best_epoch))),
-        best_val_loss=float(best_val_loss),
-        stopped_early=bool(stopped_early),
-    )
-
-    return {
-        "alpha": float(alpha[0]),
-        "beta": np.ascontiguousarray(beta, dtype=np.float32),
-        "lambda_effective": float(lambda_effective),
-        "lambda_equation": float(lambda_equation),
-        "snp_block_size": int(snp_block_size),
-        "sample_chunk_size": int(sample_chunk_size),
-        "batch_threads": int(max(1, int(dense_batch_threads))),
-        "is_packed": bool(is_packed_input),
-        "row_mean": row_mean,
-        "row_inv_sd": row_inv_sd,
-        "train_abs_idx": train_abs_idx,
-        "m_effective": int(max(1, m_effective)),
-        "best_epoch": int(max(1, int(best_epoch))),
-        "best_val_loss": float(best_val_loss),
-        "epochs_ran": int(max(1, int(epochs_ran))),
-        "stopped_early": bool(stopped_early),
-        "opt_samples": int(max(1, n_opt)),
-        "val_samples": int(0 if val_loc is None else int(val_loc.size)),
-    }
-
 
 def GSapi(
     Y: np.ndarray,
@@ -8899,8 +7762,8 @@ def GSapi(
     packed_train_indices: np.ndarray | None = None,
     packed_test_indices: np.ndarray | None = None,
     train_pred_indices: np.ndarray | None = None,
-    rrblup_solver: typing.Literal["exact", "adamw", "pcg", "auto"] = "pcg",
-    rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
+    rrblup_solver: typing.Literal["exact", "pcg", "auto"] = "pcg",
+    rrblup_cfg: dict[str, typing.Any] | None = None,
     rrblup_runtime_state: dict[str, typing.Any] | None = None,
     rrblup_progress_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
     gblup_runtime_state: dict[str, typing.Any] | None = None,
@@ -8936,16 +7799,16 @@ def GSapi(
     train_pred_indices : np.ndarray, optional
         Optional local indices (relative to Xtrain columns) used for train-set
         prediction. When provided, only these training samples are predicted.
-    rrblup_solver : {'exact', 'adamw', 'pcg', 'auto'}, optional
-        rrBLUP backend policy. `exact` keeps the legacy solver; `adamw`
-        enables mini-batch AdamW; `pcg` enables Rust packed-BED PCG solver;
-        `auto` chooses exact for n<=10k and PCG for n>10k.
-    rrblup_adamw_cfg : dict, optional
-        AdamW rrBLUP configuration used when backend resolves to `adamw`.
+    rrblup_solver : {'exact', 'pcg', 'auto'}, optional
+        rrBLUP backend policy. `exact` keeps the exact solver; `pcg`
+        enables the Rust packed-BED PCG solver; `auto` chooses a backend
+        from sample and marker dimensions.
+    rrblup_cfg : dict, optional
+        Shared rrBLUP configuration for exact/PCG backends.
     rrblup_runtime_state : dict, optional
-        Mutable runtime state sink for rrBLUP AdamW (selected tuning params, diagnostics).
+        Mutable runtime state sink for rrBLUP diagnostics.
     rrblup_progress_hook : callable, optional
-        Progress callback for rrBLUP AdamW epochs and auto-grid trials.
+        Progress callback for rrBLUP solver stages.
     gblup_runtime_state : dict, optional
         Mutable runtime state sink for packed Rust GBLUP diagnostics
         (eigh backend/time, REML lambda/likelihood).
@@ -9013,15 +7876,15 @@ def GSapi(
                 solver=str(rrblup_solver),
                 n_train=n_train_local,
                 n_snp=n_snp_local,
-                cfg=rrblup_adamw_cfg,
+                cfg=rrblup_cfg,
             )
             if method == "rrBLUP"
             else "exact"
         )
         requested_rr_solver = str(rrblup_solver).strip().lower()
-        if requested_rr_solver not in {"exact", "adamw", "pcg", "auto"}:
+        if requested_rr_solver not in {"exact", "pcg", "auto"}:
             requested_rr_solver = "auto"
-        rr_cfg_shared = dict(rrblup_adamw_cfg or {})
+        rr_cfg_shared = dict(rrblup_cfg or {})
         rr_std_mode = _resolve_rrblup_standardized_mode(rr_cfg_shared)
         requested_rr_exact_backend = str(
             rr_cfg_shared.get("exact_backend", "auto")
@@ -9050,11 +7913,6 @@ def GSapi(
             _set_rrblup_solver_state(str(resolved_rr_solver))
             if rrblup_runtime_state is not None:
                 rrblup_runtime_state["standardized_mode"] = str(rr_std_mode)
-            if is_packed_input and resolved_rr_solver == "adamw":
-                _set_rrblup_solver_state(
-                    "pcg",
-                    "packed_adamw_removed_use_streaming_pcg",
-                )
 
         def _set_rrblup_exact_backend_state(
             backend_name: str,
@@ -9774,7 +8632,7 @@ def GSapi(
                 _set_rrblup_solver_state("exact", "rust_rrblup_pcg_kernel_unavailable")
             else:
                 packed_train = typing.cast(dict[str, typing.Any], Xtrain)
-                pcg_debug_mode = bool((rrblup_adamw_cfg or {}).get("debug_mode", False)) or bool(
+                pcg_debug_mode = bool((rrblup_cfg or {}).get("debug_mode", False)) or bool(
                     _GS_DEBUG_STAGE
                 )
                 source_prefix_raw = packed_train.get("source_prefix", None)
@@ -9801,7 +8659,7 @@ def GSapi(
                 ) = _packed_gblup_stream_metadata(
                     packed_train,
                     mode="a",
-                    block_rows=int(max(1, int((rrblup_adamw_cfg or {}).get("pcg_block_rows", 4096)))),
+                    block_rows=int(max(1, int((rrblup_cfg or {}).get("pcg_block_rows", 4096)))),
                 )
                 # rrBLUP-PCG is intentionally metadata-stream only.  The
                 # source-row map is required because filtered metadata may be
@@ -9840,7 +8698,7 @@ def GSapi(
                         dtype=np.int64,
                     )
 
-                rr_cfg = dict(rrblup_adamw_cfg or {})
+                rr_cfg = dict(rrblup_cfg or {})
                 rr_operator_mode = _resolve_rrblup_operator_mode(rr_cfg)
                 rrblup_pcg_fn = (
                     None
@@ -10362,382 +9220,6 @@ def GSapi(
                     np.asarray(pred_test, dtype=float).reshape(-1, 1),
                     float(pve),
                 )
-        if method == "rrBLUP" and resolved_rr_solver == "adamw":
-            rr_cfg_base = dict(rrblup_adamw_cfg or {})
-            adamw_lambda_auto_info: dict[str, typing.Any] | None = None
-            adamw_lambda_auto_enabled = _cfg_truthy(
-                rr_cfg_base.get("lambda_auto", "on"),
-                default=True,
-            )
-            if bool(adamw_lambda_auto_enabled) and bool(is_packed_input):
-                try:
-                    packed_train = typing.cast(dict[str, typing.Any], Xtrain)
-                    n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
-                    if packed_train_indices is None:
-                        if int(packed_train["n_samples"]) != n_train_expected:
-                            raise ValueError(
-                                "Packed rrBLUP-AdamW lambda-auto requires packed_train_indices "
-                                "when n_train differs from packed n_samples."
-                            )
-                        train_abs_auto = np.ascontiguousarray(
-                            np.arange(int(packed_train["n_samples"]), dtype=np.int64),
-                            dtype=np.int64,
-                        )
-                    else:
-                        train_abs_auto = np.ascontiguousarray(
-                            np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
-                            dtype=np.int64,
-                        )
-                    if int(train_abs_auto.shape[0]) != n_train_expected:
-                        raise ValueError(
-                            "Packed rrBLUP-AdamW lambda-auto train index mismatch: "
-                            f"indices={train_abs_auto.shape[0]}, y={n_train_expected}."
-                        )
-                    adamw_lambda_auto_info = _estimate_rrblup_lambda_subsample_reml(
-                        y_train=np.asarray(Y, dtype=np.float64).reshape(-1),
-                        packed_ctx=packed_train,
-                        train_sample_indices=train_abs_auto,
-                        n_jobs=max(1, int(n_jobs)),
-                        cfg=rr_cfg_base,
-                        progress_hook=lambda event, payload: _emit_rrblup_progress(
-                            str(event),
-                            **dict(payload),
-                        ),
-                    )
-                    lam_auto = float(adamw_lambda_auto_info.get("lambda_equation", np.nan))
-                    if np.isfinite(lam_auto) and lam_auto > 0.0:
-                        lam_auto_raw = _rrblup_lambda_equation_to_raw(
-                            lambda_equation=float(lam_auto),
-                            lambda_scale=str(rr_cfg_base.get("lambda_scale", "equation")),
-                            n_train=int(n_train_local),
-                        )
-                        rr_cfg_base["lambda_value"] = float(lam_auto_raw)
-                except Exception:
-                    adamw_lambda_auto_info = None
-
-            auto_grid_enabled = _cfg_truthy(rr_cfg_base.get("auto_grid", "on"), default=True)
-            grid_candidates = _build_rrblup_adamw_grid(rr_cfg_base) if auto_grid_enabled else []
-            min_grid_samples = int(max(16, int(rr_cfg_base.get("grid_min_samples", 256))))
-            use_auto_grid = bool(
-                auto_grid_enabled
-                and len(grid_candidates) > 1
-                and n_train_local >= min_grid_samples
-            )
-            selected_cfg = dict(rr_cfg_base)
-            trial_rows: list[dict[str, typing.Any]] = []
-
-            if use_auto_grid:
-                val_idx = _build_rrblup_validation_indices(
-                    n_train=n_train_local,
-                    cfg=rr_cfg_base,
-                )
-                if val_idx is not None and int(val_idx.size) > 0:
-                    trial_epochs = int(
-                        max(
-                            1,
-                            min(
-                                int(rr_cfg_base.get("epochs", 60)),
-                                int(rr_cfg_base.get("grid_trial_epochs", 40)),
-                            ),
-                        )
-                    )
-                    best_score = np.inf
-                    best_row: dict[str, typing.Any] | None = None
-                    base_lambda = float(max(float(rr_cfg_base.get("lambda_value", 1.0)), 1e-8))
-                    base_lr = float(rr_cfg_base.get("lr", 1e-2))
-                    baseline_row: dict[str, typing.Any] | None = None
-                    for trial_id, (lam_try, lr_try) in enumerate(grid_candidates, start=1):
-                        cfg_trial = dict(rr_cfg_base)
-                        cfg_trial["lambda_value"] = float(lam_try)
-                        cfg_trial["lr"] = float(lr_try)
-                        cfg_trial["epochs"] = int(trial_epochs)
-                        cfg_trial["val_indices_local"] = np.ascontiguousarray(
-                            np.asarray(val_idx, dtype=np.int64).reshape(-1),
-                            dtype=np.int64,
-                        )
-                        cfg_trial["exclude_val_from_train"] = True
-                        cfg_trial["early_stop_patience"] = int(
-                            max(0, int(rr_cfg_base.get("es_patience", 5)))
-                        )
-                        cfg_trial["early_stop_warmup"] = int(
-                            max(1, int(rr_cfg_base.get("es_warmup", 5)))
-                        )
-                        cfg_trial["early_stop_min_delta"] = float(
-                            max(0.0, float(rr_cfg_base.get("es_min_delta", 1e-5)))
-                        )
-                        fit_trial = _fit_rrblup_adamw_cpu(
-                            y=np.asarray(Y, dtype=np.float32).reshape(-1),
-                            Xtrain=Xtrain,
-                            is_packed_input=bool(is_packed_input),
-                            packed_train_indices=packed_train_indices,
-                            cfg=cfg_trial,
-                            progress_hook=(
-                                lambda event, payload, trial_id=trial_id, trial_total=len(grid_candidates):
-                                    _emit_rrblup_progress(
-                                        event,
-                                        stage="grid",
-                                        trial_id=int(trial_id),
-                                        trial_total=int(trial_total),
-                                        **dict(payload),
-                                    )
-                            ),
-                        )
-                        trial_val = float(fit_trial.get("best_val_loss", np.nan))
-                        trial_epoch = int(max(1, int(fit_trial.get("best_epoch", trial_epochs))))
-                        trial_row = {
-                            "id": int(trial_id),
-                            "lambda": float(lam_try),
-                            "lr": float(lr_try),
-                            "val_mse": float(trial_val),
-                            "best_epoch": int(trial_epoch),
-                        }
-                        trial_rows.append(trial_row)
-                        if np.isclose(float(lam_try), base_lambda) and np.isclose(float(lr_try), base_lr):
-                            baseline_row = trial_row
-                        if np.isfinite(trial_val) and (trial_val < best_score):
-                            best_score = float(trial_val)
-                            best_row = trial_row
-                    if best_row is not None and baseline_row is not None:
-                        best_val = float(best_row["val_mse"])
-                        base_val = float(baseline_row["val_mse"])
-                        min_rel_improve = float(
-                            max(0.0, float(rr_cfg_base.get("grid_switch_min_improve", 0.02)))
-                        )
-                        if np.isfinite(best_val) and np.isfinite(base_val):
-                            rel_improve = float((base_val - best_val) / max(1e-12, abs(base_val)))
-                            if rel_improve < min_rel_improve:
-                                best_row = baseline_row
-                    if best_row is None and len(grid_candidates) > 0:
-                        # Guardrail: when all trial scores are non-finite, fall back to
-                        # the first grid candidate (anchor lambda) instead of user-input
-                        # low-lambda defaults that can destabilize AdamW training.
-                        best_row = {
-                            "id": 0,
-                            "lambda": float(grid_candidates[0][0]),
-                            "lr": float(grid_candidates[0][1]),
-                            "val_mse": float("nan"),
-                            "best_epoch": int(trial_epochs),
-                        }
-                    if best_row is not None:
-                        selected_cfg["lambda_value"] = float(best_row["lambda"])
-                        selected_cfg["lr"] = float(best_row["lr"])
-                        selected_cfg["epochs"] = int(max(1, int(rr_cfg_base.get("epochs", 60))))
-                        if _GS_DEBUG_STAGE:
-                            print(
-                                "[GS-DEBUG] rrBLUP-AdamW auto-grid selected "
-                                f"lambda={float(best_row['lambda']):.6g}, "
-                                f"lr={float(best_row['lr']):.6g}, "
-                                f"epochs={int(selected_cfg['epochs'])}, "
-                                f"val_mse={float(best_row['val_mse']):.6g}",
-                                flush=True,
-                            )
-                elif _GS_DEBUG_STAGE:
-                    print(
-                        "[GS-DEBUG] rrBLUP-AdamW auto-grid skipped: validation split unavailable.",
-                        flush=True,
-                    )
-
-            fit = _fit_rrblup_adamw_cpu(
-                y=np.asarray(Y, dtype=np.float32).reshape(-1),
-                Xtrain=Xtrain,
-                is_packed_input=bool(is_packed_input),
-                packed_train_indices=packed_train_indices,
-                cfg=selected_cfg,
-                progress_hook=(
-                    lambda event, payload: _emit_rrblup_progress(
-                        event,
-                        stage="fit",
-                        **dict(payload),
-                    )
-                ),
-            )
-            if len(trial_rows) > 0:
-                fit["auto_grid_trials"] = trial_rows
-                fit["auto_grid_selected_lambda"] = float(selected_cfg.get("lambda_value", np.nan))
-                fit["auto_grid_selected_lr"] = float(selected_cfg.get("lr", np.nan))
-                fit["auto_grid_selected_epochs"] = int(selected_cfg.get("epochs", fit.get("best_epoch", 1)))
-            _set_rrblup_solver_state("adamw")
-            if rrblup_runtime_state is not None:
-                rrblup_runtime_state["auto_grid_enabled"] = bool(use_auto_grid)
-                rrblup_runtime_state["selected_lambda"] = float(selected_cfg.get("lambda_value", np.nan))
-                rrblup_runtime_state["lambda_source"] = (
-                    str(adamw_lambda_auto_info.get("strategy", "lambda_auto")).strip()
-                    if (adamw_lambda_auto_info is not None)
-                    else "manual"
-                )
-                rrblup_runtime_state["lambda_auto_enabled"] = bool(adamw_lambda_auto_enabled)
-                rrblup_runtime_state["selected_lr"] = float(selected_cfg.get("lr", np.nan))
-                rrblup_runtime_state["selected_epochs"] = int(selected_cfg.get("epochs", fit.get("best_epoch", 1)))
-                rrblup_runtime_state["best_epoch"] = int(max(1, int(fit.get("best_epoch", 1))))
-                rrblup_runtime_state["epochs_ran"] = int(max(1, int(fit.get("epochs_ran", fit.get("best_epoch", 1)))))
-                rrblup_runtime_state["stopped_early"] = bool(fit.get("stopped_early", False))
-                rrblup_runtime_state["best_val_loss"] = float(fit.get("best_val_loss", np.nan))
-                _sync_rrblup_he_state(rrblup_runtime_state, adamw_lambda_auto_info)
-                if len(trial_rows) > 0:
-                    rrblup_runtime_state["auto_grid_trials"] = trial_rows
-            if _GS_DEBUG_STAGE:
-                print(
-                    f"[GS-DEBUG] GSapi model_fit_done method={method}(adamw) "
-                    f"elapsed={time.time() - t_fit:.3f}s",
-                    flush=True,
-                )
-                t_pred = time.time()
-
-            alpha_hat = float(fit["alpha"])
-            beta_hat = np.ascontiguousarray(np.asarray(fit["beta"], dtype=np.float32).reshape(-1))
-            snp_block = int(fit["snp_block_size"])
-            sample_chunk = int(fit["sample_chunk_size"])
-
-            if is_packed_input:
-                packed_train = typing.cast(dict[str, typing.Any], Xtrain)
-                n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
-                if packed_train_indices is None:
-                    if int(packed_train["n_samples"]) != n_train_expected:
-                        raise ValueError(
-                            "Packed rrBLUP AdamW prediction requires packed_train_indices when n_train differs from packed n_samples."
-                        )
-                    train_abs = np.ascontiguousarray(
-                        np.arange(int(packed_train["n_samples"]), dtype=np.int64)
-                    )
-                else:
-                    train_abs = np.ascontiguousarray(
-                        np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
-                        dtype=np.int64,
-                    )
-                if int(train_abs.shape[0]) != n_train_expected:
-                    raise ValueError(
-                        f"Packed rrBLUP AdamW train index mismatch: got {train_abs.shape[0]}, expected {n_train_expected}."
-                    )
-                row_mean = np.ascontiguousarray(
-                    np.asarray(fit["row_mean"], dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                )
-                row_inv_sd = np.ascontiguousarray(
-                    np.asarray(fit["row_inv_sd"], dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                )
-                pred_train_full = _predict_rrblup_packed_from_beta(
-                    packed_ctx=packed_train,
-                    sample_indices=train_abs,
-                    alpha=alpha_hat,
-                    beta=beta_hat,
-                    row_mean=row_mean,
-                    row_inv_sd=row_inv_sd,
-                    snp_block_size=snp_block,
-                    sample_chunk_size=sample_chunk,
-                )
-                if (packed_test_indices is None) or (int(np.asarray(packed_test_indices).size) == 0):
-                    pred_test = np.zeros((0, 1), dtype=float)
-                else:
-                    pred_test = _predict_rrblup_packed_from_beta(
-                        packed_ctx=typing.cast(dict[str, typing.Any], Xtest),
-                        sample_indices=np.ascontiguousarray(
-                            np.asarray(packed_test_indices, dtype=np.int64).reshape(-1),
-                            dtype=np.int64,
-                        ),
-                        alpha=alpha_hat,
-                        beta=beta_hat,
-                        row_mean=row_mean,
-                        row_inv_sd=row_inv_sd,
-                        snp_block_size=snp_block,
-                        sample_chunk_size=sample_chunk,
-                    )
-            else:
-                dense_train = np.asarray(Xtrain, dtype=np.float32)
-                pred_train_full = _predict_rrblup_dense_from_beta(
-                    X=dense_train,
-                    alpha=alpha_hat,
-                    beta=beta_hat,
-                    snp_block_size=snp_block,
-                )
-                dense_test = np.asarray(Xtest, dtype=np.float32)
-                if int(dense_test.shape[1]) <= 0:
-                    pred_test = np.zeros((0, 1), dtype=float)
-                else:
-                    pred_test = _predict_rrblup_dense_from_beta(
-                        X=dense_test,
-                        alpha=alpha_hat,
-                        beta=beta_hat,
-                        snp_block_size=snp_block,
-                    )
-
-            y_train_vec = np.asarray(Y, dtype=np.float64).reshape(-1)
-            pred_train_vec = np.asarray(pred_train_full, dtype=np.float64).reshape(-1)
-            g_hat = pred_train_vec - float(alpha_hat)
-            var_g = float(np.var(g_hat, ddof=1))
-            var_e = float(np.var(y_train_vec - pred_train_vec, ddof=1))
-            denom = var_g + var_e
-            pve_trainvar = float(var_g / denom) if (np.isfinite(denom) and denom > 0.0) else float("nan")
-            lambda_eq = float(fit.get("lambda_equation", np.nan))
-            m_eff = int(max(1, int(fit.get("m_effective", int(beta_hat.shape[0])))))
-            pve_lambda = float("nan")
-            if np.isfinite(lambda_eq) and lambda_eq >= 0.0:
-                pve_lambda = float(m_eff / (m_eff + lambda_eq))
-            rr_cfg = rrblup_adamw_cfg or {}
-            pve_mode = str(rr_cfg.get("pve_mode", "lambda")).strip().lower()
-            if pve_mode not in {"lambda", "trainvar"}:
-                pve_mode = "lambda"
-            pve = pve_lambda if (pve_mode == "lambda") else pve_trainvar
-
-            if rrblup_runtime_state is not None:
-                rrblup_runtime_state["pve_mode_used"] = str(pve_mode)
-                rrblup_runtime_state["pve_used"] = float(pve)
-                rrblup_runtime_state["pve_pheno_scale"] = float(pve)
-                rrblup_runtime_state["pve_lambda"] = float(pve_lambda)
-                rrblup_runtime_state["pve_pheno_scale_lambda"] = float(pve_lambda)
-                rrblup_runtime_state["pve_trainvar"] = float(pve_trainvar)
-                rrblup_runtime_state["pve_pheno_scale_trainvar"] = float(pve_trainvar)
-                rrblup_runtime_state["lambda_equation"] = float(lambda_eq)
-                rrblup_runtime_state["m_effective"] = int(m_eff)
-            if model_state is not None:
-                model_state["kind"] = "rrblup_linear"
-                model_state["method"] = "rrBLUP"
-                model_state["solver"] = "adamw"
-                model_state["alpha"] = float(alpha_hat)
-                model_state["beta"] = np.ascontiguousarray(
-                    np.asarray(beta_hat, dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                )
-                model_state["packed"] = bool(is_packed_input)
-                model_state["standardized"] = True
-                if is_packed_input:
-                    model_state["row_mean"] = np.ascontiguousarray(
-                        np.asarray(row_mean, dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    )
-                    model_state["row_inv_sd"] = np.ascontiguousarray(
-                        np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    )
-                model_state["snp_block_size"] = int(max(1, int(snp_block)))
-                model_state["sample_chunk_size"] = int(max(1, int(sample_chunk)))
-                model_state["pve"] = float(pve)
-
-            if need_train_pred:
-                if train_pred_idx is None:
-                    pred_train = pred_train_full
-                elif int(train_pred_idx.size) == 0:
-                    pred_train = np.zeros((0, 1), dtype=float)
-                else:
-                    pred_train = np.asarray(
-                        np.asarray(pred_train_full, dtype=np.float64)[train_pred_idx],
-                        dtype=np.float64,
-                    ).reshape(-1, 1)
-            else:
-                pred_train = np.zeros((0, 1), dtype=float)
-            if _GS_DEBUG_STAGE:
-                print(
-                    f"[GS-DEBUG] GSapi predict_done method={method}(adamw) "
-                    f"elapsed={time.time() - t_pred:.3f}s pve_mode={pve_mode} "
-                    f"pve={float(pve):.6g} pve_lambda={float(pve_lambda):.6g} "
-                    f"pve_trainvar={float(pve_trainvar):.6g}",
-                    flush=True,
-                )
-            return (
-                np.asarray(pred_train, dtype=float).reshape(-1, 1),
-                np.asarray(pred_test, dtype=float).reshape(-1, 1),
-                float(pve),
-            )
 
         if method == "rrBLUP" and resolved_rr_solver == "exact":
             rr_operator_mode = _resolve_rrblup_operator_mode(rr_cfg_shared)
@@ -12031,7 +10513,7 @@ def _run_method_task(
     rrblup_progress_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
     limit_predtrain: int | None = None,
     rrblup_solver: str = "pcg",
-    rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
+    rrblup_cfg: dict[str, typing.Any] | None = None,
     bayes_auto_r2_cache: dict[str, float] | None = None,
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
     bayes_pi: float | None = None,
@@ -12100,7 +10582,7 @@ def _run_method_task(
     cv_skipped = bool((cv_splits is None) or (len(cv_splits) == 0))
     final_fit_skipped = False
     final_predict_skipped = False
-    rrblup_cfg_base = dict(rrblup_adamw_cfg or {})
+    rrblup_cfg_base = dict(rrblup_cfg or {})
     if method == "rrBLUP":
         rrblup_cfg_base["auto_pcg_ref_n"] = int(np.asarray(train_pheno).reshape(-1).shape[0])
     packed_lmm_methods = {
@@ -12165,11 +10647,7 @@ def _run_method_task(
                 # Fail-open: if shared pre-estimation fails, fallback to fold-level auto-r2.
                 bayes_cv_shared_r2 = float("nan")
 
-    rrblup_cv_reuse_enabled = bool(
-        method == "rrBLUP"
-        and cv_splits is not None
-        and _cfg_truthy(rrblup_cfg_base.get("grid_reuse_cv", "on"), default=True)
-    )
+    rrblup_cv_reuse_enabled = bool(method == "rrBLUP" and cv_splits is not None)
     rrblup_cv_selected: dict[str, float] | None = None
     packed_payload = (
         typing.cast(dict[str, typing.Any], packed_ctx)
@@ -13018,7 +11496,7 @@ def _run_method_task(
                     fold_train = train_snp[:, fold_train_idx]
                     fold_test = train_snp[:, fold_test_idx]
                     fold_pca = pca_dec
-                rr_cfg_call: dict[str, typing.Any] | None = rrblup_adamw_cfg
+                rr_cfg_call: dict[str, typing.Any] | None = rrblup_cfg
                 rr_state_call: dict[str, typing.Any] | None = None
                 if method == "rrBLUP":
                     rr_cfg_call = dict(rrblup_cfg_base)
@@ -13030,17 +11508,9 @@ def _run_method_task(
                     else:
                         # REML-first mode can keep fold-level HE disabled.
                         rr_cfg_call["he_enable"] = "off"
-                    if (
-                        rrblup_cv_reuse_enabled
-                        and rrblup_cv_selected is not None
-                        and ("lr" in rrblup_cv_selected)
-                    ):
+                    if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
                         rr_cfg_call["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
-                        rr_sel_lr = float(rrblup_cv_selected.get("lr", np.nan))
-                        if np.isfinite(rr_sel_lr) and rr_sel_lr > 0.0:
-                            rr_cfg_call["lr"] = float(rr_sel_lr)
                         rr_cfg_call["lambda_auto"] = "off"
-                        rr_cfg_call["auto_grid"] = "off"
                     rr_state_call = {}
                 rr_progress_call = None
                 gblup_state_call: dict[str, typing.Any] | None = None
@@ -13083,7 +11553,7 @@ def _run_method_task(
                     packed_test_indices=fold_test_idx_arg,
                     train_pred_indices=fold_train_pred_local_idx,
                     rrblup_solver=typing.cast(typing.Any, rrblup_solver),
-                    rrblup_adamw_cfg=rr_cfg_call,
+                    rrblup_cfg=rr_cfg_call,
                     rrblup_runtime_state=rr_state_call,
                     rrblup_progress_hook=rr_progress_call,
                     gblup_runtime_state=gblup_state_call,
@@ -13154,26 +11624,15 @@ def _run_method_task(
                     and rr_state_call is not None
                 ):
                     sel_lam = float(rr_state_call.get("selected_lambda", np.nan))
-                    sel_lr = float(rr_state_call.get("selected_lr", np.nan))
-                    solver_eff_call = str(
-                        rr_state_call.get(
-                            "solver_effective",
-                            rr_state_call.get("solver", ""),
-                        )
-                    ).strip().lower()
                     if (
                         np.isfinite(sel_lam)
                         and sel_lam >= 0.0
-                        and solver_eff_call == "adamw"
-                        and np.isfinite(sel_lr)
-                        and sel_lr > 0.0
                     ):
                         rrblup_cv_selected = {"lambda_value": float(sel_lam)}
-                        rrblup_cv_selected["lr"] = float(sel_lr)
                         if _GS_DEBUG_STAGE:
                             print(
                                 "[GS-DEBUG] rrBLUP CV reuse armed "
-                                f"lambda={sel_lam:.6g} lr={float(sel_lr):.6g}",
+                                f"lambda={sel_lam:.6g}",
                                 flush=True,
                             )
                 if method == "rrBLUP" and rr_state_call is not None:
@@ -13536,17 +11995,9 @@ def _run_method_task(
             gblup_final_state = _aggregate_gblup_vc_rows(pve_hint=float(pve_final))
         if method == "rrBLUP":
             rrblup_final_cfg = dict(rrblup_cfg_base)
-            if (
-                rrblup_cv_reuse_enabled
-                and rrblup_cv_selected is not None
-                and ("lr" in rrblup_cv_selected)
-            ):
+            if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
                 rrblup_final_cfg["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
-                rr_sel_lr = float(rrblup_cv_selected.get("lr", np.nan))
-                if np.isfinite(rr_sel_lr) and rr_sel_lr > 0.0:
-                    rrblup_final_cfg["lr"] = float(rr_sel_lr)
                 rrblup_final_cfg["lambda_auto"] = "off"
-                rrblup_final_cfg["auto_grid"] = "off"
             tv = np.asarray(
                 [float(x.get("pve_trainvar", np.nan)) for x in rrblup_pve_rows],
                 dtype=np.float64,
@@ -13856,7 +12307,7 @@ def _run_method_task(
                 gblup_final_state["h2"] = float(h2_fit)
         _emit_stage("predict_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_pred_stage)))
     else:
-        rr_cfg_final: dict[str, typing.Any] | None = rrblup_adamw_cfg
+        rr_cfg_final: dict[str, typing.Any] | None = rrblup_cfg
         rr_state_final: dict[str, typing.Any] | None = None
         rr_progress_final = None
         gblup_state_final: dict[str, typing.Any] | None = None
@@ -13866,17 +12317,9 @@ def _run_method_task(
         bayes_r2_final_key: str | None = None
         if method == "rrBLUP":
             rr_cfg_final = dict(rrblup_cfg_base)
-            if (
-                rrblup_cv_reuse_enabled
-                and rrblup_cv_selected is not None
-                and ("lr" in rrblup_cv_selected)
-            ):
+            if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
                 rr_cfg_final["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
-                rr_sel_lr = float(rrblup_cv_selected.get("lr", np.nan))
-                if np.isfinite(rr_sel_lr) and rr_sel_lr > 0.0:
-                    rr_cfg_final["lr"] = float(rr_sel_lr)
                 rr_cfg_final["lambda_auto"] = "off"
-                rr_cfg_final["auto_grid"] = "off"
             rrblup_final_cfg = dict(rr_cfg_final)
             rr_state_final = {}
             if rrblup_progress_hook is not None:
@@ -13917,7 +12360,7 @@ def _run_method_task(
             packed_train_indices=final_train_idx_arg,
             packed_test_indices=final_test_idx_arg,
             rrblup_solver=typing.cast(typing.Any, rrblup_solver),
-            rrblup_adamw_cfg=rr_cfg_final,
+            rrblup_cfg=rr_cfg_final,
             rrblup_runtime_state=rr_state_final,
             rrblup_progress_hook=rr_progress_final,
             gblup_runtime_state=gblup_state_final,
@@ -14669,7 +13112,7 @@ def _run_methods_parallel(
     limit_predtrain: int | None = None,
     elapsed_offset_by_method: dict[str, float] | None = None,
     rrblup_solver: str = "pcg",
-    rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
+    rrblup_cfg: dict[str, typing.Any] | None = None,
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
     bayes_pi_by_method: dict[str, float | None] | None = None,
     bayes_chains: int = 1,
@@ -14798,7 +13241,7 @@ def _run_methods_parallel(
                     dict[str, typing.Any] | None,
                     result.get("rrblup_final_cfg"),
                 )
-                or dict(rrblup_adamw_cfg or {})
+                or dict(rrblup_cfg or {})
             )
             solver_req = str(
                 rr_state.get("solver_requested", str(rrblup_solver).strip().lower())
@@ -14898,31 +13341,6 @@ def _run_methods_parallel(
                 if np.isfinite(pve_vc):
                     rows.append(("PVE(pheno-scale)", f"{pve_vc:.3f}"))
                 return rows
-            elif solver_used == "adamw":
-                if solver_req != solver_used:
-                    rows.append(("solver", f"{solver_req} -> {solver_used.upper()}"))
-                else:
-                    rows.append(("solver", solver_used.upper()))
-                solver_fallback_reason = str(rr_state.get("solver_fallback_reason", "")).strip()
-                if solver_fallback_reason != "":
-                    rows.append(("solver note", solver_fallback_reason))
-                lambda_source = str(rr_state.get("lambda_source", "")).strip()
-                if lambda_source != "":
-                    rows.append(("lambda source", lambda_source))
-                lam_raw = float(rr_state.get("selected_lambda", rr_cfg.get("lambda_value", np.nan)))
-                if np.isfinite(lam_raw):
-                    lam_scale = str(rr_cfg.get("lambda_scale", "equation")).strip().lower()
-                    rows.append(("lambda", f"{lam_raw:.6g} ({lam_scale})"))
-                rows.append(
-                    (
-                        "AdamW",
-                        (
-                            f"lr={float(rr_cfg.get('lr', np.nan)):.6g}, "
-                            f"batch={int(max(1, int(rr_cfg.get('batch_size', 0))))}, "
-                            f"epochs={int(max(1, int(rr_cfg.get('epochs', 0))))}"
-                        ),
-                    )
-                )
             else:
                 solver_label = solver_used.upper() if solver_used != "" else "EXACT"
                 if solver_req != "" and solver_req != solver_used:
@@ -15177,7 +13595,7 @@ def _run_methods_parallel(
         if (name_key != "rrBLUP") and (not _is_blup_method(name_key)):
             return False
         solver_mode = str(rrblup_solver).strip().lower()
-        exact_backend_mode = str((rrblup_adamw_cfg or {}).get("exact_backend", "auto")).strip().lower()
+        exact_backend_mode = str((rrblup_cfg or {}).get("exact_backend", "auto")).strip().lower()
         n_snp = _marker_count_from_inputs(
             packed_ctx=packed_ctx,
             train_snp=train_snp,
@@ -15207,7 +13625,7 @@ def _run_methods_parallel(
                             backend=exact_backend_mode,
                             n_snp=int(n_snp),
                             is_packed_input=_looks_like_packed_payload(packed_ctx),
-                            cfg=rrblup_adamw_cfg,
+                            cfg=rrblup_cfg,
                         )
                     ).strip().lower()
                     if exact_backend_try == "snp":
@@ -15217,16 +13635,16 @@ def _run_methods_parallel(
                 solver=solver_mode,
                 n_train=int(max(0, n_train_try)),
                 n_snp=int(n_snp),
-                cfg=rrblup_adamw_cfg,
+                cfg=rrblup_cfg,
             )
-            if str(resolved) in {"adamw", "pcg"}:
+            if str(resolved) == "pcg":
                 return True
             if str(resolved) == "exact":
                 exact_backend_try = _resolve_rrblup_exact_backend(
                     backend=exact_backend_mode,
                     n_snp=int(n_snp),
                     is_packed_input=_looks_like_packed_payload(packed_ctx),
-                    cfg=rrblup_adamw_cfg,
+                    cfg=rrblup_cfg,
                 )
                 if str(exact_backend_try).strip().lower() == "snp":
                     return True
@@ -15287,7 +13705,7 @@ def _run_methods_parallel(
             rrblup_progress_hook=None,
             limit_predtrain=limit_predtrain,
             rrblup_solver=rrblup_solver,
-            rrblup_adamw_cfg=rrblup_adamw_cfg,
+            rrblup_cfg=rrblup_cfg,
             bayes_auto_r2_cache=None,
             bayes_auto_r2_cfg=bayes_auto_r2_cfg,
             bayes_pi=bayes_pi_task,
@@ -15426,8 +13844,8 @@ def _run_methods_parallel(
         rr_solver_use = str(rrblup_solver)
         rr_cfg_use = (
             None
-            if rrblup_adamw_cfg is None
-            else dict(rrblup_adamw_cfg)
+            if rrblup_cfg is None
+            else dict(rrblup_cfg)
         )
         if not _is_blup_method(str(method_name)):
             return (
@@ -15540,13 +13958,9 @@ def _run_methods_parallel(
                 search_done = 0
                 search_total = 0
                 search_total_fixed = False
-                adam_done = 0
-                adam_total = 0
-                adam_stage = "fit"
-                adam_grid_trial_total = 0
-                adam_grid_trial_epochs = 0
-                adam_grid_completed_epochs = 0
-                adam_grid_active_trial = 0
+                rr_progress_done = 0
+                rr_progress_total = 0
+                rr_progress_stage = "fit"
                 rr_bar_done = 0
                 rr_bar_total = 0
                 rr_bar_desc = ""
@@ -15837,95 +14251,26 @@ def _run_methods_parallel(
                         )
                         return
 
-                def _adam_stage_key(payload: dict[str, typing.Any]) -> str:
-                    stage = str(payload.get("stage", "fit")).strip().lower()
-                    if stage == "pcg":
-                        return "pcg"
-                    return "grid" if stage == "grid" else "fit"
+                def _rrblup_stage_key(payload: dict[str, typing.Any]) -> str:
+                    _ = payload
+                    return "pcg"
 
-                def _adam_label(stage: str, payload: dict[str, typing.Any]) -> str:
-                    if str(stage) == "grid":
-                        return _rr_phase_title("AdamW search", payload)
-                    if str(stage) == "pcg":
-                        return _rr_phase_title("PCG", payload)
-                    return _rr_phase_title("AdamW", payload)
+                def _rrblup_label(stage: str, payload: dict[str, typing.Any]) -> str:
+                    _ = stage
+                    return _rr_phase_title("PCG", payload)
 
-                def _adam_progress_values(
+                def _rrblup_progress_values(
                     event: str,
                     payload: dict[str, typing.Any],
                 ) -> tuple[str, int, int]:
-                    nonlocal adam_done, adam_total
-                    nonlocal adam_grid_trial_total, adam_grid_trial_epochs
-                    nonlocal adam_grid_completed_epochs, adam_grid_active_trial
-                    stage = _adam_stage_key(payload)
-                    if stage == "pcg":
-                        adam_grid_trial_total = 0
-                        adam_grid_trial_epochs = 0
-                        adam_grid_completed_epochs = 0
-                        adam_grid_active_trial = 0
-                        total = int(max(1, int(payload.get("total", max(1, int(adam_total))))))
-                        if str(event) == "start":
-                            done = 0
-                        elif str(event) == "end":
-                            done = int(
-                                max(
-                                    0,
-                                    int(payload.get("iters", payload.get("iter", adam_done))),
-                                )
-                            )
-                        else:
-                            done = int(
-                                max(
-                                    0,
-                                    int(payload.get("iter", payload.get("iters", adam_done))),
-                                )
-                            )
-                        done = int(min(done, total))
-                        return stage, done, total
-                    if stage != "grid":
-                        if str(event) == "start":
-                            adam_grid_trial_total = 0
-                            adam_grid_trial_epochs = 0
-                            adam_grid_completed_epochs = 0
-                            adam_grid_active_trial = 0
-                        total = int(max(1, int(payload.get("total", max(1, int(adam_total))))))
-                        if str(event) == "start":
-                            done = 0
-                        elif str(event) == "end":
-                            done = int(max(0, int(payload.get("epochs_ran", adam_done))))
-                        else:
-                            done = int(max(0, int(payload.get("epoch", adam_done))))
-                        done = int(min(done, total))
-                        return stage, done, total
-
-                    trial_total = int(
-                        max(1, int(payload.get("trial_total", max(1, int(adam_grid_trial_total or 1)))))
-                    )
-                    trial_epochs = int(
-                        max(1, int(payload.get("total", max(1, int(adam_grid_trial_epochs or 1)))))
-                    )
-                    trial_id = int(
-                        max(1, int(payload.get("trial_id", max(1, int(adam_grid_active_trial or 1)))))
-                    )
+                    total = int(max(1, int(payload.get("total", max(1, int(rr_progress_total))))))
                     if str(event) == "start":
-                        if trial_id <= 1 or trial_id < int(adam_grid_active_trial):
-                            adam_grid_completed_epochs = 0
-                        adam_grid_active_trial = int(trial_id)
-                        trial_done = 0
+                        done = 0
                     elif str(event) == "end":
-                        trial_done = int(max(0, int(payload.get("epochs_ran", payload.get("epoch", 0)))))
+                        done = int(max(0, int(payload.get("iters", payload.get("iter", rr_progress_done)))))
                     else:
-                        trial_done = int(max(0, int(payload.get("epoch", 0))))
-                    trial_done = int(min(trial_done, trial_epochs))
-
-                    total = int(max(1, trial_total * trial_epochs))
-                    done = int(max(0, int(adam_grid_completed_epochs) + trial_done))
-                    done = int(min(done, total))
-                    if str(event) == "end":
-                        adam_grid_completed_epochs = int(max(int(adam_grid_completed_epochs), done))
-                    adam_grid_trial_total = int(trial_total)
-                    adam_grid_trial_epochs = int(trial_epochs)
-                    return stage, done, total
+                        done = int(max(0, int(payload.get("iter", payload.get("iters", rr_progress_done)))))
+                    return "pcg", int(min(done, total)), total
 
                 def _close_rr_spinner() -> None:
                     nonlocal rr_spinner
@@ -16044,8 +14389,8 @@ def _run_methods_parallel(
                             search_bar.update(int(adv))
                             search_bar.set_postfix(step=f"{search_done}/{search_total}")
 
-                def _adam_hook(event: str, payload: dict[str, typing.Any]) -> None:
-                    nonlocal adam_done, adam_total, adam_stage
+                def _rrblup_progress_hook(event: str, payload: dict[str, typing.Any]) -> None:
+                    nonlocal rr_progress_done, rr_progress_total, rr_progress_stage
                     nonlocal lambda_done, lambda_total
                     if not has_rrblup_iter_progress:
                         return
@@ -16108,56 +14453,31 @@ def _run_methods_parallel(
                         if ev == "pcg_callback_unavailable":
                             _close_rr_bar()
                             _close_rr_spinner()
-                            _set_cv_rr_phase(_adam_label(_adam_stage_key(payload), payload))
+                            _set_cv_rr_phase(_rrblup_label(_rrblup_stage_key(payload), payload))
                             return
                         if ev == "pcg_start":
-                            stage, target, total = _adam_progress_values("start", payload)
-                            adam_stage = str(stage)
-                            adam_done = int(target)
-                            adam_total = int(max(1, int(total)))
+                            stage, target, total = _rrblup_progress_values("start", payload)
+                            rr_progress_stage = str(stage)
+                            rr_progress_done = int(target)
+                            rr_progress_total = int(max(1, int(total)))
                             _set_cv_rr_phase(
-                                _adam_label(adam_stage, payload),
-                                done=adam_done,
-                                total=adam_total,
+                                _rrblup_label(rr_progress_stage, payload),
+                                done=rr_progress_done,
+                                total=rr_progress_total,
                             )
                             return
                         if ev == "pcg_iter":
-                            stage, target, total = _adam_progress_values("epoch", payload)
-                            adam_stage = str(stage)
-                            adam_done = int(target)
-                            adam_total = int(max(1, int(total)))
+                            stage, target, total = _rrblup_progress_values("epoch", payload)
+                            rr_progress_stage = str(stage)
+                            rr_progress_done = int(target)
+                            rr_progress_total = int(max(1, int(total)))
                             _set_cv_rr_phase(
-                                _adam_label(adam_stage, payload),
-                                done=adam_done,
-                                total=adam_total,
+                                _rrblup_label(rr_progress_stage, payload),
+                                done=rr_progress_done,
+                                total=rr_progress_total,
                             )
                             return
                         if ev == "pcg_end":
-                            _set_cv_rr_phase(None)
-                            return
-                        if ev == "adam_start":
-                            stage, target, total = _adam_progress_values("start", payload)
-                            adam_stage = str(stage)
-                            adam_done = int(target)
-                            adam_total = int(max(1, int(total)))
-                            _set_cv_rr_phase(
-                                _adam_label(adam_stage, payload),
-                                done=adam_done,
-                                total=adam_total,
-                            )
-                            return
-                        if ev == "adam_epoch":
-                            stage, target, total = _adam_progress_values("epoch", payload)
-                            adam_stage = str(stage)
-                            adam_done = int(target)
-                            adam_total = int(max(1, int(total)))
-                            _set_cv_rr_phase(
-                                _adam_label(adam_stage, payload),
-                                done=adam_done,
-                                total=adam_total,
-                            )
-                            return
-                        if ev == "adam_end":
                             _set_cv_rr_phase(None)
                             return
                     if ev == "exact_snp_prepare_start":
@@ -16192,7 +14512,7 @@ def _run_methods_parallel(
                         _sync_rr_bar(_rr_lambda_label(payload), 0, total)
                         return
                     if ev == "pcg_callback_unavailable":
-                        _start_rr_spinner(_adam_label(_adam_stage_key(payload), payload))
+                        _start_rr_spinner(_rrblup_label(_rrblup_stage_key(payload), payload))
                         return
                     if ev == "pcg_lambda_subsample_iter":
                         total = int(max(1, int(payload.get("total", max(1, int(lambda_total or 1))))))
@@ -16210,48 +14530,27 @@ def _run_methods_parallel(
                         _close_rr_bar()
                         return
                     if ev == "pcg_start":
-                        stage, target, total = _adam_progress_values("start", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        _sync_rr_bar(_adam_label(adam_stage, payload), adam_done, adam_total)
+                        stage, target, total = _rrblup_progress_values("start", payload)
+                        rr_progress_stage = str(stage)
+                        rr_progress_done = int(target)
+                        rr_progress_total = int(max(1, int(total)))
+                        _sync_rr_bar(_rrblup_label(rr_progress_stage, payload), rr_progress_done, rr_progress_total)
                         return
                     if ev == "pcg_iter":
-                        stage, target, total = _adam_progress_values("epoch", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        _sync_rr_bar(_adam_label(adam_stage, payload), adam_done, adam_total)
+                        stage, target, total = _rrblup_progress_values("epoch", payload)
+                        rr_progress_stage = str(stage)
+                        rr_progress_done = int(target)
+                        rr_progress_total = int(max(1, int(total)))
+                        _sync_rr_bar(_rrblup_label(rr_progress_stage, payload), rr_progress_done, rr_progress_total)
                         return
                     if ev == "pcg_end":
-                        stage, target, total = _adam_progress_values("end", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        _sync_rr_bar(_adam_label(adam_stage, payload), adam_done, adam_total)
+                        stage, target, total = _rrblup_progress_values("end", payload)
+                        rr_progress_stage = str(stage)
+                        rr_progress_done = int(target)
+                        rr_progress_total = int(max(1, int(total)))
+                        _sync_rr_bar(_rrblup_label(rr_progress_stage, payload), rr_progress_done, rr_progress_total)
                         _close_rr_bar()
                         return
-                    if ev == "adam_start":
-                        stage, target, total = _adam_progress_values("start", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        _sync_rr_bar(_adam_label(adam_stage, payload), adam_done, adam_total)
-                        return
-                    if ev == "adam_epoch":
-                        stage, target, total = _adam_progress_values("epoch", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        _sync_rr_bar(_adam_label(adam_stage, payload), adam_done, adam_total)
-                        return
-                    if ev == "adam_end":
-                        stage, target, total = _adam_progress_values("end", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        _sync_rr_bar(_adam_label(adam_stage, payload), adam_done, adam_total)
-                        _close_rr_bar()
 
                 def _cv_hook(method_name: str, inc: int) -> None:
                     nonlocal cv_done_folds
@@ -16312,13 +14611,13 @@ def _run_methods_parallel(
                         progress_hook=_cv_hook,
                         search_progress_hook=_search_hook,
                         rrblup_progress_hook=(
-                            _adam_hook
+                            _rrblup_progress_hook
                             if (has_rrblup_iter_progress and use_rrblup_subprogress)
                             else None
                         ),
                         limit_predtrain=limit_predtrain,
                         rrblup_solver=rr_solver_cur,
-                        rrblup_adamw_cfg=rr_cfg_cur,
+                        rrblup_cfg=rr_cfg_cur,
                         bayes_auto_r2_cache=bayes_auto_r2_cache_shared,
                         bayes_auto_r2_cfg=bayes_auto_r2_cfg,
                         bayes_pi=(
@@ -16410,19 +14709,15 @@ def _run_methods_parallel(
             )
             search_bar = None
             cv_bar = None
-            adam_bar = None
+            rr_progress_bar = None
             lambda_bar = None
             search_done = 0
             search_total = 0
             search_total_fixed = False
-            adam_done = 0
-            adam_total = 0
-            adam_stage = "fit"
-            adam_grid_trial_total = 0
-            adam_grid_trial_epochs = 0
-            adam_grid_completed_epochs = 0
-            adam_grid_active_trial = 0
-            adam_bar_indeterminate = False
+            rr_progress_done = 0
+            rr_progress_total = 0
+            rr_progress_stage = "fit"
+            rr_progress_bar_indeterminate = False
             lambda_done = 0
             lambda_total = 0
             lambda_bar_indeterminate = False
@@ -16508,119 +14803,50 @@ def _run_methods_parallel(
                     cv_bar.update(delta)
                     cv_done_units += delta
 
-            def _adam_stage_key(payload: dict[str, typing.Any]) -> str:
-                stage = str(payload.get("stage", "fit")).strip().lower()
-                if stage == "pcg":
-                    return "pcg"
-                return "grid" if stage == "grid" else "fit"
+            def _rrblup_stage_key(payload: dict[str, typing.Any]) -> str:
+                _ = payload
+                return "pcg"
 
-            def _adam_desc(stage: str, payload: dict[str, typing.Any]) -> str:
-                if str(stage) == "grid":
-                    return _rr_phase_title("AdamW search", payload)
-                if str(stage) == "pcg":
-                    return _rr_phase_title("PCG", payload)
-                return _rr_phase_title("AdamW", payload)
+            def _rrblup_label(stage: str, payload: dict[str, typing.Any]) -> str:
+                _ = stage
+                return _rr_phase_title("PCG", payload)
 
-            def _adam_progress_values(
+            def _rrblup_progress_values(
                 event: str,
                 payload: dict[str, typing.Any],
             ) -> tuple[str, int, int]:
-                nonlocal adam_done, adam_total
-                nonlocal adam_grid_trial_total, adam_grid_trial_epochs
-                nonlocal adam_grid_completed_epochs, adam_grid_active_trial
-                stage = _adam_stage_key(payload)
-                if stage == "pcg":
-                    adam_grid_trial_total = 0
-                    adam_grid_trial_epochs = 0
-                    adam_grid_completed_epochs = 0
-                    adam_grid_active_trial = 0
-                    total = int(max(1, int(payload.get("total", max(1, int(adam_total))))))
-                    if str(event) == "start":
-                        done = 0
-                    elif str(event) == "end":
-                        done = int(
-                            max(
-                                0,
-                                int(payload.get("iters", payload.get("iter", adam_done))),
-                            )
-                        )
-                    else:
-                        done = int(
-                            max(
-                                0,
-                                int(payload.get("iter", payload.get("iters", adam_done))),
-                            )
-                        )
-                    done = int(min(done, total))
-                    return stage, done, total
-                if stage != "grid":
-                    if str(event) == "start":
-                        adam_grid_trial_total = 0
-                        adam_grid_trial_epochs = 0
-                        adam_grid_completed_epochs = 0
-                        adam_grid_active_trial = 0
-                    total = int(max(1, int(payload.get("total", max(1, int(adam_total))))))
-                    if str(event) == "start":
-                        done = 0
-                    elif str(event) == "end":
-                        done = int(max(0, int(payload.get("epochs_ran", adam_done))))
-                    else:
-                        done = int(max(0, int(payload.get("epoch", adam_done))))
-                    done = int(min(done, total))
-                    return stage, done, total
-
-                trial_total = int(
-                    max(1, int(payload.get("trial_total", max(1, int(adam_grid_trial_total or 1)))))
-                )
-                trial_epochs = int(
-                    max(1, int(payload.get("total", max(1, int(adam_grid_trial_epochs or 1)))))
-                )
-                trial_id = int(
-                    max(1, int(payload.get("trial_id", max(1, int(adam_grid_active_trial or 1)))))
-                )
+                total = int(max(1, int(payload.get("total", max(1, int(rr_progress_total))))))
                 if str(event) == "start":
-                    if trial_id <= 1 or trial_id < int(adam_grid_active_trial):
-                        adam_grid_completed_epochs = 0
-                    adam_grid_active_trial = int(trial_id)
-                    trial_done = 0
+                    done = 0
                 elif str(event) == "end":
-                    trial_done = int(max(0, int(payload.get("epochs_ran", payload.get("epoch", 0)))))
+                    done = int(max(0, int(payload.get("iters", payload.get("iter", rr_progress_done)))))
                 else:
-                    trial_done = int(max(0, int(payload.get("epoch", 0))))
-                trial_done = int(min(trial_done, trial_epochs))
+                    done = int(max(0, int(payload.get("iter", payload.get("iters", rr_progress_done)))))
+                return "pcg", int(min(done, total)), total
 
-                total = int(max(1, trial_total * trial_epochs))
-                done = int(max(0, int(adam_grid_completed_epochs) + trial_done))
-                done = int(min(done, total))
-                if str(event) == "end":
-                    adam_grid_completed_epochs = int(max(int(adam_grid_completed_epochs), done))
-                adam_grid_trial_total = int(trial_total)
-                adam_grid_trial_epochs = int(trial_epochs)
-                return stage, done, total
-
-            def _ensure_adam_bar(
+            def _ensure_rrblup_bar(
                 payload: dict[str, typing.Any],
                 *,
                 event: str = "start",
                 indeterminate: bool = False,
             ) -> None:
-                nonlocal adam_bar, adam_done, adam_total, adam_stage
-                nonlocal adam_bar_indeterminate
+                nonlocal rr_progress_bar, rr_progress_done, rr_progress_total, rr_progress_stage
+                nonlocal rr_progress_bar_indeterminate
                 if not enable_tqdm_progress:
                     return
-                stage, target_done, target_total = _adam_progress_values(str(event), payload)
-                adam_stage = str(stage)
-                desc = _adam_desc(adam_stage, payload)
+                stage, target_done, target_total = _rrblup_progress_values(str(event), payload)
+                rr_progress_stage = str(stage)
+                desc = _rrblup_label(rr_progress_stage, payload)
                 if indeterminate:
-                    adam_done = 0
-                    adam_total = 0
-                    if (adam_bar is not None) and (not adam_bar_indeterminate):
-                        adam_bar.close()
-                        adam_bar = None
-                    adam_bar_indeterminate = True
-                    if adam_bar is None:
+                    rr_progress_done = 0
+                    rr_progress_total = 0
+                    if (rr_progress_bar is not None) and (not rr_progress_bar_indeterminate):
+                        rr_progress_bar.close()
+                        rr_progress_bar = None
+                    rr_progress_bar_indeterminate = True
+                    if rr_progress_bar is None:
                         assert tqdm is not None
-                        adam_bar = tqdm(
+                        rr_progress_bar = tqdm(
                             total=None,
                             desc=desc,
                             leave=False,
@@ -16629,20 +14855,20 @@ def _run_methods_parallel(
                             bar_format="{desc} [{elapsed}]",
                         )
                     else:
-                        adam_bar.set_description_str(desc, refresh=False)
-                    adam_bar.refresh()
+                        rr_progress_bar.set_description_str(desc, refresh=False)
+                    rr_progress_bar.refresh()
                     return
-                if (adam_bar is not None) and adam_bar_indeterminate:
-                    adam_bar.close()
-                    adam_bar = None
-                adam_bar_indeterminate = False
-                adam_done = int(target_done)
-                adam_total = int(max(1, int(target_total)))
-                if adam_bar is None:
+                if (rr_progress_bar is not None) and rr_progress_bar_indeterminate:
+                    rr_progress_bar.close()
+                    rr_progress_bar = None
+                rr_progress_bar_indeterminate = False
+                rr_progress_done = int(target_done)
+                rr_progress_total = int(max(1, int(target_total)))
+                if rr_progress_bar is None:
                     assert tqdm is not None
-                    unit = "iter" if str(adam_stage) == "pcg" else "ep"
-                    adam_bar = tqdm(
-                        total=adam_total,
+                    unit = "iter" if str(rr_progress_stage) == "pcg" else "ep"
+                    rr_progress_bar = tqdm(
+                        total=rr_progress_total,
                         desc=desc,
                         unit=unit,
                         leave=False,
@@ -16651,28 +14877,22 @@ def _run_methods_parallel(
                         bar_format="{desc}: |{bar}| {n_fmt}/{total_fmt} "
                         "[{elapsed}, {rate_fmt}{postfix}]",
                     )
-                adam_bar.total = int(max(1, adam_total))
-                adam_bar.n = int(min(max(0, adam_done), max(1, adam_total)))
-                adam_bar.set_description_str(desc, refresh=False)
-                adam_bar.set_postfix_str("", refresh=False)
-                adam_bar.refresh()
+                rr_progress_bar.total = int(max(1, rr_progress_total))
+                rr_progress_bar.n = int(min(max(0, rr_progress_done), max(1, rr_progress_total)))
+                rr_progress_bar.set_description_str(desc, refresh=False)
+                rr_progress_bar.set_postfix_str("", refresh=False)
+                rr_progress_bar.refresh()
 
-            def _close_adam_bar() -> None:
-                nonlocal adam_bar, adam_done, adam_total, adam_stage
-                nonlocal adam_grid_trial_total, adam_grid_trial_epochs
-                nonlocal adam_grid_completed_epochs, adam_grid_active_trial
-                nonlocal adam_bar_indeterminate
-                if adam_bar is not None:
-                    adam_bar.close()
-                    adam_bar = None
-                adam_done = 0
-                adam_total = 0
-                adam_stage = "fit"
-                adam_grid_trial_total = 0
-                adam_grid_trial_epochs = 0
-                adam_grid_completed_epochs = 0
-                adam_grid_active_trial = 0
-                adam_bar_indeterminate = False
+            def _close_rrblup_bar() -> None:
+                nonlocal rr_progress_bar, rr_progress_done, rr_progress_total, rr_progress_stage
+                nonlocal rr_progress_bar_indeterminate
+                if rr_progress_bar is not None:
+                    rr_progress_bar.close()
+                    rr_progress_bar = None
+                rr_progress_done = 0
+                rr_progress_total = 0
+                rr_progress_stage = "fit"
+                rr_progress_bar_indeterminate = False
 
             def _ensure_lambda_bar(
                 desc: str,
@@ -16871,7 +15091,7 @@ def _run_methods_parallel(
             def _close_rr_phase(*, fail: bool = False) -> None:
                 _ = fail
                 _set_cv_rr_phase(None)
-                _close_adam_bar()
+                _close_rrblup_bar()
                 _close_lambda_bar()
 
             def _stage_hook(event: str, payload: dict[str, typing.Any]) -> None:
@@ -16977,9 +15197,9 @@ def _run_methods_parallel(
                             search_bar.set_postfix_str(stage, refresh=False)
                         search_bar.update(int(adv))
 
-            def _adam_hook(event: str, payload: dict[str, typing.Any]) -> None:
-                nonlocal adam_done, adam_total, adam_stage
-                nonlocal adam_bar_indeterminate
+            def _rrblup_progress_hook(event: str, payload: dict[str, typing.Any]) -> None:
+                nonlocal rr_progress_done, rr_progress_total, rr_progress_stage
+                nonlocal rr_progress_bar_indeterminate
                 nonlocal lambda_done, lambda_total
                 if not has_rrblup_iter_progress:
                     return
@@ -16987,7 +15207,7 @@ def _run_methods_parallel(
                 _mark_rr_subprogress()
                 if _rr_inline_cv_active():
                     if ev == "exact_snp_prepare_start":
-                        _close_adam_bar()
+                        _close_rrblup_bar()
                         _close_lambda_bar()
                         _set_cv_rr_phase(_rr_exact_desc(ev, payload))
                         return
@@ -16996,7 +15216,7 @@ def _run_methods_parallel(
                         _set_cv_rr_phase(None)
                         return
                     if ev == "exact_snp_fit_start":
-                        _close_adam_bar()
+                        _close_rrblup_bar()
                         _close_lambda_bar()
                         _set_cv_rr_phase(_rr_exact_desc(ev, payload))
                         return
@@ -17004,7 +15224,7 @@ def _run_methods_parallel(
                         _set_cv_rr_phase(None)
                         return
                     if ev == "exact_snp_total_start":
-                        _close_adam_bar()
+                        _close_rrblup_bar()
                         _close_lambda_bar()
                         _set_cv_rr_phase(_rr_exact_desc(ev, payload))
                         return
@@ -17012,7 +15232,7 @@ def _run_methods_parallel(
                         _set_cv_rr_phase(None)
                         return
                     if ev == "pcg_lambda_vc_start":
-                        _close_adam_bar()
+                        _close_rrblup_bar()
                         _close_lambda_bar()
                         _set_cv_rr_phase(_rr_lambda_desc(payload))
                         return
@@ -17040,62 +15260,37 @@ def _run_methods_parallel(
                         _set_cv_rr_phase(None)
                         return
                     if ev == "pcg_callback_unavailable":
-                        _close_adam_bar()
+                        _close_rrblup_bar()
                         _close_lambda_bar()
-                        _set_cv_rr_phase(_adam_desc(_adam_stage_key(payload), payload))
+                        _set_cv_rr_phase(_rrblup_label(_rrblup_stage_key(payload), payload))
                         return
                     if ev == "pcg_start":
-                        stage, target, total = _adam_progress_values("start", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
+                        stage, target, total = _rrblup_progress_values("start", payload)
+                        rr_progress_stage = str(stage)
+                        rr_progress_done = int(target)
+                        rr_progress_total = int(max(1, int(total)))
                         _set_cv_rr_phase(
-                            _adam_desc(adam_stage, payload),
-                            done=adam_done,
-                            total=adam_total,
+                            _rrblup_label(rr_progress_stage, payload),
+                            done=rr_progress_done,
+                            total=rr_progress_total,
                         )
                         return
                     if ev == "pcg_iter":
-                        stage, target, total = _adam_progress_values("epoch", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
+                        stage, target, total = _rrblup_progress_values("epoch", payload)
+                        rr_progress_stage = str(stage)
+                        rr_progress_done = int(target)
+                        rr_progress_total = int(max(1, int(total)))
                         _set_cv_rr_phase(
-                            _adam_desc(adam_stage, payload),
-                            done=adam_done,
-                            total=adam_total,
+                            _rrblup_label(rr_progress_stage, payload),
+                            done=rr_progress_done,
+                            total=rr_progress_total,
                         )
                         return
                     if ev == "pcg_end":
                         _set_cv_rr_phase(None)
                         return
-                    if ev == "adam_start":
-                        stage, target, total = _adam_progress_values("start", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        _set_cv_rr_phase(
-                            _adam_desc(adam_stage, payload),
-                            done=adam_done,
-                            total=adam_total,
-                        )
-                        return
-                    if ev == "adam_epoch":
-                        stage, target, total = _adam_progress_values("epoch", payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        _set_cv_rr_phase(
-                            _adam_desc(adam_stage, payload),
-                            done=adam_done,
-                            total=adam_total,
-                        )
-                        return
-                    if ev == "adam_end":
-                        _set_cv_rr_phase(None)
-                        return
                 if ev == "exact_snp_prepare_start":
-                    _close_adam_bar()
+                    _close_rrblup_bar()
                     _close_lambda_bar()
                     _ensure_lambda_bar(
                         _rr_exact_desc(ev, payload),
@@ -17107,7 +15302,7 @@ def _run_methods_parallel(
                     _close_lambda_bar()
                     return
                 if ev == "exact_snp_fit_start":
-                    _close_adam_bar()
+                    _close_rrblup_bar()
                     _close_lambda_bar()
                     _ensure_lambda_bar(
                         _rr_exact_desc(ev, payload),
@@ -17118,7 +15313,7 @@ def _run_methods_parallel(
                     _close_lambda_bar()
                     return
                 if ev == "exact_snp_total_start":
-                    _close_adam_bar()
+                    _close_rrblup_bar()
                     _close_lambda_bar()
                     _ensure_lambda_bar(
                         _rr_exact_desc(ev, payload),
@@ -17129,7 +15324,7 @@ def _run_methods_parallel(
                     _close_lambda_bar()
                     return
                 if ev == "pcg_lambda_vc_start":
-                    _close_adam_bar()
+                    _close_rrblup_bar()
                     _close_lambda_bar()
                     _ensure_lambda_bar(
                         _rr_lambda_desc(payload),
@@ -17140,7 +15335,7 @@ def _run_methods_parallel(
                     _close_lambda_bar()
                     return
                 if ev == "pcg_lambda_subsample_start":
-                    _close_adam_bar()
+                    _close_rrblup_bar()
                     _close_lambda_bar()
                     _ensure_lambda_bar(
                         _rr_lambda_desc(payload),
@@ -17164,8 +15359,8 @@ def _run_methods_parallel(
                     _close_lambda_bar()
                     return
                 if ev == "pcg_callback_unavailable":
-                    _close_adam_bar()
-                    _ensure_adam_bar(
+                    _close_rrblup_bar()
+                    _ensure_rrblup_bar(
                         payload,
                         event="start",
                         indeterminate=True,
@@ -17173,52 +15368,16 @@ def _run_methods_parallel(
                     return
                 if ev == "pcg_start":
                     _close_lambda_bar()
-                    _ensure_adam_bar(payload, event="start")
+                    _ensure_rrblup_bar(payload, event="start")
                     return
                 if ev == "pcg_iter":
-                    _ensure_adam_bar(payload, event="epoch")
+                    _ensure_rrblup_bar(payload, event="epoch")
                     return
                 if ev == "pcg_end":
-                    if not adam_bar_indeterminate:
-                        _ensure_adam_bar(payload, event="end")
-                    _close_adam_bar()
+                    if not rr_progress_bar_indeterminate:
+                        _ensure_rrblup_bar(payload, event="end")
+                    _close_rrblup_bar()
                     return
-                if ev == "adam_start":
-                    _ensure_adam_bar(payload, event="start")
-                    return
-                if ev == "adam_epoch":
-                    if adam_bar is None:
-                        _ensure_adam_bar(payload, event="epoch")
-                    if adam_bar is None:
-                        return
-                    stage, target, total = _adam_progress_values("epoch", payload)
-                    adam_stage = str(stage)
-                    adam_done = int(target)
-                    adam_total = int(max(1, int(total)))
-                    adam_bar.total = adam_total
-                    adam_bar.n = int(min(max(0, adam_done), adam_total))
-                    adam_bar.set_description_str(
-                        _adam_desc(adam_stage, payload),
-                        refresh=False,
-                    )
-                    adam_bar.set_postfix_str("", refresh=False)
-                    adam_bar.refresh()
-                    return
-                if ev == "adam_end":
-                    if adam_bar is None:
-                        return
-                    stage, target, total = _adam_progress_values("end", payload)
-                    adam_stage = str(stage)
-                    adam_done = int(target)
-                    adam_total = int(max(1, int(total)))
-                    adam_bar.total = adam_total
-                    adam_bar.n = int(min(max(0, adam_done), adam_total))
-                    adam_bar.set_description_str(
-                        _adam_desc(adam_stage, payload),
-                        refresh=False,
-                    )
-                    adam_bar.set_postfix_str("", refresh=False)
-                    adam_bar.refresh()
 
             def _cv_hook(method_name: str, inc: int) -> None:
                 nonlocal cv_done_folds
@@ -17287,13 +15446,13 @@ def _run_methods_parallel(
                         progress_hook=(_cv_hook if enable_tqdm_progress else None),
                         search_progress_hook=(_search_hook if enable_tqdm_progress else None),
                         rrblup_progress_hook=(
-                            _adam_hook
+                            _rrblup_progress_hook
                             if (has_rrblup_iter_progress and enable_tqdm_progress)
                             else None
                         ),
                         limit_predtrain=limit_predtrain,
                         rrblup_solver=rr_solver_cur,
-                        rrblup_adamw_cfg=rr_cfg_cur,
+                        rrblup_cfg=rr_cfg_cur,
                         bayes_auto_r2_cache=bayes_auto_r2_cache_shared,
                         bayes_auto_r2_cfg=bayes_auto_r2_cfg,
                         bayes_pi=(
@@ -17313,7 +15472,7 @@ def _run_methods_parallel(
                     )
                 except Exception:
                     _close_search_bar()
-                    _close_adam_bar()
+                    _close_rrblup_bar()
                     _close_lambda_bar()
                     _close_rr_phase(fail=True)
                     _close_cv_bar()
@@ -17337,7 +15496,7 @@ def _run_methods_parallel(
                             cv_done_units += left_cv_units
                             cv_bar.update(left_cv_units)
                         cv_done_folds = int(cv_total)
-                _close_adam_bar()
+                _close_rrblup_bar()
                 _close_lambda_bar()
                 _close_cv_bar()
                 _complete_fit_status(None)
@@ -19506,7 +17665,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     optional_group.add_argument(
         "--rrblup-solver",
         type=str,
-        choices=("auto", "exact", "pcg", "adamw"),
+        choices=("auto", "exact", "pcg"),
         default="auto",
         help=argparse.SUPPRESS,
     )
@@ -19577,71 +17736,9 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
-        "--rrblup-lr",
-        type=float,
-        default=1e-2,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-epochs",
-        type=int,
-        default=60,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "-batchsize", "--batchsize",
-        "--rrblup-batch-size",
-        type=int,
-        default=1024,
-        dest="rrblup_batch_size",
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-batch-threads",
-        type=int,
-        default=0,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
         "--rrblup-snp-block-size",
         type=int,
         default=None,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-beta1",
-        type=float,
-        default=0.9,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-beta2",
-        type=float,
-        default=0.999,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-eps",
-        type=float,
-        default=1e-8,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-seed",
-        type=int,
-        default=42,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-auto-min-cells",
-        type=int,
-        default=200000000,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-log-every",
-        type=int,
-        default=0,
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
@@ -19655,86 +17752,6 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         type=str,
         choices=("lambda", "trainvar"),
         default="lambda",
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-auto-grid",
-        type=str,
-        choices=("on", "off"),
-        default="on",
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-grid-size",
-        type=int,
-        default=2,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-grid-min-samples",
-        type=int,
-        default=256,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-grid-trial-epochs",
-        type=int,
-        default=20,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-grid-switch-min-improve",
-        type=float,
-        default=0.15,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-grid-reuse-cv",
-        type=str,
-        choices=("on", "off"),
-        default="on",
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-grid-seed",
-        type=int,
-        default=42,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-es-val-frac",
-        type=float,
-        default=0.08,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-es-val-min",
-        type=int,
-        default=64,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-es-min-train",
-        type=int,
-        default=128,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-es-patience",
-        type=int,
-        default=3,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-es-warmup",
-        type=int,
-        default=4,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--rrblup-es-min-delta",
-        type=float,
-        default=1e-5,
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
@@ -19937,27 +17954,16 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         parser.error("--limit-predtrain/--limit-train must be >= 0.")
     if (not np.isfinite(float(args.rrblup_lambda))) or (float(args.rrblup_lambda) < 0.0):
         parser.error("--rrblup-lambda must be a finite value >= 0.")
-    if (not np.isfinite(float(args.rrblup_lr))) or (float(args.rrblup_lr) <= 0.0):
-        parser.error("--rrblup-lr must be a finite value > 0.")
-    if int(args.rrblup_epochs) <= 0:
-        parser.error("--rrblup-epochs must be > 0.")
-    if int(args.rrblup_batch_size) <= 0:
-        parser.error("-batchsize/--batchsize/--rrblup-batch-size must be > 0.")
     try:
         args.memory = _normalize_memory_gb(args.memory)
     except ValueError as e:
         parser.error(str(e))
-    if int(args.rrblup_batch_threads) < 0:
-        parser.error("--rrblup-batch-threads must be >= 0.")
     if int(args.chains) <= 0:
         parser.error("--chains must be > 0.")
     if args.rrblup_snp_block_size is None:
-        # Default mini-batch logic: use batch-size as the primary memory knob.
-        args.rrblup_snp_block_size = int(args.rrblup_batch_size)
+        args.rrblup_snp_block_size = int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)
     if int(args.rrblup_snp_block_size) <= 0:
         parser.error("--rrblup-snp-block-size must be > 0.")
-    if int(args.rrblup_auto_min_cells) <= 0:
-        parser.error("--rrblup-auto-min-cells must be > 0.")
     if int(args.rrblup_auto_pcg_min_n) <= 1:
         parser.error("--rrblup-auto-pcg-min-n must be > 1.")
     if int(args.rrblup_exact_max_markers) <= 0:
@@ -19966,38 +17972,8 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         parser.error("--rrblup-lambda-subsample-n must be > 0.")
     if int(args.rrblup_lambda_subsample_repeats) <= 0:
         parser.error("--rrblup-lambda-subsample-repeats must be > 0.")
-    if int(args.rrblup_log_every) < 0:
-        parser.error("--rrblup-log-every must be >= 0.")
     if int(args.rrblup_sample_chunk_size) <= 0:
         parser.error("--rrblup-sample-chunk-size must be > 0.")
-    if (not np.isfinite(float(args.rrblup_beta1))) or (not np.isfinite(float(args.rrblup_beta2))):
-        parser.error("--rrblup-beta1/--rrblup-beta2 must be finite.")
-    if float(args.rrblup_beta1) < 0.0 or float(args.rrblup_beta1) >= 1.0:
-        parser.error("--rrblup-beta1 must be in [0, 1).")
-    if float(args.rrblup_beta2) < 0.0 or float(args.rrblup_beta2) >= 1.0:
-        parser.error("--rrblup-beta2 must be in [0, 1).")
-    if (not np.isfinite(float(args.rrblup_eps))) or (float(args.rrblup_eps) <= 0.0):
-        parser.error("--rrblup-eps must be a finite value > 0.")
-    if int(args.rrblup_grid_size) <= 0 or int(args.rrblup_grid_size) > 4:
-        parser.error("--rrblup-grid-size must be in [1, 4].")
-    if int(args.rrblup_grid_min_samples) <= 0:
-        parser.error("--rrblup-grid-min-samples must be > 0.")
-    if int(args.rrblup_grid_trial_epochs) <= 0:
-        parser.error("--rrblup-grid-trial-epochs must be > 0.")
-    if (not np.isfinite(float(args.rrblup_grid_switch_min_improve))) or float(args.rrblup_grid_switch_min_improve) < 0.0:
-        parser.error("--rrblup-grid-switch-min-improve must be a finite value >= 0.")
-    if (not np.isfinite(float(args.rrblup_es_val_frac))) or float(args.rrblup_es_val_frac) < 0.0:
-        parser.error("--rrblup-es-val-frac must be a finite value >= 0.")
-    if int(args.rrblup_es_val_min) <= 0:
-        parser.error("--rrblup-es-val-min must be > 0.")
-    if int(args.rrblup_es_min_train) <= 0:
-        parser.error("--rrblup-es-min-train must be > 0.")
-    if int(args.rrblup_es_patience) < 0:
-        parser.error("--rrblup-es-patience must be >= 0.")
-    if int(args.rrblup_es_warmup) <= 0:
-        parser.error("--rrblup-es-warmup must be > 0.")
-    if (not np.isfinite(float(args.rrblup_es_min_delta))) or float(args.rrblup_es_min_delta) < 0.0:
-        parser.error("--rrblup-es-min-delta must be a finite value >= 0.")
     if (not np.isfinite(float(args.rrblup_pcg_tol))) or (float(args.rrblup_pcg_tol) <= 0.0):
         parser.error("--rrblup-pcg-tol must be a finite value > 0.")
     if int(args.rrblup_pcg_max_iter) <= 0:
@@ -20164,7 +18140,7 @@ def _run_gs_pipeline_impl(
     gblup_methods: list[str] = []
 
     rrblup_solver = str(args.rrblup_solver).strip().lower()
-    rrblup_adamw_cfg: dict[str, typing.Any] = {
+    rrblup_cfg: dict[str, typing.Any] = {
         "lambda_value": float(args.rrblup_lambda),
         "lambda_scale": str(args.rrblup_lambda_scale),
         "lambda_auto": str(args.rrblup_lambda_auto),
@@ -20180,33 +18156,10 @@ def _run_gs_pipeline_impl(
         "lambda_subsample_seed": int(args.rrblup_lambda_subsample_seed),
         "he_thread_policy": str(args.rrblup_he_thread_policy),
         "lambda_large_cutoff": 15_000,
-        "lr": float(args.rrblup_lr),
-        "epochs": int(args.rrblup_epochs),
-        "batch_size": int(args.rrblup_batch_size),
-        "batch_threads": int(args.rrblup_batch_threads),
         "snp_block_size": int(args.rrblup_snp_block_size),
-        "beta1": float(args.rrblup_beta1),
-        "beta2": float(args.rrblup_beta2),
-        "eps": float(args.rrblup_eps),
-        "seed": int(args.rrblup_seed),
-        "auto_min_cells": int(args.rrblup_auto_min_cells),
-        "log_every": int(args.rrblup_log_every),
         "sample_chunk_size": int(args.rrblup_sample_chunk_size),
         "pve_mode": str(args.rrblup_pve_mode),
         "standardized_mode": _resolve_rrblup_standardized_mode(),
-        "auto_grid": str(args.rrblup_auto_grid),
-        "grid_size": int(args.rrblup_grid_size),
-        "grid_min_samples": int(args.rrblup_grid_min_samples),
-        "grid_trial_epochs": int(args.rrblup_grid_trial_epochs),
-        "grid_switch_min_improve": float(args.rrblup_grid_switch_min_improve),
-        "grid_reuse_cv": str(args.rrblup_grid_reuse_cv),
-        "grid_seed": int(args.rrblup_grid_seed),
-        "es_val_frac": float(args.rrblup_es_val_frac),
-        "es_val_min": int(args.rrblup_es_val_min),
-        "es_min_train": int(args.rrblup_es_min_train),
-        "es_patience": int(args.rrblup_es_patience),
-        "es_warmup": int(args.rrblup_es_warmup),
-        "es_min_delta": float(args.rrblup_es_min_delta),
         "pcg_tol": float(args.rrblup_pcg_tol),
         "pcg_max_iter": int(args.rrblup_pcg_max_iter),
         "pcg_std_eps": float(args.rrblup_pcg_std_eps),
@@ -20828,7 +18781,7 @@ def _run_gs_pipeline_impl(
                 n_route_samples_hint=int(min(int(n_samples_total), int(pheno.shape[0]))),
                 cv_folds=(None if not cv_enabled else int(args.cv)),
                 rr_solver_mode=str(rr_solver_mode),
-                rrblup_cfg=rrblup_adamw_cfg,
+                rrblup_cfg=rrblup_cfg,
             )
             args.memory = float(auto_memory_gb)
             auto_memory_msg = (
@@ -21746,14 +19699,14 @@ def _run_gs_pipeline_impl(
                 min_rows=1,
             )
         if rr_block_rows is not None:
-            rrblup_adamw_cfg["snp_block_size"] = int(max(1, int(rr_block_rows)))
-            rrblup_adamw_cfg["pcg_block_rows"] = int(max(1, int(rr_block_rows)))
+            rrblup_cfg["snp_block_size"] = int(max(1, int(rr_block_rows)))
+            rrblup_cfg["pcg_block_rows"] = int(max(1, int(rr_block_rows)))
             if bool(debug_mode):
                 logger.info(
                     "[GS-DEBUG] rrBLUP-PCG decode budget "
                     f"memory_gb={float(args.memory):.2f} "
                     f"n_samples={int(len(samples))} "
-                    f"block_rows={int(rrblup_adamw_cfg['pcg_block_rows'])}"
+                    f"block_rows={int(rrblup_cfg['pcg_block_rows'])}"
                 )
         active_m_rr = int(_packed_ctx_active_rows(packed_lmm_ctx))
         rr_exact_stream_row_block = _common_resolve_decode_block_rows(
@@ -21765,7 +19718,7 @@ def _run_gs_pipeline_impl(
             max_rows=active_m_rr,
         )
         if rr_exact_stream_row_block is not None:
-            rrblup_adamw_cfg["exact_stream_row_block"] = int(
+            rrblup_cfg["exact_stream_row_block"] = int(
                 max(1, int(rr_exact_stream_row_block))
             )
             if bool(debug_mode):
@@ -21773,7 +19726,7 @@ def _run_gs_pipeline_impl(
                     "[GS-DEBUG] rrBLUP exact-SNP stream decode budget "
                     f"memory_gb={float(args.memory):.2f} "
                     f"n_samples={int(len(samples))} "
-                    f"stream_row_block={int(rrblup_adamw_cfg['exact_stream_row_block'])}"
+                    f"stream_row_block={int(rrblup_cfg['exact_stream_row_block'])}"
                 )
         rr_exact_sample_block = _common_resolve_decode_block_rows(
             int(max(1, active_m_rr)),
@@ -21783,13 +19736,13 @@ def _run_gs_pipeline_impl(
             min_rows=1,
         )
         if rr_exact_sample_block is not None:
-            rrblup_adamw_cfg["exact_sample_block"] = int(max(1, int(rr_exact_sample_block)))
+            rrblup_cfg["exact_sample_block"] = int(max(1, int(rr_exact_sample_block)))
             if bool(debug_mode):
                 logger.info(
                     "[GS-DEBUG] rrBLUP exact-SNP decode budget "
                     f"memory_gb={float(args.memory):.2f} "
                     f"n_markers={int(active_m_rr)} "
-                    f"sample_block={int(rrblup_adamw_cfg['exact_sample_block'])}"
+                    f"sample_block={int(rrblup_cfg['exact_sample_block'])}"
                 )
 
     # Cache for repeated trait train/test partitions in GBLUP-only hash kinship mode.
@@ -22875,7 +20828,7 @@ def _run_gs_pipeline_impl(
                             dict[str, typing.Any] | None,
                             res_obj.get("rrblup_final_cfg"),
                         )
-                        or dict(rrblup_adamw_cfg or {})
+                        or dict(rrblup_cfg or {})
                     )
                     solver_req = str(
                         rr_state.get("solver_requested", str(rrblup_solver).strip().lower())
@@ -23692,7 +21645,7 @@ def _run_gs_pipeline_impl(
                 limit_predtrain=args.limit_predtrain,
                 elapsed_offset_by_method=method_elapsed_offsets,
                 rrblup_solver=rrblup_solver,
-                rrblup_adamw_cfg=rrblup_adamw_cfg,
+                rrblup_cfg=rrblup_cfg,
                 bayes_auto_r2_cfg=bayes_auto_r2_cfg,
                 bayes_pi_by_method=bayes_pi_by_method,
                 bayes_chains=int(getattr(args, "chains", 1)),
