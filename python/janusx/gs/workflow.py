@@ -19970,9 +19970,11 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         model_path = str(args.model).strip()
         if model_path == "":
             parser.error("--model file must not be empty.")
-        if not os.path.isfile(model_path):
-            parser.error(f"--model must be a .jxmodel file (got: {model_path})")
-        if not str(model_path).lower().endswith(".jxmodel"):
+        if (not os.path.isfile(model_path)) and (not os.path.isdir(model_path)):
+            parser.error(
+                f"--model must point to a .jxmodel file or model directory (got: {model_path})"
+            )
+        if os.path.isfile(model_path) and not str(model_path).lower().endswith(".jxmodel"):
             parser.error(f"--model must point to a .jxmodel file (got: {model_path})")
         args.model = model_path
     # if args.select is not None:
