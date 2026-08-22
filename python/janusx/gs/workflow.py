@@ -7609,6 +7609,61 @@ def _decode_packed_block_standardized(
     return x
 
 
+def _decode_packed_block_raw(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    row_idx: np.ndarray,
+    sample_indices: np.ndarray,
+) -> np.ndarray:
+    """Decode an active marker block on the raw 0/1/2 scale.
+
+    The packed context can be either resident (``packed`` present) or
+    metadata-only (``source_prefix`` present).  Keep this boundary shared by
+    loaded-model predictors so raw-scale artifacts do not accidentally force
+    a resident payload or index source-row metadata as if it were compact.
+    """
+    if _jxrs is None or (
+        (not hasattr(_jxrs, "bed_packed_decode_rows_f32"))
+        and (not hasattr(_jxrs, "bed_decode_rows_f32_from_meta"))
+    ):
+        raise RuntimeError(
+            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
+        )
+    packed_raw = packed_ctx.get("packed", None)
+    ridx_decode, row_flip, maf, _ridx = _resolve_packed_decode_rows_and_metadata(
+        packed_ctx,
+        row_idx,
+    )
+    sidx = np.ascontiguousarray(
+        np.asarray(sample_indices, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    if packed_raw is not None:
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8), dtype=np.uint8)
+        blk = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
+            packed,
+            int(packed_ctx["n_samples"]),
+            ridx_decode,
+            row_flip,
+            maf,
+            sidx,
+        )
+    else:
+        source_prefix_raw = packed_ctx.get("source_prefix", None)
+        if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
+            raise ValueError(
+                "Streaming packed context requires source_prefix when packed rows are deferred."
+            )
+        blk = _jxrs.bed_decode_rows_f32_from_meta(  # type: ignore[union-attr]
+            str(source_prefix_raw),
+            ridx_decode,
+            row_flip,
+            maf,
+            sidx,
+        )
+    return np.ascontiguousarray(np.asarray(blk, dtype=np.float32), dtype=np.float32)
+
+
 def _compute_packed_empirical_stats_for_samples(
     packed_ctx: dict[str, typing.Any],
     sample_indices: np.ndarray,
@@ -8045,20 +8100,12 @@ def _predict_rrblup_packed_raw_from_beta(
     row_block_size: int,
     sample_chunk_size: int,
 ) -> np.ndarray:
-    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
-        raise RuntimeError(
-            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
-        )
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
     n_out = int(sidx.shape[0])
     if n_out == 0:
         return np.zeros((0, 1), dtype=np.float64)
 
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8), dtype=np.uint8)
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
-    n_samples = int(packed_ctx["n_samples"])
-    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
-    m = int(packed.shape[0])
+    m = int(_packed_ctx_active_rows(packed_ctx))
     b = np.ascontiguousarray(np.asarray(beta, dtype=np.float32).reshape(-1), dtype=np.float32)
     if int(b.shape[0]) != m:
         raise ValueError(f"beta length mismatch: got {b.shape[0]}, expected {m}.")
@@ -8073,16 +8120,12 @@ def _predict_rrblup_packed_raw_from_beta(
         for st in range(0, m, row_step):
             ed = min(st + row_step, m)
             ridx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
-            x_blk = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
-                packed,
-                int(n_samples),
-                ridx,
-                row_flip,
-                maf,
-                blk_idx,
+            x_blk = _decode_packed_block_raw(
+                packed_ctx=packed_ctx,
+                row_idx=ridx,
+                sample_indices=blk_idx,
             )
-            x = np.ascontiguousarray(np.asarray(x_blk, dtype=np.float32), dtype=np.float32)
-            pred += np.asarray(x.T @ b[st:ed], dtype=np.float32).reshape(-1)
+            pred += np.asarray(x_blk.T @ b[st:ed], dtype=np.float32).reshape(-1)
         out[cst:ced] = pred
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
 
@@ -8169,20 +8212,12 @@ def _predict_bayes_packed_raw_from_effects(
     row_block_size: int,
     sample_chunk_size: int,
 ) -> np.ndarray:
-    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
-        raise RuntimeError(
-            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
-        )
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
     n_out = int(sidx.shape[0])
     if n_out == 0:
         return np.zeros((0, 1), dtype=np.float64)
 
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8), dtype=np.uint8)
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
-    n_samples = int(packed_ctx["n_samples"])
-    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
-    m = int(packed.shape[0])
+    m = int(_packed_ctx_active_rows(packed_ctx))
     b = np.ascontiguousarray(np.asarray(beta, dtype=np.float64).reshape(-1), dtype=np.float64)
     if int(b.shape[0]) != m:
         raise ValueError(f"Bayes beta length mismatch: got {b.shape[0]}, expected {m}.")
@@ -8198,16 +8233,12 @@ def _predict_bayes_packed_raw_from_effects(
         for st in range(0, m, row_step):
             ed = min(st + row_step, m)
             ridx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
-            x_blk = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
-                packed,
-                int(n_samples),
-                ridx,
-                row_flip,
-                maf,
-                blk_idx,
+            x_blk = _decode_packed_block_raw(
+                packed_ctx=packed_ctx,
+                row_idx=ridx,
+                sample_indices=blk_idx,
             )
-            x = np.ascontiguousarray(np.asarray(x_blk, dtype=np.float64), dtype=np.float64)
-            pred += np.asarray(x.T @ b[st:ed], dtype=np.float64).reshape(-1)
+            pred += np.asarray(x_blk.T @ b[st:ed], dtype=np.float64).reshape(-1)
         out[cst:ced] = pred
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
 
