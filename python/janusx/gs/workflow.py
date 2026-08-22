@@ -1167,6 +1167,34 @@ def _select_gs_packed_context(
     return blup_ctx
 
 
+def _select_loaded_model_packed_context(
+    model_state: dict[str, typing.Any],
+    packed_ctx: dict[str, typing.Any] | None,
+) -> dict[str, typing.Any] | None:
+    """Keep lazy packed metadata for loaded linear models.
+
+    A metadata-only PLINK context intentionally has no ``packed`` payload;
+    the rrBLUP/Bayes predictors can nevertheless decode rows directly from
+    ``source_prefix``.  The old caller tested only for a resident payload and
+    silently dropped this context, making loaded-model prediction return an
+    empty zero vector whenever no dense matrix was available.
+
+    Other model kinds still require their existing resident/dense route.  In
+    particular, this helper does not claim that a metadata-only context can
+    predict an ML or GBLUP projection model.
+    """
+    if packed_ctx is None:
+        return None
+    if _looks_like_packed_payload(packed_ctx):
+        return packed_ctx
+    if not _looks_like_packed_ctx(packed_ctx):
+        return None
+    kind = str(model_state.get("kind", "")).strip().lower()
+    if kind in {"rrblup_linear", "bayes_linear"}:
+        return packed_ctx
+    return None
+
+
 def _normalize_he_thread_policy_name(
     raw: object,
     *,
@@ -19744,7 +19772,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
             "Decode block memory budget in GB for Bayesian packed/streamed BED "
             "kernels in GS. It controls reusable single/double decode buffers and "
             "promotes a block covering all markers to dense. For genotype route "
-            "selection, explicit -mem contributes a 50% safety budget; when "
+            "selection, explicit -mem contributes a 50%% safety budget; when "
             "omitted, GS separately detects available scheduler/container memory. "
             "The decode block itself still uses a sample/marker shape default "
             "when -mem is omitted."
@@ -23537,10 +23565,9 @@ def _run_gs_pipeline_impl(
                     test_snp=test_snp,
                     train_snp_ml=loaded_train_snp_ml,
                     test_snp_ml=loaded_test_snp_ml,
-                    packed_ctx=(
-                        loaded_method_packed_ctx
-                        if _looks_like_packed_payload(loaded_method_packed_ctx)
-                        else None
+                    packed_ctx=_select_loaded_model_packed_context(
+                        dict(model_state),
+                        loaded_method_packed_ctx,
                     ),
                     train_sample_indices=method_train_sample_idx,
                     test_sample_indices=method_test_sample_idx,
