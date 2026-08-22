@@ -772,6 +772,119 @@ def _packed_ctx_active_row_idx(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
     return np.ascontiguousarray(np.arange(m, dtype=np.int64), dtype=np.int64)
 
 
+def _packed_ctx_select_active_metadata(
+    values: typing.Any,
+    active_row_idx: np.ndarray,
+    *,
+    dtype: typing.Any,
+    name: str,
+) -> np.ndarray:
+    """Return metadata aligned to the compact active-marker space.
+
+    Packed contexts may carry metadata in either coordinate system:
+
+    * compact/active space: one value per retained marker; or
+    * source BED space: one value per source marker, indexed by
+      ``active_row_idx``.
+
+    Never index a compact vector with source row numbers.  This helper is the
+    single boundary between those two spaces and fails with a useful error if
+    neither representation is self-consistent.
+    """
+    active = np.ascontiguousarray(
+        np.asarray(active_row_idx, dtype=np.int64).reshape(-1), dtype=np.int64
+    )
+    arr = np.ascontiguousarray(np.asarray(values, dtype=dtype).reshape(-1), dtype=dtype)
+    n_active = int(active.shape[0])
+    if n_active == 0:
+        return np.ascontiguousarray(arr[:0], dtype=dtype)
+    if np.any(active < 0):
+        raise ValueError(f"Packed context {name} contains negative source row indices.")
+    active_max = int(np.max(active))
+    if int(arr.shape[0]) == n_active:
+        # Equal lengths are interpreted as active-space metadata.  A source
+        # vector with exactly the same length is inherently ambiguous; all
+        # packed loaders use active-space metadata in that case.
+        return arr
+    if active_max < int(arr.shape[0]):
+        return np.ascontiguousarray(arr[active], dtype=dtype)
+    raise ValueError(
+        f"Packed context {name} length {int(arr.shape[0])} cannot represent "
+        f"active source row {active_max}."
+    )
+
+
+def _resolve_packed_decode_rows_and_metadata(
+    packed_ctx: dict[str, typing.Any],
+    row_idx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Resolve local active rows to payload/source rows and compact metadata.
+
+    ``row_idx`` is always expressed in active-marker space (the space used by
+    model coefficients).  Resident compact payloads use those local indices;
+    full/lazy resident payloads and metadata-only stream contexts use source
+    BED indices from ``active_row_idx``.
+    """
+    active = _packed_ctx_active_row_idx(packed_ctx)
+    ridx = np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
+    n_active = int(active.shape[0])
+    if np.any(ridx < 0) or np.any(ridx >= n_active):
+        raise ValueError(
+            f"Packed active row index out of range: got [{int(ridx.min()) if ridx.size else 0}, "
+            f"{int(ridx.max()) if ridx.size else 0}], expected [0, {n_active})."
+        )
+    source_rows = np.ascontiguousarray(active[ridx], dtype=np.int64)
+
+    packed_raw = packed_ctx.get("packed", None)
+    if packed_raw is None:
+        decode_rows = source_rows
+    else:
+        packed = np.asarray(packed_raw, dtype=np.uint8)
+        if packed.ndim != 2:
+            raise ValueError("Packed payload must be a 2D array.")
+        payload_rows = int(packed.shape[0])
+        if payload_rows == n_active:
+            decode_rows = ridx
+        elif source_rows.size == 0 or int(np.max(source_rows)) < payload_rows:
+            decode_rows = source_rows
+        else:
+            raise ValueError(
+                "Packed payload rows are inconsistent with active_row_idx: "
+                f"payload_rows={payload_rows}, active_source_max="
+                f"{int(np.max(source_rows)) if source_rows.size else -1}."
+            )
+
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is None:
+        # Compute full resident row flips when possible.  Metadata-only
+        # contexts must provide row_flip explicitly.
+        _ensure_packed_row_flip_cached(packed_ctx)
+        row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is None:
+        raise ValueError("Packed context is missing row_flip metadata.")
+    maf_raw = packed_ctx.get("maf", None)
+    if maf_raw is None:
+        raise ValueError("Packed context is missing maf metadata.")
+    row_flip_active = _packed_ctx_select_active_metadata(
+        row_flip_raw,
+        active,
+        dtype=np.bool_,
+        name="row_flip",
+    )
+    maf_active = _packed_ctx_select_active_metadata(
+        maf_raw,
+        active,
+        dtype=np.float32,
+        name="maf",
+    )
+    return (
+        np.ascontiguousarray(decode_rows, dtype=np.int64),
+        np.ascontiguousarray(row_flip_active[ridx], dtype=np.bool_),
+        np.ascontiguousarray(maf_active[ridx], dtype=np.float32),
+        ridx,
+    )
+
+
 def _packed_ctx_source_payload_bytes(packed_ctx: dict[str, typing.Any]) -> int:
     n_samples = int(packed_ctx.get("n_samples", 0))
     bytes_per_snp = max(1, (n_samples + 3) // 4)
@@ -971,17 +1084,12 @@ def _packed_ctx_dom_af(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
         dtype=np.float32,
     )
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
-    packed_raw = packed_ctx.get("packed", None)
-    compact_from_active = bool(
-        _packed_ctx_is_lazy_full(packed_ctx)
-        or ((packed_raw is None) and (int(dom_full.shape[0]) != int(active_row_idx.shape[0])))
+    return _packed_ctx_select_active_metadata(
+        dom_full,
+        active_row_idx,
+        dtype=np.float32,
+        name="dom_af",
     )
-    if compact_from_active:
-        active_max = int(np.max(active_row_idx)) if int(active_row_idx.shape[0]) > 0 else -1
-        if int(dom_full.shape[0]) <= active_max:
-            raise ValueError("Packed context dom_af length is inconsistent with active_row_idx.")
-        return np.ascontiguousarray(dom_full[active_row_idx], dtype=np.float32)
-    return dom_full
 
 
 def _packed_ctx_is_lazy_full(packed_ctx: dict[str, typing.Any]) -> bool:
@@ -2827,34 +2935,19 @@ def _decode_packed_subset_to_dense_raw_f32(
         raise RuntimeError(
             "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
         )
-    packed_raw = packed_ctx.get("packed", None)
-    maf_full = np.ascontiguousarray(
-        np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
-        dtype=np.float32,
-    )
     n_samples = int(packed_ctx["n_samples"])
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
-    compact_from_active = bool(
-        _packed_ctx_is_lazy_full(packed_ctx)
-        or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
+    m = int(active_row_idx.shape[0])
+    packed_raw = packed_ctx.get("packed", None)
+    ridx_decode, row_flip, maf, _ridx = _resolve_packed_decode_rows_and_metadata(
+        packed_ctx,
+        np.arange(m, dtype=np.int64),
     )
-    if compact_from_active:
-        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
-        ridx_decode = np.ascontiguousarray(active_row_idx, dtype=np.int64)
-    else:
-        maf = maf_full
-        ridx_decode = np.ascontiguousarray(np.arange(int(maf.shape[0]), dtype=np.int64), dtype=np.int64)
-    m = int(maf.shape[0])
     if int(sidx.size) == 0:
         return np.zeros((m, 0), dtype=np.float32)
     if np.any(sidx < 0) or np.any(sidx >= int(n_samples)):
         raise ValueError("Packed sample_indices are out of range.")
-    row_flip_full = _ensure_packed_row_flip_cached(packed_ctx)
-    if compact_from_active:
-        row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-    else:
-        row_flip = row_flip_full
     if int(row_flip.shape[0]) != m:
         raise ValueError("Packed payload mismatch: row_flip length does not match active rows.")
     if packed_raw is not None:
@@ -7434,7 +7527,12 @@ def _ensure_packed_row_flip_cached(
 ) -> np.ndarray:
     row_flip_raw = packed_ctx.get("row_flip", None)
     if row_flip_raw is None:
-        packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+        packed_raw = packed_ctx.get("packed", None)
+        if packed_raw is None:
+            raise ValueError(
+                "Packed metadata-only context requires explicit row_flip metadata."
+            )
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
         n_samples = int(packed_ctx["n_samples"])
         if _jxrs is None or (not hasattr(_jxrs, "bed_packed_row_flip_mask")):
             raise RuntimeError(
@@ -7460,9 +7558,22 @@ def _ensure_packed_row_flip_cached(
             np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32))).reshape(-1).shape[0]
         )
     if int(row_flip.shape[0]) != int(expected_rows):
-        raise ValueError(
-            "Packed payload mismatch: row_flip length does not match packed SNP rows."
-        )
+        # A lazy-full payload intentionally stores row metadata in active
+        # space while retaining all source BED rows in the payload.  Likewise,
+        # a compact resident payload may be accompanied by source-space
+        # metadata.  Keep the vector in its native coordinate system; callers
+        # must resolve it through `_packed_ctx_select_active_metadata` before
+        # decoding.
+        active = _packed_ctx_active_row_idx(packed_ctx)
+        active_max = int(np.max(active)) if int(active.size) > 0 else -1
+        if not (
+            int(row_flip.shape[0]) == int(active.shape[0])
+            or (active_max >= 0 and active_max < int(row_flip.shape[0]))
+        ):
+            raise ValueError(
+                "Packed payload mismatch: row_flip length is neither packed/source "
+                "space nor active-marker space."
+            )
     return row_flip
 
 
@@ -7495,61 +7606,31 @@ def _packed_gblup_stream_metadata(
                 "Streaming packed context requires cached row_flip metadata; "
                 "rebuild packed-meta cache or disable lazy_full packed fallback."
             )
-    row_flip_full = (
-        np.zeros((int(active_row_idx.shape[0]),), dtype=np.bool_)
-        if mode_is_dom
-        else (
-            np.ascontiguousarray(
-                np.asarray(
-                    packed_ctx["row_flip"],
-                    dtype=np.bool_,
-                ).reshape(-1),
-                dtype=np.bool_,
-            )
-            if _packed_ctx_prefers_metadata_stream(packed_ctx) and ("row_flip" in packed_ctx)
-            else _ensure_packed_row_flip_cached(packed_ctx)
-        )
-    )
-    maf_full = (
-        _packed_ctx_dom_af(packed_ctx)
-        if mode_is_dom
-        else np.ascontiguousarray(
-            np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-    )
-    packed_raw = packed_ctx.get("packed", None)
-    compact_from_active = bool(
-        _packed_ctx_is_lazy_full(packed_ctx)
-        or (
-            (packed_raw is None)
-            and (int(maf_full.shape[0]) != int(active_row_idx.shape[0]))
-        )
-    )
-    if compact_from_active:
-        if mode_is_dom:
-            row_flip_arg = np.zeros((int(active_row_idx.shape[0]),), dtype=np.bool_)
-            row_maf_arg = np.ascontiguousarray(
-                np.asarray(maf_full, dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-        else:
-            row_flip_arg = np.ascontiguousarray(
-                np.asarray(row_flip_full[active_row_idx], dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-            row_maf_arg = np.ascontiguousarray(
-                np.asarray(maf_full[active_row_idx], dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-    else:
-        row_flip_arg = np.ascontiguousarray(
-            np.asarray(row_flip_full, dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
+    if mode_is_dom:
+        row_flip_arg = np.zeros((int(active_row_idx.shape[0]),), dtype=np.bool_)
         row_maf_arg = np.ascontiguousarray(
-            np.asarray(maf_full, dtype=np.float32).reshape(-1),
+            np.asarray(_packed_ctx_dom_af(packed_ctx), dtype=np.float32).reshape(-1),
             dtype=np.float32,
+        )
+    else:
+        # Rust's metadata-stream kernels consume source BED row indices and
+        # compact metadata in the same selected order.  `active_row_idx` is
+        # already the source-row list; only metadata needs active-space
+        # normalization here.
+        row_flip_raw = packed_ctx.get("row_flip", None)
+        if row_flip_raw is None:
+            row_flip_raw = _ensure_packed_row_flip_cached(packed_ctx)
+        row_flip_arg = _packed_ctx_select_active_metadata(
+            row_flip_raw,
+            active_row_idx,
+            dtype=np.bool_,
+            name="row_flip",
+        )
+        row_maf_arg = _packed_ctx_select_active_metadata(
+            packed_ctx["maf"],
+            active_row_idx,
+            dtype=np.float32,
+            name="maf",
         )
     row_source_indices_arg = np.ascontiguousarray(
         np.asarray(active_row_idx, dtype=np.int64).reshape(-1),
@@ -7606,22 +7687,10 @@ def _decode_packed_block_standardized(
             "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
         )
     packed_raw = packed_ctx.get("packed", None)
-    maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-    row_flip_full = _ensure_packed_row_flip_cached(packed_ctx)
-    ridx = np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64).reshape(-1))
-    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
-    compact_from_active = bool(
-        _packed_ctx_is_lazy_full(packed_ctx)
-        or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
+    ridx_decode, row_flip, maf, ridx = _resolve_packed_decode_rows_and_metadata(
+        packed_ctx,
+        row_idx,
     )
-    if compact_from_active:
-        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
-        row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-        ridx_decode = np.ascontiguousarray(active_row_idx[ridx], dtype=np.int64)
-    else:
-        maf = maf_full
-        row_flip = row_flip_full
-        ridx_decode = ridx
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1))
     if packed_raw is not None:
         packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
@@ -7640,21 +7709,29 @@ def _decode_packed_block_standardized(
             raise ValueError(
                 "Streaming packed context requires source_prefix when packed rows are deferred."
             )
-        maf_blk = np.ascontiguousarray(np.asarray(maf[ridx], dtype=np.float32).reshape(-1), dtype=np.float32)
-        row_flip_blk = np.ascontiguousarray(
-            np.asarray(row_flip[ridx], dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
         blk = _jxrs.bed_decode_rows_f32_from_meta(
             str(source_prefix_raw),
             ridx_decode,
-            row_flip_blk,
-            maf_blk,
+            row_flip,
+            maf,
             sidx,
         )
     x = np.ascontiguousarray(np.asarray(blk, dtype=np.float32), dtype=np.float32)
-    mu = np.ascontiguousarray(np.asarray(row_mean[ridx], dtype=np.float32).reshape(-1, 1))
-    inv_sd = np.ascontiguousarray(np.asarray(row_inv_sd[ridx], dtype=np.float32).reshape(-1, 1))
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    mu_active = _packed_ctx_select_active_metadata(
+        row_mean,
+        active_row_idx,
+        dtype=np.float32,
+        name="row_mean",
+    )
+    inv_active = _packed_ctx_select_active_metadata(
+        row_inv_sd,
+        active_row_idx,
+        dtype=np.float32,
+        name="row_inv_sd",
+    )
+    mu = np.ascontiguousarray(np.asarray(mu_active[ridx], dtype=np.float32).reshape(-1, 1))
+    inv_sd = np.ascontiguousarray(np.asarray(inv_active[ridx], dtype=np.float32).reshape(-1, 1))
     x -= mu
     x *= inv_sd
     return x
@@ -7676,9 +7753,12 @@ def _compute_packed_empirical_stats_for_samples(
     if _jxrs is None:
         raise RuntimeError("Rust packed BED stats helpers are unavailable. Rebuild/install JanusX extension.")
 
-    row_flip_full = np.ascontiguousarray(
-        np.asarray(_ensure_packed_row_flip_cached(packed_ctx), dtype=np.bool_).reshape(-1),
+    row_flip_raw = _ensure_packed_row_flip_cached(packed_ctx)
+    row_flip_active = _packed_ctx_select_active_metadata(
+        row_flip_raw,
+        active_row_idx,
         dtype=np.bool_,
+        name="row_flip",
     )
     packed_raw = packed_ctx.get("packed", None)
     packed: np.ndarray | None = None
@@ -7695,14 +7775,17 @@ def _compute_packed_empirical_stats_for_samples(
     if use_packed_stats:
         if packed is None:
             raise ValueError("Packed context mismatch: resident packed payload missing.")
-        row_flip_use = row_flip_full
+        row_flip_use = row_flip_active
         packed_use = packed
         if int(packed_use.shape[0]) != m:
+            if int(active_row_idx.size) == 0 or int(np.max(active_row_idx)) >= int(packed_use.shape[0]):
+                raise ValueError(
+                    "Packed empirical stats payload rows are inconsistent with active_row_idx."
+                )
             packed_use = np.ascontiguousarray(
                 np.asarray(packed_use[active_row_idx, :], dtype=np.uint8),
                 dtype=np.uint8,
             )
-            row_flip_use = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
         sum_blk, sq_blk = _jxrs.bed_packed_empirical_stats_subset_f64(  # type: ignore[union-attr]
             packed_use,
             int(n_samples_full),
@@ -7771,10 +7854,12 @@ def _ensure_packed_standard_stats_cached(
     packed: np.ndarray | None = None
     if packed_raw is not None:
         packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
-    if int(maf_full.shape[0]) != m:
-        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
-    else:
-        maf = maf_full
+    maf = _packed_ctx_select_active_metadata(
+        maf_full,
+        active_row_idx,
+        dtype=np.float32,
+        name="maf",
+    )
     n_samples = int(packed_ctx["n_samples"])
     if n_samples <= 0:
         raise ValueError("Packed context invalid: n_samples must be > 0.")
@@ -7806,7 +7891,12 @@ def _ensure_packed_standard_stats_cached(
         if use_packed_stats:
             if packed is None:
                 raise ValueError("Packed context mismatch: resident packed payload missing.")
-            row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+            row_flip = _packed_ctx_select_active_metadata(
+                _ensure_packed_row_flip_cached(packed_ctx),
+                active_row_idx,
+                dtype=np.bool_,
+                name="row_flip",
+            )
             sum_blk, sq_blk = _jxrs.bed_packed_empirical_stats_f64(  # type: ignore[union-attr]
                 packed,
                 int(n_samples),
@@ -7906,11 +7996,12 @@ def _ensure_packed_centered_stats_cached(
         var = np.asarray((sq_rows_arr / float(n_subset)) - mean_f64 * mean_f64, dtype=np.float64)
         mean = np.ascontiguousarray(np.asarray(mean_f64, dtype=np.float32), dtype=np.float32)
     else:
-        maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-        if int(maf_full.shape[0]) == m:
-            maf = maf_full
-        else:
-            maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+        maf = _packed_ctx_select_active_metadata(
+            packed_ctx["maf"],
+            active_row_idx,
+            dtype=np.float32,
+            name="maf",
+        )
         p = np.clip(np.asarray(maf, dtype=np.float64), 0.0, 0.5)
         var = 2.0 * p * (1.0 - p)
         mean = np.ascontiguousarray(np.asarray(2.0 * p, dtype=np.float32), dtype=np.float32)
@@ -7959,12 +8050,9 @@ def _decode_packed_subset_to_dense_standardized(
             "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
         )
     packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    m = int(packed.shape[0])
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    m = int(active_row_idx.shape[0])
     n_samples = int(packed_ctx["n_samples"])
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
-    if int(maf.shape[0]) != m:
-        raise ValueError("Packed context mismatch: maf length != packed rows.")
-    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
     n_out = int(sidx.shape[0])
     dtype_out = np.dtype(out_dtype)
@@ -7975,21 +8063,37 @@ def _decode_packed_subset_to_dense_standardized(
     for st in range(0, m, blk_step):
         ed = min(st + blk_step, m)
         ridx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
+        ridx_decode, row_flip, maf, _ridx = _resolve_packed_decode_rows_and_metadata(
+            packed_ctx,
+            ridx,
+        )
         blk = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
             packed,
             int(n_samples),
-            ridx,
+            ridx_decode,
             row_flip,
             maf,
             sidx,
         )
         x = np.ascontiguousarray(np.asarray(blk, dtype=dtype_out), dtype=dtype_out)
+        row_mean_active = _packed_ctx_select_active_metadata(
+            row_mean,
+            active_row_idx,
+            dtype=dtype_out,
+            name="row_mean",
+        )
+        row_inv_sd_active = _packed_ctx_select_active_metadata(
+            row_inv_sd,
+            active_row_idx,
+            dtype=dtype_out,
+            name="row_inv_sd",
+        )
         mu = np.ascontiguousarray(
-            np.asarray(row_mean[st:ed], dtype=dtype_out).reshape(-1, 1),
+            np.asarray(row_mean_active[st:ed], dtype=dtype_out).reshape(-1, 1),
             dtype=dtype_out,
         )
         inv_sd = np.ascontiguousarray(
-            np.asarray(row_inv_sd[st:ed], dtype=dtype_out).reshape(-1, 1),
+            np.asarray(row_inv_sd_active[st:ed], dtype=dtype_out).reshape(-1, 1),
             dtype=dtype_out,
         )
         x -= mu
@@ -11720,16 +11824,30 @@ def GSapi(
                 )
                 if packed_payload_arg.ndim != 2:
                     raise ValueError("Packed Bayes requires resident packed payload with ndim=2.")
-            compact_from_active = bool(
-                _packed_ctx_is_lazy_full(packed_train)
-                or ((packed_raw is None) and (int(maf_full.shape[0]) != int(active_row_idx.shape[0])))
+            maf = _packed_ctx_select_active_metadata(
+                maf_full,
+                active_row_idx,
+                dtype=np.float32,
+                name="maf",
             )
-            if compact_from_active:
-                maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
-                row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-            else:
-                maf = maf_full
-                row_flip = row_flip_full
+            row_flip = _packed_ctx_select_active_metadata(
+                row_flip_full,
+                active_row_idx,
+                dtype=np.bool_,
+                name="row_flip",
+            )
+            row_mean = _packed_ctx_select_active_metadata(
+                row_mean,
+                active_row_idx,
+                dtype=np.float32,
+                name="row_mean",
+            )
+            row_inv_sd = _packed_ctx_select_active_metadata(
+                row_inv_sd,
+                active_row_idx,
+                dtype=np.float32,
+                name="row_inv_sd",
+            )
 
             bayes_snp_block = _parse_nonnegative_int(
                 os.getenv("JX_BAYES_PACKED_SNP_BLOCK", "2048")
@@ -18228,52 +18346,21 @@ def _decode_packed_ctx_to_dense(
         )
 
     packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
     n_samples = int(packed_ctx["n_samples"])
     if packed.ndim != 2:
         raise ValueError("Invalid packed payload: packed must be 2D.")
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
-    if _packed_ctx_is_lazy_full(packed_ctx):
-        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
-    else:
-        maf = maf_full
-    if int(active_row_idx.shape[0]) != int(maf.shape[0]):
-        raise ValueError("Packed payload shape mismatch between active rows and maf.")
-
-    row_flip_raw = packed_ctx.get("row_flip", None)
-    if row_flip_raw is None:
-        row_flip_full = np.asarray(
-            _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
-            dtype=np.bool_,
-        )
-        row_flip_full = np.ascontiguousarray(row_flip_full.reshape(-1), dtype=np.bool_)
-        packed_ctx["row_flip"] = row_flip_full
-        if _packed_ctx_is_lazy_full(packed_ctx):
-            row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-        else:
-            row_flip = row_flip_full
-    else:
-        row_flip_full = np.ascontiguousarray(
-            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
-        )
-        if _packed_ctx_is_lazy_full(packed_ctx):
-            if int(row_flip_full.shape[0]) != int(packed.shape[0]):
-                raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
-            row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
-        else:
-            row_flip = row_flip_full
-            if int(row_flip.shape[0]) != int(packed.shape[0]):
-                raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
-
-    ridx = (
-        active_row_idx
-        if _packed_ctx_is_lazy_full(packed_ctx)
-        else np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64))
+    ridx = np.ascontiguousarray(
+        np.arange(int(active_row_idx.shape[0]), dtype=np.int64), dtype=np.int64
+    )
+    ridx_decode, row_flip, maf, _ridx = _resolve_packed_decode_rows_and_metadata(
+        packed_ctx,
+        ridx,
     )
     decoded = _jxrs.bed_packed_decode_rows_f32(
         packed,
         int(n_samples),
-        ridx,
+        ridx_decode,
         row_flip,
         maf,
         None,
