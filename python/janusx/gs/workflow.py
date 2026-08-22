@@ -1179,9 +1179,11 @@ def _select_loaded_model_packed_context(
     silently dropped this context, making loaded-model prediction return an
     empty zero vector whenever no dense matrix was available.
 
-    Other model kinds still require their existing resident/dense route.  In
-    particular, this helper does not claim that a metadata-only context can
-    predict an ML or GBLUP projection model.
+    Other model kinds still require their existing resident/dense route.  ML
+    states are not metadata-streamable.  Additive GBLUP projection states use
+    the same raw marker decoder as linear effects; dominance/AD projections
+    are kept on this path only so the predictor can fail explicitly instead
+    of silently returning an empty vector.
     """
     if packed_ctx is None:
         return None
@@ -1190,7 +1192,12 @@ def _select_loaded_model_packed_context(
     if not _looks_like_packed_ctx(packed_ctx):
         return None
     kind = str(model_state.get("kind", "")).strip().lower()
-    if kind in {"rrblup_linear", "bayes_linear", "gblup_kernel_projection"}:
+    if kind in {
+        "rrblup_linear",
+        "bayes_linear",
+        "gblup_kernel_projection",
+        "gblup_kernel_projection_ad",
+    }:
         return packed_ctx
     return None
 
@@ -14392,6 +14399,13 @@ def _predict_from_loaded_model_state(
         return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
 
     if kind == "gblup_kernel_projection":
+        kernel_mode = str(model_state.get("kernel_mode", "a")).strip().lower()
+        if kernel_mode in {"d", "dom", "dominance", "ad"}:
+            raise ValueError(
+                f"Loaded {kernel_mode.upper()} GBLUP projection for {m} cannot be "
+                "predicted by the additive marker decoder; dominance model reload "
+                "is not supported yet."
+            )
         alpha0 = float(model_state.get("alpha", 0.0))
         beta_raw = model_state.get("kernel_projection", model_state.get("beta", None))
         if beta_raw is None:
@@ -14426,6 +14440,12 @@ def _predict_from_loaded_model_state(
         for st, ed, _ridx in _iter_row_blocks(int(x.shape[0]), block_rows):
             pred += np.asarray(x[st:ed].T @ beta[st:ed], dtype=np.float64).reshape(-1)
         return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
+
+    if kind == "gblup_kernel_projection_ad":
+        raise ValueError(
+            f"Loaded AD GBLUP model for {m} cannot be predicted yet; "
+            "AD model reload requires separate additive and dominance decoders."
+        )
 
     if kind == "mlsk_model":
         estimator = model_state.get("estimator", None)
