@@ -702,6 +702,7 @@ impl BayesSamplingController {
         self.rhat_state.values()
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn rhat_max(&self) -> f64 {
         self.rhat_state.rhat_max()
