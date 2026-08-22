@@ -1190,7 +1190,7 @@ def _select_loaded_model_packed_context(
     if not _looks_like_packed_ctx(packed_ctx):
         return None
     kind = str(model_state.get("kind", "")).strip().lower()
-    if kind in {"rrblup_linear", "bayes_linear"}:
+    if kind in {"rrblup_linear", "bayes_linear", "gblup_kernel_projection"}:
         return packed_ctx
     return None
 
@@ -14389,6 +14389,42 @@ def _predict_from_loaded_model_state(
             )
         pred = np.full((int(x.shape[1]),), float(alpha0), dtype=np.float64)
         pred += np.asarray(x.T @ beta, dtype=np.float64).reshape(-1)
+        return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
+
+    if kind == "gblup_kernel_projection":
+        alpha0 = float(model_state.get("alpha", 0.0))
+        beta_raw = model_state.get("kernel_projection", model_state.get("beta", None))
+        if beta_raw is None:
+            raise ValueError(f"Loaded GBLUP model for {m} is missing kernel projection effects.")
+        beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+        block_rows = int(max(1, int(model_state.get("snp_block_size", 2048))))
+        sample_chunk = int(max(1, int(model_state.get("sample_chunk_size", 4096))))
+        if packed_ctx is not None and packed_sample_indices is not None:
+            return _predict_bayes_packed_raw_from_effects(
+                packed_ctx=packed_ctx,
+                sample_indices=np.ascontiguousarray(
+                    np.asarray(packed_sample_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ),
+                alpha0=alpha0,
+                beta=beta,
+                row_block_size=block_rows,
+                sample_chunk_size=sample_chunk,
+            )
+        if dense_matrix is None:
+            raise ValueError(
+                f"Loaded additive GBLUP model {m} requires genotype data for prediction."
+            )
+        x = np.asarray(dense_matrix, dtype=np.float64)
+        if x.ndim != 2:
+            raise ValueError(f"Loaded GBLUP predict expects 2D matrix, got {x.shape}.")
+        if int(x.shape[0]) != int(beta.shape[0]):
+            raise ValueError(
+                f"Loaded GBLUP marker mismatch: matrix m={x.shape[0]} vs effects m={beta.shape[0]}."
+            )
+        pred = np.full((int(x.shape[1]),), alpha0, dtype=np.float64)
+        for st, ed, _ridx in _iter_row_blocks(int(x.shape[0]), block_rows):
+            pred += np.asarray(x[st:ed].T @ beta[st:ed], dtype=np.float64).reshape(-1)
         return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
 
     if kind == "mlsk_model":
