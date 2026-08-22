@@ -3512,6 +3512,7 @@ pub fn rrblupc_exact_snp_packed<'py>(
     packed_n_samples=0,
     maf=None,
     row_flip=None,
+    row_source_indices=None,
     blas_threads=0
 ))]
 pub fn rrblupc_pcg_bed<'py>(
@@ -3535,6 +3536,7 @@ pub fn rrblupc_pcg_bed<'py>(
     packed_n_samples: usize,
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
+    row_source_indices: Option<PyReadonlyArray1<'py, i64>>,
     blas_threads: usize,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
@@ -3563,6 +3565,16 @@ pub fn rrblupc_pcg_bed<'py>(
         ));
     }
 
+    if packed.is_some() && row_source_indices.is_some() {
+        return Err(PyRuntimeError::new_err(
+            "rrblupc_pcg_bed: packed payload and row_source_indices are mutually exclusive.",
+        ));
+    }
+    if site_keep.is_some() && row_source_indices.is_some() {
+        return Err(PyRuntimeError::new_err(
+            "rrblupc_pcg_bed: site_keep and row_source_indices are mutually exclusive.",
+        ));
+    }
     let use_external_packed = packed.is_some();
     let use_external_stats =
         (!use_external_packed) && (maf.is_some() || row_flip.is_some() || packed_n_samples > 0);
@@ -3574,6 +3586,7 @@ pub fn rrblupc_pcg_bed<'py>(
     let mut loaded_packed_ro: Option<PyReadonlyArray2<'py, u8>> = None;
     let mut external_maf_ro: Option<PyReadonlyArray1<'py, f32>> = None;
     let mut external_row_flip_ro: Option<PyReadonlyArray1<'py, bool>> = None;
+    let mut external_row_source_indices: Option<Vec<usize>> = None;
 
     let n_samples: usize;
     let bytes_per_snp: usize;
@@ -3650,6 +3663,23 @@ pub fn rrblupc_pcg_bed<'py>(
             return Err(PyRuntimeError::new_err(
                 "rrblup_pcg_bed: streaming stats path received zero marker stats.",
             ));
+        }
+        if let Some(row_source_ro) = row_source_indices {
+            let row_source_vec =
+                parse_nonnegative_index_vec_i64(row_source_ro.as_slice()?, "row_source_indices")
+                    .map_err(PyRuntimeError::new_err)?;
+            if row_source_vec.len() != m_total {
+                return Err(PyRuntimeError::new_err(format!(
+                    "row_source_indices length mismatch: got {}, expected {m_total}",
+                    row_source_vec.len()
+                )));
+            }
+            if row_source_vec.is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "row_source_indices must not be empty for metadata streaming path.",
+                ));
+            }
+            external_row_source_indices = Some(row_source_vec);
         }
         resident_packed_flat = None;
     } else {
@@ -3755,7 +3785,7 @@ pub fn rrblupc_pcg_bed<'py>(
     let mut eff_m = m_total;
     let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
     let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
-    let mut packed_row_indices: Option<Vec<usize>> = None;
+    let mut packed_row_indices: Option<Vec<usize>> = external_row_source_indices;
     if let Some(mask) = site_keep {
         let mask_vec: Vec<bool> = match mask.as_slice() {
             Ok(s) => s.to_vec(),

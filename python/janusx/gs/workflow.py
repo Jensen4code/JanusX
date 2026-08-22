@@ -196,8 +196,6 @@ from janusx.script._common.threads import (
 from janusx.script._common.grmstable import (
     build_dense_grm_f64,
     save_grm_npy_blocked,
-    build_stable_packed_ctx_grm_f64,
-    stable_grm_builder_available,
 )
 from janusx.script._common.grmio import (
     grm_cache_lock,
@@ -1148,6 +1146,25 @@ def _looks_like_packed_ctx(obj: typing.Any) -> bool:
         and ("maf" in obj)
         and (("packed" in obj) or ("source_prefix" in obj))
     )
+
+
+_GS_BAYES_METHODS = frozenset({"BayesA", "BayesB", "BayesC", "BayesR"})
+
+
+def _select_gs_packed_context(
+    method: str,
+    blup_ctx: dict[str, typing.Any] | None,
+    bayes_ctx: dict[str, typing.Any] | None,
+) -> dict[str, typing.Any] | None:
+    """Select the genotype context owned by one GS method family.
+
+    BLUP keeps the metadata/source-prefix context so its kernels remain
+    streaming.  Bayes may use a separately promoted resident context when the
+    route budget allows it; promotion must never replace the BLUP context.
+    """
+    if str(method).strip() in _GS_BAYES_METHODS and bayes_ctx is not None:
+        return bayes_ctx
+    return blup_ctx
 
 
 def _normalize_he_thread_policy_name(
@@ -4586,13 +4603,7 @@ def _build_gblup_cv_grm_once(
             hasattr(_jxrs, "grm_bed_f64_from_meta")
             and (str(packed_ctx.get("source_prefix", "") or "").strip() != "")
         )
-        can_build_f32 = bool(
-            hasattr(_jxrs, "grm_packed_f32")
-            and hasattr(_jxrs, "bed_packed_row_flip_mask")
-            and (not mode_is_dom)
-        )
-        can_build_stable_f64 = bool((not mode_is_dom) and stable_grm_builder_available())
-        if (not can_build_stream_f64) and (not can_build_f32) and (not can_build_stable_f64):
+        if not can_build_stream_f64:
             return None
 
         sidx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
@@ -4646,70 +4657,6 @@ def _build_gblup_cv_grm_once(
                     mmap_window_mb=int(gblup_mmap_window_mb),
                 )
                 grm = np.asarray(grm_raw, dtype=np.float64)
-            except Exception:
-                grm = None
-
-        prefer_metadata_stream = _packed_ctx_prefers_metadata_stream(packed_ctx)
-
-        if grm is None and can_build_f32 and ("packed" in packed_ctx) and (not prefer_metadata_stream):
-            packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-            maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-            if packed.ndim != 2:
-                raise ValueError("Invalid packed payload: packed must be 2D.")
-            if maf.shape[0] != packed.shape[0]:
-                raise ValueError(
-                    f"Packed payload mismatch: maf={maf.shape[0]}, packed_rows={packed.shape[0]}."
-                )
-            exp_bps = (n_samples + 3) // 4
-            if int(packed.shape[1]) != int(exp_bps):
-                raise ValueError(
-                    f"Packed payload mismatch: bytes_per_snp={packed.shape[1]}, expected={exp_bps}."
-                )
-
-            row_flip_raw = packed_ctx.get("row_flip", None)
-            if row_flip_raw is None:
-                row_flip = np.asarray(
-                    _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
-                    dtype=np.bool_,
-                )
-                row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
-                packed_ctx["row_flip"] = row_flip
-            else:
-                row_flip = np.ascontiguousarray(
-                    np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-                    dtype=np.bool_,
-                )
-                if row_flip.shape[0] != packed.shape[0]:
-                    raise ValueError(
-                        "Packed payload mismatch: row_flip length does not match packed rows."
-                    )
-
-            sidx_arg = None if full_identity else sidx
-            try:
-                grm_raw = _jxrs.grm_packed_f32(
-                    packed,
-                    int(n_samples),
-                    row_flip,
-                    maf,
-                    sample_indices=sidx_arg,
-                    method=1,
-                    block_cols=int(block_cols),
-                    threads=max(1, int(n_jobs)),
-                    progress_callback=None,
-                    progress_every=0,
-                )
-                grm = np.asarray(grm_raw, dtype=np.float64)
-            except Exception:
-                grm = None
-
-        if grm is None and can_build_stable_f64 and (not prefer_metadata_stream):
-            try:
-                grm, _eff_m = build_stable_packed_ctx_grm_f64(
-                    packed_ctx=packed_ctx,
-                    sample_indices=(None if full_identity else sidx),
-                    block_cols=int(block_cols),
-                    threads=max(1, int(n_jobs)),
-                )
             except Exception:
                 grm = None
 
@@ -5572,17 +5519,13 @@ def _kernel_projection_beta_from_backend(
             dtype=np.int64,
         )
         block_rows = int(max(1, int(packed_ctx.get("__gblup_grm_block_rows__", 4096))))
-        if _looks_like_packed_payload(packed_ctx):
-            beta_kp = _kernel_projection_beta_from_packed(
-                packed_ctx=packed_ctx,
-                sample_indices=sample_idx_local,
-                alpha=alpha_vec,
-                mode=mode,
-                coef=float(coef),
-                block_rows=block_rows,
-                threads=max(0, int(n_jobs)),
-            )
-        elif _jxrs is not None and hasattr(_jxrs, "gblup_effect_from_meta_stream"):
+        source_prefix_raw = packed_ctx.get("source_prefix", None)
+        if (
+            _jxrs is not None
+            and hasattr(_jxrs, "gblup_effect_from_meta_stream")
+            and source_prefix_raw is not None
+            and str(source_prefix_raw).strip() != ""
+        ):
             try:
                 (
                     source_prefix,
@@ -6275,93 +6218,33 @@ def _estimate_rrblup_lambda_subsample_reml(
             he_diag["stage_rayon_threads"] = int(he_thread_spec["rayon_threads"])
             he_diag["he_threads_arg"] = int(he_thread_spec["he_threads"])
 
-            n_samples_full = int(packed_ctx["n_samples"])
             packed_is_lazy = _packed_ctx_is_lazy_full(packed_ctx)
             source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
             packed_raw = packed_ctx.get("packed", None)
-            use_resident_packed = bool(
-                (packed_raw is not None) and ((not packed_is_lazy) or (source_prefix == ""))
+            if source_prefix == "":
+                raise ValueError(
+                    "rrBLUP lambda-auto requires a source PLINK prefix; resident packed "
+                    "input has been removed from the BLUP path."
+                )
+            (
+                source_prefix,
+                _site_keep_unused,
+                row_source_indices_arg,
+                row_flip_arg,
+                maf_arg,
+                he_mmap_window_mb,
+            ) = _packed_gblup_stream_metadata(
+                packed_ctx,
+                block_rows=int(he_block_rows),
             )
-            site_keep_arg: np.ndarray | None = None
-            row_source_indices_arg: np.ndarray | None = None
-            he_mmap_window_mb: int | None = None
-            he_call_path = "external_packed"
+            he_call_path = "metadata_stream"
             he_call_api = "kwargs_blas_threads"
-            packed_arg: np.ndarray | None = None
-            packed_src_view: np.ndarray | None = None
-
-            if use_resident_packed:
-                packed_src_view = np.asarray(packed_raw, dtype=np.uint8)
-                packed_arg = np.ascontiguousarray(
-                    packed_src_view,
-                    dtype=np.uint8,
-                )
-                maf_arg = np.ascontiguousarray(
-                    np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                )
-                if packed_arg.ndim != 2:
-                    raise ValueError("HE lambda-auto requires packed matrix with ndim=2.")
-                if int(maf_arg.shape[0]) != int(packed_arg.shape[0]):
-                    raise ValueError("HE lambda-auto packed payload mismatch: maf length != packed SNP rows.")
-                exp_bps = (n_samples_full + 3) // 4
-                if int(packed_arg.shape[1]) != int(exp_bps):
-                    raise ValueError(
-                        "HE lambda-auto packed payload mismatch: "
-                        f"bytes_per_snp={packed_arg.shape[1]} expected={exp_bps}."
-                    )
-
-                row_flip_raw = packed_ctx.get("row_flip", None)
-                if row_flip_raw is None:
-                    row_flip_arg = np.ascontiguousarray(
-                        np.asarray(
-                            _jxrs.bed_packed_row_flip_mask(packed_arg, int(n_samples_full)),  # type: ignore[union-attr]
-                            dtype=np.bool_,
-                        ).reshape(-1),
-                        dtype=np.bool_,
-                    )
-                    packed_ctx["row_flip"] = row_flip_arg
-                else:
-                    row_flip_arg = np.ascontiguousarray(
-                        np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
-                    )
-                if int(row_flip_arg.shape[0]) != int(packed_arg.shape[0]):
-                    raise ValueError("HE lambda-auto packed payload mismatch: row_flip length != packed SNP rows.")
-
-                site_keep_raw = packed_ctx.get("site_keep", None)
-                if site_keep_raw is not None:
-                    site_keep_arg = np.ascontiguousarray(
-                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
-                    )
-                    if (not packed_is_lazy) and (int(site_keep_arg.shape[0]) != int(maf_arg.shape[0])):
-                        site_keep_arg = None
-                he_site_keep_mode, he_site_keep_note = _describe_he_site_keep_mode(
-                    site_keep_raw,
-                    site_keep_arg,
-                    int(maf_arg.shape[0]),
-                    packed_is_lazy=bool(packed_is_lazy),
-                )
-            else:
-                (
-                    source_prefix,
-                    site_keep_arg,
-                    row_source_indices_arg,
-                    row_flip_arg,
-                    maf_arg,
-                    he_mmap_window_mb,
-                ) = _packed_gblup_stream_metadata(
-                    packed_ctx,
-                    block_rows=int(he_block_rows),
-                )
-                he_call_path = "metadata_stream"
-                he_site_keep_mode, he_site_keep_note = _describe_he_site_keep_mode(
-                    packed_ctx.get("site_keep", None),
-                    site_keep_arg,
-                    int(row_source_indices_arg.shape[0]),
-                    packed_is_lazy=bool(packed_is_lazy),
-                )
+            he_site_keep_mode, he_site_keep_note = _describe_he_site_keep_mode(
+                packed_ctx.get("site_keep", None),
+                None,
+                int(row_source_indices_arg.shape[0]),
+                packed_is_lazy=bool(packed_is_lazy),
+            )
             he_diag["he_site_keep_mode"] = str(he_site_keep_mode)
 
             he_rss_before: int | None = None
@@ -6371,10 +6254,10 @@ def _estimate_rrblup_lambda_subsample_reml(
                     int(n_train) * int(he_trace_probe_batch) * np.dtype(np.float32).itemsize
                 )
                 he_rss_before = _get_process_rss_bytes()
-                if (packed_raw is not None) and (not use_resident_packed):
+                if packed_raw is not None:
                     print(
                         (
-                            "[rrBLUP-DEBUG] HE lazy_full payload detected -> force metadata stream "
+                            "[rrBLUP-DEBUG] HE resident payload ignored; forcing metadata stream "
                             f"source_prefix={source_prefix}"
                         ),
                         flush=True,
@@ -6386,55 +6269,25 @@ def _estimate_rrblup_lambda_subsample_reml(
                     ),
                     flush=True,
                 )
-                if use_resident_packed:
-                    packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
-                    packed_same_obj = bool(packed_arg is packed_src_view)
-                    try:
-                        packed_shares_memory = bool(np.shares_memory(packed_arg, packed_src_view))
-                    except Exception:
-                        packed_shares_memory = False
-                    print(
-                        (
-                            "[rrBLUP-DEBUG] HE packed payload "
-                            f"rows={int(packed_arg.shape[0])} "
-                            f"bytes_per_snp={int(packed_arg.shape[1])} "
-                            f"c_contig={int(packed_c_contig)} "
-                            f"shared_with_ctx={int(packed_shares_memory)} "
-                            f"same_obj={int(packed_same_obj)} "
-                            f"nbytes={_format_debug_bytes(int(packed_arg.nbytes))}"
-                        ),
-                        flush=True,
-                    )
-                    print(
-                        (
-                            "[rrBLUP-DEBUG] HE workspace estimate "
-                            f"packed={_format_debug_bytes(int(packed_arg.nbytes))} "
-                            f"block={_format_debug_bytes(he_block_bytes)} "
-                            f"probe={_format_debug_bytes(he_probe_bytes)} x2 "
-                            f"rss_before={_format_debug_bytes(he_rss_before)}"
-                        ),
-                        flush=True,
-                    )
-                else:
-                    print(
-                        (
-                            "[rrBLUP-DEBUG] HE metadata stream "
-                            f"rows={int(row_source_indices_arg.shape[0])} "
-                            f"window_mb={int(he_mmap_window_mb)} "
-                            f"source_prefix={source_prefix}"
-                        ),
-                        flush=True,
-                    )
-                    print(
-                        (
-                            "[rrBLUP-DEBUG] HE workspace estimate "
-                            f"packed=streamed "
-                            f"block={_format_debug_bytes(he_block_bytes)} "
-                            f"probe={_format_debug_bytes(he_probe_bytes)} x2 "
-                            f"rss_before={_format_debug_bytes(he_rss_before)}"
-                        ),
-                        flush=True,
-                    )
+                print(
+                    (
+                        "[rrBLUP-DEBUG] HE metadata stream "
+                        f"rows={int(row_source_indices_arg.shape[0])} "
+                        f"window_mb={int(he_mmap_window_mb)} "
+                        f"source_prefix={source_prefix}"
+                    ),
+                    flush=True,
+                )
+                print(
+                    (
+                        "[rrBLUP-DEBUG] HE workspace estimate "
+                        "packed=streamed "
+                        f"block={_format_debug_bytes(he_block_bytes)} "
+                        f"probe={_format_debug_bytes(he_probe_bytes)} x2 "
+                        f"rss_before={_format_debug_bytes(he_rss_before)}"
+                    ),
+                    flush=True,
+                )
 
             _emit(
                 "pcg_lambda_vc_start",
@@ -6465,13 +6318,8 @@ def _estimate_rrblup_lambda_subsample_reml(
                         maf=maf_arg,
                         row_flip=row_flip_arg,
                     )
-                    if use_resident_packed:
-                        he_call_kwargs["site_keep"] = site_keep_arg
-                        he_call_kwargs["packed"] = packed_arg
-                        he_call_kwargs["packed_n_samples"] = int(n_samples_full)
-                    else:
-                        he_call_kwargs["row_source_indices"] = row_source_indices_arg
-                        he_call_kwargs["mmap_window_mb"] = int(he_mmap_window_mb)
+                    he_call_kwargs["row_source_indices"] = row_source_indices_arg
+                    he_call_kwargs["mmap_window_mb"] = int(he_mmap_window_mb)
                     try:
                         he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
                             source_prefix,
@@ -6497,34 +6345,17 @@ def _estimate_rrblup_lambda_subsample_reml(
                                 "kwargs_no_blas_threads",
                                 note="extension_missing_he_blas_threads_kw",
                             )
-                        except TypeError:
-                            if use_resident_packed:
-                                _emit_he_call_path(
-                                    "legacy_prefix_reload",
-                                    "legacy_positional",
-                                    note="extension_missing_packed_he_signature",
-                                )
-                                he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
-                                    source_prefix,
-                                    train_abs,
-                                    y_vec,
-                                    site_keep_arg,
-                                    int(he_trace_samples),
-                                    float(he_tol),
-                                    int(he_max_iter),
-                                    int(he_block_rows),
-                                    float(std_eps),
-                                    bool(he_use_train_maf),
-                                    int(he_thread_spec["he_threads"]),
-                                    int(he_seed),
-                                )
-                            else:
-                                _emit_he_call_path(
-                                    "metadata_stream",
-                                    "kwargs_missing_stream_signature",
-                                    note="extension_missing_stream_he_signature",
-                                )
-                                raise
+                        except TypeError as ex:
+                            _emit_he_call_path(
+                                "metadata_stream",
+                                "kwargs_missing_stream_signature",
+                                note="extension_missing_stream_he_signature",
+                            )
+                            raise RuntimeError(
+                                "The installed JanusX extension lacks the metadata row-map "
+                                "HE signature; rebuild/reinstall JanusX. Legacy prefix reload "
+                                "is disabled because it can load the full BED payload."
+                            ) from ex
             finally:
                 if he_debug_mode:
                     he_rss_after = _get_process_rss_bytes()
@@ -6974,15 +6805,28 @@ def _estimate_rrblup_lambda_subsample_reml(
             )
             return fit_fast
 
-        y_fit = np.ascontiguousarray(y_vec.reshape(-1, 1), dtype=np.float64)
-        model = MLMBLUP(
-            y_fit,
-            packed_ctx,
-            kinship=1,
-            sample_indices=np.ascontiguousarray(train_abs, dtype=np.int64),
-            force_fast=True,
+        # Do not fall back to MLMBLUP with a resident packed payload here.
+        # The lambda-auto helper is part of the streaming BLUP route as well;
+        # build the GRM through the source BED metadata when the dedicated
+        # Rust REML binding is unavailable.
+        grm_full = _build_gblup_cv_grm_once(
+            train_snp=None,
+            packed_ctx=packed_ctx,
+            train_sample_indices=np.ascontiguousarray(train_abs, dtype=np.int64),
+            n_jobs=max(1, int(n_jobs)),
         )
-        lam_k, sigma_g2, sigma_e2 = _recover_lambda_from_model(model)
+        if grm_full is None:
+            raise RuntimeError(
+                "Packed rrBLUP lambda-auto requires the streaming GBLUP backend; "
+                "resident packed fallback has been removed."
+            )
+        fit_full = _fit_gblup_reml_from_grm(
+            np.ascontiguousarray(y_vec, dtype=np.float64),
+            np.asarray(grm_full, dtype=np.float64),
+        )
+        lam_k = float(fit_full.get("lambda_reml", np.nan))
+        sigma_g2 = float(fit_full.get("sigma_g2", np.nan))
+        sigma_e2 = float(fit_full.get("sigma_e2", np.nan))
         lam_eq = (
             float(lam_k * m_scale)
             if (np.isfinite(lam_k) and lam_k > 0.0)
@@ -6993,7 +6837,7 @@ def _estimate_rrblup_lambda_subsample_reml(
             "lambda_eq": float(lam_eq),
             "sigma_g2": float(sigma_g2),
             "sigma_e2": float(sigma_e2),
-            "pve": float(getattr(model, "pve", np.nan)),
+            "pve": float(fit_full.get("pve", np.nan)),
             "m_effective_vc": int(m_effective),
         }
 
@@ -8245,82 +8089,6 @@ def _kernel_projection_beta_from_dense(
     return np.ascontiguousarray(beta, dtype=np.float64)
 
 
-def _kernel_projection_beta_from_packed(
-    *,
-    packed_ctx: dict[str, typing.Any],
-    sample_indices: np.ndarray,
-    alpha: np.ndarray,
-    mode: str,
-    coef: float = 1.0,
-    block_rows: int = 4096,
-    threads: int = 0,
-) -> np.ndarray | None:
-    if _jxrs is None or not hasattr(_jxrs, "packed_malpha_mode_f64"):
-        return None
-    if not _looks_like_packed_payload(packed_ctx):
-        return None
-    try:
-        packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8), dtype=np.uint8)
-        maf = np.ascontiguousarray(
-            np.asarray(packed_ctx.get("maf", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-        row_flip = _ensure_packed_row_flip_cached(packed_ctx)
-        n_samples = int(packed_ctx["n_samples"])
-        sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
-        a = np.ascontiguousarray(np.asarray(alpha, dtype=np.float64).reshape(-1), dtype=np.float64)
-        m = int(packed.shape[0])
-        if int(maf.shape[0]) != m or int(row_flip.shape[0]) != m:
-            return None
-        if int(sidx.shape[0]) == 0 or int(a.shape[0]) != int(sidx.shape[0]):
-            return None
-
-        mode_norm = str(mode).strip().lower()
-        mode_arg = "d" if mode_norm in {"d", "dom", "dominance"} else "a"
-        m_alpha_raw = _jxrs.packed_malpha_mode_f64(  # type: ignore[union-attr]
-            packed,
-            int(n_samples),
-            row_flip,
-            maf,
-            sidx,
-            a,
-            mode=mode_arg,
-            block_rows=int(max(1, int(block_rows))),
-            threads=int(max(0, int(threads))),
-        )
-        m_alpha = np.ascontiguousarray(np.asarray(m_alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
-        if int(m_alpha.shape[0]) != m:
-            return None
-
-        p_raw = np.asarray(maf, dtype=np.float64).reshape(-1)
-        p_raw = np.clip(p_raw, 0.0, 1.0)
-        flip = np.asarray(row_flip, dtype=np.bool_).reshape(-1)
-        p_oriented = np.where(
-            p_raw <= 0.5,
-            p_raw,
-            np.where(flip, 1.0 - p_raw, p_raw),
-        )
-        p_oriented = np.clip(p_oriented, 0.0, 1.0)
-        if mode_arg == "d":
-            row_mean = 2.0 * p_oriented * (1.0 - p_oriented)
-            row_var = row_mean * (1.0 - row_mean)
-        else:
-            row_mean = 2.0 * p_oriented
-            row_var = 2.0 * p_oriented * (1.0 - p_oriented)
-        row_var = np.where(np.isfinite(row_var) & (row_var > 0.0), row_var, 0.0)
-        var_sum = float(np.sum(row_var, dtype=np.float64))
-        if (not np.isfinite(var_sum)) or (var_sum <= 0.0):
-            var_sum = 1e-12
-        alpha_sum = float(np.sum(a, dtype=np.float64))
-        beta = (m_alpha - row_mean * alpha_sum) / float(var_sum)
-        coef_v = float(coef)
-        if np.isfinite(coef_v) and coef_v != 1.0:
-            beta = beta * coef_v
-        return np.ascontiguousarray(beta, dtype=np.float64)
-    except Exception:
-        return None
-
-
 def _predict_bayes_packed_from_effects(
     *,
     packed_ctx: dict[str, typing.Any],
@@ -8430,6 +8198,11 @@ def _fit_rrblup_adamw_cpu(
     n_train = int(y_vec.shape[0])
     if n_train <= 0:
         raise ValueError("rrBLUP AdamW training requires at least one sample.")
+    if is_packed_input:
+        raise ValueError(
+            "rrBLUP-AdamW packed genotype path has been removed; use the streaming "
+            "rrBLUP-PCG or exact backend."
+        )
 
     lambda_value = float(cfg_use.get("lambda_value", 1.0))
     lambda_scale = str(cfg_use.get("lambda_scale", "equation")).strip().lower()
@@ -9211,6 +8984,11 @@ def GSapi(
             _set_rrblup_solver_state(str(resolved_rr_solver))
             if rrblup_runtime_state is not None:
                 rrblup_runtime_state["standardized_mode"] = str(rr_std_mode)
+            if is_packed_input and resolved_rr_solver == "adamw":
+                _set_rrblup_solver_state(
+                    "pcg",
+                    "packed_adamw_removed_use_streaming_pcg",
+                )
 
         def _set_rrblup_exact_backend_state(
             backend_name: str,
@@ -9524,6 +9302,11 @@ def GSapi(
             if can_use_rust_gblup and (rust_backend not in allowed_rust_backends):
                 _warn_rust_gblup_backend_fallback_once(rust_backend, allowed_rust_backends)
                 can_use_rust_gblup = False
+            if is_packed_input and (not can_use_rust_gblup):
+                raise RuntimeError(
+                    "Packed GBLUP requires the metadata-stream Rust backend; "
+                    "the resident packed fallback has been removed."
+                )
             if can_use_rust_gblup:
                 packed_train = typing.cast(dict[str, typing.Any], Xtrain)
                 n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
@@ -9934,81 +9717,32 @@ def GSapi(
                     if source_prefix_raw is None
                     else str(source_prefix_raw).strip()
                 )
-                packed_src_view: np.ndarray | None = None
-                packed_arg: np.ndarray | None = None
-                packed_has_payload = bool("packed" in packed_train)
-                packed_is_lazy = bool(packed_has_payload and _packed_ctx_is_lazy_full(packed_train))
-                use_resident_packed = bool(
-                    packed_has_payload and ((not packed_is_lazy) or (source_prefix == ""))
-                )
-                site_keep_arg_legacy = None
-                if use_resident_packed:
-                    packed_src_view = np.asarray(packed_train["packed"], dtype=np.uint8)
-                    packed_arg = np.ascontiguousarray(
-                        packed_src_view,
-                        dtype=np.uint8,
-                    )
-                    maf_arg = np.ascontiguousarray(
-                        np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    )
-                    row_flip_arg = np.ascontiguousarray(
-                        np.asarray(_ensure_packed_row_flip_cached(packed_train), dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
-                    )
-                else:
-                    maf_arg = np.ascontiguousarray(
-                        np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    )
-                    row_flip_arg = np.ascontiguousarray(
-                        np.asarray(_ensure_packed_row_flip_cached(packed_train), dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
+                if source_prefix == "":
+                    raise ValueError(
+                        "rrBLUP-PCG requires a source PLINK prefix; resident packed input "
+                        "has been removed from the BLUP path."
                     )
                 packed_n_samples = int(packed_train["n_samples"])
                 if packed_n_samples <= 0:
                     raise ValueError("Packed rrBLUP-PCG requires n_samples > 0 in packed context.")
-                if (packed_arg is None) and (source_prefix == ""):
-                    raise ValueError(
-                        "Packed rrBLUP-PCG streaming context requires source_prefix when packed rows are deferred."
-                    )
-                if packed_arg is not None:
-                    if packed_arg.ndim != 2:
-                        raise ValueError("Packed rrBLUP-PCG requires packed array shape (m, bytes_per_snp).")
-                    if int(packed_arg.shape[0]) != int(maf_arg.shape[0]):
-                        raise ValueError(
-                            "Packed rrBLUP-PCG payload mismatch: packed SNP rows != maf length."
-                        )
-                    if int(packed_arg.shape[0]) != int(row_flip_arg.shape[0]):
-                        raise ValueError(
-                            "Packed rrBLUP-PCG payload mismatch: packed SNP rows != row_flip length."
-                        )
-                    expected_bps = int((packed_n_samples + 3) // 4)
-                    if int(packed_arg.shape[1]) != expected_bps:
-                        raise ValueError(
-                            f"Packed rrBLUP-PCG payload mismatch: packed bytes_per_snp={packed_arg.shape[1]} "
-                            f"!= expected {expected_bps}."
-                        )
-                site_keep_raw = packed_train.get("site_keep", None)
-                if use_resident_packed and site_keep_raw is not None:
-                    site_keep_arg_legacy = np.ascontiguousarray(
-                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
-                    )
-                elif (not use_resident_packed) and site_keep_raw is not None:
-                    site_keep_arg_legacy = np.ascontiguousarray(
-                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                        dtype=np.bool_,
-                    )
+                (
+                    source_prefix,
+                    _site_keep_unused,
+                    row_source_indices_arg,
+                    row_flip_arg,
+                    maf_arg,
+                    _pcg_mmap_window_mb,
+                ) = _packed_gblup_stream_metadata(
+                    packed_train,
+                    mode="a",
+                    block_rows=int(max(1, int((rrblup_adamw_cfg or {}).get("pcg_block_rows", 4096)))),
+                )
+                # rrBLUP-PCG is intentionally metadata-stream only.  The
+                # source-row map is required because filtered metadata may be
+                # a compact active subset of the source BED rows.
+                packed_arg: np.ndarray | None = None
                 site_keep_arg = None
-                if site_keep_arg_legacy is not None:
-                    expected_site_keep_len = int(maf_arg.shape[0])
-                    if (
-                        (not use_resident_packed)
-                        or (packed_is_lazy)
-                        or (int(site_keep_arg_legacy.shape[0]) == int(expected_site_keep_len))
-                    ):
-                        site_keep_arg = site_keep_arg_legacy
+                packed_has_payload = bool("packed" in packed_train)
 
                 n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
                 if packed_train_indices is None:
@@ -10222,44 +9956,24 @@ def GSapi(
                         int(pcg_block_rows) * int(n_train_expected) * np.dtype(np.float32).itemsize
                     )
                     pcg_rss_before = _get_process_rss_bytes()
-                    if packed_has_payload and (not use_resident_packed):
+                    if packed_has_payload:
                         print(
                             (
-                                "[rrBLUP-DEBUG] PCG lazy_full payload detected -> force metadata stream "
-                                f"source_prefix={source_prefix or '<none>'}"
+                                "[rrBLUP-DEBUG] PCG resident payload ignored; forcing metadata stream "
+                                f"source_prefix={source_prefix}"
                             ),
                             flush=True,
                         )
-                    if packed_arg is not None and packed_src_view is not None:
-                        packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
-                        packed_same_obj = bool(packed_arg is packed_src_view)
-                        try:
-                            packed_shares_memory = bool(np.shares_memory(packed_arg, packed_src_view))
-                        except Exception:
-                            packed_shares_memory = False
-                        print(
-                            (
-                                "[rrBLUP-DEBUG] PCG packed payload "
-                                f"rows={int(packed_arg.shape[0])} "
-                                f"bytes_per_snp={int(packed_arg.shape[1])} "
-                                f"c_contig={int(packed_c_contig)} "
-                                f"shared_with_ctx={int(packed_shares_memory)} "
-                                f"same_obj={int(packed_same_obj)} "
-                                f"nbytes={_format_debug_bytes(int(packed_arg.nbytes))}"
-                            ),
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            (
-                                "[rrBLUP-DEBUG] PCG streaming payload "
-                                f"source_prefix={source_prefix or '<none>'} "
-                                f"rows={int(maf_arg.shape[0])} "
-                                f"bytes_per_snp={int((packed_n_samples + 3) // 4)} "
-                                f"packed_resident=0"
-                            ),
-                            flush=True,
-                        )
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] PCG streaming payload "
+                            f"source_prefix={source_prefix} "
+                            f"rows={int(maf_arg.shape[0])} "
+                            f"bytes_per_snp={int((packed_n_samples + 3) // 4)} "
+                            "packed_resident=0"
+                        ),
+                        flush=True,
+                    )
                     print(
                         (
                             "[rrBLUP-DEBUG] PCG workspace estimate "
@@ -10282,6 +9996,7 @@ def GSapi(
                             packed_n_samples=int(packed_n_samples),
                             maf=maf_arg,
                             row_flip=row_flip_arg,
+                            row_source_indices=row_source_indices_arg,
                             blas_threads=int(pcg_thread_spec["blas_threads"]),
                         )
                         if rr_operator_mode != "centered":
@@ -10327,71 +10042,12 @@ def GSapi(
                                 int(pcg_thread_spec["pcg_threads"]),
                                 **pcg_call_kwargs,
                             )
-                except TypeError:
-                    _emit_rrblup_progress(
-                        "pcg_callback_unavailable",
-                        stage="pcg",
-                        reason="legacy_rrblup_pcg_bed_signature",
-                    )
-                    allow_legacy_prefix_reload = _cfg_truthy(
-                        os.getenv(
-                            "JX_GS_ALLOW_LEGACY_PCG_PREFIX_RELOAD",
-                            os.getenv(
-                                "JX_RRBLUP_ALLOW_LEGACY_PCG_PREFIX_RELOAD",
-                                "off",
-                            ),
-                        ),
-                        default=False,
-                    )
-                    legacy_prefix_reload_reason = ""
-                    if packed_arg is not None:
-                        legacy_prefix_reload_reason = "packed_signature_missing"
-                    elif source_prefix != "":
-                        legacy_prefix_reload_reason = "stream_signature_missing"
-                    if (
-                        legacy_prefix_reload_reason != ""
-                        and (not bool(allow_legacy_prefix_reload))
-                    ):
-                        raise RuntimeError(
-                            "Current JanusX extension does not support the rrBLUP-PCG "
-                            "packed/streaming signature required by this workflow. "
-                            "Legacy fallback would reload the full BED payload from prefix "
-                            "and can explode memory usage. Rebuild/reinstall the extension, "
-                            "or set JX_GS_ALLOW_LEGACY_PCG_PREFIX_RELOAD=1 to force the old "
-                            f"prefix-reload path ({legacy_prefix_reload_reason})."
-                        )
-                    if source_prefix == "":
-                        raise RuntimeError(
-                            "Current JanusX extension does not support direct packed rrBLUP-PCG "
-                            "arguments, and packed context has no source_prefix for legacy fallback."
-                        )
-                    if _GS_DEBUG_STAGE:
-                        print(
-                            (
-                                "[GS-DEBUG] rrBLUP PCG legacy prefix reload fallback "
-                                f"allowed=1 reason={legacy_prefix_reload_reason or 'unknown'} "
-                                f"source_prefix={source_prefix}"
-                            ),
-                            flush=True,
-                        )
-                    with runtime_thread_stage(
-                        blas_threads=int(pcg_thread_spec["blas_threads"]),
-                        rayon_threads=int(pcg_thread_spec["rayon_threads"]),
-                    ):
-                        rr_out = rrblup_pcg_fn(
-                            source_prefix,
-                            train_abs,
-                            y_train_vec,
-                            test_abs,
-                            train_pred_local_arg,
-                            site_keep_arg_legacy,
-                            float(lambda_equation),
-                            float(pcg_tol),
-                            int(pcg_max_iter),
-                            int(pcg_block_rows),
-                            float(pcg_std_eps),
-                            int(pcg_thread_spec["pcg_threads"]),
-                        )
+                except TypeError as ex:
+                    raise RuntimeError(
+                        "The installed JanusX extension lacks the metadata row-map "
+                        "rrBLUP-PCG signature; rebuild/reinstall JanusX. Legacy prefix "
+                        "reload is disabled because it can load the full BED payload."
+                    ) from ex
                 finally:
                     if pcg_debug_mode:
                         pcg_rss_after = _get_process_rss_bytes()
@@ -11019,45 +10675,6 @@ def GSapi(
 
         if method == "rrBLUP" and resolved_rr_solver == "exact":
             rr_operator_mode = _resolve_rrblup_operator_mode(rr_cfg_shared)
-            exact_packed_fn = (
-                None
-                if _jxrs is None
-                else getattr(
-                    _jxrs,
-                    (
-                        "rrblupc_exact_snp_packed"
-                        if rr_operator_mode == "centered"
-                        else "rrblup_exact_snp_packed"
-                    ),
-                    None,
-                )
-            )
-            exact_prepare_packed_fn = (
-                None
-                if _jxrs is None
-                else getattr(
-                    _jxrs,
-                    (
-                        "rrblupc_exact_snp_prepare_packed"
-                        if rr_operator_mode == "centered"
-                        else "rrblup_exact_snp_prepare_packed"
-                    ),
-                    None,
-                )
-            )
-            exact_fit_packed_fn = (
-                None
-                if _jxrs is None
-                else getattr(
-                    _jxrs,
-                    (
-                        "rrblupc_exact_snp_fit_prepared"
-                        if rr_operator_mode == "centered"
-                        else "rrblup_exact_snp_fit_prepared"
-                    ),
-                    None,
-                )
-            )
             exact_prepare_meta_fn = (
                 None
                 if _jxrs is None
@@ -11101,13 +10718,6 @@ def GSapi(
                 if packed_train_probe is None
                 else str(packed_train_probe.get("source_prefix", "") or "").strip()
             )
-            can_use_rust_exact_snp_packed = bool(
-                packed_train_probe is not None
-                and (exact_packed_fn is not None)
-                and (exact_source_prefix == "")
-                and (not _packed_ctx_is_lazy_full(packed_train_probe))
-                and ("packed" in packed_train_probe)
-            )
             can_use_rust_exact_snp_meta = bool(
                 packed_train_probe is not None
                 and (exact_prepare_meta_fn is not None)
@@ -11115,12 +10725,15 @@ def GSapi(
                 and (exact_source_prefix != "")
             )
             use_rust_exact_snp_meta = bool(can_use_rust_exact_snp_meta)
-            use_rust_exact_snp_packed = bool((not use_rust_exact_snp_meta) and can_use_rust_exact_snp_packed)
-            if resolved_rr_exact_backend == "snp" and (
-                (not use_rust_exact_snp_packed) and (not use_rust_exact_snp_meta)
-            ):
+            if resolved_rr_exact_backend == "snp" and (not use_rust_exact_snp_meta):
                 if exact_source_prefix != "":
                     exact_backend_fallback_reason = "exact_snp_meta_backend_unavailable_for_source_prefix"
+                elif is_packed_input:
+                    raise RuntimeError(
+                        "Packed rrBLUP exact SNP requires a source PLINK prefix and "
+                        "the metadata-stream Rust backend; resident packed exact fallback "
+                        "has been removed."
+                    )
                 else:
                     exact_backend_fallback_reason = "exact_snp_backend_unavailable"
                 resolved_rr_exact_backend = "fast"
@@ -11228,213 +10841,77 @@ def GSapi(
                     )
                 if _GS_DEBUG_STAGE:
                     print(
-                        "[GS-DEBUG] rrBLUP exact SNP route="
-                        f"{'rust_rrblup_exact_snp_packed' if use_rust_exact_snp_packed else 'rust_rrblup_exact_snp_prepare_bed_from_meta'} "
+                        "[GS-DEBUG] rrBLUP exact SNP route=rust_rrblup_exact_snp_prepare_bed_from_meta "
                         f"n_train={n_train_expected} n_snp={n_snp_local} "
                         f"sample_block={exact_sample_block} "
                         f"stream_row_block={exact_stream_row_block} "
                         f"threads={int(max(1, int(n_jobs)))}",
                         flush=True,
                     )
-                if use_rust_exact_snp_packed:
-                    packed_arg = np.ascontiguousarray(
-                        np.asarray(packed_train["packed"], dtype=np.uint8),
-                        dtype=np.uint8,
-                    )
-                    maf_arg = np.ascontiguousarray(
-                        np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    )
-                    row_flip_arg = np.ascontiguousarray(
-                        np.asarray(
-                            _ensure_packed_row_flip_cached(packed_train),
-                            dtype=np.bool_,
-                        ).reshape(-1),
-                        dtype=np.bool_,
-                    )
-                    if packed_arg.ndim != 2:
-                        raise ValueError(
-                            "Packed rrBLUP exact SNP backend requires packed array shape (m, bytes_per_snp)."
-                        )
-                    if int(packed_arg.shape[0]) != int(maf_arg.shape[0]):
-                        raise ValueError(
-                            "Packed rrBLUP exact SNP backend payload mismatch: packed SNP rows != maf length."
-                        )
-                    if int(packed_arg.shape[0]) != int(row_flip_arg.shape[0]):
-                        raise ValueError(
-                            "Packed rrBLUP exact SNP backend payload mismatch: packed SNP rows != row_flip length."
-                        )
-                    expected_bps = int((packed_n_samples + 3) // 4)
-                    if int(packed_arg.shape[1]) != expected_bps:
-                        raise ValueError(
-                            "Packed rrBLUP exact SNP backend payload mismatch: "
-                            f"packed bytes_per_snp={packed_arg.shape[1]} != expected {expected_bps}."
-                        )
-                    site_keep_arg = None
-                    site_keep_raw = packed_train.get("site_keep", None)
-                    if site_keep_raw is not None:
-                        site_keep_arr = np.ascontiguousarray(
-                            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
-                            dtype=np.bool_,
-                        )
-                        if int(site_keep_arr.shape[0]) == int(packed_arg.shape[0]):
-                            site_keep_arg = site_keep_arr
-                    can_use_split_exact_snp = bool(
-                        (exact_prepare_packed_fn is not None)
-                        and (exact_fit_packed_fn is not None)
-                    )
-                    if can_use_split_exact_snp:
-                        _emit_rrblup_progress(
-                            "exact_snp_prepare_start",
-                            backend="snp",
-                        )
-                        with runtime_thread_stage(
-                            blas_threads=int(max(1, int(n_jobs))),
-                            rayon_threads=int(max(1, int(n_jobs))),
-                        ):
-                            rr_exact_cache = exact_prepare_packed_fn(
-                                packed_arg,
-                                int(packed_n_samples),
-                                train_abs,
-                                site_keep_arg,
-                                maf_arg,
-                                row_flip_arg,
-                                rr_row_mean_arg,
-                                rr_row_inv_arg,
-                                int(exact_sample_block),
-                                float(exact_std_eps),
-                                int(max(1, int(n_jobs))),
-                                int(max(1, int(n_jobs))),
-                            )
-                        _emit_rrblup_progress(
-                            "exact_snp_prepare_end",
-                            backend="snp",
-                        )
-                        _emit_rrblup_progress(
-                            "exact_snp_fit_start",
-                            backend="snp",
-                        )
-                        with runtime_thread_stage(
-                            blas_threads=int(max(1, int(n_jobs))),
-                            rayon_threads=int(max(1, int(n_jobs))),
-                        ):
-                            rr_out = exact_fit_packed_fn(
-                                rr_exact_cache,
-                                packed_arg,
-                                int(packed_n_samples),
-                                y_train_vec,
-                                test_abs,
-                                train_pred_local_arg,
-                                float(exact_log10_low),
-                                float(exact_log10_high),
-                                float(exact_reml_tol),
-                                int(exact_reml_max_iter),
-                                int(max(1, int(n_jobs))),
-                                int(max(1, int(n_jobs))),
-                            )
-                        _emit_rrblup_progress(
-                            "exact_snp_fit_end",
-                            backend="snp",
-                        )
-                    else:
-                        _emit_rrblup_progress(
-                            "exact_snp_total_start",
-                            backend="snp",
-                        )
-                        with runtime_thread_stage(
-                            blas_threads=int(max(1, int(n_jobs))),
-                            rayon_threads=int(max(1, int(n_jobs))),
-                        ):
-                            rr_out = exact_packed_fn(
-                                packed_arg,
-                                int(packed_n_samples),
-                                train_abs,
-                                y_train_vec,
-                                test_abs,
-                                train_pred_local_arg,
-                                site_keep_arg,
-                                maf_arg,
-                                row_flip_arg,
-                                rr_row_mean_arg,
-                                rr_row_inv_arg,
-                                float(exact_log10_low),
-                                float(exact_log10_high),
-                                float(exact_reml_tol),
-                                int(exact_reml_max_iter),
-                                int(exact_sample_block),
-                                float(exact_std_eps),
-                                int(max(1, int(n_jobs))),
-                                int(max(1, int(n_jobs))),
-                            )
-                        _emit_rrblup_progress(
-                            "exact_snp_total_end",
-                            backend="snp",
-                        )
-                else:
-                    (
-                        source_prefix_arg,
-                        _site_keep_unused,
+                (
+                    source_prefix_arg,
+                    _site_keep_unused,
+                    row_source_indices_arg,
+                    row_flip_stream_arg,
+                    row_maf_arg,
+                    _mmap_window_mb_unused,
+                ) = _packed_gblup_stream_metadata(
+                    packed_train,
+                    mode="a",
+                    block_rows=int(max(1, n_snp_local)),
+                    use_ctx_budget=False,
+                )
+                _emit_rrblup_progress(
+                    "exact_snp_prepare_start",
+                    backend="snp",
+                )
+                with runtime_thread_stage(
+                    blas_threads=int(max(1, int(n_jobs))),
+                    rayon_threads=int(max(1, int(n_jobs))),
+                ):
+                    rr_exact_cache = exact_prepare_meta_fn(
+                        str(source_prefix_arg),
+                        train_abs,
                         row_source_indices_arg,
-                        row_flip_stream_arg,
                         row_maf_arg,
-                        _mmap_window_mb_unused,
-                    ) = _packed_gblup_stream_metadata(
-                        packed_train,
-                        mode="a",
-                        block_rows=int(max(1, n_snp_local)),
-                        use_ctx_budget=False,
+                        row_flip_stream_arg,
+                        rr_row_mean_arg,
+                        rr_row_inv_arg,
+                        int(exact_sample_block),
+                        int(exact_stream_row_block),
+                        float(exact_std_eps),
+                        int(max(1, int(n_jobs))),
+                        int(max(1, int(n_jobs))),
                     )
-                    _emit_rrblup_progress(
-                        "exact_snp_prepare_start",
-                        backend="snp",
+                _emit_rrblup_progress(
+                    "exact_snp_prepare_end",
+                    backend="snp",
+                )
+                _emit_rrblup_progress(
+                    "exact_snp_fit_start",
+                    backend="snp",
+                )
+                with runtime_thread_stage(
+                    blas_threads=int(max(1, int(n_jobs))),
+                    rayon_threads=int(max(1, int(n_jobs))),
+                ):
+                    rr_out = exact_fit_meta_fn(
+                        rr_exact_cache,
+                        str(source_prefix_arg),
+                        y_train_vec,
+                        test_abs,
+                        train_pred_local_arg,
+                        float(exact_log10_low),
+                        float(exact_log10_high),
+                        float(exact_reml_tol),
+                        int(exact_reml_max_iter),
+                        int(max(1, int(n_jobs))),
+                        int(max(1, int(n_jobs))),
                     )
-                    with runtime_thread_stage(
-                        blas_threads=int(max(1, int(n_jobs))),
-                        rayon_threads=int(max(1, int(n_jobs))),
-                    ):
-                        rr_exact_cache = exact_prepare_meta_fn(
-                            str(source_prefix_arg),
-                            train_abs,
-                            row_source_indices_arg,
-                            row_maf_arg,
-                            row_flip_stream_arg,
-                            rr_row_mean_arg,
-                            rr_row_inv_arg,
-                            int(exact_sample_block),
-                            int(exact_stream_row_block),
-                            float(exact_std_eps),
-                            int(max(1, int(n_jobs))),
-                            int(max(1, int(n_jobs))),
-                        )
-                    _emit_rrblup_progress(
-                        "exact_snp_prepare_end",
-                        backend="snp",
-                    )
-                    _emit_rrblup_progress(
-                        "exact_snp_fit_start",
-                        backend="snp",
-                    )
-                    with runtime_thread_stage(
-                        blas_threads=int(max(1, int(n_jobs))),
-                        rayon_threads=int(max(1, int(n_jobs))),
-                    ):
-                        rr_out = exact_fit_meta_fn(
-                            rr_exact_cache,
-                            str(source_prefix_arg),
-                            y_train_vec,
-                            test_abs,
-                            train_pred_local_arg,
-                            float(exact_log10_low),
-                            float(exact_log10_high),
-                            float(exact_reml_tol),
-                            int(exact_reml_max_iter),
-                            int(max(1, int(n_jobs))),
-                            int(max(1, int(n_jobs))),
-                        )
-                    _emit_rrblup_progress(
-                        "exact_snp_fit_end",
-                        backend="snp",
-                    )
+                _emit_rrblup_progress(
+                    "exact_snp_fit_end",
+                    backend="snp",
+                )
                 rr_out_t = tuple(rr_out)
                 if len(rr_out_t) >= 12:
                     (
@@ -11540,6 +11017,11 @@ def GSapi(
                     )
                 return pred_train, pred_test, float(pve)
 
+        if is_packed_input and method == "rrBLUP":
+            raise RuntimeError(
+                "Packed rrBLUP requires the metadata-stream Rust backend; "
+                "the resident packed fallback has been removed."
+            )
         model = MLMBLUP(
             Y.reshape(-1, 1),
             Xtrain,
@@ -11712,32 +11194,7 @@ def GSapi(
             alpha_vec = np.asarray(getattr(model, "alpha", np.zeros((0, 1))), dtype=np.float64).reshape(-1)
             beta_kp: np.ndarray | None = None
             if int(alpha_vec.size) == n_train_cur:
-                if is_packed_input and _looks_like_packed_payload(Xtrain):
-                    packed_train_local = typing.cast(dict[str, typing.Any], Xtrain)
-                    if packed_train_indices is None:
-                        if int(packed_train_local["n_samples"]) == n_train_cur:
-                            sample_idx_local = np.ascontiguousarray(
-                                np.arange(int(n_train_cur), dtype=np.int64),
-                                dtype=np.int64,
-                            )
-                        else:
-                            sample_idx_local = None
-                    else:
-                        sample_idx_local = np.ascontiguousarray(
-                            np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
-                            dtype=np.int64,
-                        )
-                    if sample_idx_local is not None and int(sample_idx_local.shape[0]) == n_train_cur:
-                        beta_kp = _kernel_projection_beta_from_packed(
-                            packed_ctx=packed_train_local,
-                            sample_indices=sample_idx_local,
-                            alpha=alpha_vec,
-                            mode="a",
-                            coef=1.0,
-                            block_rows=4096,
-                            threads=max(0, int(n_jobs)),
-                        )
-                if beta_kp is None and (not is_packed_input):
+                if not is_packed_input:
                     beta_kp = _kernel_projection_beta_from_dense(
                         marker_by_sample=np.asarray(Xtrain, dtype=np.float64),
                         alpha=alpha_vec,
@@ -15090,6 +14547,7 @@ def _run_methods_parallel(
     strict_cv: bool,
     force_fast: bool = False,
     packed_ctx: dict[str, typing.Any] | None = None,
+    bayes_packed_ctx: dict[str, typing.Any] | None = None,
     train_sample_indices: np.ndarray | None = None,
     test_sample_indices: np.ndarray | None = None,
     train_sample_ids: np.ndarray | None = None,
@@ -16729,7 +16187,9 @@ def _run_methods_parallel(
                         seed,
                         strict_cv,
                         force_fast,
-                        packed_ctx=packed_ctx,
+                        packed_ctx=_select_gs_packed_context(
+                            str(m), packed_ctx, bayes_packed_ctx
+                        ),
                         train_sample_indices=train_sample_indices,
                         test_sample_indices=test_sample_indices,
                         train_sample_ids=train_sample_ids,
@@ -17702,7 +17162,9 @@ def _run_methods_parallel(
                         seed,
                         strict_cv,
                         force_fast,
-                        packed_ctx=packed_ctx,
+                        packed_ctx=_select_gs_packed_context(
+                            str(m), packed_ctx, bayes_packed_ctx
+                        ),
                         train_sample_indices=train_sample_indices,
                         test_sample_indices=test_sample_indices,
                         train_sample_ids=train_sample_ids,
@@ -21505,6 +20967,9 @@ def _run_gs_pipeline_impl(
         (args.hash_dim is not None) or (ldprune_spec is not None)
     )
     packed_lmm_ctx: dict[str, typing.Any] | None = None
+    # BLUP always owns the metadata/source-prefix context.  Bayes may receive
+    # a separate resident promotion without changing the BLUP route.
+    packed_bayes_ctx: dict[str, typing.Any] | None = None
     packed_qc_baseline_ctx: dict[str, typing.Any] | None = None
     geno_is_memmap = False
     if use_packed_lmm:
@@ -21584,7 +21049,7 @@ def _run_gs_pipeline_impl(
                 enabled=use_spinner,
             ) as task:
                 try:
-                    sample_ids_reload, packed_lmm_ctx = _load_plink_packed_for_lmm(
+                    sample_ids_reload, packed_bayes_ctx = _load_plink_packed_for_lmm(
                         str(gfile),
                         maf=float(args.maf),
                         missing_rate=float(args.geno),
@@ -21608,7 +21073,7 @@ def _run_gs_pipeline_impl(
                     )
                 )
             _emit_packed_load_debug(
-                packed_lmm_ctx,
+                packed_bayes_ctx,
                 label="bayes-promoted",
                 enabled=bool(debug_mode),
             )
@@ -24061,6 +23526,9 @@ def _run_gs_pipeline_impl(
                     if not isinstance(raw_state, dict) or len(raw_state) == 0:
                         raise ValueError(f"Loaded model artifact missing model_state: {model_file}")
                     model_state = dict(raw_state)
+                loaded_method_packed_ctx = _select_gs_packed_context(
+                    str(m), trait_packed_ctx, packed_bayes_ctx
+                )
                 res = _run_loaded_model_task(
                     method=str(m),
                     model_state=dict(model_state),
@@ -24069,7 +23537,11 @@ def _run_gs_pipeline_impl(
                     test_snp=test_snp,
                     train_snp_ml=loaded_train_snp_ml,
                     test_snp_ml=loaded_test_snp_ml,
-                    packed_ctx=trait_packed_ctx if _looks_like_packed_payload(trait_packed_ctx) else None,
+                    packed_ctx=(
+                        loaded_method_packed_ctx
+                        if _looks_like_packed_payload(loaded_method_packed_ctx)
+                        else None
+                    ),
                     train_sample_indices=method_train_sample_idx,
                     test_sample_indices=method_test_sample_idx,
                     cv_splits=None,
@@ -24096,6 +23568,7 @@ def _run_gs_pipeline_impl(
                 strict_cv=bool(args.strict_cv),
                 force_fast=bool(args.force_fast),
                 packed_ctx=trait_packed_ctx,
+                bayes_packed_ctx=packed_bayes_ctx,
                 train_sample_indices=method_train_sample_idx,
                 test_sample_indices=method_test_sample_idx,
                 train_sample_ids=np.asarray(samples[trainmask], dtype=str).reshape(-1),
