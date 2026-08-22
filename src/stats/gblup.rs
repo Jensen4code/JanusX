@@ -3118,7 +3118,6 @@ pub fn packed_mtm_f64<'py>(
                     let idx_lo = i * n + j;
                     let idx_up = j * n + i;
                     let v = gram[idx_lo];
-                    gram[idx_lo] = v;
                     gram[idx_up] = v;
                 }
             }
