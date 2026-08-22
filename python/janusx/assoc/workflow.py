@@ -904,13 +904,11 @@ def _format_gwas_thread_plan(
     args,
     fvlmm_scan_spec: Optional[dict[str, int]],
 ) -> str:
-    scan_stage = _resolve_fvlmm_scan_stage_mode()
     if fvlmm_scan_spec is None:
-        blas_threads = int(args.thread)
-        rayon_threads = int(args.thread)
-    else:
-        blas_threads = int(fvlmm_scan_spec.get("blas_threads", args.thread))
-        rayon_threads = int(fvlmm_scan_spec.get("rayon_threads", args.thread))
+        return f"GWAS_scan_threads={max(1, int(args.thread))}"
+    scan_stage = _resolve_fvlmm_scan_stage_mode()
+    blas_threads = int(fvlmm_scan_spec.get("blas_threads", args.thread))
+    rayon_threads = int(fvlmm_scan_spec.get("rayon_threads", args.thread))
     return (
         f"FvLMM_scan_stage={scan_stage} | "
         f"BLAS={blas_threads} | Rayon={rayon_threads}"
@@ -2106,6 +2104,66 @@ def _parse_qcov_dim(qcov_opt: object) -> int:
     return int(q)
 
 
+def _validate_qcov_dim_for_n(qdim: int, n_samples: int) -> None:
+    """Validate a requested PCA dimension before an eigendecomposition.
+
+    The BED path already performs this check.  Keeping the contract in a
+    small helper lets the k-file path fail before building a GRM instead of
+    producing an opaque slice/linear-algebra error.
+    """
+    q = int(qdim)
+    n = int(n_samples)
+    if n <= 0:
+        raise ValueError("Q/PC preparation requires at least one sample.")
+    if q < 0:
+        raise ValueError(f"Q/PC dimension must be >= 0, got {q}.")
+    if q >= n and q != 0:
+        raise ValueError(
+            f"Q/PC dimension must be smaller than the aligned sample count: "
+            f"requested {q}, samples {n}."
+        )
+
+
+def _validate_kfile_cli_contract(
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    bimranges: Optional[list[tuple[str, int, int]]],
+) -> None:
+    """Reject BED-only scan filters that a stored k-file cannot reapply.
+
+    A k-file is the post-QC 0/2 matrix produced by ``gformat``.  Its native
+    scanners intentionally consume exactly those stored rows; silently
+    accepting a different BED filter would therefore report a misleading
+    configuration.  Until row-level filtering/metadata is added to every
+    native k-file scanner, fail early with an actionable message.
+    """
+    if bimranges:
+        raise ValueError(
+            "-bimrange/--bimrange is not supported with -kfile yet: "
+            "the k-file native scanner consumes its complete stored marker set. "
+            "Use a filtered k-file (or a BED/BIM/FAM input) for a range-restricted scan."
+        )
+    checks = (
+        ("-maf", float(maf_threshold), 0.02),
+        ("-geno", float(max_missing_rate), 0.05),
+        ("-het", float(het_threshold), 1.0),
+    )
+    changed = [
+        f"{flag}={value:g} (k-file conversion already fixed this filter)"
+        for flag, value, default in checks
+        if not np.isclose(value, default, rtol=0.0, atol=1e-12)
+    ]
+    if changed:
+        raise ValueError(
+            "BED-side variant filters cannot be changed for -kfile because "
+            "the stored marker set has already been QC-filtered and imputed: "
+            + ", ".join(changed)
+            + ". Rebuild the k-file with the desired filters."
+        )
+
+
 def _normalize_bimrange_chr(value: object) -> str:
     text = str(value).strip()
     if text.lower().startswith("chr"):
@@ -2189,6 +2247,79 @@ def _canon_site_key(chrom: str, pos: int) -> tuple[str, int]:
     return c, int(pos)
 
 
+def _kfile_site_row_indices(
+    prefix: str,
+    site_specs: list[tuple[str, int]],
+) -> list[int]:
+    """Map requested ``chrom:pos`` tokens to source-row indices in a BIM."""
+    bim_path = _resolve_gwas_snp_bim_path(prefix)
+    if bim_path is None:
+        raise ValueError(
+            "k-file site covariates require a sibling .bim site header: "
+            f"{_display_path(_resolve_kfile_prefix(prefix))}.bim"
+        )
+    requested = {_canon_site_key(chrom, pos) for chrom, pos in site_specs}
+    found: dict[tuple[str, int], int] = {}
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as handle:
+        row_index = 0
+        for line_no, raw in enumerate(handle, start=1):
+            line = raw.strip()
+            if line == "" or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 4:
+                raise ValueError(f"Malformed BIM line at {bim_path}:{line_no}")
+            key = _canon_site_key(fields[0], int(float(fields[3])))
+            if key in requested and key not in found:
+                found[key] = int(row_index)
+            row_index += 1
+    missing = [
+        f"{chrom}:{int(pos)}"
+        for chrom, pos in site_specs
+        if _canon_site_key(chrom, pos) not in found
+    ]
+    if missing:
+        show = ", ".join(missing[:10])
+        if len(missing) > 10:
+            show += f", ... ({len(missing)} missing)"
+        raise ValueError(f"Some --cov SNP site(s) were not found in k-file BIM: {show}")
+    return [found[_canon_site_key(chrom, pos)] for chrom, pos in site_specs]
+
+
+def _load_kfile_site_covariates(
+    prefix: str,
+    site_specs: list[tuple[str, int]],
+    sample_ids: np.ndarray,
+) -> np.ndarray:
+    """Decode a small set of k-file BIM rows as raw additive dosage."""
+    if not hasattr(jxrs, "kfile_read_rows_f32"):
+        raise RuntimeError(
+            "Rust extension missing kfile_read_rows_f32; rebuild/reinstall JanusX."
+        )
+    source_ids, _n_kmers, _info = _inspect_kfile_source(_resolve_kfile_prefix(prefix))
+    source_pos = {sid: i for i, sid in enumerate(source_ids.tolist())}
+    selected_ids = np.asarray(sample_ids, dtype=str).reshape(-1)
+    missing = [sid for sid in selected_ids.tolist() if sid not in source_pos]
+    if missing:
+        raise ValueError(f"k-file site covariate samples are missing: {missing[:5]}")
+    sample_indices = [source_pos[sid] for sid in selected_ids.tolist()]
+    row_indices = _kfile_site_row_indices(prefix, site_specs)
+    decoded = np.asarray(
+        jxrs.kfile_read_rows_f32(
+            str(_resolve_kfile_prefix(prefix)),
+            sample_indices=[int(i) for i in sample_indices],
+            row_indices=[int(i) for i in row_indices],
+        ),
+        dtype=np.float32,
+    )
+    expected = (len(row_indices), len(sample_indices))
+    if decoded.shape != expected:
+        raise ValueError(
+            f"k-file site covariate shape mismatch: got {decoded.shape}, expected {expected}"
+        )
+    return np.ascontiguousarray(decoded.T, dtype=np.float32)
+
+
 def _read_cov_file_flexible(
     path: str,
     sample_ids: Union[np.ndarray, None],
@@ -2269,6 +2400,13 @@ def _load_site_covariates(
     """
     if len(site_specs) == 0:
         return np.zeros((len(sample_ids), 0), dtype="float32")
+
+    if _is_kfile_prefix(genofile):
+        return _load_kfile_site_covariates(
+            _resolve_kfile_prefix(genofile),
+            site_specs,
+            np.asarray(sample_ids, dtype=str),
+        )
 
     sample_ids = np.asarray(sample_ids, dtype=str)
     unique_sites: list[tuple[str, int]] = []
@@ -4691,6 +4829,7 @@ def _build_kfile_grm_streaming(
     n_kmers: int,
     chunk_size: int,
     method: int,
+    threads: int = 1,
     logger: Optional[logging.Logger] = None,
     use_spinner: bool = False,
 ) -> tuple[np.ndarray, int]:
@@ -4742,7 +4881,7 @@ def _build_kfile_grm_streaming(
             method=int(method),
             maf_threshold=0.0,
             block_rows=max(1, int(chunk_size)),
-            threads=0,
+            threads=max(1, int(threads)),
             progress_callback=_progress_callback,
             progress_every=_progress_callback_step(progress_total),
         )
@@ -4801,6 +4940,63 @@ def _kfile_sparse_sample_hash(sample_ids: np.ndarray) -> str:
         digest.update(encoded)
     digest.update(int(ids.shape[0]).to_bytes(8, "little", signed=False))
     return digest.hexdigest()
+
+
+def _kfile_sparse_cache_prefix(
+    source_prefix: str,
+    sample_ids: np.ndarray,
+    cutoff: float,
+    method: int,
+) -> str:
+    """Return a source-scoped SparseLMM cache prefix.
+
+    The output prefix is a publication target, not an input identity.  Using
+    it for the sparse-GRM cache caused every GWAS output name to trigger a
+    fresh dense-to-sparse conversion.  Scope the cache to the k-file and the
+    aligned sample subset instead, while retaining cutoff/method in the name.
+    """
+    source = _resolve_kfile_prefix(source_prefix)
+    cutoff_f = float(cutoff)
+    cutoff_tag = f"{cutoff_f:.8g}".replace("-", "m").replace(".", "p")
+    return (
+        f"{source}.splmm.m{int(method)}.c{cutoff_tag}.n{int(len(sample_ids))}."
+        f"{_kfile_sparse_sample_hash(np.asarray(sample_ids, dtype=str))}"
+    )
+
+
+def _hash_f32_array(values: np.ndarray, *, digest_size: int = 16) -> str:
+    """Hash a float32 array without materializing a second full byte copy."""
+    arr = np.ascontiguousarray(np.asarray(values, dtype=np.float32))
+    raw = arr.view(np.uint8).reshape(-1)
+    digest = hashlib.blake2b(digest_size=int(digest_size))
+    # 64 MiB keeps the temporary memory bounded even for a large GRM.
+    step = 64 * 1024 * 1024
+    for start in range(0, int(raw.size), step):
+        digest.update(memoryview(raw[start : min(start + step, int(raw.size))]))
+    return digest.hexdigest()
+
+
+def _stream_model_pve(model_key: object, model: object) -> Optional[float]:
+    """Read PVE consistently from dense and sparse null-model wrappers."""
+    key = str(model_key).strip().lower()
+    if key in {"lmm", "lmm2", "fvlmm"}:
+        candidates = [getattr(model, "pve", np.nan)]
+    elif key in {"splmm", "splmm2"}:
+        null_fit = getattr(model, "null_fit_", None)
+        if isinstance(null_fit, dict):
+            candidates = [null_fit.get("pve", np.nan), getattr(model, "pve", np.nan)]
+        else:
+            candidates = [getattr(model, "pve", np.nan)]
+    else:
+        return None
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except Exception:
+            continue
+        if np.isfinite(value):
+            return value
+    return None
 
 
 def _ensure_kfile_sparse_grm(
@@ -4866,10 +5062,7 @@ def _ensure_kfile_sparse_grm(
         except OSError:
             source_stat = {"source_path": os.path.normpath(source_path)}
     ids_hash = _kfile_sparse_sample_hash(ids)
-    matrix_digest = hashlib.blake2b(
-        np.ascontiguousarray(matrix, dtype=np.float32).tobytes(order="C"),
-        digest_size=16,
-    ).hexdigest()
+    matrix_digest = _hash_f32_array(matrix, digest_size=16)
     spec: dict[str, object] = {
         "builder_revision": "kfile_dense_crop_v1",
         "source": "dense_grm_kfile_cropped",
@@ -5047,6 +5240,7 @@ def _prepare_kfile_stream_context(
             "(average ties; finite values only; transformed scale)."
         )
     qdim = _parse_qcov_dim(qcov)
+    _validate_qcov_dim_for_n(qdim, int(len(ids)))
     grm = None
     eff_m = int(n_kmers)
     grm_option_text = str(grm_option).strip()
@@ -5076,6 +5270,7 @@ def _prepare_kfile_stream_context(
             n_kmers=n_kmers,
             chunk_size=max(1, int(chunk_size)),
             method=int(grm_option_text),
+            threads=max(1, int(threads)),
             logger=logger,
             use_spinner=use_spinner,
         )
@@ -8338,6 +8533,12 @@ def _run_gwas_pipeline(
                 "-kfile native GWAS currently supports only the additive model "
                 "(-model add); the Python fallback has been removed."
             )
+        _validate_kfile_cli_contract(
+            maf_threshold=float(args.maf),
+            max_missing_rate=float(args.geno),
+            het_threshold=float(args.het),
+            bimranges=scan_bimranges,
+        )
     qcov_requested = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     qcov_needs_grm = False
     standard_stream_models_requested = bool(
@@ -9057,6 +9258,17 @@ def _run_gwas_pipeline(
                     ),
                     inverse_normal=bool(getattr(args, "intrans", False)),
                 )
+                if bool(args.fvlmm):
+                    # The versioned FvLMM sidecar schema intentionally
+                    # fingerprints a PLINK BED/BIM/FAM triplet for downstream
+                    # fine-mapping.  A k-file has no BED dependency, so do not
+                    # silently pretend that the BED sidecar was emitted.
+                    _emit_warning_line(
+                        logger,
+                        "FvLMM null-model sidecar is unavailable for -kfile; "
+                        "the sidecar schema requires a PLINK BED/BIM/FAM source.",
+                        use_spinner=bool(use_spinner),
+                    )
 
                 # The BED route prepares SparseLMM through post_grm_hook.  A
                 # k-file has no BED prefix, so that hook is intentionally not
@@ -9075,9 +9287,11 @@ def _run_gwas_pipeline(
                     if sparse_cfg is None:
                         raise RuntimeError("Missing SparseLMM run configuration for k-file GWAS.")
                     sparse_cutoff = float(sparse_cfg.get("sparse_cutoff", 0.05))
-                    sparse_cache_prefix = (
-                        f"{str(outprefix)}.kfile.splmm.n{int(len(ids))}."
-                        f"{_kfile_sparse_sample_hash(np.asarray(ids, dtype=str))}"
+                    sparse_cache_prefix = _kfile_sparse_cache_prefix(
+                        str(genofile_stream),
+                        np.asarray(ids, dtype=str),
+                        sparse_cutoff,
+                        int(prepared_splmm_sparse_method),
                     )
                     kfile_sparse_grm = _ensure_kfile_sparse_grm(
                         dense_grm=np.asarray(grm),

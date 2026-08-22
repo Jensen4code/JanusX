@@ -52,6 +52,7 @@ from .workflow import (
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _safe_trait_file_label,
+    _stream_model_pve,
     _phenotype_source_column_index,
     _trait_values_and_mask,
     build_rich_progress,
@@ -999,14 +1000,7 @@ def run_chunked_gwas_kfile(
                     use_spinner=bool(use_spinner),
                     emit_done_line=False,
                 )
-            pve_now: Optional[float] = None
-            if native_model_key in {"lmm", "fvlmm"}:
-                try:
-                    pve_tmp = float(getattr(model, "pve", np.nan))
-                    if np.isfinite(pve_tmp):
-                        pve_now = pve_tmp
-                except Exception:
-                    pve_now = None
+            pve_now = _stream_model_pve(native_model_key, model)
             summary_rows.append(
                 {
                     "phenotype": str(trait_name),
@@ -1030,7 +1024,7 @@ def run_chunked_gwas_kfile(
             if (
                 pve_now is not None
                 and np.isfinite(float(pve_now))
-                and str(native_model_key).lower() in {"lmm", "lmm2", "fvlmm"}
+                and str(native_model_key).lower() in {"lmm", "lmm2", "fvlmm", "splmm", "splmm2"}
             ):
                 done_msg = (
                     f"{_gwas_stream_model_label(native_model_key)} ...pve(pheno) "

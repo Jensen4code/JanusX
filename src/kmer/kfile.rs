@@ -1039,7 +1039,57 @@ impl KfileAssocSource {
         Ok((dosage, maf))
     }
 
+    /// Read selected rows as raw 0/2 dosage values without changing the
+    /// sequential association cursor.  This is used for k-file site
+    /// covariates, where centering belongs to the model design matrix rather
+    /// than to the genotype decoder.
+    pub(crate) fn read_dosage_rows_at(&self, row_indices: &[usize]) -> Result<Vec<f32>> {
+        let n_selected = self.sample_indices.len();
+        if row_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bytes_per_col = usize::try_from(self.layout.meta.bytes_per_col)
+            .context("bytes_per_col does not fit usize")?;
+        let mut bsite = self
+            .bsite
+            .try_clone()
+            .with_context(|| format!("failed to clone {}", self.layout.bsite_path.display()))?;
+        let mut packed = vec![0u8; bytes_per_col];
+        let mut dosage = vec![0.0_f32; row_indices.len().saturating_mul(n_selected)];
+        for (out_row_idx, &row_idx) in row_indices.iter().enumerate() {
+            if row_idx >= self.n_kmers() {
+                bail!("k-file association row index out of range: {row_idx}");
+            }
+            let offset = (BSITE_HEADER_SIZE as u64)
+                .checked_add(
+                    (row_idx as u64)
+                        .checked_mul(self.layout.meta.bytes_per_col)
+                        .ok_or_else(|| anyhow::anyhow!("k-file association offset overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("k-file association offset overflow"))?;
+            bsite
+                .seek(SeekFrom::Start(offset))
+                .with_context(|| format!("failed to seek {}", self.layout.bsite_path.display()))?;
+            bsite
+                .read_exact(&mut packed)
+                .with_context(|| format!("failed to read {}", self.layout.bsite_path.display()))?;
+            let out = &mut dosage[out_row_idx * n_selected..(out_row_idx + 1) * n_selected];
+            self.decode_dosage_row(&packed, out)?;
+        }
+        Ok(dosage)
+    }
+
     fn decode_centered_row(&self, packed_row: &[u8], out_row: &mut [f32]) -> Result<f32> {
+        let presence = self.decode_dosage_row(packed_row, out_row)?;
+        let p = presence as f32 / self.sample_indices.len() as f32;
+        let center = 2.0 * p;
+        for value in out_row.iter_mut() {
+            *value -= center;
+        }
+        Ok(p.min(1.0 - p))
+    }
+
+    fn decode_dosage_row(&self, packed_row: &[u8], out_row: &mut [f32]) -> Result<usize> {
         let n_selected = self.sample_indices.len();
         if out_row.len() != n_selected {
             bail!("k-file association row buffer has the wrong number of samples");
@@ -1047,7 +1097,26 @@ impl KfileAssocSource {
         let n_samples_full = self.n_samples_full();
         let full_identity = self.decode_plan.full_identity;
         if full_identity {
-            return decode_centered_row_full_identity_simd(packed_row, n_samples_full, out_row);
+            if n_samples_full == 0 {
+                bail!("full-identity k-file row has zero samples");
+            }
+            let bytes_per_col = n_samples_full.div_ceil(8);
+            if packed_row.len() < bytes_per_col {
+                bail!(
+                    "full-identity k-file row is too short: got {}, expected at least {}",
+                    packed_row.len(),
+                    bytes_per_col
+                );
+            }
+            let presence = full_bitset_presence(packed_row, n_samples_full);
+            let lut = bitset_dosage_lut();
+            for byte_idx in 0..bytes_per_col {
+                let start = byte_idx * 8;
+                let width = (n_samples_full - start).min(8);
+                let expanded = &lut[packed_row[byte_idx] as usize];
+                out_row[start..start + width].copy_from_slice(&expanded[..width]);
+            }
+            return Ok(presence);
         }
         let lut = bitset_dosage_lut();
         let mut presence = 0usize;
@@ -1061,12 +1130,7 @@ impl KfileAssocSource {
                 }
             }
         }
-        let p = presence as f32 / n_selected as f32;
-        let center = 2.0 * p;
-        for value in out_row.iter_mut() {
-            *value -= center;
-        }
-        Ok(p.min(1.0 - p))
+        Ok(presence)
     }
 
     /// Decode at most `max_rows` rows into centered 0/2 dosage values.
@@ -1574,6 +1638,53 @@ impl KfileChunkReader {
             PyArray1::from_owned_array(py, Array1::from_vec(row_indices)).into_bound(),
         )))
     }
+}
+
+/// Decode selected k-file rows to raw 0/2 dosage values.
+///
+/// This narrow helper is intentionally separate from the sequential chunk
+/// reader: GWAS site covariates need a few BIM-addressed rows while preserving
+/// the native scanner's one-pass cursor and bounded memory behavior.
+#[pyfunction(name = "kfile_read_rows_f32")]
+#[pyo3(signature = (prefix, sample_indices, row_indices))]
+pub fn kfile_read_rows_f32_py<'py>(
+    py: Python<'py>,
+    prefix: String,
+    sample_indices: Vec<i64>,
+    row_indices: Vec<i64>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    if sample_indices.is_empty() {
+        return Err(PyValueError::new_err("sample_indices must not be empty"));
+    }
+    if row_indices.is_empty() {
+        return Err(PyValueError::new_err("row_indices must not be empty"));
+    }
+    let samples = sample_indices
+        .iter()
+        .enumerate()
+        .map(|(i, &raw)| {
+            usize::try_from(raw).map_err(|_| {
+                PyValueError::new_err(format!("sample_indices[{i}] must be non-negative"))
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let rows = row_indices
+        .iter()
+        .enumerate()
+        .map(|(i, &raw)| {
+            usize::try_from(raw).map_err(|_| {
+                PyValueError::new_err(format!("row_indices[{i}] must be non-negative"))
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let source = KfileAssocSource::open(Path::new(&prefix), &samples)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let dosage = source
+        .read_dosage_rows_at(&rows)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let array = Array2::from_shape_vec((rows.len(), samples.len()), dosage)
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to shape k-file dosage: {e}")))?;
+    Ok(PyArray2::from_owned_array(py, array).into_bound())
 }
 
 #[pyfunction(name = "kfile_inspect")]

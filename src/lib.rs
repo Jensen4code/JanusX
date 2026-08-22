@@ -275,8 +275,8 @@ use heritability::{
     prepare_sparse_onehot_blup_cache, SparseOneHotBlupCache,
 };
 use kmer::{
-    kfile_inspect_py, kformat_run_py, kmer_count_run_py, kmer_resolve_inputs_py, kmerge_run_py,
-    kstats_run_py, KfileChunkReader,
+    kfile_inspect_py, kfile_read_rows_f32_py, kformat_run_py, kmer_count_run_py,
+    kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py, KfileChunkReader,
 };
 use ld::{
     bed_ld_corr_rust, bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority,
@@ -763,6 +763,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kmer_resolve_inputs_py, m)?)?;
     m.add_function(wrap_pyfunction!(kstats_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(kfile_inspect_py, m)?)?;
+    m.add_function(wrap_pyfunction!(kfile_read_rows_f32_py, m)?)?;
     m.add_function(wrap_pyfunction!(kformat_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(fastq2count_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(fastq2vcf_run_py, m)?)?;
