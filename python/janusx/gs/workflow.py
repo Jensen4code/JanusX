@@ -20535,13 +20535,14 @@ def _run_gs_pipeline_impl(
             m for m in methods
             if not (
                 _is_jxmodel_export_supported(m)
+                or _is_binary_jxmodel_artifact_supported(m)
                 or (bundle_model_loaded and _is_blup_method(str(m)))
             )
         ]
         if len(unsupported) > 0:
             logger.error(
-                "Loaded-model mode currently supports rrBLUP/RF/ET/GBDT/XGB/SVM/ENET "
-                "and BLUP inside TOP bundles. "
+                "Loaded-model mode currently supports additive GBLUP, rrBLUP, "
+                "RF/ET/GBDT/XGB/SVM/ENET and BLUP inside TOP bundles. "
                 "Unsupported: " + ", ".join(unsupported)
             )
             raise SystemExit(1)
