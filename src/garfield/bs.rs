@@ -21,15 +21,12 @@ use super::score::{
     and_popcount_sum_y_where_both1_with_lookup, binary_maf_from_n_hit, dosage_maf_from_dual_counts,
     dual_packed_summary, score_cont_centered_gain_dual_from_summary,
     score_cont_centered_gain_dual_packed_with_sum, score_cont_centered_gain_from_sum_and_n_hit,
-    score_cont_centered_gain_packed_with_n_hit, score_cont_centered_gain_packed_with_sum,
-    score_cont_corr_packed, sum_y_where_both1, sum_y_where_both1_four,
-    sum_y_where_both1_with_lookup, support_size_packed, validate_continuous_y, ContinuousRuleScore,
-    PackedYSumLookup,
+    score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, sum_y_where_both1,
+    sum_y_where_both1_four, sum_y_where_both1_with_lookup, validate_continuous_y,
+    ContinuousRuleScore, PackedYSumLookup,
 };
 use super::score_gpu::{
-    centered_gain_backend_mode_is_auto, parse_centered_gain_backend_mode_from_env,
-    score_cont_centered_gain_singletons_packed_cpu_impl,
-    score_cont_centered_gain_singletons_packed_legacy_impl,
+    parse_centered_gain_backend_mode_from_env,
     score_cont_centered_gain_singletons_packed_with_backend,
 };
 use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked, popcount};
@@ -2832,13 +2829,13 @@ fn apply_first_literal(
 
 fn precompute_literal_singleton_scores(
     y_train: &[f64],
-    sum_y_train: f64,
+    _sum_y_train: f64,
     bits_train: &[u64],
     row_words_train: usize,
     needed_words_train: usize,
     n_train: usize,
     y_test: &[f64],
-    sum_y_test: f64,
+    _sum_y_test: f64,
     bits_test: &[u64],
     row_words_test: usize,
     needed_words_test: usize,
@@ -2864,10 +2861,8 @@ fn precompute_literal_singleton_scores(
             let shared_scores = precompute_literal_singleton_backend_scores(
                 mode,
                 y_train,
-                sum_y_train,
                 bits_train,
                 row_words_train,
-                needed_words_train,
                 n_train,
                 n_rows,
             )?;
@@ -2882,20 +2877,16 @@ fn precompute_literal_singleton_scores(
         let train_scores = precompute_literal_singleton_backend_scores(
             mode,
             y_train,
-            sum_y_train,
             bits_train,
             row_words_train,
-            needed_words_train,
             n_train,
             n_rows,
         )?;
         let test_scores = precompute_literal_singleton_backend_scores(
             mode,
             y_test,
-            sum_y_test,
             bits_test,
             row_words_test,
-            needed_words_test,
             n_test,
             n_rows,
         )?;
@@ -2927,8 +2918,6 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
         validate_continuous_y(y_train, n_train, ctx)?;
         validate_continuous_y(y_test, n_test, ctx)?;
         let mode = parse_centered_gain_backend_mode_from_env()?;
-        let sum_y_train = y_train.iter().take(n_train).copied().sum::<f64>();
-        let sum_y_test = y_test.iter().take(n_test).copied().sum::<f64>();
         let max_rows = literal_batch_max_rows();
         let max_work_words = literal_batch_max_work_words();
         let mut out = vec![Vec::<LiteralSingletonScore>::new(); requests.len()];
@@ -3027,10 +3016,8 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
                 let shared_scores = precompute_literal_singleton_backend_scores(
                     mode,
                     y_train,
-                    sum_y_train,
                     merged_train.as_slice(),
                     row_words_train,
-                    needed_words_train,
                     n_train,
                     batch_rows,
                 )?;
@@ -3052,20 +3039,16 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
                 let train_scores = precompute_literal_singleton_backend_scores(
                     mode,
                     y_train,
-                    sum_y_train,
                     merged_train.as_slice(),
                     row_words_train,
-                    needed_words_train,
                     n_train,
                     batch_rows,
                 )?;
                 let test_scores = precompute_literal_singleton_backend_scores(
                     mode,
                     y_test,
-                    sum_y_test,
                     merged_test.as_slice(),
                     row_words_test,
-                    needed_words_test,
                     n_test,
                     batch_rows,
                 )?;
@@ -3093,49 +3076,15 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
 fn precompute_literal_singleton_backend_scores(
     mode: super::score_gpu::GarfieldCenteredGainBackendMode,
     y: &[f64],
-    sum_y: f64,
     bits: &[u64],
     row_words: usize,
-    needed_words: usize,
     n_samples: usize,
     n_rows: usize,
 ) -> Result<Vec<ContinuousRuleScore>, String> {
-    let strict = score_cont_centered_gain_singletons_packed_with_backend(
-        y, bits, row_words, n_rows, n_samples,
+    score_cont_centered_gain_singletons_packed_with_backend(
+        mode, y, bits, row_words, n_rows, n_samples,
     )
-    .map(|v| v.0);
-    if !centered_gain_backend_mode_is_auto(mode) {
-        return strict;
-    }
-    strict
-        .or_else(|_| {
-            score_cont_centered_gain_singletons_packed_cpu_impl(
-                y, bits, row_words, n_rows, n_samples,
-            )
-        })
-        .or_else(|_| {
-            score_cont_centered_gain_singletons_packed_legacy_impl(
-                y, bits, row_words, n_rows, n_samples,
-            )
-        })
-        .or_else(|_| {
-            let mut fallback = Vec::with_capacity(n_rows.saturating_mul(2));
-            for row_idx in 0..n_rows {
-                let row = row_prefix(bits, row_words, row_idx, needed_words);
-                for &negated in &[false, true] {
-                    let literal_bits = apply_first_literal(row, needed_words, n_samples, negated);
-                    let n_hit = support_size_packed(&literal_bits, n_samples);
-                    fallback.push(score_cont_centered_gain_packed_with_n_hit(
-                        y,
-                        &literal_bits,
-                        n_samples,
-                        sum_y,
-                        n_hit,
-                    ));
-                }
-            }
-            Ok(fallback)
-        })
+    .map(|v| v.0)
 }
 
 #[inline]
@@ -8213,12 +8162,20 @@ fn expand_fuzzy_states_exhaustive(
                         None,
                         params,
                     );
-                    if !keep_child_after_parent_abs_improvement_pruning(
-                        node.train_abs_score,
-                        rule.len(),
-                        train_abs_score,
-                        params,
-                    ) {
+                    // The exhaustive prefix is deliberately unpruned by
+                    // gain/parent-improvement thresholds.  Those candidates
+                    // are retained for the final rerank; otherwise a valid
+                    // interaction with a negative in-sample gain can never
+                    // reach that stage.
+                    let in_exhaustive_prefix = rule.len() <= params.exhaustive_depth.max(1);
+                    if !in_exhaustive_prefix
+                        && !keep_child_after_parent_abs_improvement_pruning(
+                            node.train_abs_score,
+                            rule.len(),
+                            train_abs_score,
+                            params,
+                        )
+                    {
                         continue;
                     }
                     garfield_layer_debug_add(
@@ -8227,7 +8184,9 @@ fn expand_fuzzy_states_exhaustive(
                         GarfieldLayerDebugMetric::AbsOk,
                         1,
                     );
-                    if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                    if !in_exhaustive_prefix
+                        && !keep_state_after_min_gain_pruning(rule.len(), train_score, params)
+                    {
                         continue;
                     }
                     garfield_layer_debug_add(
@@ -8236,7 +8195,9 @@ fn expand_fuzzy_states_exhaustive(
                         GarfieldLayerDebugMetric::GainOk,
                         1,
                     );
-                    if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
+                    if !in_exhaustive_prefix
+                        && !keep_child_after_parent_gain_pruning(&rule, train_score, params)
+                    {
                         continue;
                     }
                     garfield_layer_debug_add(
@@ -8764,6 +8725,7 @@ fn final_test_score_for_rule_fuzzy(
 
 #[cfg(test)]
 mod tests {
+    use super::super::score::{score_cont_centered_gain_packed_with_n_hit, support_size_packed};
     use super::*;
 
     #[test]
@@ -9069,6 +9031,7 @@ mod tests {
 
     #[test]
     fn test_batched_literal_singleton_precompute_matches_per_unit() {
+        init_python_for_tests();
         let y = vec![0.2, 1.1, -0.4, 0.8, 1.6, -0.3];
         let rows_a = vec![vec![1, 0, 1, 0, 0, 1], vec![0, 1, 1, 0, 1, 0]];
         let rows_b = vec![vec![1, 1, 0, 0, 1, 0], vec![0, 0, 1, 1, 0, 1]];

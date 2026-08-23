@@ -2382,7 +2382,26 @@ def _read_cov_file_flexible(
     data = df_use.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
     if data.ndim == 1:
         data = data.reshape(-1, 1)
-    return np.asarray(ids, dtype=str), data
+    ids_out = np.asarray(ids, dtype=str)
+    if len(set(ids_out.tolist())) != int(ids_out.shape[0]):
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for sid_i in ids_out.tolist():
+            if sid_i in seen and sid_i not in duplicates:
+                duplicates.append(sid_i)
+            seen.add(sid_i)
+        raise ValueError(
+            f"{label} file contains duplicate sample IDs: {duplicates[:5]}"
+        )
+    bad = np.argwhere(~np.isfinite(data))
+    if bad.size > 0:
+        row_i, col_i = (int(x) for x in bad[0])
+        sid_i = ids_out[row_i] if row_i < ids_out.shape[0] else "?"
+        raise ValueError(
+            f"{label} file contains a non-numeric/non-finite value at "
+            f"sample '{sid_i}', covariate column {col_i + 1}: {path}"
+        )
+    return ids_out, data
 
 
 def _load_site_covariates(
@@ -2498,8 +2517,7 @@ def _load_covariates_for_models(
 
     for path in cov_files:
         if not os.path.isfile(path):
-            logger.warning(f"Covariate file not found: {path}; skipped.")
-            continue
+            raise FileNotFoundError(f"Covariate file not found: {path}")
         src = _basename_only(path)
         with CliStatus(f"Loading covariate from {src}...", enabled=bool(use_spinner)) as task:
             try:
@@ -2528,6 +2546,14 @@ def _load_covariates_for_models(
                         use_spinner=use_spinner,
                         snps_only=bool(snps_only),
                     )
+                    bad = np.argwhere(~np.isfinite(cov_site))
+                    if bad.size > 0:
+                        row_i, col_i = (int(x) for x in bad[0])
+                        sid_i = str(sample_ids[row_i]) if row_i < len(sample_ids) else "?"
+                        raise ValueError(
+                            f"Covariate site {token} contains a non-finite value at "
+                            f"sample '{sid_i}', column {col_i + 1}."
+                        )
                 except Exception:
                     task.fail(f"Loading covariate from {token} ...Failed")
                     raise

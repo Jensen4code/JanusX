@@ -1299,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_penalty_uses_length_buckets_with_len3plus_collapsed() {
+    fn test_penalty_prefers_exact_length_bucket_before_len_fallback() {
         let mut cal = RuleNullCalibrator::new();
         let len1 = b(1);
         let len2 = b(2);
@@ -1314,7 +1314,7 @@ mod tests {
         let lookup = cal.finalize();
         assert_eq!(lookup.train_penalty(len1).unwrap(), 20.0);
         assert_eq!(lookup.train_penalty(len2).unwrap(), 120.0);
-        assert_eq!(lookup.train_penalty(len3).unwrap(), 320.0);
+        assert_eq!(lookup.train_penalty(len3).unwrap(), 220.0);
         assert_eq!(lookup.train_penalty(len4).unwrap(), 320.0);
     }
 

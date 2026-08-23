@@ -43,7 +43,6 @@ from janusx.script._common.cli_args import (
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.genoio import (
     determine_genotype_source_from_args as determine_genotype_source,
-    packed_meta_cache_prefix,
     prepare_packed_ctx_from_plink,
 )
 from janusx.script._common.genocache import configure_genotype_cache_from_out
@@ -78,14 +77,9 @@ from janusx.assoc.workflow_ui import _emit_plain_info_line, _rich_success
 from janusx.assoc.workflow_ui import _run_fastplot_from_tsv_with_status
 from janusx.pyBLUP.assoc import FvLMM
 from janusx.script.fvlmm2 import (
-    InteractionSpec as _Fvlmm2InteractionSpec,
     _bh_adjust as _fvlmm2_bh_adjust,
     _decode_rows as _fvlmm2_decode_rows,
-    _attach_combo_joint_fdr as _fvlmm2_attach_combo_joint_fdr,
-    _format_fvlmm2_output_df_for_tsv as _fvlmm2_format_output_df_for_tsv,
     _load_active_sites as _fvlmm2_load_active_sites,
-    _require_rust_backend as _fvlmm2_require_rust_backend,
-    _run_trait_scan as _fvlmm2_run_trait_scan,
 )
 
 
@@ -544,78 +538,6 @@ def _prepare_site_keep(
     return site_keep
 
 
-_GARFIELD_FOLLOWUP_PAIR_RE = re.compile(
-    r"^\s*(!?[^\s&|*^]+)\s*([&|*^])\s*(!?[^\s&|*^]+)\s*$"
-)
-
-
-def _garfield_parse_literal_token(token: str) -> tuple[str, bool, str | None]:
-    text = str(token).strip()
-    if text == "":
-        raise ValueError("Literal token is empty.")
-    negated = False
-    while text.startswith("!"):
-        negated = not negated
-        text = text[1:].strip()
-    if text == "":
-        raise ValueError("Literal token has no SNP name after '!'.")
-    target_allele: str | None = None
-    if text.endswith(")") and "(" in text:
-        base, suffix = text.rsplit("(", 1)
-        allele_txt = suffix[:-1].strip()
-        base = base.strip()
-        if allele_txt != "" and base != "":
-            text = base
-            target_allele = allele_txt
-    return text, bool(negated), target_allele
-
-
-def _garfield_site_coord_name(site: object) -> str:
-    return f"{str(getattr(site, 'chrom'))}_{int(getattr(site, 'pos'))}"
-
-
-def _garfield_literal_target_name(site: object, negated: bool) -> str:
-    target = str(getattr(site, "allele0" if bool(negated) else "allele1"))
-    return f"{_garfield_site_coord_name(site)}({target})"
-
-
-def _garfield_resolve_literal_token(
-    token: str,
-    *,
-    name_map: dict[str, list[int]],
-    source_sites: list[object],
-) -> tuple[str, bool, int]:
-    snp_name, explicit_neg, target_allele = _garfield_parse_literal_token(token)
-    row = _resolve_garfield_followup_snp_token(snp_name, name_map)
-    site = source_sites[int(row)]
-    if target_allele is None:
-        negated = bool(explicit_neg)
-    else:
-        allele0 = str(getattr(site, "allele0"))
-        allele1 = str(getattr(site, "allele1"))
-        if target_allele == allele1 and target_allele != allele0:
-            negated = False
-        elif target_allele == allele0 and target_allele != allele1:
-            negated = True
-        elif target_allele == allele0 == allele1:
-            negated = bool(explicit_neg)
-        else:
-            raise ValueError(
-                f"Literal token '{token}' targets allele '{target_allele}', "
-                f"but active site '{snp_name}' has alleles ({allele0}, {allele1})."
-            )
-        if explicit_neg and (not negated):
-            raise ValueError(
-                f"Literal token '{token}' mixes '!' with target allele '{target_allele}' "
-                "in an inconsistent direction."
-            )
-    return snp_name, bool(negated), int(row)
-
-
-def _garfield_followup_key(chrom: object, pos: object, snp: object) -> tuple[str, int, str]:
-    return (str(chrom).strip(), int(pos), str(snp).strip())
-
-
 def _garfield_followup_chisq(beta: object, se: object) -> float:
     try:
         beta_f = float(beta)
@@ -842,476 +764,6 @@ def _emit_garfield_file_only_record(
             parent = parent.parent
 
 
-def _resolve_garfield_followup_snp_token(
-    token: str,
-    name_map: dict[str, list[int]],
-) -> int:
-    hits = name_map.get(str(token).strip(), [])
-    if len(hits) == 1:
-        return int(hits[0])
-    if len(hits) > 1:
-        raise ValueError(
-            f"SNP token '{token}' is ambiguous after filtering; matched {len(hits)} active rows."
-        )
-    raise KeyError(f"SNP token '{token}' was not found among active filtered variants.")
-
-
-def _load_garfield_pseudo_row_meta(
-    *,
-    pseudo_prefix: str,
-    expected_sample_ids: list[str],
-    maf_threshold: float,
-    max_missing_rate: float,
-    het_threshold: float,
-) -> dict[tuple[str, int, str], dict[str, object]]:
-    pseudo_ids, pseudo_ctx = prepare_packed_ctx_from_plink(
-        str(pseudo_prefix),
-        maf=float(maf_threshold),
-        missing_rate=float(max_missing_rate),
-        het_threshold=float(het_threshold),
-        snps_only=False,
-        filter_mode="compact",
-        use_cache=False,
-    )
-    pseudo_ids_arr = np.asarray(pseudo_ids, dtype=str)
-    expected_ids_arr = np.asarray(expected_sample_ids, dtype=str)
-    if (
-        int(pseudo_ids_arr.shape[0]) != int(expected_ids_arr.shape[0])
-        or not np.array_equal(pseudo_ids_arr, expected_ids_arr)
-    ):
-        raise ValueError(
-            "GARFIELD pseudo follow-up sample mismatch between pseudo BED and aligned trait samples."
-        )
-    pseudo_sites, _ = _fvlmm2_load_active_sites(str(pseudo_prefix), pseudo_ctx)
-    af = np.ascontiguousarray(
-        np.asarray(pseudo_ctx.get("af", pseudo_ctx["maf"]), dtype=np.float32).reshape(-1),
-        dtype=np.float32,
-    )
-    miss = np.ascontiguousarray(
-        np.asarray(pseudo_ctx["missing_rate"], dtype=np.float32).reshape(-1),
-        dtype=np.float32,
-    )
-    if int(af.shape[0]) != len(pseudo_sites) or int(miss.shape[0]) != len(pseudo_sites):
-        raise ValueError(
-            "GARFIELD pseudo follow-up metadata length mismatch: "
-            f"sites={len(pseudo_sites)}, af={int(af.shape[0])}, miss={int(miss.shape[0])}."
-        )
-    out: dict[tuple[str, int, str], dict[str, object]] = {}
-    for idx, site in enumerate(pseudo_sites):
-        out[_garfield_followup_key(site.chrom, site.pos, site.snp)] = {
-            "chrom": str(site.chrom),
-            "pos": int(site.pos),
-            "snp": str(site.snp),
-            "allele0": str(site.allele0),
-            "allele1": str(site.allele1),
-            "af": float(af[idx]),
-            "miss": float(miss[idx]),
-        }
-    return out
-
-
-def _collect_garfield_fvlmm2_specs(
-    *,
-    rules_tsv: str,
-    name_map: dict[str, list[int]],
-    source_sites: list[object],
-) -> tuple[list[_Fvlmm2InteractionSpec], pd.DataFrame, list[dict[str, str]]]:
-    rules = pd.read_csv(
-        str(rules_tsv),
-        sep="\t",
-        dtype=str,
-        keep_default_na=False,
-    )
-    specs: list[_Fvlmm2InteractionSpec] = []
-    supported_meta: list[dict[str, object]] = []
-    skipped: list[dict[str, str]] = []
-    seen_combo: set[str] = set()
-
-    for row_no, row in enumerate(rules.to_dict(orient="records"), start=2):
-        snp_name = str(row.get("snp_name", "")).strip()
-        expr = str(row.get("expr", "")).strip()
-        if snp_name == "":
-            skipped.append(
-                {
-                    "line": str(row_no),
-                    "expr": expr,
-                    "snp_name": snp_name,
-                    "reason": "missing_snp_name",
-                }
-            )
-            continue
-        if snp_name in seen_combo:
-            skipped.append(
-                {
-                    "line": str(row_no),
-                    "expr": expr,
-                    "snp_name": snp_name,
-                    "reason": "duplicate_combo",
-                }
-            )
-            continue
-        seen_combo.add(snp_name)
-        match = _GARFIELD_FOLLOWUP_PAIR_RE.match(snp_name)
-        if match is None:
-            skipped.append(
-                {
-                    "line": str(row_no),
-                    "expr": expr,
-                    "snp_name": snp_name,
-                    "reason": (
-                        "singleton_rule"
-                        if not any(op in snp_name for op in ("|", "&", "*", "^"))
-                        else "requires_exactly_two_literals"
-                    ),
-                }
-            )
-            continue
-        token1 = str(match.group(1)).strip()
-        op = str(match.group(2)).strip()
-        token2 = str(match.group(3)).strip()
-        try:
-            snp1, neg1, row1 = _garfield_resolve_literal_token(
-                token1,
-                name_map=name_map,
-                source_sites=source_sites,
-            )
-            snp2, neg2, row2 = _garfield_resolve_literal_token(
-                token2,
-                name_map=name_map,
-                source_sites=source_sites,
-            )
-            site1 = source_sites[int(row1)]
-            site2 = source_sites[int(row2)]
-            literal1 = _garfield_literal_target_name(site1, neg1)
-            literal2 = _garfield_literal_target_name(site2, neg2)
-            combo = f"{literal1}{op}{literal2}"
-        except Exception as ex:
-            skipped.append(
-                {
-                    "line": str(row_no),
-                    "expr": expr,
-                    "snp_name": snp_name,
-                    "reason": str(ex),
-                }
-            )
-            continue
-        if op == "*" and (neg1 or neg2):
-            skipped.append(
-                {
-                    "line": str(row_no),
-                    "expr": expr,
-                    "snp_name": snp_name,
-                    "reason": "negated_literals_not_supported_for_multiplicative_interaction",
-                }
-            )
-            continue
-        specs.append(
-            _Fvlmm2InteractionSpec(
-                expr=combo,
-                snp1=snp1,
-                op=op,
-                snp2=snp2,
-                row1=int(row1),
-                row2=int(row2),
-                neg1=bool(neg1),
-                neg2=bool(neg2),
-            )
-        )
-        supported_meta.append(
-            {
-                "combo": combo,
-                "garfield_unit_kind": str(row.get("unit_kind", "")).strip(),
-                "garfield_unit_index": str(row.get("unit_index", "")).strip(),
-                "garfield_unit_name": str(row.get("unit_name", "")).strip(),
-                "garfield_region_size": str(row.get("region_size", "")).strip(),
-                "garfield_ml_feature_count": str(row.get("ml_feature_count", "")).strip(),
-                "garfield_ml_rank": str(row.get("MLrank", row.get("ml_rank", ""))).strip(),
-                "garfield_rule_snp_name": snp_name,
-                "garfield_rule_expr": expr,
-                "garfield_rule_score": str(row.get("score", "")).strip(),
-                "garfield_rule_delta_score": str(row.get("delta_score", "")).strip(),
-            }
-        )
-
-    return specs, pd.DataFrame(supported_meta), skipped
-
-
-def _garfield_followup_meta_or_fallback(
-    *,
-    row_meta: dict[tuple[str, int, str], dict[str, object]],
-    key: tuple[str, int, str],
-    allele0: str,
-    allele1: str,
-) -> dict[str, object]:
-    meta = row_meta.get(key)
-    if meta is not None:
-        return meta
-    chrom, pos, snp = key
-    return {
-        "chrom": chrom,
-        "pos": int(pos),
-        "snp": snp,
-        "allele0": str(allele0),
-        "allele1": str(allele1),
-        "af": float("nan"),
-        "miss": float("nan"),
-    }
-
-
-def _garfield_compact_fvlmm2_output_df(full_df: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "chrom",
-        "pos",
-        "combo_id",
-        "combo_af",
-        "unit_name",
-        "beta_combo_joint",
-        "se_combo_joint",
-        "p_combo_joint",
-        "p_combo_joint_fdr",
-        "p_lit1_joint",
-        "p_lit2_joint",
-    ]
-    if full_df.shape[0] == 0:
-        return pd.DataFrame(columns=columns)
-
-    out_rows: list[dict[str, object]] = []
-    for rec in full_df.itertuples(index=False):
-        unit_name = "."
-        if hasattr(rec, "garfield_unit_name"):
-            raw_unit_name = str(getattr(rec, "garfield_unit_name", "")).strip()
-            if raw_unit_name != "" and raw_unit_name.lower() != "nan":
-                unit_name = raw_unit_name
-        shared = {
-            "combo_id": str(rec.combo),
-            "combo_af": pd.to_numeric(getattr(rec, "combo_af", float("nan")), errors="coerce"),
-            "unit_name": unit_name,
-            "beta_combo_joint": pd.to_numeric(
-                getattr(rec, "beta_combo_joint", float("nan")),
-                errors="coerce",
-            ),
-            "se_combo_joint": pd.to_numeric(
-                getattr(rec, "se_combo_joint", float("nan")),
-                errors="coerce",
-            ),
-            "p_combo_joint": pd.to_numeric(
-                getattr(rec, "p_combo_joint", float("nan")),
-                errors="coerce",
-            ),
-            "p_combo_joint_fdr": pd.to_numeric(
-                getattr(rec, "p_combo_joint_fdr", float("nan")),
-                errors="coerce",
-            ),
-            "p_lit1_joint": pd.to_numeric(getattr(rec, "p1_joint", float("nan")), errors="coerce"),
-            "p_lit2_joint": pd.to_numeric(getattr(rec, "p2_joint", float("nan")), errors="coerce"),
-        }
-        out_rows.append(
-            {
-                "chrom": str(rec.chrom1),
-                "pos": pd.to_numeric(getattr(rec, "pos1", float("nan")), errors="coerce"),
-                **shared,
-            }
-        )
-        out_rows.append(
-            {
-                "chrom": str(rec.chrom2),
-                "pos": pd.to_numeric(getattr(rec, "pos2", float("nan")), errors="coerce"),
-                **shared,
-            }
-        )
-
-    return pd.DataFrame(out_rows, columns=columns)
-
-
-def _build_garfield_fvlmm2_expanded_df(
-    *,
-    raw_df: pd.DataFrame,
-    pseudo_row_meta: dict[tuple[str, int, str], dict[str, object]],
-) -> pd.DataFrame:
-    if raw_df.shape[0] == 0:
-        return raw_df.copy()
-
-    emitted_singletons: set[tuple[str, int, str]] = set()
-    out_rows: list[dict[str, object]] = []
-    for rec in raw_df.itertuples(index=False):
-        rec_dict = rec._asdict()
-        single_specs = [
-            (
-                1,
-                _garfield_followup_key(rec.chrom1, rec.pos1, rec.literal1),
-                str(rec.allele0_literal1),
-                str(rec.allele1_literal1),
-                float(rec.beta_literal1_marginal),
-                float(rec.se_literal1_marginal),
-                float(rec.p_literal1_marginal),
-                float(rec.beta1_marginal),
-                float(rec.se1_marginal),
-                float(rec.p1_marginal),
-                float(rec.beta1_joint),
-                float(rec.se1_joint),
-                float(rec.p1_joint),
-            ),
-            (
-                2,
-                _garfield_followup_key(rec.chrom2, rec.pos2, rec.literal2),
-                str(rec.allele0_literal2),
-                str(rec.allele1_literal2),
-                float(rec.beta_literal2_marginal),
-                float(rec.se_literal2_marginal),
-                float(rec.p_literal2_marginal),
-                float(rec.beta2_marginal),
-                float(rec.se2_marginal),
-                float(rec.p2_marginal),
-                float(rec.beta2_joint),
-                float(rec.se2_joint),
-                float(rec.p2_joint),
-            ),
-        ]
-        for (
-            component_index,
-            key,
-            allele0,
-            allele1,
-            beta_lit,
-            se_lit,
-            p_lit,
-            beta_main,
-            se_main,
-            p_main,
-            beta_j,
-            se_j,
-            p_j,
-        ) in single_specs:
-            if key in emitted_singletons:
-                continue
-            meta = _garfield_followup_meta_or_fallback(
-                row_meta=pseudo_row_meta,
-                key=key,
-                allele0=allele0,
-                allele1=allele1,
-            )
-            row = dict(rec_dict)
-            row.update(
-                {
-                    "chrom": str(meta["chrom"]),
-                    "pos": int(meta["pos"]),
-                    "snp": str(meta["snp"]),
-                    "allele0": str(meta["allele0"]),
-                    "allele1": str(meta["allele1"]),
-                    "af": float(meta["af"]),
-                    "miss": float(meta["miss"]),
-                    "beta": float(beta_j),
-                    "se": float(se_j),
-                    "chisq": _garfield_followup_chisq(beta_j, se_j),
-                    "pwald": float(p_j),
-                    "row_role": "singleton",
-                    "component_index": int(component_index),
-                    "parent_combo": str(rec.combo),
-                    "main_beta_marginal": float(beta_main),
-                    "main_se_marginal": float(se_main),
-                    "main_pwald_marginal": float(p_main),
-                    "main_beta_joint_in_parent": float(beta_j),
-                    "main_se_joint_in_parent": float(se_j),
-                    "main_pwald_joint_in_parent": float(p_j),
-                    "combo_beta_joint": float(rec.beta_combo_joint),
-                    "combo_se_joint": float(rec.se_combo_joint),
-                    "combo_pwald_joint": float(rec.p_combo_joint),
-                    "combo_pwald_joint_fdr": float(
-                        getattr(rec, "p_combo_joint_fdr", float("nan"))
-                    ),
-                }
-            )
-            out_rows.append(row)
-            emitted_singletons.add(key)
-
-        combo_specs = [
-            (
-                1,
-                _garfield_followup_key(rec.chrom1, rec.pos1, rec.combo),
-                f"{str(rec.allele0_literal1)},{str(rec.allele0_literal2)}",
-                f"{str(rec.allele1_literal1)},{str(rec.allele1_literal2)}",
-            ),
-            (
-                2,
-                _garfield_followup_key(rec.chrom2, rec.pos2, rec.combo),
-                f"{str(rec.allele0_literal1)},{str(rec.allele0_literal2)}",
-                f"{str(rec.allele1_literal1)},{str(rec.allele1_literal2)}",
-            ),
-        ]
-        for component_index, key, allele0, allele1 in combo_specs:
-            meta = _garfield_followup_meta_or_fallback(
-                row_meta=pseudo_row_meta,
-                key=key,
-                allele0=allele0,
-                allele1=allele1,
-            )
-            row = dict(rec_dict)
-            row.update(
-                {
-                    "chrom": str(meta["chrom"]),
-                    "pos": int(meta["pos"]),
-                    "snp": str(meta["snp"]),
-                    "allele0": str(meta["allele0"]),
-                    "allele1": str(meta["allele1"]),
-                    "af": float(meta["af"]),
-                    "miss": float(meta["miss"]),
-                    "beta": float(rec.beta_combo_joint),
-                    "se": float(rec.se_combo_joint),
-                    "chisq": _garfield_followup_chisq(rec.beta_combo_joint, rec.se_combo_joint),
-                    "pwald": float(rec.p_combo_joint),
-                    "pwald_fdr": float(getattr(rec, "p_combo_joint_fdr", float("nan"))),
-                    "row_role": "combo",
-                    "component_index": int(component_index),
-                    "parent_combo": str(rec.combo),
-                    "main_beta_marginal": float("nan"),
-                    "main_se_marginal": float("nan"),
-                    "main_pwald_marginal": float("nan"),
-                    "main_beta_joint_in_parent": float("nan"),
-                    "main_se_joint_in_parent": float("nan"),
-                    "main_pwald_joint_in_parent": float("nan"),
-                    "combo_beta_joint": float(rec.beta_combo_joint),
-                    "combo_se_joint": float(rec.se_combo_joint),
-                    "combo_pwald_joint": float(rec.p_combo_joint),
-                    "combo_pwald_joint_fdr": float(
-                        getattr(rec, "p_combo_joint_fdr", float("nan"))
-                    ),
-                }
-            )
-            out_rows.append(row)
-
-    out_df = pd.DataFrame(out_rows)
-    preferred = [
-        "chrom",
-        "pos",
-        "snp",
-        "allele0",
-        "allele1",
-        "af",
-        "miss",
-        "beta",
-        "se",
-        "chisq",
-        "pwald",
-        "pwald_fdr",
-        "row_role",
-        "component_index",
-        "parent_combo",
-        "main_beta_marginal",
-        "main_se_marginal",
-        "main_pwald_marginal",
-        "main_beta_joint_in_parent",
-        "main_se_joint_in_parent",
-        "main_pwald_joint_in_parent",
-        "combo_beta_joint",
-        "combo_se_joint",
-        "combo_pwald_joint",
-        "combo_pwald_joint_fdr",
-    ]
-    ordered = [col for col in preferred if col in out_df.columns]
-    ordered.extend([col for col in out_df.columns if col not in ordered])
-    return out_df.loc[:, ordered]
-
-
 def _run_garfield_pseudo_fvlmm(
     *,
     pseudo_prefix: str,
@@ -1503,187 +955,6 @@ def _run_garfield_pseudo_fvlmm(
         "figure_path": figure_path if tsv_df.shape[0] > 0 else None,
         "n_rules_supported": int(combo_unique.shape[0]),
         "n_rules_skipped": 0,
-    }
-
-
-def _run_garfield_pseudo_fvlmm2(
-    *,
-    genofile: str,
-    pseudo_prefix: str,
-    rules_tsv: str,
-    trait_label: str,
-    pheno_values: np.ndarray,
-    sample_ids: list[str],
-    sample_indices_full: np.ndarray,
-    trait_grm: np.ndarray,
-    trait_cov: Optional[np.ndarray],
-    source_packed_ctx: dict[str, object],
-    source_sites: list[object],
-    source_name_map: dict[str, list[int]],
-    maf_threshold: float,
-    max_missing_rate: float,
-    het_threshold: float,
-    fdr_n_tests: int | None,
-    threads: int,
-    logger,
-    use_spinner: bool,
-) -> dict[str, object]:
-    _fvlmm2_require_rust_backend()
-    specs, rule_meta_df, skipped = _collect_garfield_fvlmm2_specs(
-        rules_tsv=str(rules_tsv),
-        name_map=source_name_map,
-        source_sites=source_sites,
-    )
-    out_base = f"{pseudo_prefix}.fvlmm2"
-    tsv_path = f"{out_base}.tsv"
-    skipped_tsv_path = f"{out_base}.skip"
-    figure_path = f"{out_base}.svg"
-    saved_paths: list[str] = []
-
-    if len(skipped) > 0:
-        pd.DataFrame(skipped).to_csv(skipped_tsv_path, sep="\t", index=False)
-        saved_paths.append(skipped_tsv_path)
-        logger.warning(
-            "GARFIELD pseudo FvLMM2 skipped %d rule(s); details saved to %s",
-            len(skipped),
-            format_path_for_display(skipped_tsv_path),
-        )
-
-    if len(specs) == 0:
-        logger.warning(
-            "GARFIELD pseudo FvLMM2 found no pairwise rules that can be jointly rechecked for '%s'.",
-            trait_label,
-        )
-        return {
-            "saved_paths": saved_paths,
-            "tsv_paths": [p for p in saved_paths if str(p).lower().endswith(".tsv")],
-            "figure_paths": [],
-            "summary_rows": [],
-            "tsv_path": None,
-            "raw_tsv_path": None,
-            "expanded_tsv_path": None,
-            "skipped_tsv_path": skipped_tsv_path if len(skipped) > 0 else None,
-            "figure_path": None,
-            "n_rules_supported": 0,
-            "n_rules_skipped": len(skipped),
-        }
-
-    pheno_df = pd.DataFrame(
-        {str(trait_label): np.asarray(pheno_values, dtype=np.float64)},
-        index=pd.Index(np.asarray(sample_ids, dtype=str), dtype=str),
-    )
-    full_df = _fvlmm2_run_trait_scan(
-        trait_ref=str(trait_label),
-        pheno_base=pheno_df,
-        base_ids=np.asarray(sample_ids, dtype=str),
-        base_full_indices=np.asarray(sample_indices_full, dtype=np.int64),
-        base_grm=np.asarray(trait_grm, dtype=np.float64, order="C"),
-        base_cov=(
-            None
-            if trait_cov is None
-            else np.asarray(trait_cov, dtype=np.float64, order="C")
-        ),
-        packed_ctx=source_packed_ctx,
-        sites=source_sites,
-        specs=specs,
-        threads=int(threads),
-        batch_size=4096,
-    )
-    if rule_meta_df.shape[0] > 0:
-        full_df = full_df.merge(rule_meta_df, on="combo", how="left", sort=False)
-    full_df = _fvlmm2_attach_combo_joint_fdr(
-        full_df,
-        p_col="p_combo_joint",
-        out_col="p_combo_joint_fdr",
-        group_col="garfield_unit_name",
-        n_tests=fdr_n_tests,
-    )
-    tsv_df = _fvlmm2_format_output_df_for_tsv(_garfield_compact_fvlmm2_output_df(full_df))
-    tsv_df.to_csv(tsv_path, sep="\t", index=False)
-    saved_paths.append(tsv_path)
-
-    pseudo_row_meta = _load_garfield_pseudo_row_meta(
-        pseudo_prefix=str(pseudo_prefix),
-        expected_sample_ids=list(sample_ids),
-        maf_threshold=float(maf_threshold),
-        max_missing_rate=float(max_missing_rate),
-        het_threshold=float(het_threshold),
-    )
-    expanded_df = _build_garfield_fvlmm2_expanded_df(
-        raw_df=full_df,
-        pseudo_row_meta=pseudo_row_meta,
-    )
-    plot_tsv_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            prefix=f"{Path(str(pseudo_prefix)).name}.{str(trait_label)}.",
-            suffix=".fvlmm2.plot.tsv",
-            delete=False,
-            encoding="utf-8",
-            newline="",
-        ) as tmp_handle:
-            plot_tsv_path = str(tmp_handle.name)
-        expanded_df.to_csv(plot_tsv_path, sep="\t", index=False)
-        _run_fastplot_from_tsv_with_status(
-            plot_tsv_path,
-            np.asarray(pheno_values, dtype=np.float64),
-            xlabel=str(trait_label),
-            outpdf=figure_path,
-            threshold_n_tests=fdr_n_tests,
-            plot_style="garfield",
-            use_spinner=bool(use_spinner),
-            emit_done_line=False,
-        )
-    finally:
-        _remove_file_if_exists(plot_tsv_path)
-    saved_paths.append(figure_path)
-
-    summary_rows: list[dict[str, object]] = []
-    best_combo = None
-    best_combo_joint_p = float("nan")
-    best_combo_joint_fdr = float("nan")
-    best_combo_marginal_p = float("nan")
-    if full_df.shape[0] > 0 and "p_combo_joint" in full_df.columns:
-        p_joint = pd.to_numeric(full_df["p_combo_joint"], errors="coerce")
-        if p_joint.notna().any():
-            best_idx = int(p_joint.idxmin())
-            best_row = full_df.loc[best_idx]
-            best_combo = str(best_row.get("combo", ""))
-            best_combo_joint_p = float(best_row.get("p_combo_joint", float("nan")))
-            best_combo_joint_fdr = float(best_row.get("p_combo_joint_fdr", float("nan")))
-            best_combo_marginal_p = float(best_row.get("p_combo_marginal", float("nan")))
-    summary_rows.append(
-        {
-            "trait": str(trait_label),
-            "n_pairs_tested": int(full_df.shape[0]),
-            "fdr_n_tests": (
-                int(fdr_n_tests)
-                if fdr_n_tests is not None and int(fdr_n_tests) > 0
-                else int(full_df["garfield_unit_name"].nunique())
-                if "garfield_unit_name" in full_df.columns
-                else int(full_df.shape[0])
-            ),
-            "n_rules_skipped": int(len(skipped)),
-            "best_combo": best_combo,
-            "best_combo_joint_p": best_combo_joint_p,
-            "best_combo_joint_fdr": best_combo_joint_fdr,
-            "best_combo_marginal_p": best_combo_marginal_p,
-            "route": "fvlmm2",
-        }
-    )
-    return {
-        "saved_paths": saved_paths,
-        "tsv_paths": [p for p in saved_paths if str(p).lower().endswith(".tsv")],
-        "figure_paths": [figure_path],
-        "summary_rows": summary_rows,
-        "tsv_path": tsv_path,
-        "raw_tsv_path": None,
-        "expanded_tsv_path": None,
-        "skipped_tsv_path": skipped_tsv_path if len(skipped) > 0 else None,
-        "figure_path": figure_path,
-        "n_rules_supported": int(full_df.shape[0]),
-        "n_rules_skipped": int(len(skipped)),
     }
 
 
@@ -2112,21 +1383,6 @@ def _emit_garfield_summary_to_log(logger, summary_rows: list[dict[str, object]])
         logger.info("  ".join(row[idx].ljust(widths[idx]) for idx in range(len(row))))
 
 
-def _format_rule_null_quantile_label(quantile: object) -> str:
-    try:
-        q = float(quantile)
-    except Exception:
-        return "q99"
-    if not np.isfinite(q):
-        return "q99"
-    pct = q * 100.0
-    if abs(pct - round(pct)) <= 1e-9:
-        pct_text = str(int(round(pct)))
-    else:
-        pct_text = f"{pct:.4f}".rstrip("0").rstrip(".")
-    return f"q{pct_text}"
-
-
 def _emit_garfield_bg_noise_summary_to_log(
     logger,
     *,
@@ -2238,32 +1494,6 @@ def _remove_file_if_exists(path: Optional[str]) -> None:
             os.remove(path)
     except Exception:
         return
-
-
-def _garfield_pseudo_pmeta_paths(
-    *,
-    pseudo_prefix: str,
-    maf_threshold: float,
-    max_missing_rate: float,
-    het_threshold: float,
-) -> list[str]:
-    cache_prefix = packed_meta_cache_prefix(
-        str(pseudo_prefix),
-        maf=float(maf_threshold),
-        missing_rate=float(max_missing_rate),
-        het_threshold=float(het_threshold),
-        snps_only=False,
-    )
-    stem = f"{cache_prefix}.pmeta"
-    return [
-        f"{stem}.json",
-        f"{stem}.site_keep.npy",
-        f"{stem}.row_missing.npy",
-        f"{stem}.row_maf.npy",
-        f"{stem}.row_flip.npy",
-        f"{stem}.std_denom.npy",
-        f"{stem}.dom_af.npy",
-    ]
 
 
 def _split_structure_prior_payload(payload):
@@ -2628,8 +1858,7 @@ def main() -> None:
             "and reuse the keep mask across traits. Default is per-trait row statistics."
         ),
     )
-    optional_group.add_argument("--prior-not", type=float, default=None, help=argparse.SUPPRESS)
-    optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 4).")
+    optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 2).")
     dev_group = parser.add_argument_group("Development Arguments (show with -dev)")
     dev_group.add_argument(
         "-gain",
@@ -2678,21 +1907,6 @@ def main() -> None:
             "Effective SNP count used for GARFIELD Manhattan Bonferroni thresholding "
             "and FDR test counting. Default uses the input genotype SNP count."
         ),
-    )
-    optional_group.add_argument(
-        "--max-pick",
-        type=int,
-        default=None,
-        dest="layer_compat",
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "--feature-source",
-        type=str,
-        choices=["bin", "mbin"],
-        default=None,
-        dest="feature_source_compat",
-        help=argparse.SUPPRESS,
     )
     optional_group.add_argument("--seed", type=int, default=42, help="Random seed.")
     add_common_thread_arg(optional_group, default_threads=detect_effective_threads(), help_profile="cpu_short")
@@ -2790,7 +2004,6 @@ def main() -> None:
 
     args.layer = (
         int(args.layer) if args.layer is not None
-        else int(args.layer_compat) if args.layer_compat is not None
         else 2
     )
     if int(args.layer) <= 0:
@@ -2806,13 +2019,6 @@ def main() -> None:
         if str(args.scan_mode).lower() == "wholegenome"
         else 2 if int(args.layer) >= 2 else 1
     )
-    if args.prior_not is not None:
-        try:
-            if not np.isfinite(float(args.prior_not)):
-                parser.error("--prior-not must be finite when provided")
-        except Exception:
-            parser.error("--prior-not must be finite when provided")
-
     if args.engine is not None:
         args.engine = str(args.engine).upper()
     if str(args.scan_mode).lower() == "wholegenome":
@@ -2823,17 +2029,6 @@ def main() -> None:
     args.top_rules_runtime = int(args.rule_topk)
     args.max_output_rules_runtime = 0
     args.max_output_ratio_runtime = 0.0
-
-    args.feature_source = (
-        str(args.feature_source_compat).lower()
-        if args.feature_source_compat is not None
-        else ("mbin" if bool(args.dev) else "bin")
-    )
-    if args.feature_source not in {"bin", "mbin"}:
-        parser.error("--feature-source must be one of: bin, mbin")
-    args.feature_source_requested = str(args.feature_source)
-    if args.feature_source == "mbin":
-        args.feature_source = "bin"
 
     args.rank_score = f"gain_from_layer:{int(args.gain_layer)}"
     args.rank_schedule_source = "cli-gain-layer"
@@ -2859,12 +2054,6 @@ def main() -> None:
     log_path = f"{outprefix}.garfield.log"
     logger = setup_logging(log_path)
     apply_outer_thread_cap(int(args.thread))
-    if args.feature_source_requested == "mbin":
-        logger.warning(
-            "MBIN encoding is deprecated for GARFIELD pure-line mode; using BIN instead. "
-            "Current BIN beam search uses packed 0/1 homozygote logic (0->0, 2->1, 1/NA->mode). "
-            "Heterozygotes are treated as logic-missing and folded into -geno filtering."
-        )
     ml_skipped = args.engine in ml_skip_tokens
     engine_runtime = "none" if ml_skipped else str(args.engine)
     rank_score_runtime = str(args.rank_score)
@@ -2890,10 +2079,6 @@ def main() -> None:
         checks.append(ensure_file_exists(logger, args.simbench, "Simulation benchmark TSV"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
-
-    feature_source = str(args.feature_source).lower()
-    if feature_source not in {"bin", "mbin"}:
-        raise ValueError(f"Unsupported feature-source: {args.feature_source}")
 
     general_rows = [
         ("Genotype input", gfile),
@@ -3200,7 +2385,7 @@ def main() -> None:
                 extension=int(args.extension),
                 step=int(args.step),
                 scan_bimranges=args.bimrange,
-                bin_mode=feature_source,
+                bin_mode="bin",
                 ml_method=str(engine_runtime).lower(),
                 ml_importance="imp",
                 ml_top_k=int(args.ml_top_k_runtime),
@@ -3450,9 +2635,6 @@ def main() -> None:
             "pair_seed_depth": int(args.exhaustive_depth_runtime),
             "beam_width": int(args.beam_width),
             "not_control": "null_penalty_only",
-            "prior_not_ignored": (
-                None if args.prior_not is None else float(args.prior_not)
-            ),
             "rank_schedule_source": rank_schedule_source,
             "gain_start_layer_runtime": gain_start_layer_runtime,
             "rank_schedule_runtime": rank_schedule_runtime,
@@ -3467,7 +2649,7 @@ def main() -> None:
             "bimrange": (list(args.bimrange) if args.bimrange else None),
             "meff": (None if args.meff is None else int(args.meff)),
             "ranking_dataset": "full",
-            "feature_source": feature_source,
+            "feature_source": "bin",
             "gene_files": list(args.genefiles),
             "gff3": gff3_effective,
             "grm_path": args.grm,
@@ -3514,37 +2696,17 @@ def main() -> None:
                     else pseudo_gwas_payload.get("figure_path")
                 ),
                 "pseudo_fvlmm2_raw_tsv": None,
-                "pseudo_fvlmm2_tsv": (
-                    None
-                    if pseudo_gwas_payload is None
-                    else pseudo_gwas_payload.get("tsv_path")
-                ),
-                "pseudo_fvlmm2_skipped_tsv": (
-                    None
-                    if pseudo_gwas_payload is None
-                    else pseudo_gwas_payload.get("skipped_tsv_path")
-                ),
-                "pseudo_fvlmm2_figure": (
-                    None
-                    if pseudo_gwas_payload is None
-                    else pseudo_gwas_payload.get("figure_path")
-                ),
-                "pseudo_fastlmm_tsv": (
-                    None
-                    if pseudo_gwas_payload is None
-                    else pseudo_gwas_payload.get("tsv_path")
-                ),
-                "pseudo_fastlmm_figure": (
-                    None
-                    if pseudo_gwas_payload is None
-                    else pseudo_gwas_payload.get("figure_path")
-                ),
+                "pseudo_fvlmm2_tsv": None,
+                "pseudo_fvlmm2_skipped_tsv": None,
+                "pseudo_fvlmm2_figure": None,
+                "pseudo_fastlmm_tsv": None,
+                "pseudo_fastlmm_figure": None,
             },
             "prior": prior_payload,
             "posterior": posterior_payload,
             "pseudo_fvlmm": pseudo_gwas_payload,
-            "pseudo_fvlmm2": pseudo_gwas_payload,
-            "pseudo_fastlmm": pseudo_gwas_payload,
+            "pseudo_fvlmm2": None,
+            "pseudo_fastlmm": None,
         }
         trait_manifest.update(_copy_prefixed_result_fields(result, ("timing_", "ld_")))
         garfield_manifest_traits.append(trait_manifest)
@@ -3605,7 +2767,7 @@ def main() -> None:
                 "genotype_input": gfile,
                 "input_kind": "bfile",
                 "execution_route": "direct Rust BED pipeline",
-                "encoding": feature_source,
+                "encoding": "bin",
                 "phenotype_file": args.pheno,
                 "gene_files": list(args.genefiles),
                 "gff3": gff3_effective,
@@ -3629,9 +2791,6 @@ def main() -> None:
                 "top_rules_per_unit": int(args.top_rules_runtime),
                 "pair_seed_depth": int(args.exhaustive_depth_runtime),
                 "not_control": "null_penalty_only",
-                "prior_not_ignored": (
-                    None if args.prior_not is None else float(args.prior_not)
-                ),
                 "thread": int(args.thread),
                 "seed": int(args.seed),
                 "summary_rows": summary_rows,

@@ -120,12 +120,7 @@ pub use score::{
     score_cont_weighted_mean_diff_packed, support_size_packed, ContinuousRuleScore,
     PackedYSumLookup,
 };
-pub use score_gpu::{
-    garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
-    garfield_compare_score_cont_centered_gain_singleton_backends_py,
-    garfield_metal_runtime_status_py, garfield_score_cont_centered_gain_batch_packed_cpu_py,
-    garfield_score_cont_centered_gain_batch_packed_metal_py,
-};
+pub use score_gpu::garfield_score_cont_centered_gain_batch_packed_cpu_py;
 
 const GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS: usize = 256;
@@ -3659,28 +3654,6 @@ struct GarfieldLogicRuleRecord {
     support_bits: Option<GarfieldRuleSupportBits>,
 }
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct GarfieldUnitRuleCompareRecord {
-    unit_name: String,
-    unit_kind: String,
-    unit_index: usize,
-    region_size: usize,
-    ml_feature_count: usize,
-    best_rule_len: usize,
-    best_rule_snp_name: String,
-    best_rule_score: f64,
-    best_rule_raw_score: f64,
-    best_rule_penalty: f64,
-    best_singleton_snp_name: String,
-    best_singleton_score: f64,
-    best_singleton_raw_score: f64,
-    best_singleton_penalty: f64,
-    score_gap: f64,
-    raw_score_gap: f64,
-    penalty_gap: f64,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct GarfieldPermutationNullScores {
     bucket: RuleNullBucket,
@@ -3714,7 +3687,6 @@ struct GarfieldRenderedRule {
 #[derive(Clone, Debug, Default)]
 struct GarfieldUnitEvaluationOutput {
     records: Vec<GarfieldLogicRuleRecord>,
-    compare_record: Option<GarfieldUnitRuleCompareRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -3727,6 +3699,9 @@ struct GarfieldBeamDebugProbe {
 struct GarfieldLogicPipelineResult {
     pseudo_prefix: Option<String>,
     rules_tsv: Option<String>,
+    // Kept as a nullable compatibility field for callers that deserialize the
+    // historical result shape; the old per-unit comparison TSV is no longer
+    // computed or written.
     rules_compare_tsv: Option<String>,
     posterior_json: Option<String>,
     memory_debug: Option<GarfieldMemoryDebugSummary>,
@@ -4158,7 +4133,7 @@ fn rule_bim_alleles_with_polarity<S: GarfieldDisplaySite>(
         allele0.push(a0);
         allele1.push(a1);
     }
-    Ok((allele0.join(""), allele1.join("")))
+    Ok((allele0.join(","), allele1.join(",")))
 }
 
 fn rule_ml_rank_name_with_polarity(
@@ -4399,72 +4374,6 @@ fn render_candidate_rule_for_output(
         bim_allele1: rule_bim_alleles_with_polarity(&cand.rule, local_sites, polarity)?.1,
         pos: first_site.pos,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_unit_rule_compare_record(
-    ui: usize,
-    unit: &GarfieldLogicUnit,
-    prepared: &GarfieldUnitPrepared,
-    beam_hits: &[BeamRuleCandidate],
-    ranked_hits: &[(usize, f64)],
-    local_sites: &[GarfieldLogicSite],
-    selected_bits_full: &[u64],
-    selected_bits_full_hi: Option<&[u64]>,
-    logic_bits: &GarfieldLogicBits,
-    unit_kind_lc: &str,
-) -> Result<Option<GarfieldUnitRuleCompareRecord>, String> {
-    let Some((best_idx, best_score)) = ranked_hits.first().copied() else {
-        return Ok(None);
-    };
-    let Some((best_singleton_idx, best_singleton_score)) = ranked_hits
-        .iter()
-        .copied()
-        .find(|(idx, _)| beam_hits[*idx].rule.len() == 1)
-    else {
-        return Ok(None);
-    };
-    let best_rule = &beam_hits[best_idx];
-    let best_singleton = &beam_hits[best_singleton_idx];
-    let best_render = render_candidate_rule_for_output(
-        best_rule,
-        local_sites,
-        selected_bits_full,
-        selected_bits_full_hi,
-        logic_bits,
-        prepared.selected_global_rows.len(),
-    )?;
-    let best_singleton_render = render_candidate_rule_for_output(
-        best_singleton,
-        local_sites,
-        selected_bits_full,
-        selected_bits_full_hi,
-        logic_bits,
-        prepared.selected_global_rows.len(),
-    )?;
-    let best_rule_raw_score = best_rule.test.raw_score;
-    let best_singleton_raw_score = best_singleton.test.raw_score;
-    let best_rule_penalty = best_rule_raw_score - best_score;
-    let best_singleton_penalty = best_singleton_raw_score - best_singleton_score;
-    Ok(Some(GarfieldUnitRuleCompareRecord {
-        unit_name: unit.label.clone(),
-        unit_kind: unit_kind_lc.to_string(),
-        unit_index: ui + 1,
-        region_size: unit.indices.len(),
-        ml_feature_count: prepared.selected_global_rows.len(),
-        best_rule_len: best_rule.rule.len(),
-        best_rule_snp_name: best_render.snp_name,
-        best_rule_score: best_score,
-        best_rule_raw_score,
-        best_rule_penalty,
-        best_singleton_snp_name: best_singleton_render.snp_name,
-        best_singleton_score,
-        best_singleton_raw_score,
-        best_singleton_penalty,
-        score_gap: best_score - best_singleton_score,
-        raw_score_gap: best_rule_raw_score - best_singleton_raw_score,
-        penalty_gap: best_rule_penalty - best_singleton_penalty,
-    }))
 }
 
 fn select_reportable_ranked_hits(
@@ -4926,7 +4835,7 @@ fn simbench_rule_bim_alleles<S: GarfieldDisplaySite>(
         allele0.push(a0);
         allele1.push(a1);
     }
-    (allele0.join(""), allele1.join(""))
+    (allele0.join(","), allele1.join(","))
 }
 
 fn simbench_rule_expr<S: GarfieldDisplaySite>(
@@ -5013,12 +4922,16 @@ fn nearest_unit_span_index(unit: &GarfieldLogicUnit, chrom: &str, pos: i32) -> O
         let center = (lo + hi) / 2;
         let dist = (i64::from(pos) - center).abs();
         let span_len = (hi - lo).abs();
-        let cand = (dist, span_len, idx);
+        // When a site lies in an exactly symmetric overlap, prefer the later
+        // (right-most) span.  This keeps overlap assignment deterministic and
+        // avoids always starving the later geneset member.
+        let tie_break = usize::MAX.saturating_sub(idx);
+        let cand = (dist, span_len, tie_break);
         if best.map(|cur| cand < cur).unwrap_or(true) {
             best = Some(cand);
         }
     }
-    best.map(|(_, _, idx)| idx)
+    best.map(|(_, _, tie_break)| usize::MAX.saturating_sub(tie_break))
 }
 
 fn build_unit_window_group_ids<S: GarfieldChromPosSite>(
@@ -9152,7 +9065,7 @@ fn maybe_prune_geneset_unit_rows_by_ld_with_cache(
     check_garfield_ld_interrupt(variable_local.len(), interrupt_interval)?;
 
     kept_local.sort_unstable();
-    let kept_local = rescue_geneset_missing_groups_local_indices(
+    let rescued_local = rescue_geneset_missing_groups_local_indices(
         unit,
         candidate_global_rows,
         kept_local.as_slice(),
@@ -9160,10 +9073,24 @@ fn maybe_prune_geneset_unit_rows_by_ld_with_cache(
         logic_bits.sites.as_slice(),
         unit_kind_lc,
     )?;
-    let kept = kept_local
-        .into_iter()
-        .map(|local_idx| candidate_global_rows[local_idx])
+    // Group rescue is allowed to add one row for an uncovered span, but the
+    // rescue row must still obey the same LD rule as ordinary candidates.
+    // Re-clump only the rescued set with the already-kept rows first in the
+    // priority order; this removes exact/high-LD duplicates reintroduced by
+    // the per-span coverage requirement.
+    let rescued_global = rescued_local
+        .iter()
+        .map(|&local_idx| candidate_global_rows[local_idx])
         .collect::<Vec<_>>();
+    let rescued_priority = (0..rescued_global.len()).collect::<Vec<_>>();
+    let kept = prune_candidate_rows_by_ld_priority_impl(
+        rescued_global.as_slice(),
+        rescued_priority.as_slice(),
+        logic_bits,
+        sample_indices,
+        support_cache,
+        None,
+    )?;
     GARFIELD_GENESET_LD_EXACT_PAIRS.fetch_add(exact_pairs, Ordering::Relaxed);
     GARFIELD_GENESET_LD_ROWS_KEPT.fetch_add(
         u64::try_from(kept.len()).unwrap_or(u64::MAX),
@@ -10839,18 +10766,6 @@ fn evaluate_logic_unit_prepared_continuous(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| cmp_candidate(&beam_hits[a.0], &beam_hits[b.0]))
     });
-    let compare_record = build_unit_rule_compare_record(
-        ui,
-        unit,
-        prepared,
-        beam_hits.as_slice(),
-        ranked_hits.as_slice(),
-        local_sites.as_slice(),
-        selected_bits_full,
-        selected_bits_full_hi,
-        logic_bits,
-        unit_kind_lc,
-    )?;
     maybe_write_beam_debug_probe_tsv(
         debug_probe,
         unit,
@@ -10918,10 +10833,7 @@ fn evaluate_logic_unit_prepared_continuous(
             support_bits: None,
         });
     }
-    Ok(GarfieldUnitEvaluationOutput {
-        records: out,
-        compare_record,
-    })
+    Ok(GarfieldUnitEvaluationOutput { records: out })
 }
 
 #[allow(dead_code)]
@@ -11965,52 +11877,6 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
             )
             .map_err(|e| e.to_string())?;
         }
-    }
-    w.flush().map_err(|e| e.to_string())
-}
-
-#[allow(dead_code)]
-fn write_logic_rule_compare_tsv(
-    path: &str,
-    records: &[GarfieldUnitRuleCompareRecord],
-) -> Result<(), String> {
-    let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
-    let mut ordered = records.iter().collect::<Vec<_>>();
-    ordered.sort_by(|a, b| {
-        logic_rule_output_kind_rank(a.unit_kind.as_str())
-            .cmp(&logic_rule_output_kind_rank(b.unit_kind.as_str()))
-            .then_with(|| a.unit_kind.cmp(&b.unit_kind))
-            .then_with(|| a.unit_index.cmp(&b.unit_index))
-            .then_with(|| a.unit_name.cmp(&b.unit_name))
-    });
-    writeln!(
-        w,
-        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tbest_rule_len\tbest_rule_snp_name\tbest_rule_score\tbest_rule_raw_score\tbest_rule_penalty\tbest_singleton_snp_name\tbest_singleton_score\tbest_singleton_raw_score\tbest_singleton_penalty\tscore_gap\traw_score_gap\tpenalty_gap"
-    )
-    .map_err(|e| e.to_string())?;
-    for rec in ordered.into_iter() {
-        writeln!(
-            w,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}",
-            rec.unit_kind,
-            rec.unit_index,
-            rec.unit_name,
-            rec.region_size,
-            rec.ml_feature_count,
-            rec.best_rule_len,
-            rec.best_rule_snp_name,
-            rec.best_rule_score,
-            rec.best_rule_raw_score,
-            rec.best_rule_penalty,
-            rec.best_singleton_snp_name,
-            rec.best_singleton_score,
-            rec.best_singleton_raw_score,
-            rec.best_singleton_penalty,
-            rec.score_gap,
-            rec.raw_score_gap,
-            rec.penalty_gap,
-        )
-        .map_err(|e| e.to_string())?;
     }
     w.flush().map_err(|e| e.to_string())
 }
@@ -14019,13 +13885,9 @@ fn garfield_logic_search_bed_owned(
         out
     };
     let mut records = Vec::<GarfieldLogicRuleRecord>::new();
-    let mut compare_records = Vec::<GarfieldUnitRuleCompareRecord>::new();
     for unit_out in unit_results.into_iter() {
         let unit_out = unit_out?;
         records.extend(unit_out.records);
-        if let Some(compare) = unit_out.compare_record {
-            compare_records.push(compare);
-        }
     }
     let skipped_units = Arc::try_unwrap(skipped_units)
         .map_err(|_| "GARFIELD skipped-units still shared".to_string())?
@@ -14131,7 +13993,6 @@ fn garfield_logic_search_bed_owned(
     let mut rules_tsv_out = None;
     let rules_compare_tsv_out = None;
     let mut posterior_json_out = None;
-    drop(compare_records);
     if let Some(prefix_out) = out_prefix.as_ref() {
         write_logic_pseudo_plink(
             prefix_out,
@@ -14141,8 +14002,6 @@ fn garfield_logic_search_bed_owned(
         )?;
         let rules_tsv = format!("{prefix_out}.rules.tsv");
         write_logic_rules_tsv(&rules_tsv, records.as_slice())?;
-        let rules_compare_tsv = format!("{prefix_out}.rules.compare.tsv");
-        let _ = std::fs::remove_file(&rules_compare_tsv);
         if let Some(prior) = structure_prior_for_output.as_deref() {
             let posterior_json = format!("{prefix_out}.posterior.json");
             write_rule_structure_prior_json(&posterior_json, prior)?;
@@ -16746,11 +16605,39 @@ mod tests {
         let (a0, a1) = rule_bim_alleles_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
 
         assert_eq!(expr, "NOT BIN(1_100) AND NOT BIN(1_200)");
-        assert_eq!(snp_name, "!1_100[A>G]&!1_200[A>G]");
-        assert_eq!(bim_name, "!1_100[A>G]&!1_200[A>G]");
+        assert_eq!(snp_name, "1_100[A]&1_200[A]");
+        assert_eq!(bim_name, "1_100[A]&1_200[A]");
         assert_eq!(ml_rank, "!1&!2");
         assert_eq!(a0, "G,G");
         assert_eq!(a1, "A,A");
+    }
+
+    #[test]
+    fn test_rule_bim_alleles_use_component_delimiter_for_composite_rules() {
+        let sites = vec![test_site("1", 100), test_site("1", 200)];
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let (allele0, allele1) = rule_bim_alleles_with_polarity(
+            &rule,
+            sites.as_slice(),
+            GarfieldRuleDisplayPolarity::Original,
+        )
+        .unwrap();
+        assert_eq!(allele0, "A,A");
+        assert_eq!(allele1, "G,G");
     }
 
     #[test]
@@ -16778,8 +16665,8 @@ mod tests {
         let ml_rank = rule_ml_rank_name_with_polarity(&rule, polarity);
 
         assert_eq!(expr, "BIN(1_100) OR BIN(1_200)");
-        assert_eq!(snp_name, "1_100[A>G]|1_200[A>G]");
-        assert_eq!(bim_name, "1_100[A>G]|1_200[A>G]");
+        assert_eq!(snp_name, "1_100[G]|1_200[G]");
+        assert_eq!(bim_name, "1_100[G]|1_200[G]");
         assert_eq!(ml_rank, "1|2");
     }
 
@@ -16846,8 +16733,8 @@ mod tests {
             rule_bim_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
 
         assert_eq!(expr, "BIN(rsA) AND BIN(rsB)");
-        assert_eq!(snp_name, "1_100[A>G]&1_200[A>G]");
-        assert_eq!(bim_name, "1_100[A>G]&1_200[A>G]");
+        assert_eq!(snp_name, "1_100[G]&1_200[G]");
+        assert_eq!(bim_name, "1_100[G]&1_200[G]");
     }
 
     #[test]
@@ -16881,7 +16768,7 @@ mod tests {
             rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
 
         assert_eq!(expr, "BIN(1_100) AND BIN(1_200)");
-        assert_eq!(snp_name, "1_100[A>G]&1_200[A>G]");
+        assert_eq!(snp_name, "1_100[G]&1_200[G]");
     }
 
     #[test]
@@ -17134,8 +17021,8 @@ mod tests {
         assert_eq!(
             bim_txt.lines().collect::<Vec<_>>(),
             vec![
-                "1\t1_100(G)\t0\t100\tA\tG",
-                "1\t1_200(A)\t0\t200\tG\tA",
+                "1\t1_100[G]\t0\t100\tA\tG",
+                "1\t1_200[A]\t0\t200\tG\tA",
                 "1\t1_100(G)&1_200(A)\t0\t100\tA,C\tG,T",
                 "1\t1_100(G)&1_200(A)\t0\t200\tA,C\tG,T",
             ]
