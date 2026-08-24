@@ -12,9 +12,9 @@ use super::bs::BeamRule;
 pub const DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS: usize = 32;
 pub const DEFAULT_RULE_NULL_PHYSICAL_CHUNKS: usize = 150;
 pub const DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK: usize = 50;
-pub const DEFAULT_RULE_NULL_MAX_REPEATS: usize = 20;
-pub const DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS: usize = 5;
-pub const DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS: usize = 3;
+pub const DEFAULT_RULE_NULL_MAX_REPEATS: usize = 100;
+pub const DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS: usize = 50;
+pub const DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS: usize = 5;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS: usize = 5;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS: usize = 30;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS: usize = 3;
@@ -22,7 +22,7 @@ pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD: f64 = 0.005;
 pub const DEFAULT_RULE_STRUCTURE_DENSITY_TOPK: usize = 10;
 const DEFAULT_RULE_NULL_QUANTILE: f64 = 0.99;
 pub const DEFAULT_RULE_NULL_GEV_FWER_ALPHA: f64 = 0.01;
-const DEFAULT_RULE_NULL_Q99_REL_TOL: f64 = 0.05;
+const DEFAULT_RULE_NULL_Q99_REL_TOL: f64 = 0.02;
 // Minimum samples per exact bucket before falling back to the global null.
 const NULL_EXACT_MIN_SAMPLES: usize = 10;
 // Top-k per repeat: keep a single best null score for every bucket / repeat.
@@ -1296,6 +1296,16 @@ mod tests {
         cal.insert(bk, 1000.0, 1000.0);
         let lookup = cal.finalize();
         assert_eq!(lookup.train_penalty(bk).unwrap(), 1000.0);
+    }
+
+    #[test]
+    fn test_default_null_calibration_is_tail_stable() {
+        assert_eq!(DEFAULT_RULE_NULL_MAX_REPEATS, 100);
+        assert_eq!(DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS, 50);
+        assert_eq!(DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS, 5);
+        assert!((DEFAULT_RULE_NULL_Q99_REL_TOL - 0.02).abs() < f64::EPSILON);
+        assert!(penalty_value_converged(Some(100.0), Some(101.5)));
+        assert!(!penalty_value_converged(Some(100.0), Some(102.5)));
     }
 
     #[test]

@@ -3,13 +3,13 @@ mod permutation;
 mod residual;
 mod sampling;
 mod score;
-mod score_gpu;
+mod score_backend;
 
 // GARFIELD runtime note (2026-08):
 // - Active BIN search uses packed 0/1 homozygote bits only:
 //   0 -> 0, 2 -> 1, and 1/NA are treated as missing then mode-imputed.
-// - Active MBIN/fuzzy compatibility helpers remain available in-tree for
-//   backward-compatible parsing/evaluation and targeted debugging.
+// - Legacy MBIN/fuzzy file/evaluation helpers remain available in-tree for
+//   targeted debugging, but are not accepted as active search modes.
 // - Active beam expansion is AND/XOR-only; negation remains supported.
 
 use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
@@ -77,6 +77,7 @@ use crate::stats_common::{
     arm_interrupt_trap, check_ctrlc, env_truthy, format_bytes, interrupt_requested,
     map_err_string_to_py, process_memory_usage, INTERRUPTED_MSG,
 };
+use memmap2::{Advice, MmapMut, MmapOptions};
 
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
@@ -92,7 +93,7 @@ use rayon::ThreadPoolBuilder;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -120,7 +121,7 @@ pub use score::{
     score_cont_weighted_mean_diff_packed, support_size_packed, ContinuousRuleScore,
     PackedYSumLookup,
 };
-pub use score_gpu::garfield_score_cont_centered_gain_batch_packed_cpu_py;
+pub use score_backend::garfield_score_cont_centered_gain_batch_packed_cpu_py;
 
 const GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS: usize = 256;
@@ -1139,10 +1140,7 @@ fn parse_bin_mode(mode: &str) -> Result<GarfieldBinMode, String> {
     let t = mode.trim().to_ascii_lowercase();
     match t.as_str() {
         "bin" | "bin02" => Ok(GarfieldBinMode::Bin),
-        // MBIN is retained only as a compatibility alias. The active GARFIELD
-        // path is BIN with packed 0/1 homozygote logic (0->0, 2->1, 1/NA->mode).
-        "mbin" => Ok(GarfieldBinMode::Bin),
-        _ => Err("mode must be one of: bin, mbin(alias->bin)".to_string()),
+        _ => Err("mode must be one of: bin, bin02".to_string()),
     }
 }
 
@@ -2858,12 +2856,27 @@ struct GarfieldLogicUnit {
 #[derive(Clone, Debug)]
 struct GarfieldLogicBits {
     bits_flat: Vec<u64>,
+    bits_mmap: Option<Arc<memmap2::Mmap>>,
+    bits_mmap_words: usize,
     bits_hi_flat: Option<Vec<u64>>,
     row_words: usize,
     sample_ids: Vec<String>,
     sites: Vec<GarfieldLogicSite>,
     group_ids: Vec<usize>,
     n_samples: usize,
+}
+
+impl GarfieldLogicBits {
+    #[inline]
+    fn bits(&self) -> &[u64] {
+        if let Some(mmap) = self.bits_mmap.as_ref() {
+            // The backing file is created with a u64-aligned offset and a
+            // length that is a multiple of eight bytes.
+            unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u64, self.bits_mmap_words) }
+        } else {
+            self.bits_flat.as_slice()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3389,7 +3402,7 @@ fn materialize_prepared_bit_matrices<'a>(
         if train_is_full_sample {
             (
                 Cow::Borrowed(borrow_rows_from_full_bits_range(
-                    logic_bits.bits_flat.as_slice(),
+                    logic_bits.bits(),
                     logic_bits.row_words,
                     row_start,
                     row_end,
@@ -3401,7 +3414,7 @@ fn materialize_prepared_bit_matrices<'a>(
             )
         } else {
             let (bits, row_words_train) = packed_rows_subset_from_full_bits_range(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.row_words,
                 row_start,
                 row_end,
@@ -3413,7 +3426,7 @@ fn materialize_prepared_bit_matrices<'a>(
         }
     } else {
         let (bits, row_words_train) = packed_rows_subset_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
+            logic_bits.bits(),
             logic_bits.row_words,
             prepared.selected_global_rows.as_slice(),
             train_idx_local,
@@ -3470,7 +3483,7 @@ fn materialize_prepared_bit_matrices<'a>(
         if sample_indices_are_full_identity(test_idx_local, logic_bits.n_samples) {
             (
                 Some(Cow::Borrowed(borrow_rows_from_full_bits_range(
-                    logic_bits.bits_flat.as_slice(),
+                    logic_bits.bits(),
                     logic_bits.row_words,
                     row_start,
                     row_end,
@@ -3482,7 +3495,7 @@ fn materialize_prepared_bit_matrices<'a>(
             )
         } else {
             let (bits, row_words_test) = packed_rows_subset_from_full_bits_range(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.row_words,
                 row_start,
                 row_end,
@@ -3494,7 +3507,7 @@ fn materialize_prepared_bit_matrices<'a>(
         }
     } else {
         let (bits, row_words_test) = packed_rows_subset_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
+            logic_bits.bits(),
             logic_bits.row_words,
             prepared.selected_global_rows.as_slice(),
             test_idx_local,
@@ -3552,7 +3565,7 @@ fn materialize_prepared_bit_matrices<'a>(
     let selected_bits_full = if include_full_bits && !alias_full_to_train {
         Some(if let Some((row_start, row_end)) = contiguous {
             Cow::Borrowed(borrow_rows_from_full_bits_range(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.row_words,
                 row_start,
                 row_end,
@@ -3562,7 +3575,7 @@ fn materialize_prepared_bit_matrices<'a>(
             )?)
         } else {
             Cow::Owned(gather_rows_by_indices(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.row_words,
                 prepared.selected_global_rows.as_slice(),
                 "garfield::unit_bits_indices",
@@ -3720,10 +3733,9 @@ struct GarfieldLogicPipelineResult {
     permutation_bootstrap_repeats: usize,
     records: Vec<GarfieldLogicRuleRecord>,
     simbench_count: usize,
-    split_applied: bool,
-    n_train: usize,
-    n_test: usize,
     n_samples: usize,
+    logic_bits_backend: String,
+    logic_bits_bytes: usize,
     units_total: usize,
     units_scanned: usize,
     timing_total_wall_s: f64,
@@ -3776,8 +3788,7 @@ struct GarfieldLogicPipelineResult {
     timing_beam_share_of_scan_pct: f64,
     skipped_units: Vec<GarfieldSkippedUnitInfo>,
     skipped_messages: Vec<String>,
-    train_fit: GarfieldResidualResult,
-    test_fit: GarfieldResidualResult,
+    train_fit: Arc<GarfieldResidualResult>,
 }
 
 #[derive(Clone, Debug)]
@@ -5107,7 +5118,7 @@ fn build_garfield_ld_support_cache(
     let block_count = logic_bits.row_words.div_ceil(block_words);
     let mut support = vec![0u32; local_rows];
     let mut block_support = vec![0u16; local_rows.saturating_mul(block_count)];
-    let bits_flat = logic_bits.bits_flat.as_slice();
+    let bits_flat = logic_bits.bits();
     let row_words = logic_bits.row_words;
 
     support
@@ -5324,7 +5335,7 @@ fn prune_candidate_rows_by_ld_priority_impl(
         logic_bits.row_words
     } else {
         let (packed_rows_out, row_words_out) = packed_rows_subset_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
+            logic_bits.bits(),
             logic_bits.row_words,
             candidate_global_rows,
             sample_indices,
@@ -5337,7 +5348,7 @@ fn prune_candidate_rows_by_ld_priority_impl(
     let row_slice = |local_idx: usize| -> &[u64] {
         if use_full_identity {
             let global_idx = candidate_global_rows[local_idx];
-            &logic_bits.bits_flat[global_idx * row_words..(global_idx + 1) * row_words]
+            &logic_bits.bits()[global_idx * row_words..(global_idx + 1) * row_words]
         } else {
             &packed_rows[local_idx * row_words..(local_idx + 1) * row_words]
         }
@@ -5717,7 +5728,7 @@ fn build_simbench_ml_contexts(
             continue;
         };
         let dense_train = dense_dosage_rows_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
+            logic_bits.bits(),
             logic_bits.bits_hi_flat.as_deref(),
             logic_bits.row_words,
             unit.indices.as_slice(),
@@ -6124,7 +6135,7 @@ fn evaluate_simbench_terms(
         )?;
         let n_rule_rows = bench_sites.len();
         let (train_ge1, row_words_train) = packed_rows_subset_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
+            logic_bits.bits(),
             logic_bits.row_words,
             selected_row_indices.as_slice(),
             train_idx_local,
@@ -6148,7 +6159,7 @@ fn evaluate_simbench_terms(
             None
         };
         let (assoc_ge1, row_words_assoc) = packed_rows_subset_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
+            logic_bits.bits(),
             logic_bits.row_words,
             selected_row_indices.as_slice(),
             assoc_sample_indices,
@@ -6743,15 +6754,12 @@ fn materialize_rule_support_bits_from_selected_rows_full(
     for &global_row_idx in selected_row_indices.iter() {
         let row_start = global_row_idx.saturating_mul(row_words);
         let row_end = row_start.saturating_add(row_words);
-        let row = logic_bits
-            .bits_flat
-            .get(row_start..row_end)
-            .ok_or_else(|| {
-                format!(
-                    "GARFIELD stored rule '{}' row slice out of range: row={} row_words={}",
-                    label, global_row_idx, row_words
-                )
-            })?;
+        let row = logic_bits.bits().get(row_start..row_end).ok_or_else(|| {
+            format!(
+                "GARFIELD stored rule '{}' row slice out of range: row={} row_words={}",
+                label, global_row_idx, row_words
+            )
+        })?;
         bits_flat.extend_from_slice(row);
     }
     if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
@@ -7644,6 +7652,8 @@ fn convert_prepared_bed_to_logic_bits(
 
     Ok(GarfieldLogicBits {
         bits_flat,
+        bits_mmap: None,
+        bits_mmap_words: 0,
         bits_hi_flat,
         row_words,
         sample_ids: sample_ids.to_vec(),
@@ -7652,6 +7662,13 @@ fn convert_prepared_bed_to_logic_bits(
         n_samples,
     })
 }
+
+#[inline]
+fn should_use_mapped_logic_bits(estimated_bytes: usize, budget_bytes: u64) -> bool {
+    budget_bytes > 0 && (estimated_bytes as u64) > budget_bytes
+}
+
+static GARFIELD_BITS_MMAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn convert_bed_prefix_to_logic_bits(
     prefix: &str,
@@ -7663,6 +7680,7 @@ fn convert_bed_prefix_to_logic_bits(
     sample_indices: &[usize],
     sample_ids: Vec<String>,
     mode: GarfieldBinMode,
+    logic_mem_budget_bytes: u64,
     mem_tracker: Option<&GarfieldStageMemoryTracker>,
 ) -> Result<GarfieldLogicBits, String> {
     let total_t0 = Instant::now();
@@ -7749,7 +7767,47 @@ fn convert_bed_prefix_to_logic_bits(
     let group_ids = build_logic_mode_group_ids(row_source_indices.len(), mode);
     let n_rows = out_sites.len();
     let bits_alloc_t0 = Instant::now();
-    let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
+    let total_words = n_rows.saturating_mul(row_mul).saturating_mul(row_words);
+    let estimated_bytes = total_words.saturating_mul(std::mem::size_of::<u64>());
+    let use_mmap = should_use_mapped_logic_bits(estimated_bytes, logic_mem_budget_bytes);
+    let mut bits_flat = if use_mmap {
+        Vec::new()
+    } else {
+        vec![0u64; total_words]
+    };
+    let mut bits_mmap_mut: Option<MmapMut> = None;
+    let mut bits_mmap_path: Option<std::path::PathBuf> = None;
+    if use_mmap {
+        let path = std::env::temp_dir().join(format!(
+            "janusx_garfield_bits_{}_{}.bin",
+            std::process::id(),
+            GARFIELD_BITS_MMAP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("create GARFIELD mapped bitset '{}': {e}", path.display()))?;
+        if let Err(e) = file.set_len(estimated_bytes as u64) {
+            let _ = fs::remove_file(&path);
+            return Err(format!(
+                "size GARFIELD mapped bitset '{}': {e}",
+                path.display()
+            ));
+        }
+        let mmap = unsafe {
+            MmapOptions::new()
+                .len(estimated_bytes)
+                .map_mut(&file)
+                .map_err(|e| {
+                    let _ = fs::remove_file(&path);
+                    format!("map GARFIELD bitset '{}': {e}", path.display())
+                })?
+        };
+        bits_mmap_mut = Some(mmap);
+        bits_mmap_path = Some(path);
+    }
     let bits_alloc_secs = bits_alloc_t0.elapsed().as_secs_f64();
     let bits_hi_flat = None;
     if let Some(tracker) = mem_tracker {
@@ -7790,8 +7848,13 @@ fn convert_bed_prefix_to_logic_bits(
         }
 
         let bed_ref: &BedSnpIter = &bed_iter;
+        let bits_storage_mut: &mut [u64] = if let Some(mmap) = bits_mmap_mut.as_mut() {
+            unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr() as *mut u64, total_words) }
+        } else {
+            bits_flat.as_mut_slice()
+        };
         let dst_lo =
-            &mut bits_flat[kept_start * row_mul * row_words..kept_end * row_mul * row_words];
+            &mut bits_storage_mut[kept_start * row_mul * row_words..kept_end * row_mul * row_words];
         if matches!(mode, GarfieldBinMode::Bin) {
             if sample_identity {
                 dst_lo
@@ -7872,8 +7935,29 @@ fn convert_bed_prefix_to_logic_bits(
         );
     }
 
+    let bits_mmap = if let Some(mmap_mut) = bits_mmap_mut {
+        let mmap = match mmap_mut.make_read_only() {
+            Ok(mmap) => mmap,
+            Err(e) => {
+                if let Some(path) = bits_mmap_path.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(format!("finalize GARFIELD mapped bitset: {e}"));
+            }
+        };
+        let _ = mmap.advise(Advice::Random);
+        if let Some(path) = bits_mmap_path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        Some(Arc::new(mmap))
+    } else {
+        None
+    };
+
     Ok(GarfieldLogicBits {
         bits_flat,
+        bits_mmap,
+        bits_mmap_words: if use_mmap { total_words } else { 0 },
         bits_hi_flat,
         row_words,
         sample_ids,
@@ -8934,7 +9018,7 @@ fn maybe_prune_geneset_unit_rows_by_ld_with_cache(
         logic_bits.row_words
     } else {
         let (packed_rows_out, row_words_out) = packed_rows_subset_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
+            logic_bits.bits(),
             logic_bits.row_words,
             candidate_global_rows,
             sample_indices,
@@ -8947,7 +9031,7 @@ fn maybe_prune_geneset_unit_rows_by_ld_with_cache(
     let row_slice = |local_idx: usize| -> &[u64] {
         if use_full_identity {
             let global_idx = candidate_global_rows[local_idx];
-            &logic_bits.bits_flat[global_idx * row_words..(global_idx + 1) * row_words]
+            &logic_bits.bits()[global_idx * row_words..(global_idx + 1) * row_words]
         } else {
             &packed_rows[local_idx * row_words..(local_idx + 1) * row_words]
         }
@@ -9555,7 +9639,7 @@ fn select_logic_unit_global_rows_with_ld_cache(
                 feat_sum_x2,
                 feat_sum_xy,
             ) = packed_dosage_rows_subset_from_full_bits_with_stage1(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.bits_hi_flat.as_deref(),
                 logic_bits.row_words,
                 candidate_global_rows.as_slice(),
@@ -9615,7 +9699,7 @@ fn select_logic_unit_global_rows_with_ld_cache(
                 geneset_corr_stage1_allow_parallel(unit_kind_lc, n_region, allow_parallel);
             let summary_t0 = garfield_stage_profile_start();
             let summaries = dosage_stage1_dual_summaries_from_full_bits(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.bits_hi_flat.as_deref(),
                 logic_bits.row_words,
                 candidate_global_rows.as_slice(),
@@ -9784,7 +9868,7 @@ fn select_logic_unit_global_rows_with_ld_cache(
 
         // ---- General ML path (Vec<Vec<u8>>) ----
         let dense_train = dense_dosage_rows_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
+            logic_bits.bits(),
             logic_bits.bits_hi_flat.as_deref(),
             logic_bits.row_words,
             candidate_global_rows.as_slice(),
@@ -10014,7 +10098,7 @@ fn prepare_logic_chunk_continuous(
                 feat_sum_x2,
                 feat_sum_xy,
             ) = packed_dosage_rows_subset_from_full_bits_range_with_stage1(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.bits_hi_flat.as_deref(),
                 logic_bits.row_words,
                 row_start,
@@ -10071,7 +10155,7 @@ fn prepare_logic_chunk_continuous(
         } else if engine_one == MlEngine::Corr {
             let t0 = Instant::now();
             let summaries = dosage_stage1_dual_summaries_from_full_bits_range(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.bits_hi_flat.as_deref(),
                 logic_bits.row_words,
                 row_start,
@@ -10126,7 +10210,7 @@ fn prepare_logic_chunk_continuous(
         } else {
             // ---- General ML path ----
             let dense_train = dense_dosage_rows_from_full_bits_range(
-                logic_bits.bits_flat.as_slice(),
+                logic_bits.bits(),
                 logic_bits.bits_hi_flat.as_deref(),
                 logic_bits.row_words,
                 row_start,
@@ -10196,6 +10280,8 @@ fn collect_rule_permutation_nulls_for_repeat(
     beam_params: BeamSearchParams,
     keep_topk: usize,
     rep_seed: u64,
+    rep_index: usize,
+    null_y_replicates: Option<&[Vec<f64>]>,
 ) -> Result<Vec<GarfieldPermutationNullScores>, String> {
     if prepared.selected_global_rows.is_empty() {
         return Ok(Vec::new());
@@ -10204,7 +10290,25 @@ fn collect_rule_permutation_nulls_for_repeat(
     let null_complexity_bin = beam_params.null_complexity_bin;
     let null_max_rule_len = beam_params.max_pick.max(1);
 
-    let perm_train = shuffled_copy_f64(y_train, rep_seed);
+    let perm_train = if let Some(nulls) = null_y_replicates.filter(|nulls| !nulls.is_empty()) {
+        let null_y = nulls.get(rep_index % nulls.len()).ok_or_else(|| {
+            format!(
+                "GARFIELD conditional null replicate {} is unavailable (n={})",
+                rep_index,
+                nulls.len()
+            )
+        })?;
+        if null_y.len() != y_train.len() {
+            return Err(format!(
+                "GARFIELD conditional null length mismatch: got {}, expected {}",
+                null_y.len(),
+                y_train.len()
+            ));
+        }
+        null_y.to_vec()
+    } else {
+        shuffled_copy_f64(y_train, rep_seed)
+    };
     let perm_test = if split_applied {
         shuffled_copy_f64(y_test, rep_seed ^ 0xD1B5_4A32_D192_ED03)
     } else {
@@ -11105,6 +11209,7 @@ fn process_rule_permutation_task_chunk<'bits>(
     test_idx_local: &[usize],
     y_train: &[f64],
     y_test: &[f64],
+    null_y_replicates: Option<&[Vec<f64>]>,
     split_applied: bool,
     perm_beam_params: BeamSearchParams,
     keep_topk: usize,
@@ -11167,6 +11272,8 @@ fn process_rule_permutation_task_chunk<'bits>(
                 perm_beam_params.clone(),
                 keep_topk,
                 rep_seed,
+                rep,
+                null_y_replicates,
             ) {
                 Ok(v) => v,
                 Err(err) if is_no_valid_initial_literals_error(&err) => Vec::new(),
@@ -11205,6 +11312,7 @@ fn process_rule_permutation_task_chunk_flat<'bits>(
     test_idx_local: &[usize],
     y_train: &[f64],
     y_test: &[f64],
+    null_y_replicates: Option<&[Vec<f64>]>,
     split_applied: bool,
     perm_beam_params: BeamSearchParams,
     keep_topk: usize,
@@ -11262,6 +11370,8 @@ fn process_rule_permutation_task_chunk_flat<'bits>(
             perm_beam_params.clone(),
             keep_topk,
             rep_seed,
+            rep,
+            null_y_replicates,
         ) {
             Ok(v) => v,
             Err(err) if is_no_valid_initial_literals_error(&err) => Vec::new(),
@@ -11688,7 +11798,7 @@ fn write_logic_pseudo_plink(
                 .map_err(|e| e.to_string())?;
                 let row_start = lit.selected_row_index.saturating_mul(logic_bits.row_words);
                 let row_end = row_start.saturating_add(logic_bits.row_words);
-                let bits = logic_bits.bits_flat.get(row_start..row_end).ok_or_else(|| {
+                let bits = logic_bits.bits().get(row_start..row_end).ok_or_else(|| {
                     format!(
                         "GARFIELD pseudo export literal row slice out of range: row={} row_words={}",
                         lit.selected_row_index, logic_bits.row_words
@@ -12015,7 +12125,6 @@ fn garfield_logic_search_bed_owned(
     rule_null_quantile: f64,
     rule_null_report_pvalue: bool,
     tree_cfg: ExtraTreesConfig,
-    fold: usize,
     seed: u64,
     max_pick: usize,
     exhaustive_depth: usize,
@@ -12050,6 +12159,7 @@ fn garfield_logic_search_bed_owned(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     debug_probe: Option<GarfieldBeamDebugProbe>,
+    logic_mem_budget_bytes: u64,
 ) -> Result<GarfieldLogicPipelineResult, String> {
     let total_wall_t0 = Instant::now();
     let rss_debug_enabled = garfield_rss_debug_enabled();
@@ -12231,12 +12341,6 @@ fn garfield_logic_search_bed_owned(
         }
     }
 
-    if fold >= 2 {
-        return Err(
-            "GARFIELD train/test splitting is disabled; only the full-sample path is supported."
-                .to_string(),
-        );
-    }
     let split_applied = false;
     let full = (0..n_selected).collect::<Vec<_>>();
     let (train_idx_local, test_idx_local) = (full.clone(), full);
@@ -12357,6 +12461,8 @@ fn garfield_logic_search_bed_owned(
             exact_n_max,
             require_lapack,
             eff_m_train,
+            0,
+            0,
         )?;
 
         let (grm_test, eff_m_test) = if let Some(full_grm) = grm.as_ref() {
@@ -12400,10 +12506,12 @@ fn garfield_logic_search_bed_owned(
             exact_n_max,
             require_lapack,
             eff_m_test,
+            0,
+            0,
         )?;
-        (train_fit, test_fit)
+        (Arc::new(train_fit), Arc::new(test_fit))
     } else {
-        let (grm_full, eff_m_full) = if let Some(full_grm) = grm.as_ref() {
+        let (grm_full, eff_m_full) = if let Some(full_grm) = grm {
             if full_grm.len() != n_selected.saturating_mul(n_selected) {
                 return Err(format!(
                     "garfield_logic_search_bed: provided GRM length mismatch: got {}, expected {}",
@@ -12411,7 +12519,7 @@ fn garfield_logic_search_bed_owned(
                     n_selected.saturating_mul(n_selected)
                 ));
             }
-            (full_grm.clone(), None)
+            (full_grm, None)
         } else {
             (
                 auto_grm_full
@@ -12435,7 +12543,16 @@ fn garfield_logic_search_bed_owned(
             exact_n_max,
             require_lapack,
             eff_m_full,
+            if rule_permutation {
+                permutation_repeats
+                    .max(DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS)
+                    .min(DEFAULT_RULE_NULL_MAX_REPEATS)
+            } else {
+                0
+            },
+            seed,
         )?;
+        let fit = Arc::new(fit);
         (fit.clone(), fit)
     };
     garfield_prepare_breakpoint(
@@ -12519,8 +12636,19 @@ fn garfield_logic_search_bed_owned(
         selected_sample_indices.as_slice(),
         selected_sample_ids,
         mode,
+        logic_mem_budget_bytes,
         Some(&global_bits_mem_tracker),
     )?;
+    let logic_bits_backend = if logic_bits.bits_mmap.is_some() {
+        "mmap"
+    } else {
+        "resident"
+    }
+    .to_string();
+    let logic_bits_bytes = logic_bits
+        .bits()
+        .len()
+        .saturating_mul(std::mem::size_of::<u64>());
     drop(logic_row_source_indices);
     drop(logic_row_flip);
     garfield_prepare_breakpoint(
@@ -13303,6 +13431,7 @@ fn garfield_logic_search_bed_owned(
                                 test_idx_local.as_slice(),
                                 train_fit.residualized_y.as_slice(),
                                 test_fit.residualized_y.as_slice(),
+                                Some(train_fit.null_residualized_y.as_slice()),
                                 split_applied,
                                 perm_beam_params.clone(),
                                 null_keep_topk,
@@ -13356,6 +13485,7 @@ fn garfield_logic_search_bed_owned(
                                 test_idx_local.as_slice(),
                                 train_fit.residualized_y.as_slice(),
                                 test_fit.residualized_y.as_slice(),
+                                Some(train_fit.null_residualized_y.as_slice()),
                                 split_applied,
                                 perm_beam_params.clone(),
                                 null_keep_topk,
@@ -13407,6 +13537,7 @@ fn garfield_logic_search_bed_owned(
                             test_idx_local.as_slice(),
                             train_fit.residualized_y.as_slice(),
                             test_fit.residualized_y.as_slice(),
+                            Some(train_fit.null_residualized_y.as_slice()),
                             split_applied,
                             perm_beam_params.clone(),
                             null_keep_topk,
@@ -14040,10 +14171,9 @@ fn garfield_logic_search_bed_owned(
         },
         records,
         simbench_count,
-        split_applied,
-        n_train: train_idx_local.len(),
-        n_test: test_idx_local.len(),
         n_samples: logic_bits.n_samples,
+        logic_bits_backend,
+        logic_bits_bytes,
         units_total: total_units,
         units_scanned: scanned_units,
         timing_total_wall_s: total_wall_s,
@@ -14100,7 +14230,6 @@ fn garfield_logic_search_bed_owned(
         skipped_units,
         skipped_messages,
         train_fit,
-        test_fit,
     })
 }
 
@@ -14233,7 +14362,6 @@ pub fn garfield_debug_probe_single_group_from_files(
             seed: 42,
             allow_parallel: true,
         },
-        0usize,
         42u64,
         4usize,
         2usize,
@@ -14268,6 +14396,7 @@ pub fn garfield_debug_probe_single_group_from_files(
         None,
         0usize,
         Some(probe),
+        0,
     )?;
     Ok(out_tsv)
 }
@@ -14293,7 +14422,7 @@ pub fn garfield_debug_probe_single_group_from_files(
     ml_importance="imp",
     ml_top_k=64,
     ml_top_frac=0.0,
-    permutation_repeats=20,
+    permutation_repeats=100,
     permutation_scoring="auto",
     rule_null_penalty_method="gev",
     rule_null_quantile=0.99,
@@ -14304,7 +14433,6 @@ pub fn garfield_debug_probe_single_group_from_files(
     min_samples_split=2,
     bootstrap=true,
     feature_subsample=0.0,
-    fold=0,
     seed=42,
     max_pick=4,
     exhaustive_depth=1,
@@ -14337,7 +14465,8 @@ pub fn garfield_debug_probe_single_group_from_files(
     xor_search=false,
     whole_genome_dev_mode=false,
     progress_callback=None,
-    progress_every=0
+    progress_every=0,
+    logic_mem_budget_bytes=0
 ))]
 pub fn garfield_logic_search_bed_py<'py>(
     py: Python<'py>,
@@ -14371,7 +14500,6 @@ pub fn garfield_logic_search_bed_py<'py>(
     min_samples_split: usize,
     bootstrap: bool,
     feature_subsample: f64,
-    fold: usize,
     seed: u64,
     max_pick: usize,
     exhaustive_depth: usize,
@@ -14405,6 +14533,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    logic_mem_budget_bytes: u64,
 ) -> PyResult<Bound<'py, PyDict>> {
     arm_interrupt_trap();
     let y_vec = read_y_f64(&y);
@@ -14485,7 +14614,6 @@ pub fn garfield_logic_search_bed_py<'py>(
                 rule_null_quantile,
                 rule_null_report_pvalue,
                 tree_cfg,
-                fold,
                 seed,
                 max_pick,
                 exhaustive_depth,
@@ -14520,6 +14648,7 @@ pub fn garfield_logic_search_bed_py<'py>(
                 progress_callback,
                 progress_every,
                 None,
+                logic_mem_budget_bytes,
             )
         })
         .map_err(map_err_string_to_py)?;
@@ -14560,6 +14689,7 @@ pub fn garfield_logic_search_bed_py<'py>(
         out.set_item("scheduler_permutation", py.None())?;
     }
     out.set_item("rule_permutation_active", result.rule_permutation_active)?;
+    out.set_item("rule_null_generation", "lmm_parametric_bootstrap")?;
     out.set_item("null_chunk_bp", result.null_chunk_bp)?;
     out.set_item("null_chunk_min_snps", result.null_chunk_min_snps)?;
     out.set_item("null_chunk_target", result.null_chunk_target)?;
@@ -14580,9 +14710,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     )?;
     out.set_item("n_rules", result.records.len())?;
     out.set_item("n_simbench", result.simbench_count)?;
-    out.set_item("split_applied", result.split_applied)?;
-    out.set_item("n_train", result.n_train)?;
-    out.set_item("n_test", result.n_test)?;
+    out.set_item("evaluation_mode", "full_exploratory")?;
     out.set_item("n_samples", result.n_samples)?;
     out.set_item("units_total", result.units_total)?;
     out.set_item("units_scanned", result.units_scanned)?;
@@ -14698,14 +14826,13 @@ pub fn garfield_logic_search_bed_py<'py>(
     out.set_item("n_skipped_units", result.skipped_units.len())?;
     out.set_item("skipped_units", skipped_units_py)?;
     out.set_item("skipped_messages", result.skipped_messages.clone())?;
-    out.set_item("train_pve", result.train_fit.pve)?;
-    out.set_item("test_pve", result.test_fit.pve)?;
-    out.set_item("train_sigma_g2", result.train_fit.sigma_g2)?;
-    out.set_item("train_sigma_e2", result.train_fit.sigma_e2)?;
-    out.set_item("test_sigma_g2", result.test_fit.sigma_g2)?;
-    out.set_item("test_sigma_e2", result.test_fit.sigma_e2)?;
-    out.set_item("train_eigh_backend", result.train_fit.eigh_backend)?;
-    out.set_item("test_eigh_backend", result.test_fit.eigh_backend)?;
+    out.set_item("full_n", result.n_samples)?;
+    out.set_item("logic_bits_backend", result.logic_bits_backend.clone())?;
+    out.set_item("logic_bits_bytes", result.logic_bits_bytes)?;
+    out.set_item("full_pve", result.train_fit.pve)?;
+    out.set_item("full_sigma_g2", result.train_fit.sigma_g2)?;
+    out.set_item("full_sigma_e2", result.train_fit.sigma_e2)?;
+    out.set_item("full_eigh_backend", result.train_fit.eigh_backend.clone())?;
     out.set_item(
         "snp_names",
         result
@@ -15578,6 +15705,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn logic_bit_storage_switches_to_mmap_only_over_budget() {
+        assert!(!should_use_mapped_logic_bits(1024, 0));
+        assert!(!should_use_mapped_logic_bits(1024, 1024));
+        assert!(should_use_mapped_logic_bits(1025, 1024));
+    }
+
+    #[test]
+    fn active_logic_mode_rejects_legacy_mbin_alias() {
+        assert!(parse_bin_mode("mbin").is_err());
+        assert!(parse_bin_mode("bin").is_ok());
+    }
+
+    #[test]
     fn test_scheduler_profile_summary_reports_percentiles_and_work() {
         let samples = vec![
             GarfieldSchedulerTaskSample {
@@ -15683,6 +15823,8 @@ mod tests {
         let (bits_flat, row_words, group_ids) = build_test_bits(n_rows, n_samples);
         GarfieldLogicBits {
             bits_flat,
+            bits_mmap: None,
+            bits_mmap_words: 0,
             bits_hi_flat: None,
             row_words,
             sample_ids: (0..n_samples).map(|i| format!("s{i}")).collect(),
@@ -15719,6 +15861,8 @@ mod tests {
         let group_ids = (0..n_rows).collect::<Vec<_>>();
         let logic_bits = GarfieldLogicBits {
             bits_flat,
+            bits_mmap: None,
+            bits_mmap_words: 0,
             bits_hi_flat: None,
             row_words,
             sample_ids: (0..n_samples).map(|i| format!("s{i}")).collect(),
@@ -15823,7 +15967,7 @@ mod tests {
         assert!(prepared_bits.test_bits.is_none());
         assert!(prepared_bits.selected_bits_full_alias_train);
         let expected =
-            &logic_bits.bits_flat[logic_bits.row_words..logic_bits.row_words.saturating_mul(4)];
+            &logic_bits.bits()[logic_bits.row_words..logic_bits.row_words.saturating_mul(4)];
         assert_eq!(prepared_bits.train_bits(), expected);
         assert_eq!(prepared_bits.selected_bits_full().unwrap(), expected);
     }
@@ -15852,7 +15996,7 @@ mod tests {
             prepared_bits.selected_bits_full,
             Some(Cow::Borrowed(_))
         ));
-        let expected = &logic_bits.bits_flat
+        let expected = &logic_bits.bits()
             [logic_bits.row_words.saturating_mul(2)..logic_bits.row_words.saturating_mul(5)];
         assert_eq!(prepared_bits.selected_bits_full().unwrap(), expected);
     }
@@ -16874,6 +17018,8 @@ mod tests {
         ];
         let empty_logic_bits = GarfieldLogicBits {
             bits_flat: Vec::new(),
+            bits_mmap: None,
+            bits_mmap_words: 0,
             bits_hi_flat: None,
             row_words: 0,
             sample_ids: Vec::new(),
@@ -16946,6 +17092,8 @@ mod tests {
         ];
         let empty_logic_bits = GarfieldLogicBits {
             bits_flat: Vec::new(),
+            bits_mmap: None,
+            bits_mmap_words: 0,
             bits_hi_flat: None,
             row_words: 0,
             sample_ids: Vec::new(),
@@ -16977,6 +17125,8 @@ mod tests {
         );
         let logic_bits = GarfieldLogicBits {
             bits_flat: vec![0b0101u64, 0b0110u64],
+            bits_mmap: None,
+            bits_mmap_words: 0,
             bits_hi_flat: None,
             row_words: 1,
             sample_ids: sample_ids.clone(),
@@ -17441,6 +17591,8 @@ mod tests {
             pack_test_binary_rows(&[vec![1u8, 1, 0, 0], vec![1u8, 1, 0, 0], vec![1u8, 0, 1, 0]]);
         let logic_bits = GarfieldLogicBits {
             bits_flat,
+            bits_mmap: None,
+            bits_mmap_words: 0,
             bits_hi_flat: None,
             row_words,
             sample_ids: vec![
@@ -17558,6 +17710,8 @@ mod tests {
             pack_test_binary_rows(&[vec![1u8, 1, 0, 0], vec![1u8, 1, 0, 0], vec![1u8, 0, 1, 0]]);
         let logic_bits = GarfieldLogicBits {
             bits_flat,
+            bits_mmap: None,
+            bits_mmap_words: 0,
             bits_hi_flat: None,
             row_words,
             sample_ids: vec![
@@ -18146,6 +18300,8 @@ mod tests {
         let (ge1_flat, ge2_flat, row_words) = pack_dual_flat(rows.as_slice());
         let logic_bits = GarfieldLogicBits {
             bits_flat: ge1_flat,
+            bits_mmap: None,
+            bits_mmap_words: 0,
             bits_hi_flat: Some(ge2_flat),
             row_words,
             sample_ids: vec!["s1".into(), "s2".into(), "s3".into(), "s4".into()],

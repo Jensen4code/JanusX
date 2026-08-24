@@ -363,17 +363,10 @@ fn parse_centered_gain_backend_mode(raw: &str) -> Result<GarfieldCenteredGainBac
     let mode = raw.trim().to_ascii_lowercase();
     match mode.as_str() {
         "" => Ok(GarfieldCenteredGainBackendMode::Cpu),
-        "legacy" | "old" | "scalar" => Ok(GarfieldCenteredGainBackendMode::Legacy),
-        // `auto` and the old batch aliases are retained as CPU-only aliases
-        // so existing shell scripts do not silently select a removed device
-        // backend.
-        "auto" | "cpu" | "batch_cpu" | "new_cpu" => Ok(GarfieldCenteredGainBackendMode::Cpu),
-        "gpu" | "metal" | "new_gpu" => Err(
-            "GARFIELD Metal scoring was removed; use JX_GARFIELD_SCORE_BACKEND=cpu or legacy"
-                .to_string(),
-        ),
+        "legacy" => Ok(GarfieldCenteredGainBackendMode::Legacy),
+        "cpu" => Ok(GarfieldCenteredGainBackendMode::Cpu),
         _ => Err(format!(
-            "JX_GARFIELD_SCORE_BACKEND must be one of: legacy, cpu; got '{}'",
+            "JX_GARFIELD_SCORE_BACKEND must be one of: cpu, legacy; got '{}'",
             raw
         )),
     }
@@ -444,15 +437,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_removed_garfield_device_backends_are_rejected() {
-        for raw in ["gpu", "metal", "new_gpu"] {
-            let err = parse_centered_gain_backend_mode(raw).expect_err("removed backend accepted");
-            assert!(err.contains("Metal scoring was removed"));
-        }
+    fn test_score_backend_accepts_only_cpu_or_legacy() {
         assert_eq!(
-            parse_centered_gain_backend_mode("auto").expect("auto CPU alias"),
+            parse_centered_gain_backend_mode("cpu").expect("cpu backend"),
             GarfieldCenteredGainBackendMode::Cpu
         );
+        assert_eq!(
+            parse_centered_gain_backend_mode("legacy").expect("legacy backend"),
+            GarfieldCenteredGainBackendMode::Legacy
+        );
+        for raw in ["auto", "gpu", "metal", "new_gpu"] {
+            assert!(parse_centered_gain_backend_mode(raw).is_err());
+        }
     }
 
     #[test]

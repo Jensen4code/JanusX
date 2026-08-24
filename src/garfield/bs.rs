@@ -2,10 +2,9 @@
 // Shared beam-search kernels used by GARFIELD.
 //
 // Active GARFIELD continuous search is intentionally restricted to:
-// - fuzzy dosage rules backed by dual bitplanes (`g >= 1`, `g >= 2`)
+// - binary pure-line rules backed by one packed 0/1 bitplane
 // - AND/XOR beam expansion plus negation at the literal level
-// - ternary XOR on literal dosages: same homozygotes -> 0, opposite
-//   homozygotes -> 2, and any heterozygote-involving mismatch -> 1
+// - binary AND/XOR expansion with optional literal negation
 // - active search/output scoring only exposes bucket null penalties; inactive
 //   compatibility penalty hooks stay pinned off in the current runtime path
 //
@@ -25,7 +24,7 @@ use super::score::{
     sum_y_where_both1_four, sum_y_where_both1_with_lookup, validate_continuous_y,
     ContinuousRuleScore, PackedYSumLookup,
 };
-use super::score_gpu::{
+use super::score_backend::{
     parse_centered_gain_backend_mode_from_env,
     score_cont_centered_gain_singletons_packed_with_backend,
 };
@@ -3074,7 +3073,7 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
 }
 
 fn precompute_literal_singleton_backend_scores(
-    mode: super::score_gpu::GarfieldCenteredGainBackendMode,
+    mode: super::score_backend::GarfieldCenteredGainBackendMode,
     y: &[f64],
     bits: &[u64],
     row_words: usize,

@@ -7,6 +7,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::BoundObject;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use rand_distr::StandardNormal;
 use rayon::prelude::*;
 
 use crate::brent::brent_minimize;
@@ -45,6 +48,7 @@ pub(crate) struct GarfieldResidualResult {
     pub eigh_elapsed: f64,
     pub eigenvalues: Vec<f64>,
     pub eff_m: Option<usize>,
+    pub null_residualized_y: Vec<Vec<f64>>,
 }
 
 #[inline]
@@ -299,6 +303,65 @@ fn exact_lmm_null_fit_from_rotated(
     })
 }
 
+/// Generate conditional parametric null phenotypes for a fitted LMM.
+///
+/// The draws are made in the GRM eigenbasis, where the fitted covariance is
+/// diagonal. Fixed effects are projected out with the same weighted design
+/// used by the fitted null model, then the resulting Py vectors are mapped
+/// back to sample space and standardized exactly like the observed response.
+/// The eigenvectors are deliberately not retained in the residual result;
+/// this keeps the O(n²) eigensystem workspace transient instead of doubling
+/// the resident memory of a GARFIELD run.
+fn generate_lmm_null_residualized(
+    s: &[f64],
+    u: &[f64],
+    x_rot: &[f64],
+    n: usize,
+    p: usize,
+    lbd: f64,
+    repeats: usize,
+    seed: u64,
+    threads: usize,
+) -> Result<Vec<Vec<f64>>, String> {
+    if repeats == 0 {
+        return Ok(Vec::new());
+    }
+    if s.len() != n || u.len() != n.saturating_mul(n) || x_rot.len() != n.saturating_mul(p) {
+        return Err("conditional LMM null workspace shape mismatch".to_string());
+    }
+    if !(lbd.is_finite() && lbd > 0.0) {
+        return Err(format!(
+            "conditional LMM null requires positive lbd, got {lbd}"
+        ));
+    }
+    let log10_lbd = lbd.log10();
+    let mut sqrt_v = Vec::with_capacity(n);
+    for (i, &sv) in s.iter().enumerate() {
+        let vv = sv.max(0.0) + lbd;
+        if !(vv.is_finite() && vv > 0.0) {
+            return Err(format!(
+                "invalid fitted null variance at eigenvalue {i}: {vv}"
+            ));
+        }
+        sqrt_v.push(vv.sqrt());
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let y_rot = sqrt_v
+            .iter()
+            .map(|&scale| scale * rng.sample::<f64, _>(StandardNormal))
+            .collect::<Vec<_>>();
+        let fit = exact_lmm_null_fit_from_rotated(s, x_rot, &y_rot, n, p, log10_lbd)
+            .ok_or_else(|| "failed to evaluate conditional LMM null draw".to_string())?;
+        let mut py = project_back_from_eigenvectors(u, &fit.py_rot, n, threads)?;
+        standardize_residualized_y(&mut py)?;
+        out.push(py);
+    }
+    Ok(out)
+}
+
 fn exact_reml_loglike_from_rotated(
     s: &[f64],
     x_rot: &[f64],
@@ -352,6 +415,8 @@ pub(crate) fn garfield_residualize_exact_from_grm_rust(
     exact_n_max: usize,
     require_lapack: bool,
     eff_m: Option<usize>,
+    null_repeats: usize,
+    null_seed: u64,
 ) -> Result<GarfieldResidualResult, String> {
     if n > exact_n_max {
         return Err(format!(
@@ -434,6 +499,17 @@ pub(crate) fn garfield_residualize_exact_from_grm_rust(
     let py_vec = project_back_from_eigenvectors(&u_vec, &fit.py_rot, n, threads)?;
     let mut residualized_y = py_vec.clone();
     standardize_residualized_y(&mut residualized_y)?;
+    let null_residualized_y = generate_lmm_null_residualized(
+        &s_vec,
+        &u_vec,
+        &x_rot,
+        n,
+        p,
+        fit.lbd,
+        null_repeats,
+        null_seed,
+        threads,
+    )?;
     let mean_s = s_vec.iter().copied().sum::<f64>() / (n as f64);
     let var_g = fit.sigma_g2 * mean_s.max(0.0);
     let denom = var_g + fit.sigma_e2;
@@ -460,6 +536,7 @@ pub(crate) fn garfield_residualize_exact_from_grm_rust(
         eigh_elapsed,
         eigenvalues: s_vec,
         eff_m,
+        null_residualized_y,
     })
 }
 
@@ -495,6 +572,8 @@ fn garfield_residualize_exact_from_grm_impl<'py>(
         exact_n_max,
         require_lapack,
         eff_m,
+        0,
+        0,
     )
     .map_err(PyRuntimeError::new_err)?;
 
@@ -725,7 +804,7 @@ pub fn garfield_residualize_bed_py<'py>(
 
 #[cfg(test)]
 mod tests {
-    use super::standardize_residualized_y;
+    use super::{generate_lmm_null_residualized, standardize_residualized_y};
 
     fn sample_mean(values: &[f64]) -> f64 {
         values.iter().copied().sum::<f64>() / (values.len() as f64)
@@ -756,5 +835,27 @@ mod tests {
         let mut values = vec![3.0, 3.0, 3.0];
         let err = standardize_residualized_y(&mut values).unwrap_err();
         assert!(err.contains("zero-variance Py"));
+    }
+
+    #[test]
+    fn conditional_lmm_null_is_seeded_and_finite() {
+        let s = vec![0.0, 0.5, 1.0, 2.0, 3.0, 4.0];
+        let u = (0..s.len() * s.len())
+            .map(|idx| {
+                if idx / s.len() == idx % s.len() {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let x_rot = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let first =
+            generate_lmm_null_residualized(&s, &u, &x_rot, s.len(), 2, 1.0, 8, 1234, 1).unwrap();
+        let second =
+            generate_lmm_null_residualized(&s, &u, &x_rot, s.len(), 2, 1.0, 8, 1234, 1).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 8);
+        assert!(first.iter().flatten().all(|v| v.is_finite()));
     }
 }

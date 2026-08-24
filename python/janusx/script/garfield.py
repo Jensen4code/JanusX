@@ -77,7 +77,6 @@ from janusx.assoc.workflow_ui import _emit_plain_info_line, _rich_success
 from janusx.assoc.workflow_ui import _run_fastplot_from_tsv_with_status
 from janusx.pyBLUP.assoc import FvLMM
 from janusx.script.fvlmm2 import (
-    _bh_adjust as _fvlmm2_bh_adjust,
     _decode_rows as _fvlmm2_decode_rows,
     _load_active_sites as _fvlmm2_load_active_sites,
 )
@@ -555,35 +554,6 @@ def _garfield_followup_row_role(snp: object) -> str:
     return "combo" if any(op in token for op in ("&", "|", "*", "^")) else "singleton"
 
 
-def _attach_garfield_logic_padj(
-    df: pd.DataFrame,
-    *,
-    p_col: str = "pwald",
-    snp_col: str = "snp",
-    role_col: str = "row_role",
-    out_col: str = "padj",
-    n_tests: int | None = None,
-) -> pd.DataFrame:
-    out = df.copy()
-    out[out_col] = np.nan
-    if out.shape[0] == 0 or p_col not in out.columns or snp_col not in out.columns:
-        return out
-
-    if role_col not in out.columns:
-        out[role_col] = out[snp_col].map(_garfield_followup_row_role)
-    pvals = pd.to_numeric(out[p_col], errors="coerce")
-    m_eff = (
-        int(n_tests)
-        if n_tests is not None and int(n_tests) > 0
-        else int(pvals.notna().sum())
-    )
-    out[out_col] = _fvlmm2_bh_adjust(
-        pvals.to_numpy(dtype=np.float64, copy=False),
-        n_tests=m_eff,
-    )
-    return out
-
-
 def _garfield_format_fixed4(value: object) -> str:
     try:
         v = float(value)
@@ -649,12 +619,11 @@ def _format_garfield_fvlmm_output_df_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
         "se",
         "chisq",
         "pwald",
-        "padj",
     ]
     if df.shape[0] == 0:
         return pd.DataFrame(columns=ordered)
     out = df.copy()
-    out = out.drop(columns=["row_role"], errors="ignore")
+    out = out.drop(columns=["row_role", "padj"], errors="ignore")
     if "chrom" in out.columns:
         out["chrom"] = out["chrom"].astype(str)
     if "pos" in out.columns:
@@ -665,8 +634,6 @@ def _format_garfield_fvlmm_output_df_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
     for col in ("chisq", "pwald"):
         if col in out.columns:
             out[col] = [_garfield_format_sci4(v) for v in out[col]]
-    if "padj" in out.columns:
-        out["padj"] = [_garfield_format_sci4(v, blank_if_nan=True) for v in out["padj"]]
     ordered_present = [col for col in ordered if col in out.columns]
     ordered_present.extend([col for col in out.columns if col not in ordered_present])
     return out.loc[:, ordered_present]
@@ -680,9 +647,6 @@ def _sort_garfield_fvlmm_rows_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
     if "pwald" in out.columns:
         out["__sort_pwald"] = pd.to_numeric(out["pwald"], errors="coerce")
         sort_cols.append("__sort_pwald")
-    if "padj" in out.columns:
-        out["__sort_padj"] = pd.to_numeric(out["padj"], errors="coerce")
-        sort_cols.append("__sort_padj")
     if "chrom" in out.columns:
         sort_cols.append("chrom")
     if "pos" in out.columns:
@@ -693,7 +657,7 @@ def _sort_garfield_fvlmm_rows_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
     if len(sort_cols) == 0:
         return out
     out = out.sort_values(by=sort_cols, kind="mergesort", na_position="last").reset_index(drop=True)
-    return out.drop(columns=["__sort_pwald", "__sort_padj", "__sort_pos"], errors="ignore")
+    return out.drop(columns=["__sort_pwald", "__sort_pos"], errors="ignore")
 
 
 def _garfield_invocation_command() -> str:
@@ -775,10 +739,10 @@ def _run_garfield_pseudo_fvlmm(
     logic_maf_threshold: float,
     max_missing_rate: float,
     het_threshold: float,
-    fdr_n_tests: int | None,
     threads: int,
     logger,
     use_spinner: bool,
+    bonferroni_n_tests: int | None = None,
     batch_size: int = 4096,
 ) -> dict[str, object]:
     pseudo_ids, pseudo_ctx = prepare_packed_ctx_from_plink(
@@ -876,14 +840,6 @@ def _run_garfield_pseudo_fvlmm(
             )
 
     full_df = pd.DataFrame(rows)
-    full_df = _attach_garfield_logic_padj(
-        full_df,
-        p_col="pwald",
-        snp_col="snp",
-        role_col="row_role",
-        out_col="padj",
-        n_tests=fdr_n_tests,
-    )
     tsv_df = _format_garfield_fvlmm_output_df_for_tsv(
         _sort_garfield_fvlmm_rows_for_tsv(full_df)
     )
@@ -894,52 +850,52 @@ def _run_garfield_pseudo_fvlmm(
     tsv_df.to_csv(tsv_path, sep="\t", index=False)
     saved_paths = [tsv_path]
 
+    # GARFIELD's ``-m/--meff`` is the effective number of independent SNP
+    # tests, not the number of expanded pseudo-rule rows.  Keep the fallback
+    # local to this follow-up so old callers which do not pass ``meff`` still
+    # get a valid Bonferroni threshold.
+    bonferroni_tests = int(bonferroni_n_tests or 0)
+    if bonferroni_tests <= 0:
+        bonferroni_tests = max(1, int(full_df.shape[0]))
+
     if tsv_df.shape[0] > 0:
         _run_fastplot_from_tsv_with_status(
             tsv_path,
             y_trait,
             xlabel=str(trait_label),
             outpdf=figure_path,
-            threshold_n_tests=fdr_n_tests,
+            threshold_n_tests=bonferroni_tests,
             plot_style="garfield",
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
         saved_paths.append(figure_path)
 
-    combo_unique = pd.DataFrame(columns=["snp", "pwald", "padj"])
+    combo_unique = pd.DataFrame(columns=["snp", "pwald"])
     if full_df.shape[0] > 0:
         combo_unique = (
-            full_df.loc[full_df["row_role"].astype(str).str.lower().eq("combo"), ["snp", "pwald", "padj"]]
+            full_df.loc[full_df["row_role"].astype(str).str.lower().eq("combo"), ["snp", "pwald"]]
             .drop_duplicates(subset=["snp"], keep="first")
             .copy()
         )
         combo_unique["pwald"] = pd.to_numeric(combo_unique["pwald"], errors="coerce")
-        combo_unique["padj"] = pd.to_numeric(combo_unique["padj"], errors="coerce")
         combo_unique = combo_unique.sort_values(by=["pwald", "snp"], kind="mergesort").reset_index(drop=True)
 
     best_combo = None
     best_combo_p = float("nan")
-    best_combo_padj = float("nan")
     if combo_unique.shape[0] > 0:
         best_row = combo_unique.iloc[0]
         best_combo = str(best_row.get("snp", ""))
         best_combo_p = float(best_row.get("pwald", float("nan")))
-        best_combo_padj = float(best_row.get("padj", float("nan")))
 
     summary_rows = [
         {
             "trait": str(trait_label),
             "n_rows_tested": int(full_df.shape[0]),
             "n_combo_tested": int(combo_unique.shape[0]),
-            "fdr_n_tests": (
-                int(fdr_n_tests)
-                if fdr_n_tests is not None and int(fdr_n_tests) > 0
-                else int(full_df.shape[0])
-            ),
+            "bonferroni_n_tests": bonferroni_tests,
             "best_combo": best_combo,
             "best_combo_p": best_combo_p,
-            "best_combo_padj": best_combo_padj,
             "route": "fvlmm",
         }
     ]
@@ -1766,6 +1722,18 @@ def main() -> None:
         ),
     )
     optional_group.add_argument(
+        "-mem",
+        "--memory",
+        dest="logic_memory_mb",
+        type=float,
+        default=0.0,
+        help=(
+            "Decoded GARFIELD logic-bit working budget in MiB. "
+            "0 keeps the resident path; a positive value enables the mmap-backed path "
+            "when the decoded bitset exceeds this budget."
+        ),
+    )
+    optional_group.add_argument(
         "-dev",
         "--dev",
         action="store_true",
@@ -1811,12 +1779,6 @@ def main() -> None:
             "This option only controls the null-penalty threshold; it does not append "
             "permutation p-value or FDR columns."
         ),
-    )
-    optional_group.add_argument(
-        "--fold",
-        type=int,
-        default=0,
-        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-no-clean",
@@ -1904,8 +1866,8 @@ def main() -> None:
         type=int,
         default=None,
         help=(
-            "Effective SNP count used for GARFIELD Manhattan Bonferroni thresholding "
-            "and FDR test counting. Default uses the input genotype SNP count."
+            "Effective SNP count used for GARFIELD Manhattan Bonferroni thresholding. "
+            "Default uses the input genotype SNP count."
         ),
     )
     optional_group.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -2000,6 +1962,8 @@ def main() -> None:
     args.width = int(args.width) if args.width is not None else 100
     if int(args.width) <= 0:
         parser.error("-width/--width must be > 0")
+    if not np.isfinite(float(args.logic_memory_mb)) or float(args.logic_memory_mb) < 0.0:
+        parser.error("-mem/--memory must be >= 0")
     args.beam_width = int(args.width)
 
     args.layer = (
@@ -2012,8 +1976,6 @@ def main() -> None:
         parser.error("-gain/--gain-layer must be >= 1")
     if int(args.rule_topk) <= 0:
         parser.error("-topk/--topk must be > 0")
-    if int(args.fold) >= 2:
-        parser.error("--fold train/test splitting is disabled; GARFIELD now only supports the full-sample path")
     args.exhaustive_depth_runtime = (
         1
         if str(args.scan_mode).lower() == "wholegenome"
@@ -2390,7 +2352,7 @@ def main() -> None:
                 ml_importance="imp",
                 ml_top_k=int(args.ml_top_k_runtime),
                 ml_top_frac=0.0,
-                permutation_repeats=20,
+                permutation_repeats=100,
                 permutation_scoring="auto",
                 rule_null_penalty_method=str(args.rule_null_penalty_method_runtime),
                 rule_null_quantile=float(args.rule_null_quantile_runtime),
@@ -2401,7 +2363,6 @@ def main() -> None:
                 min_samples_split=2,
                 bootstrap=True,
                 feature_subsample=0.0,
-                fold=0,
                 seed=trait_seed,
                 max_pick=int(args.layer),
                 exhaustive_depth=int(args.exhaustive_depth_runtime),
@@ -2435,6 +2396,9 @@ def main() -> None:
                 whole_genome_dev_mode=bool(str(args.scan_mode).lower() == "wholegenome"),
                 progress_callback=progress_cb,
                 progress_every=0,
+                logic_mem_budget_bytes=int(
+                    max(0.0, float(args.logic_memory_mb)) * 1024.0 * 1024.0
+                ),
             ),
         )
         rust_memory_debug = result.get("memory_debug")
@@ -2500,7 +2464,6 @@ def main() -> None:
 
         _remove_file_if_exists(pseudo_path)
         _remove_file_if_exists(posterior_tsv_path)
-        split_applied = bool(result.get("split_applied", False))
         prior_payload, posterior_payload = _split_structure_prior_payload(
             _load_json_if_exists(posterior_json_path)
         )
@@ -2508,6 +2471,11 @@ def main() -> None:
         followup_memory_debug = None
         pseudo_prefix = result.get("pseudo_prefix")
         rules_tsv = result.get("rules_tsv")
+        bonferroni_n_tests = (
+            int(args.meff)
+            if args.meff is not None
+            else max(1, int(_n_snps))
+        )
         if pseudo_prefix:
             def _run_followup() -> dict[str, object]:
                 nonlocal followup_grm_full
@@ -2537,20 +2505,6 @@ def main() -> None:
                 logger.info(
                     f"Running pseudo FvLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
                 )
-                units_for_fdr = (
-                    int(result.get("units_total", 0))
-                    if int(result.get("units_total", 0)) > 0
-                    else int(result.get("units_scanned", 0))
-                    if int(result.get("units_scanned", 0)) > 0
-                    else 0
-                )
-                site_tests_for_fdr = (
-                    max(0, int(args.meff))
-                    if args.meff is not None
-                    else max(0, int(_n_snps))
-                )
-                total_tests_for_fdr = site_tests_for_fdr + max(0, units_for_fdr)
-                fdr_n_tests = total_tests_for_fdr if total_tests_for_fdr > 0 else None
                 return _run_garfield_pseudo_fvlmm(
                     pseudo_prefix=str(pseudo_prefix),
                     trait_label=suffix,
@@ -2561,10 +2515,10 @@ def main() -> None:
                     logic_maf_threshold=float(logic_maf_threshold),
                     max_missing_rate=float(args.geno),
                     het_threshold=float(args.het),
-                    fdr_n_tests=fdr_n_tests,
                     threads=int(args.thread),
                     logger=logger,
                     use_spinner=use_spinner,
+                    bonferroni_n_tests=bonferroni_n_tests,
                 )
             followup_sampler = (
                 _GarfieldRssSampler() if _garfield_rss_debug_enabled() else None
@@ -2600,14 +2554,21 @@ def main() -> None:
             "garfield_prefix": trait_logic_prefix,
             "pseudo_prefix": pseudo_prefix,
             "route": "rust-bed",
-            "split_applied": split_applied,
+            "evaluation_mode": str(result.get("evaluation_mode", "full_exploratory")),
             "scan_mode": args.scan_mode,
             "unit_kind": logic_unit_kind,
             "response": response_mode,
             "engine": args.engine,
             "engine_runtime": engine_runtime,
             "ml_skipped": ml_skipped,
-            "permutation": True,
+            # Keep the historical flag for downstream readers, but make its
+            # scope explicit: it calibrates rule-null penalties rather than
+            # representing an independent train/test validation split.
+            "permutation": bool(result.get("rule_permutation_active", False)),
+            "permutation_scope": "rule_null_penalty",
+            "null_generation": str(
+                result.get("rule_null_generation", "lmm_parametric_bootstrap")
+            ),
             "rule_null_penalty_method": str(args.rule_null_penalty_method_runtime),
             "rule_null_quantile": float(args.rule_null_quantile_runtime),
             "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
@@ -2659,23 +2620,22 @@ def main() -> None:
             "logic_maf_source": logic_maf_source,
             "geno": float(args.geno),
             "het": float(args.het),
+            "logic_memory_mb": float(args.logic_memory_mb),
+            "logic_bits_backend": str(result.get("logic_bits_backend", "resident")),
+            "logic_bits_bytes": int(result.get("logic_bits_bytes", 0)),
             "pure_line_missing_rule": "na_only",
             "pure_line_het_rule": "drop_if_het_rate_gt_threshold",
             "simbench_path": args.simbench,
             "simbench_rows": int(result.get("n_simbench", 0)),
             "seed": trait_seed,
             "n_samples": len(common_ids),
-            "n_train": int(result.get("n_train", 0)),
-            "n_test": int(result.get("n_test", 0)),
+            "full_n": int(result.get("full_n", result.get("n_samples", 0))),
             "n_rules": int(result.get("n_rules", 0)),
             "units_total": int(result.get("units_total", 0)),
             "units_scanned": int(result.get("units_scanned", 0)),
-            "train_pve": float(result.get("train_pve", float("nan"))),
-            "test_pve": float(result.get("test_pve", float("nan"))),
-            "train_sigma_g2": float(result.get("train_sigma_g2", float("nan"))),
-            "train_sigma_e2": float(result.get("train_sigma_e2", float("nan"))),
-            "test_sigma_g2": float(result.get("test_sigma_g2", float("nan"))),
-            "test_sigma_e2": float(result.get("test_sigma_e2", float("nan"))),
+            "full_pve": float(result.get("full_pve", float("nan"))),
+            "full_sigma_g2": float(result.get("full_sigma_g2", float("nan"))),
+            "full_sigma_e2": float(result.get("full_sigma_e2", float("nan"))),
             "memory_debug": trait_memory_debug,
             "outputs": {
                 "rules_tsv": result.get("rules_tsv"),
@@ -2714,7 +2674,7 @@ def main() -> None:
             logger,
             (
                 f"GARFIELD null-model PVE for '{trait_name}': "
-                f"full={float(result.get('train_pve', float('nan'))):.4g}"
+                f"full={float(result.get('full_pve', float('nan'))):.4g}"
             ),
             use_spinner=use_spinner,
         )
@@ -2779,7 +2739,10 @@ def main() -> None:
                 "rank_schedule_source": rank_schedule_source,
                 "xor_search_requested": bool(args.xor_search_requested),
                 "xor_search_enabled": bool(args.xor_search),
+                "evaluation_mode": "full_exploratory",
                 "permutation": True,
+                "permutation_scope": "rule_null_penalty",
+                "null_generation": "lmm_parametric_bootstrap",
                 "rule_null_penalty_method": str(args.rule_null_penalty_method_runtime),
                 "rule_null_quantile": float(args.rule_null_quantile_runtime),
                 "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),

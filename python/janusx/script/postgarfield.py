@@ -453,7 +453,8 @@ def _postgarfield_build_combo_summary(
     work = combo_df.copy()
     work[_GARFIELD_GROUP_COL] = work[_GARFIELD_GROUP_COL].astype(str)
     work[_GARFIELD_P_COL] = pd.to_numeric(work[_GARFIELD_P_COL], errors="coerce")
-    if _GARFIELD_PADJ_COL in work.columns:
+    has_padj = _GARFIELD_PADJ_COL in work.columns
+    if has_padj:
         work[_GARFIELD_PADJ_COL] = pd.to_numeric(work[_GARFIELD_PADJ_COL], errors="coerce")
     else:
         work[_GARFIELD_PADJ_COL] = np.nan
@@ -470,6 +471,7 @@ def _postgarfield_build_combo_summary(
     )
     summary.attrs["requested_p_col"] = str(requested_p_col)
     summary.attrs["resolved_requested_p_col"] = str(resolved_requested_p)
+    summary.attrs["has_padj"] = bool(has_padj)
     return summary
 
 
@@ -495,18 +497,26 @@ def _postgarfield_resolve_sig_groups(
             f"combo_{resolved_requested_p}<={float(thr):.4g}",
         )
 
-    padj = pd.to_numeric(summary_df["combo_padj"], errors="coerce")
-    sig_mask = padj <= float(_GARFIELD_SIG_PADJ_DEFAULT)
+    if bool(summary_df.attrs.get("has_padj", False)):
+        padj = pd.to_numeric(summary_df["combo_padj"], errors="coerce")
+        sig_mask = padj <= float(_GARFIELD_SIG_PADJ_DEFAULT)
+        sig_groups = set(summary_df.index[sig_mask].tolist())
+        if len(sig_groups) == 0:
+            return set(), None, f"combo_padj<={float(_GARFIELD_SIG_PADJ_DEFAULT):.4g} (none)"
+        if resolved_requested_p == _GARFIELD_PADJ_COL:
+            thr_p = float(_GARFIELD_SIG_PADJ_DEFAULT)
+        else:
+            thr_p = float(
+                pd.to_numeric(summary_df.loc[list(sig_groups), "combo_pwald"], errors="coerce").max()
+            )
+        return sig_groups, thr_p, f"combo_padj<={float(_GARFIELD_SIG_PADJ_DEFAULT):.4g}"
+
+    pvals = pd.to_numeric(summary_df["combo_pwald"], errors="coerce")
+    n_tests = int(pvals.notna().sum())
+    bonferroni = 1.0 / float(max(1, n_tests))
+    sig_mask = pvals <= bonferroni
     sig_groups = set(summary_df.index[sig_mask].tolist())
-    if len(sig_groups) == 0:
-        return set(), None, f"combo_padj<={float(_GARFIELD_SIG_PADJ_DEFAULT):.4g} (none)"
-    if resolved_requested_p == _GARFIELD_PADJ_COL:
-        thr_p = float(_GARFIELD_SIG_PADJ_DEFAULT)
-    else:
-        thr_p = float(
-            pd.to_numeric(summary_df.loc[list(sig_groups), "combo_pwald"], errors="coerce").max()
-        )
-    return sig_groups, thr_p, f"combo_padj<={float(_GARFIELD_SIG_PADJ_DEFAULT):.4g}"
+    return sig_groups, bonferroni, f"combo_pwald<=Bonferroni(1/{max(1, n_tests)})"
 
 
 def _postgarfield_annotate_sig_rows(
@@ -985,8 +995,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         "-thr", "--thr", dest="thr", type=float, default=None,
         help=(
             "Interaction p-value threshold for GARFIELD links. "
-            "If omitted, significant interactions are defined by group-level padj<=0.05, "
-            "and the circle threshold line uses the largest pwald among those significant groups."
+            "If omitted, new GARFIELD files use a group-level Bonferroni threshold "
+            "(1/number of interaction groups); legacy files with padj retain padj<=0.05 compatibility."
         ),
     )
     optional_group.add_argument(
@@ -1158,7 +1168,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     ("Annotation", str(args.anno_file)),
                     ("GWAS background", "auto(singleton fallback)" if args.gwasfile is None else ", ".join([os.path.basename(str(x)) for x in list(args.gwasfile)])),
                     ("Background Chr|Pos|P", f"{args.chr}|{args.pos}|{args.pvalue}"),
-                    ("Threshold", str(args.thr) if args.thr is not None else "auto from combo padj<=0.05"),
+                    ("Threshold", str(args.thr) if args.thr is not None else "auto Bonferroni(1/n_combo)"),
                     ("Circle", f"size={float(args.circle_size):g}, track_ratio={float(args.circle_track_ratio):g}, gap={float(args.circle_interval):g}, lw={float(args.circle_lw):g}, dir={str(args.circle_direction)}"),
                     ("Output format", str(args.format)),
                     (
