@@ -10554,6 +10554,10 @@ def _run_method_task(
     rrblup_final_cfg: dict[str, typing.Any] | None = None
     gblup_vc_rows: list[dict[str, typing.Any]] = []
     gblup_final_state: dict[str, typing.Any] | None = None
+    # The final fit can be intentionally skipped (for example, a CV-only
+    # run with no held-out samples).  Keep this state defined for the
+    # downstream metadata/export path in that case.
+    bayes_state_final: dict[str, typing.Any] | None = None
     bayes_r2_rows: list[float] = []
     bayes_rhat_rows: list[float] = []
     bayes_rhat_metrics_rows: list[dict[str, float]] = []
@@ -12313,7 +12317,6 @@ def _run_method_task(
         gblup_state_final: dict[str, typing.Any] | None = None
         model_state_call: dict[str, typing.Any] | None = None
         bayes_r2_final_call: float | None = None
-        bayes_state_final: dict[str, typing.Any] | None = None
         bayes_r2_final_key: str | None = None
         if method == "rrBLUP":
             rr_cfg_final = dict(rrblup_cfg_base)
