@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import threading
 from typing import Optional
 
@@ -86,4 +87,31 @@ def run_gs_config(
     log: bool = True,
 ):
     argv = config.build_gs_argv(out_dir=out, out_prefix=prefix)
-    return run_gs_cli(argv, log=log, return_result=True)
+    # Keep the Python wrapper's explicit GBLUP/rrBLUP methods compatible with
+    # the unified CLI without leaking a route override into the caller's
+    # process.  `blup()` intentionally leaves the environment untouched so
+    # the normal automatic dispatch and an explicit GS_BLUP override remain
+    # available.
+    force_mode: str | None = None
+    kernels = tuple(str(x).strip().lower() for x in config.gblup_kernels)
+    if kernels == ("a",) and not bool(config.rrblup) and not bool(config.blup):
+        force_mode = "0"
+    elif (
+        len(kernels) == 0
+        and bool(config.rrblup)
+        and not bool(config.blup)
+    ):
+        force_mode = "1"
+
+    had_previous = "GS_BLUP" in os.environ
+    previous = os.environ.get("GS_BLUP")
+    if force_mode is not None:
+        os.environ["GS_BLUP"] = force_mode
+    try:
+        return run_gs_cli(argv, log=log, return_result=True)
+    finally:
+        if had_previous:
+            assert previous is not None
+            os.environ["GS_BLUP"] = previous
+        else:
+            os.environ.pop("GS_BLUP", None)

@@ -133,14 +133,19 @@ class GsConfig:
 
         if len(self.gblup_kernels) > 0:
             g_tokens = [str(x).strip().lower() for x in self.gblup_kernels]
-            if len(g_tokens) == 1 and g_tokens[0] == "a":
-                argv.append("-GBLUP")
-            else:
-                argv.extend(["-GBLUP"] + g_tokens)
-        if bool(self.blup):
+            if g_tokens != ["a"]:
+                raise ValueError(
+                    "The public GS CLI now exposes additive GBLUP through -BLUP; "
+                    "explicit dominance GBLUP kernels are not available through GsConfig."
+                )
             argv.append("-BLUP")
+        if bool(self.blup):
+            if "-BLUP" not in argv:
+                argv.append("-BLUP")
         if bool(self.rrblup):
-            argv.append("-rrBLUP")
+            if "-BLUP" not in argv:
+                argv.append("-BLUP")
+            argv.extend(["--rrblup-solver", "exact"])
         if bool(self.bayesa):
             argv.append("-BayesA")
         if self.bayesb is not False and self.bayesb is not None:
