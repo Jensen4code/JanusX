@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -767,6 +768,13 @@ def validate_text_effect_artifact(
         fail(f"{method_name} artifact missing from summary: {summary_path}")
     rec = artifacts[method_name]
     artifact_format = str(rec.get("artifact_format", "")).strip()
+    if artifact_format == "binary_jxmodel":
+        validate_binary_jxmodel_artifact(
+            summary_path,
+            method_name=method_name,
+            expected_rows=expected_rows,
+        )
+        return
     if artifact_format != "text_effect":
         fail(f"{method_name} artifact format mismatch: expected text_effect, got {artifact_format!r}")
 
@@ -785,8 +793,8 @@ def validate_text_effect_artifact(
         method_name=method_name,
     )
     effect_col = str(rec.get("effect_column", "") or "").strip().lower()
-    if effect_col not in {"", "beta"}:
-        fail(f"{method_name} effect_column should be beta, got {effect_col!r}")
+    if effect_col not in {"", "beta", "imp"}:
+        fail(f"{method_name} effect_column should be beta or imp, got {effect_col!r}")
 
     effect_meta = dict(rec.get("effect_meta", {}) or {})
     meta_rows = _coerce_optional_int(effect_meta.get("rows"))
@@ -811,7 +819,12 @@ def validate_text_effect_artifact(
         fail(f"{method_name} should not report pip rows, got {meta_pip_rows}")
 
 
-def validate_binary_jxmodel_artifact(summary_path: Path, *, method_name: str) -> None:
+def validate_binary_jxmodel_artifact(
+    summary_path: Path,
+    *,
+    method_name: str,
+    expected_rows: int | None = None,
+) -> None:
     artifacts = _summary_artifact_by_method(summary_path)
     if method_name not in artifacts:
         fail(f"{method_name} artifact missing from summary: {summary_path}")
@@ -826,14 +839,67 @@ def validate_binary_jxmodel_artifact(summary_path: Path, *, method_name: str) ->
     require_file(model_path, f"{method_name} binary .jxmodel missing")
     if model_path.suffix.lower() != ".jxmodel":
         fail(f"{method_name} model_file is not .jxmodel: {model_path}")
+    if not zipfile.is_zipfile(model_path):
+        fail(f"{method_name} .jxmodel is not a v2 container: {model_path}")
+    effect_col = str(rec.get("effect_column", "") or "").strip().lower()
+    if effect_col not in {"", "beta", "imp"}:
+        fail(f"{method_name} effect_column should be beta or imp, got {effect_col!r}")
+    try:
+        with zipfile.ZipFile(model_path, mode="r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            if str(manifest.get("format", "")).strip() != "janusx.gs.jxmodel.v2":
+                fail(f"{method_name} .jxmodel manifest format is not v2: {model_path}")
+            marker_name = "markers.tsv"
+            if marker_name not in archive.namelist():
+                fail(f"{method_name} .jxmodel has no embedded marker table: {model_path}")
+            with archive.open(marker_name, mode="r") as handle:
+                reader = csv.DictReader(
+                    (line.decode("utf-8", errors="replace") for line in handle),
+                    delimiter="\t",
+                )
+                actual = set(reader.fieldnames or [])
+                canonical_required = {"chr", "pos", "snp", "allele0", "allele1", "af", "inv_sd"}
+                effect_required = effect_col if effect_col in {"beta", "imp"} else None
+                if canonical_required.issubset(actual):
+                    if effect_required is not None and effect_required not in actual:
+                        fail(
+                            f"{method_name} embedded marker table lacks effect column "
+                            f"{effect_required!r}: {model_path}"
+                        )
+                    if effect_required is None and not ({"beta", "imp"} & actual):
+                        fail(
+                            f"{method_name} embedded marker table lacks beta/imp effect column: "
+                            f"{model_path}"
+                        )
+                elif {"chr", "pos", "snp", "beta"}.issubset(actual):
+                    # Read-only compatibility for v2 models created before the
+                    # canonical self-contained marker schema.
+                    pass
+                else:
+                    required = canonical_required | ({effect_required} if effect_required else {"beta", "imp"})
+                    fail(
+                        f"{method_name} embedded marker table lacks columns "
+                        f"{sorted(required - actual)}: {model_path}"
+                    )
+                rows = sum(1 for row in reader if any(str(v or "").strip() for v in row.values()))
+            manifest_rows = int(manifest.get("n_markers", manifest.get("marker_count", rows)))
+            if rows != manifest_rows:
+                fail(f"{method_name} marker count mismatch: manifest={manifest_rows}, table={rows}")
+            if expected_rows is not None and rows != int(expected_rows):
+                fail(f"{method_name} marker row count mismatch: expected {expected_rows}, got {rows}")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail(f"{method_name} invalid v2 .jxmodel container {model_path}: {exc}")
 
     effect_meta = dict(rec.get("effect_meta", {}) or {})
     meta_rows = _coerce_optional_int(effect_meta.get("rows"))
-    meta_beta_rows = _coerce_optional_int(effect_meta.get("beta_non_nan_rows"))
+    meta_effect_key = "imp_non_nan_rows" if effect_col == "imp" else "beta_non_nan_rows"
+    meta_effect_rows = _coerce_optional_int(effect_meta.get(meta_effect_key))
     if meta_rows is not None and meta_rows <= 0:
         fail(f"{method_name} effect_meta.rows should be positive, got {meta_rows}")
-    if meta_beta_rows is not None and meta_beta_rows <= 0:
-        fail(f"{method_name} effect_meta.beta_non_nan_rows should be positive, got {meta_beta_rows}")
+    if meta_effect_rows is not None and meta_effect_rows <= 0:
+        fail(f"{method_name} effect_meta.{meta_effect_key} should be positive, got {meta_effect_rows}")
 
 
 def validate_postgs_outputs(
@@ -1353,7 +1419,7 @@ def run_gs_file_suite(
     txt_matrix = paths["txt_matrix"]
     pheno_txt = paths["pheno_txt"]
 
-    step("GS-FILE. Validate GS text-input route and text .jxmodel outputs")
+    step("GS-FILE. Validate GS text-input route and self-contained .jxmodel outputs")
     run(
         [
             "jx",
@@ -1404,7 +1470,7 @@ def run_gs_bfile_suite(
     pheno_txt = paths["pheno_txt"]
     expected_rows = _count_bim_rows(sim_prefix.with_suffix(".bim"))
 
-    step("GS-BFILE. Validate GS PLINK-input route and numeric effect outputs")
+    step("GS-BFILE. Validate GS PLINK-input route and self-contained .jxmodel outputs")
     run(
         [
             "jx",

@@ -745,8 +745,16 @@ def _resolve_effect_col(
         "marker",
         "allele0",
         "allele1",
+        "af",
         "maf",
+        "inv_sd",
+        "pip",
     }
+    meta_cols.update(
+        str(c).strip().lower()
+        for c in df.columns
+        if str(c).strip().lower().startswith("component_prob_")
+    )
     for c in df.columns:
         if str(c).strip().lower() in meta_cols:
             continue
@@ -792,6 +800,9 @@ def _load_effect_table(path: str) -> pd.DataFrame:
             from janusx.gs.workflow import _build_method_effect_table, _load_jxmodel
 
             payload = _load_jxmodel(path)
+            embedded_table = payload.get("_jxmodel_marker_table", None)
+            if isinstance(embedded_table, pd.DataFrame):
+                return _sanitize_effect_table_pip(embedded_table)
             raw_state = payload.get("model_state", None)
             if isinstance(raw_state, dict) and len(raw_state) > 0:
                 prefix_hint_raw = payload.get(

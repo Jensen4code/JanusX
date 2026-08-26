@@ -1502,6 +1502,7 @@ def bed_chunk_reader(
     model: str = "add",
     het: float = 1.0,
     *,
+    preserve_alt_orientation: bool = False,
     snp_range: Union[tuple[int, int] , None] = None,
     snp_indices: Union[list[int],None ]= None,
     bim_range: Union[tuple[str, int, int] , None] = None,
@@ -1528,6 +1529,9 @@ def bed_chunk_reader(
       - sample_indices : explicit 0-based sample indices
     mmap_window_mb:
       - limit BED mmap window size (MB); disables snp_range/snp_indices/bim_range
+    preserve_alt_orientation:
+      - keep the source BED dosage/allele orientation instead of applying
+        prediction-cohort MAF flipping. Intended for loaded-model inference.
     """
     global _WARNED_BED_MODEL_FALLBACK
     base_kwargs = dict(
@@ -1546,6 +1550,7 @@ def bed_chunk_reader(
         sample_ids=sample_ids,
         sample_indices=sample_indices,
         mmap_window_mb=mmap_window_mb,
+        preserve_alt_orientation=bool(preserve_alt_orientation),
     )
     try:
         reader = BedChunkReader(
@@ -1571,6 +1576,11 @@ def bed_chunk_reader(
                 "BedChunkReader extension does not support model/het_threshold filtering. "
                 "Please rebuild/reinstall janusx Rust extension."
             )
+        if bool(preserve_alt_orientation):
+            raise RuntimeError(
+                "BedChunkReader extension does not support preserve_alt_orientation. "
+                "Please rebuild/reinstall janusx Rust extension."
+            )
         legacy_kwargs = dict(base_kwargs)
         # Older extensions may not support snp_sites.
         legacy_kwargs.pop("snp_sites", None)
@@ -1578,6 +1588,7 @@ def bed_chunk_reader(
         legacy_kwargs.pop("bp_min", None)
         legacy_kwargs.pop("bp_max", None)
         legacy_kwargs.pop("ranges", None)
+        legacy_kwargs.pop("preserve_alt_orientation", None)
         reader = BedChunkReader(**legacy_kwargs)
         if not _WARNED_BED_MODEL_FALLBACK:
             warnings.warn(
@@ -1775,6 +1786,7 @@ def load_genotype_chunks(
     mmap_window_mb: Union[int , None] = None,
     delimiter: Union[str , None] = None,
     force_kind: Union[str, None] = None,
+    preserve_alt_orientation: bool = False,
 ):
     """
     High-level Python interface for reading genotype data in chunks
@@ -1861,6 +1873,8 @@ def load_genotype_chunks(
     - sample_indices: list of 0-based sample indices
     - mmap_window_mb: window size (MB) for BED mmap; supported for PLINK (incl. cached VCF), not TXT
     - delimiter: optional token delimiter used for TXT matrix inputs
+    - preserve_alt_orientation: keep source dosage orientation instead of
+      prediction-cohort MAF flipping; intended for loaded-model inference
 
     Example
     -------
@@ -1903,6 +1917,7 @@ def load_genotype_chunks(
                 sample_ids=sample_ids,
                 sample_indices=sample_indices,
                 mmap_window_mb=mmap_window_mb,
+                preserve_alt_orientation=bool(preserve_alt_orientation),
             )
 
         try:
@@ -1952,6 +1967,7 @@ def load_genotype_chunks(
             sample_ids=sample_ids,
             sample_indices=sample_indices,
             mmap_window_mb=mmap_window_mb,
+            preserve_alt_orientation=bool(preserve_alt_orientation),
         )
         return
 
@@ -1989,6 +2005,7 @@ def load_genotype_chunks(
                     sample_ids=sample_ids,
                     sample_indices=sample_indices,
                     mmap_window_mb=mmap_window_mb,
+                    preserve_alt_orientation=bool(preserve_alt_orientation),
                 )
 
             try:
@@ -2073,6 +2090,7 @@ def load_genotype_chunks(
             sample_indices,
             str(model),
             float(het),
+            preserve_alt_orientation=bool(preserve_alt_orientation),
         )
         row0 = 0
         while True:

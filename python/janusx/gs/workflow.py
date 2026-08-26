@@ -60,6 +60,7 @@ import typing
 import os
 import time
 import json
+import io
 import socket
 import argparse
 import warnings
@@ -71,6 +72,7 @@ import gc
 import glob
 import platform
 import pickle
+import zipfile
 import threading
 import subprocess
 import shutil
@@ -108,6 +110,7 @@ from janusx.bioplotkit import gsplot
 from janusx._optional_deps import format_missing_dependency_message
 from janusx.gfreader import (
     inspect_genotype_file,
+    load_bed_2bit_packed,
     load_genotype_chunks,
     prepare_cli_input_cache,
 )
@@ -251,6 +254,510 @@ _ML_METHOD_MAP: dict[str, str] = {
     "SVM": "svm",
     "ENET": "enet",
 }
+
+
+# Experimental nested GARFIELD->GBLUP path.  This is deliberately kept out of
+# the normal model list unless the hidden ``-GARFIELD`` development option is
+# requested.  Rules are learned on each training fold and then evaluated on
+# both sides of that fold.
+_GARFIELD_METHOD = "GARFIELD"
+_GARFIELD_EXTENSION_BP = 50_000
+_GARFIELD_STEP_BP = 25_000
+_GARFIELD_BEAM_WIDTH = 100
+_GARFIELD_LAYER = 5
+_GARFIELD_ML_TOP_K = 150
+
+
+def _split_garfield_rule_expression(expression: str) -> tuple[list[str], list[str]]:
+    """Split GARFIELD's compact rule display into literals and operators."""
+    text = str(expression).strip()
+    if text == "":
+        raise ValueError("GARFIELD rule expression is empty.")
+    parts = re.split(r"([&|^*])", text)
+    literals: list[str] = []
+    operators: list[str] = []
+    expect_literal = True
+    for part in parts:
+        token = str(part).strip()
+        if token == "":
+            continue
+        if expect_literal:
+            if token in {"&", "|", "^", "*"}:
+                raise ValueError(f"GARFIELD rule has an operator without a literal: {expression!r}")
+            literals.append(token)
+            expect_literal = False
+        else:
+            if token not in {"&", "|", "^", "*"}:
+                raise ValueError(f"GARFIELD rule has a literal without an operator: {expression!r}")
+            operators.append("&" if token == "*" else token)
+            expect_literal = True
+    if expect_literal or len(literals) == 0 or len(operators) != len(literals) - 1:
+        raise ValueError(f"Malformed GARFIELD rule expression: {expression!r}")
+    return literals, operators
+
+
+def _evaluate_garfield_rule_expression(
+    expression: str,
+    literal_masks: typing.Mapping[str, np.ndarray],
+) -> np.ndarray:
+    """Evaluate a compact GARFIELD rule over already-decoded BIN literals."""
+    literals, operators = _split_garfield_rule_expression(expression)
+
+    def _lookup(token: str) -> np.ndarray:
+        negated = str(token).startswith("!")
+        key = str(token)[1:] if negated else str(token)
+        if key not in literal_masks:
+            raise KeyError(f"GARFIELD literal is missing from decoded masks: {key!r}")
+        value = np.asarray(literal_masks[key], dtype=bool)
+        return np.logical_not(value) if negated else value
+
+    result = np.array(_lookup(literals[0]), dtype=bool, copy=True)
+    for op, token in zip(operators, literals[1:]):
+        rhs = _lookup(token)
+        if op == "&":
+            result &= rhs
+        elif op == "|":
+            result |= rhs
+        elif op == "^":
+            result ^= rhs
+        else:  # pragma: no cover - parser normalizes all supported operators
+            raise ValueError(f"Unsupported GARFIELD rule operator: {op!r}")
+    return np.ascontiguousarray(result, dtype=bool)
+
+
+_GARFIELD_LITERAL_RE = re.compile(r"^!?(.+)_([0-9]+)\[([^\]]+)\]$")
+
+
+def _read_garfield_bim_metadata(
+    prefix: str,
+) -> tuple[dict[tuple[str, int], list[tuple[int, str, str]]], int]:
+    """Read source BED metadata needed to materialize selected rule literals."""
+    prefix_text = str(prefix)
+    bim_path = (
+        f"{prefix_text[:-4]}.bim"
+        if prefix_text.lower().endswith(".bed")
+        else f"{prefix_text}.bim"
+    )
+    lookup: dict[tuple[str, int], list[tuple[int, str, str]]] = {}
+    n_rows = 0
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as handle:
+        for line_no, raw in enumerate(handle, start=1):
+            parts = str(raw).strip().split()
+            if len(parts) < 6:
+                raise ValueError(f"Malformed GARFIELD source BIM row at {bim_path}:{line_no}")
+            chrom = str(parts[0]).strip()
+            try:
+                pos = int(float(parts[3]))
+            except Exception as exc:
+                raise ValueError(f"Invalid GARFIELD source BIM position at {bim_path}:{line_no}") from exc
+            lookup.setdefault((chrom, pos), []).append(
+                (int(n_rows), str(parts[4]).strip().upper(), str(parts[5]).strip().upper())
+            )
+            n_rows += 1
+    return lookup, int(n_rows)
+
+
+def _parse_garfield_literal_token(
+    token: str,
+) -> tuple[str, int, str, bool]:
+    negated = str(token).startswith("!")
+    text = str(token)[1:] if negated else str(token)
+    match = _GARFIELD_LITERAL_RE.match(text.strip())
+    if match is None:
+        raise ValueError(f"Unsupported GARFIELD literal token: {token!r}")
+    chrom = str(match.group(1)).strip()
+    pos = int(match.group(2))
+    allele = str(match.group(3)).strip().upper()
+    if chrom == "" or allele == "":
+        raise ValueError(f"Malformed GARFIELD literal token: {token!r}")
+    return chrom, pos, allele, bool(negated)
+
+
+def _materialize_garfield_pseudo_features(
+    genotype_prefix: str,
+    expressions: typing.Iterable[str],
+    train_sample_indices: np.ndarray,
+    eval_sample_indices: np.ndarray,
+    *,
+    n_samples: int,
+) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, int]]:
+    """Materialize one BIN pseudo feature per unique GARFIELD rule.
+
+    The mode used for heterozygous/missing calls is learned from the training
+    samples only and then applied unchanged to the evaluation samples.  This
+    mirrors GARFIELD's BIN encoder while keeping the CV boundary explicit.
+    """
+    train_idx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
+    eval_idx = np.ascontiguousarray(np.asarray(eval_sample_indices, dtype=np.int64).reshape(-1))
+    if train_idx.size == 0:
+        raise ValueError("GARFIELD pseudo-feature materialization requires non-empty training samples.")
+    if np.any(train_idx < 0) or np.any(train_idx >= int(n_samples)):
+        raise ValueError("GARFIELD training sample indices are out of range.")
+    if np.any(eval_idx < 0) or np.any(eval_idx >= int(n_samples)):
+        raise ValueError("GARFIELD evaluation sample indices are out of range.")
+
+    unique_expr: list[str] = []
+    seen_expr: set[str] = set()
+    for raw in expressions:
+        expr = str(raw).strip()
+        if expr == "" or expr in seen_expr:
+            continue
+        # Validate syntax before touching the BED payload.
+        _split_garfield_rule_expression(expr)
+        seen_expr.add(expr)
+        unique_expr.append(expr)
+    if len(unique_expr) == 0:
+        empty_train = np.zeros((0, int(train_idx.size)), dtype=np.float32)
+        empty_eval = np.zeros((0, int(eval_idx.size)), dtype=np.float32)
+        return empty_train, empty_eval, [], {"rules_seen": 0, "rules_used": 0, "rules_constant": 0}
+
+    bim_lookup, n_snps = _read_garfield_bim_metadata(str(genotype_prefix))
+    payload = open_plink_bed_payload_memmap(
+        str(genotype_prefix),
+        n_samples=int(n_samples),
+        n_snps=int(n_snps),
+    )
+    all_idx = np.concatenate([train_idx, eval_idx]).astype(np.int64, copy=False)
+    literal_tokens: list[str] = []
+    seen_literals: set[str] = set()
+    for expr in unique_expr:
+        literals, _ops = _split_garfield_rule_expression(expr)
+        for token in literals:
+            key = str(token)
+            if key.startswith("!"):
+                key = key[1:]
+            if key not in seen_literals:
+                seen_literals.add(key)
+                literal_tokens.append(key)
+
+    literal_masks: dict[str, np.ndarray] = {}
+    for token in literal_tokens:
+        chrom, pos, target_allele, _negated = _parse_garfield_literal_token(token)
+        candidates = bim_lookup.get((chrom, int(pos)), [])
+        chosen: tuple[int, str, str] | None = None
+        for candidate in candidates:
+            if target_allele in {candidate[1], candidate[2]}:
+                chosen = candidate
+                break
+        if chosen is None:
+            raise ValueError(
+                f"GARFIELD literal {token!r} was not found in source BIM or has incompatible alleles."
+            )
+        row_idx, allele0, allele1 = chosen
+        codes = np.asarray(
+            (payload[int(row_idx), all_idx // 4] >> ((all_idx & 3) * 2)) & 0b11,
+            dtype=np.uint8,
+        )
+        known0 = codes == 0b00
+        known2 = codes == 0b11
+        if target_allele == allele1:
+            hits = known2.copy()
+        elif target_allele == allele0:
+            hits = known0.copy()
+        else:  # pragma: no cover - guarded by candidate selection
+            raise ValueError(f"GARFIELD target allele mismatch for {token!r}")
+        train_known = known0[: int(train_idx.size)] | known2[: int(train_idx.size)]
+        train_hits = hits[: int(train_idx.size)]
+        mode_is_hit = bool(int(np.sum(train_hits & train_known)) > int(np.sum((~train_hits) & train_known)))
+        hits[~(known0 | known2)] = mode_is_hit
+        literal_masks[token] = np.ascontiguousarray(hits, dtype=bool)
+
+    train_rows: list[np.ndarray] = []
+    eval_rows: list[np.ndarray] = []
+    used_names: list[str] = []
+    n_constant = 0
+    n_train = int(train_idx.size)
+    for expr in unique_expr:
+        mask = _evaluate_garfield_rule_expression(expr, literal_masks)
+        train_mask = np.ascontiguousarray(mask[:n_train], dtype=bool)
+        eval_mask = np.ascontiguousarray(mask[n_train:], dtype=bool)
+        if int(np.unique(train_mask).size) < 2:
+            n_constant += 1
+            continue
+        train_rows.append(np.asarray(train_mask, dtype=np.float32) * 2.0)
+        eval_rows.append(np.asarray(eval_mask, dtype=np.float32) * 2.0)
+        used_names.append(expr)
+
+    if len(train_rows) == 0:
+        train_out = np.zeros((0, n_train), dtype=np.float32)
+        eval_out = np.zeros((0, int(eval_idx.size)), dtype=np.float32)
+    else:
+        train_out = np.ascontiguousarray(np.vstack(train_rows), dtype=np.float32)
+        eval_out = np.ascontiguousarray(np.vstack(eval_rows), dtype=np.float32)
+    return train_out, eval_out, used_names, {
+        "rules_seen": int(len(unique_expr)),
+        "rules_used": int(len(used_names)),
+        "rules_constant": int(n_constant),
+    }
+
+
+def _run_garfield_nested_cv(
+    *,
+    genotype_prefix: str,
+    sample_ids: np.ndarray,
+    train_pheno: np.ndarray,
+    train_sample_indices: np.ndarray,
+    test_sample_indices: np.ndarray,
+    cv_splits: list[tuple[np.ndarray, np.ndarray]],
+    outprefix: str,
+    trait_name: str,
+    n_jobs: int,
+    seed: int,
+    maf: float,
+    missing_rate: float,
+    het_threshold: float,
+    logger: logging.Logger | None = None,
+) -> dict[str, typing.Any]:
+    """Run fold-local GARFIELD rule search followed by pseudo-feature GBLUP.
+
+    Every fold searches rules using only its training individuals.  The final
+    prediction model is then refit once on all observed phenotypes, which is
+    valid for an external genotype test set because those phenotypes are not
+    used during rule search.  This routine intentionally does not call the
+    ordinary GS method dispatcher: GARFIELD is an experimental, dedicated
+    nested-CV mode.
+    """
+    if _jxrs is None or not hasattr(_jxrs, "garfield_logic_search_bed"):
+        raise RuntimeError("Rust backend is unavailable: GARFIELD nested GS requires garfield_logic_search_bed.")
+    train_y = np.ascontiguousarray(np.asarray(train_pheno, dtype=np.float64).reshape(-1, 1))
+    train_abs = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
+    test_abs = np.ascontiguousarray(np.asarray(test_sample_indices, dtype=np.int64).reshape(-1))
+    source_ids = np.asarray(sample_ids, dtype=str).reshape(-1)
+    if int(train_y.shape[0]) != int(train_abs.size):
+        raise ValueError("GARFIELD nested GS phenotype/sample index lengths do not match.")
+    if int(source_ids.size) == 0:
+        raise ValueError("GARFIELD nested GS received no source genotype samples.")
+
+    def _search_rules(abs_indices: np.ndarray, y_values: np.ndarray, fold_label: str):
+        abs_idx = np.ascontiguousarray(np.asarray(abs_indices, dtype=np.int64).reshape(-1))
+        y_vec = np.ascontiguousarray(np.asarray(y_values, dtype=np.float64).reshape(-1))
+        if int(abs_idx.size) != int(y_vec.size) or int(abs_idx.size) < 2:
+            raise ValueError(f"GARFIELD {fold_label} requires at least two aligned training samples.")
+        t0 = time.monotonic()
+        result = _jxrs.garfield_logic_search_bed(
+            str(genotype_prefix),
+            y_vec,
+            grm=None,
+            x_cov=None,
+            sample_indices=abs_idx.tolist(),
+            site_keep=None,
+            unit_kind="window",
+            groups=None,
+            null_groups=None,
+            group_names=None,
+            extension=int(_GARFIELD_EXTENSION_BP),
+            step=int(_GARFIELD_STEP_BP),
+            scan_bimranges=None,
+            bin_mode="bin",
+            ml_method="corr",
+            ml_importance="imp",
+            ml_top_k=int(_GARFIELD_ML_TOP_K),
+            ml_top_frac=0.0,
+            permutation_repeats=0,
+            permutation_scoring="auto",
+            rule_null_penalty_method="gev",
+            rule_null_quantile=0.99,
+            rule_null_report_pvalue=False,
+            n_estimators=100,
+            max_depth=5,
+            min_samples_leaf=1,
+            min_samples_split=2,
+            bootstrap=True,
+            feature_subsample=0.0,
+            seed=int(seed),
+            max_pick=5,
+            exhaustive_depth=1,
+            beam_width=int(_GARFIELD_BEAM_WIDTH),
+            rank_score="gain_from_layer:1",
+            maf_threshold=float(maf),
+            logic_maf_threshold=float(maf),
+            max_missing_rate=float(missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=False,
+            block_cols=65536,
+            threads=max(1, int(n_jobs)),
+            low=-5.0,
+            high=5.0,
+            max_iter=50,
+            tol=1e-3,
+            add_intercept=True,
+            exact_n_max=15000,
+            require_lapack=False,
+            out_prefix=None,
+            simbench_path=None,
+            top_rules_per_unit=1,
+            max_output_rules=0,
+            max_output_ratio=0.0,
+            rule_permutation=False,
+            prior_len=None,
+            no_clean=False,
+            raw_design=False,
+            filter_xor_substates=True,
+            xor_search=False,
+            whole_genome_dev_mode=False,
+            progress_callback=None,
+            progress_every=0,
+            logic_mem_budget_bytes=0,
+            diagnostics=False,
+        )
+        # ``expressions`` is the native design syntax (e.g. ``BIN(rs1)``),
+        # whereas ``snp_names`` is the coordinate/allele display syntax that
+        # can be decoded against the source BIM (e.g. ``1_100[G]``).
+        expressions_raw = result.get("snp_names", None)
+        if expressions_raw is None or len(list(expressions_raw)) == 0:
+            expressions_raw = result.get("expressions", [])
+        expressions = [str(x).strip() for x in list(expressions_raw or []) if str(x).strip() != ""]
+        scores_raw = result.get("scores", [])
+        scores = list(scores_raw) if scores_raw is not None else []
+        elapsed = float(time.monotonic() - t0)
+        if logger is not None:
+            logger.info(
+                "GARFIELD %s: searched %d samples, selected %d rules in %.2fs",
+                str(fold_label), int(abs_idx.size), int(len(expressions)), elapsed,
+            )
+        return expressions, scores, elapsed, result
+
+    def _write_rules(path: str, expressions: list[str], scores: list[typing.Any]) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("rule\tscore\n")
+            for i, expression in enumerate(expressions):
+                score = scores[i] if i < len(scores) else ""
+                handle.write(f"{expression}\t{score}\n")
+
+    fold_rows: list[tuple[str, int, float, float, float, float, float, float, float]] = []
+    oof_pred = np.full((int(train_y.shape[0]),), np.nan, dtype=np.float64)
+    best_test = None
+    best_train = None
+    best_r2 = -np.inf
+    fold_rule_counts: list[dict[str, typing.Any]] = []
+    cv_started = time.monotonic()
+    for fold_id, (test_local, train_local) in enumerate(cv_splits, start=1):
+        fold_test_local = np.asarray(test_local, dtype=np.int64).reshape(-1)
+        fold_train_local = np.asarray(train_local, dtype=np.int64).reshape(-1)
+        fold_train_abs = train_abs[fold_train_local]
+        fold_test_abs = train_abs[fold_test_local]
+        expressions, scores, search_elapsed, _search_result = _search_rules(
+            fold_train_abs,
+            train_y[fold_train_local, 0],
+            f"fold {fold_id}/{len(cv_splits)}",
+        )
+        fold_train_x, fold_test_x, used_names, counts = _materialize_garfield_pseudo_features(
+            str(genotype_prefix),
+            expressions,
+            fold_train_abs,
+            fold_test_abs,
+            n_samples=int(source_ids.size),
+        )
+        if len(used_names) == 0:
+            raise RuntimeError(f"GARFIELD fold {fold_id} produced no non-constant pseudo features.")
+        t_fit = time.monotonic()
+        _yhat_train, yhat_test, pve = GSapi(
+            train_y[fold_train_local],
+            fold_train_x,
+            fold_test_x,
+            method="GBLUP",
+            PCAdec=False,
+            n_jobs=max(1, int(n_jobs)),
+            seed=int(seed + fold_id),
+            force_fast=False,
+            need_train_pred=False,
+        )
+        metric = _regression_metric_pack(train_y[fold_test_local, 0], np.asarray(yhat_test).reshape(-1))
+        pred_fold = np.asarray(yhat_test, dtype=np.float64).reshape(-1)
+        oof_pred[fold_test_local] = pred_fold
+        elapsed = float(search_elapsed + (time.monotonic() - t_fit))
+        row = (
+            _GARFIELD_METHOD,
+            int(fold_id),
+            float(metric.get("pearson", np.nan)),
+            float(metric.get("spearman", np.nan)),
+            float(metric.get("r2", np.nan)),
+            float(pve),
+            elapsed,
+            float(metric.get("mse", np.nan)),
+            float(metric.get("mae", np.nan)),
+        )
+        fold_rows.append(row)
+        fold_rule_counts.append({"fold": int(fold_id), **counts, "search_sec": float(search_elapsed)})
+        rule_path = f"{outprefix}.{trait_name}.garfield.cv{int(fold_id)}.rules.tsv"
+        _write_rules(rule_path, used_names, scores[: len(used_names)])
+        ttest = np.column_stack((train_y[fold_test_local, 0], pred_fold))
+        ttrain = np.zeros((0, 2), dtype=np.float64)
+        if float(row[4]) > best_r2:
+            best_r2 = float(row[4])
+            best_test = ttest
+            best_train = ttrain
+
+    cv_elapsed = float(time.monotonic() - cv_started)
+    full_search_started = time.monotonic()
+    full_expressions, full_scores, full_search_elapsed, _full_result = _search_rules(
+        train_abs,
+        train_y[:, 0],
+        "final full-training fit",
+    )
+    full_train_x, full_test_x, full_used_names, full_counts = _materialize_garfield_pseudo_features(
+        str(genotype_prefix),
+        full_expressions,
+        train_abs,
+        test_abs,
+        n_samples=int(source_ids.size),
+    )
+    if len(full_used_names) == 0:
+        raise RuntimeError("GARFIELD final search produced no non-constant pseudo features.")
+    _yhat_train_final, yhat_test_final, pve_final = GSapi(
+        train_y,
+        full_train_x,
+        full_test_x,
+        method="GBLUP",
+        PCAdec=False,
+        n_jobs=max(1, int(n_jobs)),
+        seed=int(seed),
+        force_fast=False,
+        need_train_pred=False,
+    )
+    final_elapsed = float(time.monotonic() - full_search_started)
+    final_rule_path = f"{outprefix}.{trait_name}.garfield.final.rules.tsv"
+    _write_rules(final_rule_path, full_used_names, full_scores[: len(full_used_names)])
+    if logger is not None:
+        logger.info(
+            "GARFIELD final: selected %d/%d rules, %d pseudo features, %.2fs",
+            int(len(full_used_names)), int(full_counts.get("rules_seen", 0)),
+            int(full_train_x.shape[0]), final_elapsed,
+        )
+    oof_metrics = _regression_metric_pack(train_y[:, 0], oof_pred)
+    return {
+        "method": _GARFIELD_METHOD,
+        "method_display": _method_display_name(_GARFIELD_METHOD),
+        "fold_rows": fold_rows,
+        "best_test": best_test,
+        "best_train": best_train,
+        "oof_pred": oof_pred.reshape(-1, 1),
+        "oof_truth": train_y.reshape(-1, 1),
+        "oof_sample_ids": source_ids[train_abs],
+        "test_pred": np.asarray(yhat_test_final, dtype=np.float64).reshape(-1, 1),
+        "pve_final": float(pve_final),
+        "cv_mode": "nested_garfield_cv",
+        "cv_skipped": False,
+        "final_fit_skipped": False,
+        "final_predict_skipped": int(test_abs.size) == 0,
+        "elapsed_cv_sec": cv_elapsed,
+        "elapsed_fit_sec": float(full_search_elapsed),
+        "elapsed_predict_sec": float(max(0.0, final_elapsed - full_search_elapsed)),
+        "elapsed_total_sec": float(cv_elapsed + final_elapsed),
+        "garfield_nested": {
+            "fold_rule_counts": fold_rule_counts,
+            "final_rule_counts": dict(full_counts),
+            "final_pseudo_features": int(full_train_x.shape[0]),
+            "oof_metrics": oof_metrics,
+            "final_rules_file": final_rule_path,
+        },
+        "model_state": None,
+        "gblup_final_state": None,
+        "rrblup_final_state": None,
+        "rrblup_final_cfg": None,
+        "rrblup_pve_final": None,
+    }
 
 
 @dataclass(frozen=True)
@@ -1335,6 +1842,8 @@ def _method_display_name(method: str) -> str:
         return BLUP_METHOD
     if _is_gblup_method(m):
         return _gblup_method_display(m)
+    if m == _GARFIELD_METHOD:
+        return "GARFIELD-GBLUP"
     return m
 
 
@@ -1498,7 +2007,8 @@ def _marker_count_from_inputs(
     return 0
 
 
-_JXMODEL_FORMAT = "janusx.gs.jxmodel.v1"
+_JXMODEL_FORMAT = "janusx.gs.jxmodel.v2"
+_JXMODEL_LEGACY_FORMAT = "janusx.gs.jxmodel.v1"
 _JXMODEL_TOP_BUNDLE_METHOD = "GS_TOP_BUNDLE"
 _SELECT_INTERACTIVE_SENTINEL = "__JX_INTERACTIVE_TOP_SELECT__"
 
@@ -1514,14 +2024,23 @@ def _is_top_bundle_payload(payload: typing.Mapping[str, typing.Any]) -> bool:
 def _is_jxmodel_export_supported(method: str) -> bool:
     m = str(method)
     return bool(
-        (m == "rrBLUP")
+        _is_blup_method(m)
+        or _is_gblup_method(m)
+        or (m == "rrBLUP")
         or (m in _ML_METHOD_MAP)
+        or (m in _GS_BAYES_METHODS)
     )
 
 
 def _is_binary_jxmodel_artifact_supported(method: str) -> bool:
     m = str(method).strip()
-    return bool(_is_gblup_method(m) or (m == "rrBLUP") or (m in _ML_METHOD_MAP))
+    return bool(
+        _is_blup_method(m)
+        or _is_gblup_method(m)
+        or (m == "rrBLUP")
+        or (m in _ML_METHOD_MAP)
+        or (m in _GS_BAYES_METHODS)
+    )
 
 
 def _is_text_effect_jxmodel_supported(method: str) -> bool:
@@ -1544,13 +2063,9 @@ def _resolve_save_model_artifact_kind(
     requested_method: str,
     effect_export_method: str,
 ) -> str:
-    req = str(requested_method).strip()
-    eff = str(effect_export_method).strip()
-    if _is_text_effect_jxmodel_supported(req):
-        return "text_effect"
-    if _is_binary_jxmodel_artifact_supported(req):
+    if _is_binary_jxmodel_artifact_supported(str(requested_method).strip()):
         return "binary_jxmodel"
-    if _is_binary_jxmodel_artifact_supported(eff):
+    if _is_binary_jxmodel_artifact_supported(str(effect_export_method).strip()):
         return "binary_jxmodel"
     return "none"
 
@@ -1701,10 +2216,132 @@ def _resolve_jxmodel_file(
     )
 
 
-def _save_jxmodel(path: str, payload: dict[str, typing.Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as fh:
-        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+def _jxmodel_marker_table_bytes(marker_table: pd.DataFrame | None) -> bytes | None:
+    if marker_table is None:
+        return None
+    table = marker_table.copy()
+    if int(table.shape[1]) == 0:
+        return b""
+    # Keep the embedded table deterministic and shell-friendly.  The table is
+    # metadata for view/postgs and is also the prediction preprocessing source.
+    numeric_columns = {
+        "af",
+        "inv_sd",
+        "beta",
+        "imp",
+        "pip",
+    }
+    numeric_columns.update(
+        str(column)
+        for column in table.columns
+        if str(column).lower().startswith("component_prob_")
+    )
+
+    def _format_value(value: typing.Any, column: str) -> str:
+        if str(column).lower() not in numeric_columns:
+            return str(value)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "NA"
+        if not np.isfinite(number):
+            return "NA"
+        if number == 0.0:
+            return "0.0000"
+        if abs(number) < 1e-4:
+            return f"{number:.4e}"
+        return f"{number:.4f}"
+
+    for column in table.columns:
+        if str(column).lower() in numeric_columns:
+            table[column] = [_format_value(value, str(column)) for value in table[column]]
+    buf = io.StringIO()
+    table.to_csv(
+        buf,
+        sep="\t",
+        index=False,
+        na_rep="NA",
+        lineterminator="\n",
+    )
+    return buf.getvalue().encode("utf-8")
+
+
+def _jxmodel_manifest_payload(
+    payload: typing.Mapping[str, typing.Any],
+    *,
+    marker_table: pd.DataFrame | None,
+    entries: dict[str, bytes],
+) -> dict[str, typing.Any]:
+    state = payload.get("model_state", {})
+    state_map = state if isinstance(state, typing.Mapping) else {}
+    manifest: dict[str, typing.Any] = {
+        "format": _JXMODEL_FORMAT,
+        "container": "zip",
+        "method": str(payload.get("method", state_map.get("method", ""))),
+        "trait": str(payload.get("trait", "")),
+        "created_at_unix": payload.get("created_at_unix", None),
+        "model_state_kind": str(state_map.get("kind", "")),
+        "n_markers": 0 if marker_table is None else int(marker_table.shape[0]),
+        "marker_columns": [] if marker_table is None else [str(x) for x in marker_table.columns],
+        "entries": {},
+    }
+    for name, data in entries.items():
+        manifest["entries"][str(name)] = {
+            "bytes": int(len(data)),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    for key in ("export_scale_meta", "training"):
+        if key in payload:
+            manifest[key] = _json_safe(payload[key])
+    return typing.cast(dict[str, typing.Any], _json_safe(manifest))
+
+
+def _save_jxmodel(
+    path: str,
+    payload: dict[str, typing.Any],
+    *,
+    marker_table: pd.DataFrame | None = None,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload_out = dict(payload)
+    payload_out["format"] = _JXMODEL_FORMAT
+    payload_bytes = pickle.dumps(payload_out, protocol=pickle.HIGHEST_PROTOCOL)
+    entries: dict[str, bytes] = {"payload.pkl": payload_bytes}
+    marker_bytes = _jxmodel_marker_table_bytes(marker_table)
+    if marker_bytes is not None:
+        entries["markers.tsv"] = marker_bytes
+    manifest = _jxmodel_manifest_payload(
+        payload_out,
+        marker_table=marker_table,
+        entries=entries,
+    )
+    manifest_bytes = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with zipfile.ZipFile(
+            tmp_path,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+            allowZip64=True,
+        ) as archive:
+            archive.writestr("manifest.json", manifest_bytes)
+            for name, data in entries.items():
+                archive.writestr(str(name), data)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def _format_effect_beta(x: float) -> str:
@@ -1734,16 +2371,133 @@ def _save_effect_text_jxmodel(path: str, table: pd.DataFrame) -> None:
 
 
 def _load_jxmodel(path: str) -> dict[str, typing.Any]:
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path, mode="r") as archive:
+            try:
+                manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            except KeyError as exc:
+                raise ValueError(f"Missing manifest.json in jxmodel container: {path}") from exc
+            if not isinstance(manifest, dict):
+                raise ValueError(f"Invalid jxmodel manifest type in: {path}")
+            fmt = str(manifest.get("format", "")).strip()
+            if fmt != _JXMODEL_FORMAT:
+                raise ValueError(
+                    f"Unsupported jxmodel container format: {fmt!r}. "
+                    f"Expected {_JXMODEL_FORMAT!r}."
+                )
+            entries = manifest.get("entries", {})
+            if not isinstance(entries, dict):
+                raise ValueError(f"Invalid jxmodel manifest entries in: {path}")
+
+            def _read_entry(name: str) -> bytes:
+                if name not in archive.namelist():
+                    raise ValueError(f"Missing {name} in jxmodel container: {path}")
+                data = archive.read(name)
+                meta = entries.get(name, {})
+                if isinstance(meta, dict):
+                    expected_sha = str(meta.get("sha256", "")).strip()
+                    if expected_sha and hashlib.sha256(data).hexdigest() != expected_sha:
+                        raise ValueError(f"Checksum mismatch for {name} in jxmodel: {path}")
+                return data
+
+            payload = pickle.loads(_read_entry("payload.pkl"))
+            if not isinstance(payload, dict):
+                raise ValueError(f"Invalid jxmodel payload type: {type(payload)!r}")
+            payload["format"] = _JXMODEL_FORMAT
+            payload["_jxmodel_manifest"] = manifest
+            marker_name = "markers.tsv"
+            if marker_name in archive.namelist():
+                marker_bytes = _read_entry(marker_name)
+                if len(marker_bytes) == 0:
+                    marker_table = pd.DataFrame()
+                else:
+                    marker_table = pd.read_csv(
+                        io.BytesIO(marker_bytes),
+                        sep="\t",
+                        dtype={
+                            "chr": str,
+                            "snp": str,
+                            "allele0": str,
+                            "allele1": str,
+                            "ref": str,
+                            "alt": str,
+                            "effect_allele": str,
+                        },
+                    )
+                payload["_jxmodel_marker_table"] = marker_table
+            return typing.cast(dict[str, typing.Any], payload)
+
     with open(path, "rb") as fh:
         obj = pickle.load(fh)
     if not isinstance(obj, dict):
         raise ValueError(f"Invalid jxmodel payload type: {type(obj)!r}")
     fmt = str(obj.get("format", "")).strip()
-    if fmt != _JXMODEL_FORMAT:
+    if fmt not in {_JXMODEL_FORMAT, _JXMODEL_LEGACY_FORMAT}:
         raise ValueError(
-            f"Unsupported jxmodel format: {fmt!r}. Expected {_JXMODEL_FORMAT!r}."
+            f"Unsupported jxmodel format: {fmt!r}. Expected {_JXMODEL_FORMAT!r} "
+            f"or legacy {_JXMODEL_LEGACY_FORMAT!r}."
         )
     return typing.cast(dict[str, typing.Any], obj)
+
+
+def _load_legacy_text_effect_jxmodel(path: str) -> dict[str, typing.Any]:
+    """Load pre-v2 effect tables that were incorrectly named ``.jxmodel``."""
+    try:
+        table = pd.read_csv(path, sep="\t")
+        if int(table.shape[1]) <= 1:
+            table = pd.read_csv(path, sep=None, engine="python")
+    except Exception as exc:
+        raise ValueError(f"Cannot parse legacy text .jxmodel: {path}: {exc}") from exc
+    columns = {str(c).strip().lower(): c for c in table.columns}
+
+    def _column(names: tuple[str, ...], required: bool = True) -> str | None:
+        for name in names:
+            if name in columns:
+                return str(columns[name])
+        if required:
+            raise ValueError(
+                f"Legacy text .jxmodel {path} requires one of columns: {', '.join(names)}"
+            )
+        return None
+
+    chr_col = _column(("chr", "chrom", "chromosome"))
+    pos_col = _column(("pos", "bp", "position"))
+    beta_col = _column(("beta", "effect", "coefficient", "coef"))
+    snp_col = _column(("snp", "id", "marker", "rs"), required=False)
+    normalized = pd.DataFrame(
+        {
+            "chr": table[chr_col].astype(str),
+            "pos": pd.to_numeric(table[pos_col], errors="raise").astype(np.int64),
+            "snp": (
+                table[snp_col].astype(str)
+                if snp_col is not None
+                else pd.Series([f"SNP{i + 1}" for i in range(len(table))])
+            ),
+            "beta": pd.to_numeric(table[beta_col], errors="raise").astype(np.float64),
+        }
+    )
+    method = _parse_jxmodel_method_from_name(path) or "effect"
+    base = os.path.basename(str(path))
+    stem = base[: -len(".jxmodel")] if base.lower().endswith(".jxmodel") else base
+    method_token = f".{method}"
+    trait = stem[: -len(method_token)] if stem.endswith(method_token) else stem
+    state: dict[str, typing.Any] = {
+        "kind": "text_effect_linear",
+        "method": str(method),
+        "beta": np.ascontiguousarray(normalized["beta"].to_numpy(dtype=np.float64)),
+        "alpha": 0.0,
+        "standardized": False,
+        "legacy_text_effect": True,
+    }
+    return {
+        "format": _JXMODEL_LEGACY_FORMAT,
+        "method": str(method),
+        "method_display": _method_display_name(str(method)),
+        "trait": str(trait),
+        "model_state": state,
+        "_jxmodel_marker_table": normalized,
+        "_jxmodel_legacy_text": True,
+    }
 
 
 def _strip_plink_suffix(path_or_prefix: str) -> str:
@@ -1757,6 +2511,13 @@ def _strip_plink_suffix(path_or_prefix: str) -> str:
 def _read_plink_bim_effect_meta(
     prefix_or_bim: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    chrom, pos, snp, _ref, _alt = _read_plink_bim_marker_meta(prefix_or_bim)
+    return chrom, pos, snp
+
+
+def _read_plink_bim_marker_meta(
+    prefix_or_bim: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     prefix = _strip_plink_suffix(str(prefix_or_bim))
     bim_path = prefix if str(prefix).lower().endswith(".bim") else f"{prefix}.bim"
     if not os.path.isfile(bim_path):
@@ -1765,6 +2526,8 @@ def _read_plink_bim_effect_meta(
     chrom: list[str] = []
     pos: list[int] = []
     snp: list[str] = []
+    ref: list[str] = []
+    alt: list[str] = []
     with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
         for line_no, line in enumerate(fh, start=1):
             s = str(line).strip()
@@ -1782,10 +2545,14 @@ def _read_plink_bim_effect_meta(
                 p = int(float(parts[3]))
             pos.append(int(p))
             snp.append(str(parts[1]))
+            ref.append(str(parts[4]))
+            alt.append(str(parts[5]))
     return (
         np.asarray(chrom, dtype=object),
         np.asarray(pos, dtype=np.int64),
         np.asarray(snp, dtype=object),
+        np.asarray(ref, dtype=object),
+        np.asarray(alt, dtype=object),
     )
 
 
@@ -2160,6 +2927,7 @@ def _attach_effect_export_hints_to_model_state(
     model_state: dict[str, typing.Any],
     packed_ctx: dict[str, typing.Any] | None,
     genotype_prefix_hint: str | None,
+    training_sample_indices: np.ndarray | None = None,
 ) -> None:
     prefix_hint = str(genotype_prefix_hint or "").strip()
     if prefix_hint != "":
@@ -2190,6 +2958,112 @@ def _attach_effect_export_hints_to_model_state(
                 or not np.array_equal(keep_idx, active_row_idx)
             ):
                 model_state["export_active_row_idx"] = active_row_idx
+
+    # Freeze the training allele orientation and statistics in the artifact.
+    # Prediction must never infer these from the deployment cohort: its AF can
+    # differ because of sampling, ascertainment, or a different population.
+    if int(active_row_idx.size) > 0:
+        try:
+            row_flip_raw = packed_local.get("row_flip", None)
+            if row_flip_raw is not None:
+                row_flip_active = _packed_ctx_select_active_metadata(
+                    row_flip_raw,
+                    active_row_idx,
+                    dtype=np.bool_,
+                    name="row_flip",
+                )
+                if site_keep_arr is not None:
+                    row_flip_full = np.zeros(site_keep_arr.shape[0], dtype=np.bool_)
+                    if int(np.max(active_row_idx)) >= int(row_flip_full.shape[0]):
+                        raise ValueError("row_flip source rows exceed export_site_keep length")
+                    row_flip_full[active_row_idx] = row_flip_active
+                    model_state["export_row_flip"] = np.ascontiguousarray(
+                        row_flip_full,
+                        dtype=np.bool_,
+                    )
+                else:
+                    model_state["export_row_flip"] = np.ascontiguousarray(
+                        row_flip_active,
+                        dtype=np.bool_,
+                    )
+
+            maf_raw = packed_local.get("maf", packed_local.get("af", None))
+            if maf_raw is not None:
+                training_maf = _packed_ctx_select_active_metadata(
+                    maf_raw,
+                    active_row_idx,
+                    dtype=np.float32,
+                    name="maf",
+                )
+                model_state["export_training_maf"] = np.ascontiguousarray(
+                    training_maf,
+                    dtype=np.float32,
+                )
+
+                # Prefer exact training means already attached to the model
+                # (strict-train linear models and ML estimators).  Otherwise
+                # the oriented training AF gives the same mean-imputation
+                # convention used by the packed decoder.
+                n_active = int(active_row_idx.size)
+                state_mean_raw = model_state.get("row_mean", None)
+                state_mean = (
+                    np.asarray(state_mean_raw, dtype=np.float32).reshape(-1)
+                    if state_mean_raw is not None
+                    else np.asarray([], dtype=np.float32)
+                )
+                if int(state_mean.size) != n_active:
+                    marker_mean_raw = model_state.get("marker_means", None)
+                    marker_mean = (
+                        np.asarray(marker_mean_raw, dtype=np.float32).reshape(-1)
+                        if marker_mean_raw is not None
+                        else np.asarray([], dtype=np.float32)
+                    )
+                    state_mean = marker_mean if int(marker_mean.size) == n_active else np.asarray([], dtype=np.float32)
+                if int(state_mean.size) != n_active and training_sample_indices is not None:
+                    train_idx = np.ascontiguousarray(
+                        np.asarray(training_sample_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                    if int(train_idx.size) > 0:
+                        try:
+                            training_mean, _training_inv_sd = _ensure_packed_standard_stats_cached(
+                                packed_local,
+                                sample_indices=train_idx,
+                                std_mode="strict_train",
+                            )
+                            training_mean = _packed_ctx_select_active_metadata(
+                                training_mean,
+                                active_row_idx,
+                                dtype=np.float32,
+                                name="training_row_mean",
+                            )
+                        except Exception:
+                            # Optional export metadata must not make a fitted
+                            # model unsaveable; the oriented AF fallback below
+                            # remains safe when exact subset statistics are unavailable.
+                            training_mean = None
+                        if training_mean is not None:
+                            state_mean = training_mean
+                if int(state_mean.size) != n_active:
+                    state_mean = np.asarray(2.0 * training_maf, dtype=np.float32)
+                model_state["export_training_dosage_mean"] = np.ascontiguousarray(
+                    state_mean,
+                    dtype=np.float32,
+                )
+
+            state_inv_raw = model_state.get("row_inv_sd", None)
+            if state_inv_raw is not None:
+                state_inv = np.asarray(state_inv_raw, dtype=np.float32).reshape(-1)
+                if int(state_inv.size) == int(active_row_idx.size):
+                    model_state["export_training_row_inv_sd"] = np.ascontiguousarray(
+                        state_inv,
+                        dtype=np.float32,
+                    )
+        except Exception as ex:
+            # Do not make effect-table export fail just because optional
+            # deployment metadata is unavailable; model-only prediction will
+            # report the missing metadata explicitly.
+            model_state["export_alignment_metadata_error"] = str(ex)
 
 
 def _pcg_trace_policy_for_export(
@@ -2629,6 +3503,223 @@ def _build_method_effect_table(
         "notes": list(notes),
     }
     return table, meta
+
+
+def _build_jxmodel_marker_table(
+    *,
+    model_state: dict[str, typing.Any],
+    packed_ctx: dict[str, typing.Any] | None,
+    genotype_prefix_hint: str | None,
+    fallback_marker_count: int | None,
+    marker_meta: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict[str, typing.Any]]:
+    """Build the self-contained marker audit table embedded in a v2 model."""
+    table, meta = _build_method_effect_table(
+        model_state=model_state,
+        packed_ctx=packed_ctx,
+        genotype_prefix_hint=genotype_prefix_hint,
+        fallback_marker_count=fallback_marker_count,
+    )
+    out = table.copy()
+    n_rows = int(out.shape[0])
+    active_idx = np.zeros((0,), dtype=np.int64)
+    active_raw = model_state.get("export_active_row_idx", None)
+    if active_raw is not None:
+        try:
+            active_idx = np.ascontiguousarray(
+                np.asarray(active_raw, dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+        except Exception:
+            active_idx = np.zeros((0,), dtype=np.int64)
+    if int(active_idx.size) == 0:
+        keep_raw = model_state.get("export_site_keep", None)
+        if keep_raw is not None:
+            keep = np.asarray(keep_raw, dtype=np.bool_).reshape(-1)
+            active_idx = np.flatnonzero(keep).astype(np.int64, copy=False)
+    if int(active_idx.size) != n_rows:
+        active_idx = np.arange(n_rows, dtype=np.int64)
+
+    def _select_vector(
+        value: typing.Any,
+        *,
+        dtype: typing.Any,
+        fill: typing.Any,
+    ) -> np.ndarray:
+        if value is None:
+            return np.full((n_rows,), fill, dtype=dtype)
+        try:
+            arr = np.asarray(value, dtype=dtype).reshape(-1)
+        except Exception:
+            return np.full((n_rows,), fill, dtype=dtype)
+        if int(arr.size) == n_rows:
+            return np.ascontiguousarray(arr, dtype=dtype)
+        if int(active_idx.size) == n_rows and int(active_idx.size) > 0 and int(np.max(active_idx)) < int(arr.size):
+            return np.ascontiguousarray(arr[active_idx], dtype=dtype)
+        return np.full((n_rows,), fill, dtype=dtype)
+
+    ref = np.full((n_rows,), "", dtype=object)
+    alt = np.full((n_rows,), "", dtype=object)
+    metadata_source = str(meta.get("metadata_source", "")).strip()
+    if metadata_source and _is_plink_prefix(_strip_plink_suffix(metadata_source)):
+        try:
+            _chrom_full, _pos_full, _snp_full, ref_full, alt_full = _read_plink_bim_marker_meta(
+                metadata_source
+            )
+            if int(active_idx.size) == n_rows and int(np.max(active_idx, initial=-1)) < int(ref_full.size):
+                ref = np.asarray(ref_full[active_idx], dtype=object)
+                alt = np.asarray(alt_full[active_idx], dtype=object)
+        except Exception:
+            pass
+
+    row_flip = _select_vector(
+        model_state.get("export_row_flip", None), dtype=np.bool_, fill=False
+    )
+    train_af = _select_vector(
+        model_state.get("export_training_maf", None), dtype=np.float32, fill=np.nan
+    )
+    impute = _select_vector(
+        model_state.get("export_training_dosage_mean", None),
+        dtype=np.float32,
+        fill=np.nan,
+    )
+    row_mean = _select_vector(
+        model_state.get("row_mean", None), dtype=np.float32, fill=np.nan
+    )
+    if not np.any(np.isfinite(row_mean)):
+        # ML estimators retain their training-space marker means under this
+        # name; use them as the AF source when no linear-model row statistics
+        # are present (for example, VCF/HMP input without a packed context).
+        row_mean = _select_vector(
+            model_state.get("marker_means", None), dtype=np.float32, fill=np.nan
+        )
+    row_inv_sd = _select_vector(
+        model_state.get("export_training_row_inv_sd", model_state.get("row_inv_sd", None)),
+        dtype=np.float32,
+        fill=np.nan,
+    )
+    if _looks_like_packed_ctx(packed_ctx):
+        packed_local = typing.cast(dict[str, typing.Any], packed_ctx)
+        packed_active = _packed_ctx_active_row_idx(packed_local)
+
+        def _select_packed(value: typing.Any, fill: float = np.nan) -> np.ndarray:
+            if value is None:
+                return np.full((n_rows,), fill, dtype=np.float32)
+            arr = np.asarray(value, dtype=np.float32).reshape(-1)
+            if int(arr.size) == n_rows:
+                return np.ascontiguousarray(arr, dtype=np.float32)
+            if int(arr.size) == int(packed_active.size):
+                return np.ascontiguousarray(arr, dtype=np.float32)
+            if int(packed_active.size) == n_rows and int(np.max(packed_active, initial=-1)) < int(arr.size):
+                return np.ascontiguousarray(arr[packed_active], dtype=np.float32)
+            return np.full((n_rows,), fill, dtype=np.float32)
+
+        if np.all(~np.isfinite(train_af)):
+            train_af = _select_packed(packed_local.get("maf", packed_local.get("af", None)))
+
+    effect_kind = str(meta.get("effect_kind", "")).strip().lower()
+    effect_column = "imp" if effect_kind == "importance" else "beta"
+    effect_values = pd.to_numeric(out["beta"], errors="coerce").to_numpy(dtype=np.float64)
+
+    # `marker_meta` is emitted by generic genotype readers after their own
+    # filtering/orientation.  Its alleles are therefore already in training
+    # dosage order; PLINK BIM metadata still needs the model's MAF flip.
+    marker_meta_oriented = False
+    if marker_meta is not None:
+        marker_meta_local = marker_meta.copy()
+        if int(marker_meta_local.shape[0]) != n_rows:
+            raise ValueError(
+                "Embedded genotype site metadata does not match model effects: "
+                f"metadata_rows={marker_meta_local.shape[0]}, effect_rows={n_rows}."
+            )
+
+        def _meta_column(names: tuple[str, ...]) -> pd.Series | None:
+            columns = {str(c).strip().lower(): c for c in marker_meta_local.columns}
+            for name in names:
+                if name in columns:
+                    return marker_meta_local[columns[name]]
+            return None
+
+        meta_chr = _meta_column(("chr", "chrom", "chromosome"))
+        meta_pos = _meta_column(("pos", "bp", "position"))
+        meta_snp = _meta_column(("snp", "id", "marker", "rs"))
+        meta_ref = _meta_column(("allele0", "ref", "ref_allele"))
+        meta_alt = _meta_column(("allele1", "alt", "alt_allele"))
+        if meta_chr is not None:
+            out["chr"] = meta_chr.astype(str).to_numpy(dtype=object)
+        if meta_pos is not None:
+            out["pos"] = pd.to_numeric(meta_pos, errors="raise").astype(np.int64).to_numpy()
+        if meta_snp is not None:
+            out["snp"] = meta_snp.astype(str).to_numpy(dtype=object)
+        if meta_ref is not None:
+            ref = meta_ref.astype(str).to_numpy(dtype=object)
+        if meta_alt is not None:
+            alt = meta_alt.astype(str).to_numpy(dtype=object)
+        meta_train_af = _meta_column(("af", "train_af", "frequency"))
+        if meta_train_af is not None and np.all(~np.isfinite(train_af)):
+            train_af = pd.to_numeric(meta_train_af, errors="coerce").to_numpy(dtype=np.float32)
+        meta["metadata_source"] = "genotype-site-metadata"
+        marker_meta_oriented = meta_ref is not None or meta_alt is not None
+
+    if marker_meta_oriented:
+        allele0 = np.asarray(ref, dtype=object)
+        allele1 = np.asarray(alt, dtype=object)
+    else:
+        allele0 = np.asarray(ref, dtype=object).copy()
+        allele1 = np.asarray(alt, dtype=object).copy()
+        flip_rows = np.flatnonzero(row_flip)
+        if int(flip_rows.size) > 0:
+            old_allele0 = allele0[flip_rows].copy()
+            allele0[flip_rows] = allele1[flip_rows]
+            allele1[flip_rows] = old_allele0
+    allele0 = np.asarray(
+        ["NA" if str(value).strip() == "" else str(value) for value in allele0],
+        dtype=object,
+    )
+    allele1 = np.asarray(
+        ["NA" if str(value).strip() == "" else str(value) for value in allele1],
+        dtype=object,
+    )
+
+    # AF is the only stored imputation statistic.  Prefer the exact training
+    # mean when it is available, then derive AF as mean / 2.  This keeps the
+    # model-only path deterministic without storing a duplicate MEAN column.
+    dosage_mean = np.asarray(impute, dtype=np.float64)
+    state_mean = np.asarray(row_mean, dtype=np.float64)
+    af_values = np.asarray(train_af, dtype=np.float64)
+    use_mean = np.isfinite(dosage_mean)
+    if state_mean.shape == dosage_mean.shape:
+        dosage_mean = np.where(use_mean, dosage_mean, state_mean)
+        use_mean |= np.isfinite(state_mean)
+    af_values = np.where(use_mean, dosage_mean * 0.5, af_values)
+    af_values = np.where(np.isfinite(af_values), af_values, np.nan)
+
+    canonical: dict[str, typing.Any] = {
+        "chr": np.asarray(out["chr"], dtype=object),
+        "pos": np.asarray(out["pos"], dtype=np.int64),
+        "snp": np.asarray(out["snp"], dtype=object),
+        "allele0": allele0,
+        "allele1": allele1,
+        "af": af_values,
+        effect_column: effect_values,
+        "inv_sd": np.asarray(row_inv_sd, dtype=np.float64),
+    }
+    if "pip" in out.columns:
+        canonical["pip"] = pd.to_numeric(out["pip"], errors="coerce").to_numpy(dtype=np.float64)
+    for component_name in out.columns:
+        if str(component_name).lower().startswith("component_prob_"):
+            canonical[str(component_name)] = pd.to_numeric(
+                out[component_name], errors="coerce"
+            ).to_numpy(dtype=np.float64)
+
+    meta["effect_column"] = effect_column
+    meta["effect_non_nan_rows"] = int(np.sum(np.isfinite(effect_values)))
+    meta["effect_scale"] = meta.get("beta_scale", "")
+    if effect_column == "imp":
+        meta["imp_source"] = str(meta.get("effect_source", ""))
+        meta["imp_available"] = bool(np.any(np.isfinite(effect_values)))
+        meta["imp_non_nan_rows"] = int(np.sum(np.isfinite(effect_values)))
+    return pd.DataFrame(canonical), meta
 
 
 def _sanitize_artifact_token(token: str) -> str:
@@ -10598,6 +11689,7 @@ def _run_method_task(
         "BayesB",
         "BayesC",
         "BayesR",
+        _GARFIELD_METHOD,
     }
     bayes_methods = {"BayesA", "BayesB", "BayesC", "BayesR"}
     bayes_cfg_base = dict(bayes_auto_r2_cfg or {})
@@ -12852,11 +13944,21 @@ def _predict_from_loaded_model_state(
                 "predicted by the additive marker decoder; dominance model reload "
                 "is not supported yet."
             )
-        alpha0 = float(model_state.get("alpha", 0.0))
         beta_raw = model_state.get("kernel_projection", model_state.get("beta", None))
         if beta_raw is None:
             raise ValueError(f"Loaded GBLUP model for {m} is missing kernel projection effects.")
         beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+        alpha0 = float(model_state.get("prediction_alpha_raw_012", model_state.get("alpha", 0.0)))
+        if "prediction_alpha_raw_012" not in model_state and not bool(
+            model_state.get("standardized", False)
+        ):
+            training_mean_raw = model_state.get("export_training_dosage_mean", None)
+            if training_mean_raw is not None:
+                training_mean = np.asarray(training_mean_raw, dtype=np.float64).reshape(-1)
+                if int(training_mean.size) == int(beta.size) and np.all(np.isfinite(training_mean)):
+                    # Older artifacts stored the centered-kernel intercept as
+                    # alpha=mean(y).  Convert it back to the raw 0/1/2 scale.
+                    alpha0 = float(alpha0 - float(np.dot(training_mean, beta)))
         block_rows = int(max(1, int(model_state.get("snp_block_size", 2048))))
         sample_chunk = int(max(1, int(model_state.get("sample_chunk_size", 4096))))
         if packed_ctx is not None and packed_sample_indices is not None:
@@ -12892,6 +13994,26 @@ def _predict_from_loaded_model_state(
             f"Loaded AD GBLUP model for {m} cannot be predicted yet; "
             "AD model reload requires separate additive and dominance decoders."
         )
+
+    if kind == "text_effect_linear":
+        if dense_matrix is None:
+            raise ValueError(f"Loaded text effect model {m} requires dense genotype matrix.")
+        beta = np.asarray(
+            model_state.get("beta", np.zeros((0,), dtype=np.float64)),
+            dtype=np.float64,
+        ).reshape(-1)
+        x = np.asarray(dense_matrix, dtype=np.float64)
+        if x.ndim != 2 or int(x.shape[0]) != int(beta.size):
+            raise ValueError(
+                f"Loaded text effect marker mismatch: matrix={x.shape}, beta={beta.size}."
+            )
+        pred = np.full(
+            (int(x.shape[1]),),
+            float(model_state.get("alpha", 0.0)),
+            dtype=np.float64,
+        )
+        pred += np.asarray(x.T @ beta, dtype=np.float64).reshape(-1)
+        return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
 
     if kind == "mlsk_model":
         estimator = model_state.get("estimator", None)
@@ -13089,6 +14211,896 @@ def _run_loaded_model_task(
         "cv_skipped": bool((cv_splits is None) or (len(cv_splits) == 0)),
         "final_fit_skipped": False,
         "final_predict_skipped": False,
+    }
+
+
+def _gs_model_paths_from_args(args: typing.Any) -> list[str]:
+    raw = getattr(args, "model_paths", None)
+    if raw is None:
+        raw = getattr(args, "model", None)
+    if raw is None:
+        return []
+    values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+    return [
+        os.path.expanduser(str(value).strip())
+        for value in values
+        if str(value).strip() != ""
+    ]
+
+
+def _expand_model_only_paths(model_paths: typing.Sequence[str]) -> list[str]:
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for raw_path in model_paths:
+        path = os.path.expanduser(str(raw_path).strip())
+        if os.path.isdir(path):
+            candidates = sorted(glob.glob(os.path.join(path, "*.jxmodel")))
+            if len(candidates) == 0:
+                raise FileNotFoundError(
+                    f"No .jxmodel files found in model directory: {path}"
+                )
+        elif os.path.isfile(path):
+            candidates = [path]
+        else:
+            raise FileNotFoundError(f"Model path does not exist: {path}")
+        for candidate in candidates:
+            normalized = os.path.abspath(candidate)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            expanded.append(candidate)
+    if len(expanded) == 0:
+        raise ValueError("No model artifacts were supplied for prediction-only mode.")
+    return expanded
+
+
+def _loaded_model_feature_count(model_state: typing.Mapping[str, typing.Any]) -> int | None:
+    kind = str(model_state.get("kind", "")).strip().lower()
+    if kind == "mlsk_model":
+        marker_means = np.asarray(
+            model_state.get("marker_means", np.zeros((0,), dtype=np.float32))
+        ).reshape(-1)
+        if int(marker_means.size) > 0:
+            return int(marker_means.size)
+        estimator = model_state.get("estimator", None)
+        try:
+            value = int(getattr(estimator, "n_features_in_"))
+        except Exception:
+            value = 0
+        return value if value > 0 else None
+    if kind in {"rrblup_linear", "bayes_linear"}:
+        beta = np.asarray(model_state.get("beta", np.zeros((0,))), dtype=np.float64).reshape(-1)
+        return int(beta.size) if int(beta.size) > 0 else None
+    if kind == "gblup_kernel_projection":
+        beta_raw = model_state.get("kernel_projection", model_state.get("beta", None))
+        if beta_raw is None:
+            return None
+        beta = np.asarray(beta_raw, dtype=np.float64).reshape(-1)
+        return int(beta.size) if int(beta.size) > 0 else None
+    for key in ("beta", "marker_means"):
+        raw = model_state.get(key, None)
+        if raw is None:
+            continue
+        values = np.asarray(raw).reshape(-1)
+        if int(values.size) > 0:
+            return int(values.size)
+    return None
+
+
+def _model_only_source_row_vector(
+    value: typing.Any,
+    *,
+    active_row_idx: np.ndarray,
+    n_source: int,
+    name: str,
+    dtype: typing.Any,
+) -> np.ndarray | None:
+    if value is None:
+        return None
+    arr = np.ascontiguousarray(np.asarray(value, dtype=dtype).reshape(-1), dtype=dtype)
+    n_active = int(active_row_idx.size)
+    if int(arr.size) == n_active:
+        return arr
+    if int(arr.size) == int(n_source):
+        return np.ascontiguousarray(arr[active_row_idx], dtype=dtype)
+    raise ValueError(
+        f"Loaded model {name} metadata has length {arr.size}; expected "
+        f"active markers={n_active} or source markers={n_source}."
+    )
+
+
+def _model_only_training_alignment(
+    *,
+    model_state: typing.Mapping[str, typing.Any],
+    model_path: str,
+    n_source: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    """Resolve frozen training rows, orientation, imputation and scaling."""
+    site_keep_raw = model_state.get("export_site_keep", None)
+    if site_keep_raw is None:
+        raise ValueError(
+            f"Model {model_path} does not contain export_site_keep. "
+            "Prediction-only mode cannot align an unfiltered genotype safely; "
+            "retrain with the current JanusX and -save-model."
+        )
+    site_keep = np.ascontiguousarray(
+        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    if int(site_keep.size) != int(n_source):
+        raise ValueError(
+            f"Model {model_path} was trained against {site_keep.size} source markers, "
+            f"but prediction genotype contains {n_source}. The source marker order/count "
+            "must match exactly; partial marker matching is not enabled."
+        )
+    active_row_idx = np.ascontiguousarray(
+        np.flatnonzero(site_keep).astype(np.int64, copy=False),
+        dtype=np.int64,
+    )
+    expected = _loaded_model_feature_count(model_state)
+    if expected is not None and int(active_row_idx.size) != int(expected):
+        raise ValueError(
+            f"Model {model_path} expects {expected} active markers, but export_site_keep "
+            f"retains {active_row_idx.size}."
+        )
+
+    row_flip = _model_only_source_row_vector(
+        model_state.get("export_row_flip", None),
+        active_row_idx=active_row_idx,
+        n_source=int(n_source),
+        name="export_row_flip",
+        dtype=np.bool_,
+    )
+    training_maf = _model_only_source_row_vector(
+        model_state.get("export_training_maf", None),
+        active_row_idx=active_row_idx,
+        n_source=int(n_source),
+        name="export_training_maf",
+        dtype=np.float32,
+    )
+
+    # Existing artifacts predating export_row_flip are supported only when
+    # their training BED is still available. This recovers the exact source
+    # orientation rather than guessing from the deployment cohort.
+    if row_flip is None or training_maf is None:
+        source_prefix = str(
+            model_state.get(
+                "source_prefix",
+                model_state.get("genotype_prefix_hint", ""),
+            )
+            or ""
+        ).strip()
+        source_prefix = _strip_plink_suffix(source_prefix)
+        if source_prefix == "" or not _is_plink_prefix(source_prefix):
+            raise ValueError(
+                f"Model {model_path} lacks frozen training orientation/statistics and its "
+                "training PLINK source is unavailable. Retrain/re-export this model "
+                "with the current JanusX."
+            )
+        try:
+            from janusx.gfreader import scan_bed_2bit_packed_stats
+
+            _miss, source_maf, _std, source_flip, _het, _source_n_samples = (
+                scan_bed_2bit_packed_stats(source_prefix)
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot recover training marker metadata for {model_path} from {source_prefix}: {exc}"
+            ) from exc
+        source_maf_arr = np.ascontiguousarray(
+            np.asarray(source_maf, dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        source_flip_arr = np.ascontiguousarray(
+            np.asarray(source_flip, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        if int(source_maf_arr.size) != int(n_source) or int(source_flip_arr.size) != int(n_source):
+            raise ValueError(
+                f"Training source for {model_path} has marker metadata lengths "
+                f"maf={source_maf_arr.size}, row_flip={source_flip_arr.size}, "
+                f"but export_site_keep requires {n_source}."
+            )
+        if row_flip is None:
+            row_flip = np.ascontiguousarray(source_flip_arr[active_row_idx], dtype=np.bool_)
+        if training_maf is None:
+            training_maf = np.ascontiguousarray(source_maf_arr[active_row_idx], dtype=np.float32)
+
+    if row_flip is None:
+        row_flip = np.zeros((int(active_row_idx.size),), dtype=np.bool_)
+    if training_maf is None:
+        raise ValueError(f"Model {model_path} has no training imputation statistics.")
+
+    dosage_mean = _model_only_source_row_vector(
+        model_state.get("export_training_dosage_mean", None),
+        active_row_idx=active_row_idx,
+        n_source=int(n_source),
+        name="export_training_dosage_mean",
+        dtype=np.float32,
+    )
+    if dosage_mean is None:
+        kind = str(model_state.get("kind", "")).strip().lower()
+        if kind == "mlsk_model":
+            dosage_mean = _model_only_source_row_vector(
+                model_state.get("marker_means", None),
+                active_row_idx=active_row_idx,
+                n_source=int(n_source),
+                name="marker_means",
+                dtype=np.float32,
+            )
+        if dosage_mean is None:
+            dosage_mean = np.ascontiguousarray(2.0 * training_maf, dtype=np.float32)
+    if int(dosage_mean.size) != int(active_row_idx.size) or not np.all(np.isfinite(dosage_mean)):
+        raise ValueError(f"Model {model_path} has invalid training dosage means.")
+
+    row_inv = _model_only_source_row_vector(
+        model_state.get("export_training_row_inv_sd", None),
+        active_row_idx=active_row_idx,
+        n_source=int(n_source),
+        name="export_training_row_inv_sd",
+        dtype=np.float32,
+    )
+    if row_inv is None:
+        row_inv = _model_only_source_row_vector(
+            model_state.get("row_inv_sd", None),
+            active_row_idx=active_row_idx,
+            n_source=int(n_source),
+            name="row_inv_sd",
+            dtype=np.float32,
+        )
+    return active_row_idx, row_flip, dosage_mean, row_inv
+
+
+def _model_only_marker_alignment(
+    *,
+    marker_table: pd.DataFrame,
+    source_meta: typing.Mapping[str, np.ndarray],
+    model_state: typing.Mapping[str, typing.Any],
+    model_path: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    """Align a v2 marker table to an arbitrary input marker order."""
+    table = marker_table.copy()
+    columns = {str(c).strip().lower(): str(c) for c in table.columns}
+    required = ("chr", "pos")
+    missing_columns = [name for name in required if name not in columns]
+    if missing_columns:
+        raise ValueError(
+            f"Model {model_path} marker table lacks required columns: {', '.join(missing_columns)}"
+        )
+
+    def _column(name: str, default: typing.Any) -> np.ndarray:
+        col = columns.get(name)
+        if col is None:
+            return np.full((int(table.shape[0]),), default)
+        return table[col].to_numpy(copy=False)
+
+    model_chr = np.asarray(_column("chr", ""), dtype=object).reshape(-1)
+    model_pos = np.asarray(
+        pd.to_numeric(pd.Series(_column("pos", -1)), errors="coerce")
+        .fillna(-1)
+        .to_numpy(dtype=np.int64),
+        dtype=np.int64,
+    )
+    model_snp = np.asarray(_column("snp", ""), dtype=object).reshape(-1)
+    canonical_alleles = "allele0" in columns or "allele1" in columns
+    if canonical_alleles:
+        model_ref = np.asarray(_column("allele0", ""), dtype=object).reshape(-1)
+        model_alt = np.asarray(_column("allele1", ""), dtype=object).reshape(-1)
+    else:
+        model_ref = np.asarray(_column("ref", ""), dtype=object).reshape(-1)
+        model_alt = np.asarray(_column("alt", ""), dtype=object).reshape(-1)
+    n_model = int(model_chr.size)
+    expected = _loaded_model_feature_count(model_state)
+    if expected is not None and int(expected) != n_model:
+        raise ValueError(
+            f"Model {model_path} contains {n_model} marker rows but the model expects {expected}."
+        )
+
+    source_chr = np.asarray(source_meta.get("chrom", np.asarray([], dtype=object)), dtype=object).reshape(-1)
+    source_pos = np.asarray(source_meta.get("pos", np.asarray([], dtype=np.int64)), dtype=np.int64).reshape(-1)
+    source_snp = np.asarray(source_meta.get("snp", np.asarray([], dtype=object)), dtype=object).reshape(-1)
+    source_ref = np.asarray(source_meta.get("ref", np.asarray([], dtype=object)), dtype=object).reshape(-1)
+    source_alt = np.asarray(source_meta.get("alt", np.asarray([], dtype=object)), dtype=object).reshape(-1)
+    n_source = int(source_chr.size)
+    if any(int(x.size) != n_source for x in (source_pos, source_snp, source_ref, source_alt)):
+        raise ValueError(f"Prediction genotype metadata is internally inconsistent for model {model_path}.")
+
+    def _text(value: typing.Any) -> str:
+        text = str(value).strip()
+        return "" if text.lower() in {"nan", "none", "<na>"} else text
+
+    def _allele(value: typing.Any) -> str:
+        return _text(value).upper()
+
+    exact: dict[tuple[str, int, str, str], list[int]] = {}
+    locus: dict[tuple[str, int], list[int]] = {}
+    ids: dict[str, list[int]] = {}
+    for i in range(n_source):
+        c = _text(source_chr[i])
+        p = int(source_pos[i])
+        r = _allele(source_ref[i])
+        a = _allele(source_alt[i])
+        if c != "" and p >= 0:
+            locus.setdefault((c, p), []).append(i)
+            if r != "" and a != "":
+                exact.setdefault((c, p, r, a), []).append(i)
+        marker_id = _text(source_snp[i])
+        if marker_id != "":
+            ids.setdefault(marker_id, []).append(i)
+
+    if canonical_alleles:
+        row_flip_raw = np.zeros((n_model,), dtype=np.bool_)
+        af_raw = np.asarray(
+            pd.to_numeric(pd.Series(_column("af", np.nan)), errors="coerce"),
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(af_raw)):
+            raise ValueError(
+                f"Model {model_path} has missing training AF in its canonical marker table."
+            )
+        dosage_raw = np.asarray(2.0 * af_raw, dtype=np.float64)
+        inv_raw = _column("inv_sd", np.nan)
+    else:
+        row_flip_raw = _column("row_flip", False)
+        dosage_raw = _column("impute", np.nan)
+        if "dosage_mean" in columns:
+            dosage_raw = _column("dosage_mean", np.nan)
+        if "train_af" in columns:
+            af_raw = np.asarray(
+                pd.to_numeric(pd.Series(_column("train_af", np.nan)), errors="coerce"),
+                dtype=np.float64,
+            )
+        else:
+            af_raw = np.full((n_model,), np.nan, dtype=np.float32)
+        inv_raw = _column("row_inv_sd", np.nan)
+
+    source_rows: list[int] = []
+    flips: list[bool] = []
+    dosage: list[float] = []
+    row_inv: list[float] = []
+    used: set[int] = set()
+    failures: list[str] = []
+    for i in range(n_model):
+        c = _text(model_chr[i])
+        p = int(model_pos[i])
+        r = _allele(model_ref[i])
+        a = _allele(model_alt[i])
+        marker_id = _text(model_snp[i])
+        candidates: list[int] = []
+        swapped = False
+        if c != "" and p >= 0 and r != "" and a != "":
+            candidates = list(exact.get((c, p, r, a), []))
+            if len(candidates) == 0:
+                candidates = list(exact.get((c, p, a, r), []))
+                swapped = len(candidates) > 0
+        if len(candidates) == 0 and marker_id != "":
+            candidates = list(ids.get(marker_id, []))
+            if len(candidates) == 1 and r != "" and a != "":
+                source_i = candidates[0]
+                sr = _allele(source_ref[source_i])
+                sa = _allele(source_alt[source_i])
+                if (sr, sa) == (a, r):
+                    swapped = True
+                elif (sr, sa) != (r, a):
+                    candidates = []
+        if len(candidates) == 0 and c != "" and p >= 0:
+            candidates = list(locus.get((c, p), []))
+            if len(candidates) == 1 and r != "" and a != "":
+                source_i = candidates[0]
+                sr = _allele(source_ref[source_i])
+                sa = _allele(source_alt[source_i])
+                if (sr, sa) == (a, r):
+                    swapped = True
+                elif (sr, sa) != (r, a):
+                    candidates = []
+        if len(candidates) != 1 or candidates[0] in used:
+            reason = "not found" if len(candidates) == 0 else "ambiguous or duplicated"
+            failures.append(f"row {i + 1} ({c}:{p}:{marker_id or 'NA'}; {reason})")
+            continue
+        source_i = int(candidates[0])
+        used.add(source_i)
+        try:
+            base_flip = bool(row_flip_raw[i])
+        except Exception:
+            base_flip = False
+        try:
+            mean_value = float(dosage_raw[i])
+        except Exception:
+            mean_value = float("nan")
+        if not np.isfinite(mean_value):
+            try:
+                mean_value = float(2.0 * float(af_raw[i]))
+            except Exception:
+                mean_value = float("nan")
+        try:
+            inv_value = float(inv_raw[i])
+        except Exception:
+            inv_value = float("nan")
+        source_rows.append(source_i)
+        flips.append(bool(base_flip) ^ bool(swapped))
+        dosage.append(mean_value)
+        row_inv.append(inv_value)
+
+    if failures:
+        preview = "; ".join(failures[:5])
+        extra = " ..." if len(failures) > 5 else ""
+        raise ValueError(
+            f"Model {model_path} is missing or cannot uniquely match {len(failures)} "
+            f"required markers ({preview}{extra})."
+        )
+    # The embedded canonical table is intentionally human-readable and may
+    # round AF/INV_SD.  Prefer the exact vectors retained in model_state for
+    # numerical prediction, so model-only and model-plus-phenotype paths use
+    # the same training preprocessing.
+    active_model_rows = np.arange(n_model, dtype=np.int64)
+    for stat_name in ("export_training_dosage_mean", "marker_means"):
+        state_stat = _model_only_source_row_vector(
+            model_state.get(stat_name, None),
+            active_row_idx=active_model_rows,
+            n_source=n_model,
+            name=stat_name,
+            dtype=np.float32,
+        )
+        if state_stat is not None and np.all(np.isfinite(state_stat)):
+            dosage = state_stat
+            break
+    for stat_name in ("export_training_row_inv_sd", "row_inv_sd"):
+        state_stat = _model_only_source_row_vector(
+            model_state.get(stat_name, None),
+            active_row_idx=active_model_rows,
+            n_source=n_model,
+            name=stat_name,
+            dtype=np.float32,
+        )
+        if state_stat is not None:
+            row_inv = state_stat
+            break
+    row_inv_array = np.asarray(row_inv, dtype=np.float32)
+    return (
+        np.asarray(source_rows, dtype=np.int64),
+        np.asarray(flips, dtype=np.bool_),
+        np.asarray(dosage, dtype=np.float32),
+        (row_inv_array if np.any(np.isfinite(row_inv_array)) else None),
+    )
+
+
+def _load_model_only_raw_genotype(
+    genotype_path: str,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, dict[str, np.ndarray]]:
+    """Load all source markers without prediction-side QC or allele flipping."""
+    norm_prefix = _strip_plink_suffix(str(genotype_path))
+    if _is_plink_prefix(norm_prefix):
+        sample_ids_raw, n_source = inspect_genotype_file(norm_prefix, snps_only=False)
+        packed_raw, _miss, _maf, _std, n_samples = load_bed_2bit_packed(norm_prefix)
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8), dtype=np.uint8)
+        if packed.ndim != 2 or int(packed.shape[0]) != int(n_source) or int(n_samples) != int(len(sample_ids_raw)):
+            raise ValueError(
+                "Raw model-only PLINK payload is inconsistent with BIM/FAM metadata."
+            )
+        chrom, pos, snp, ref, alt = _read_plink_bim_marker_meta(norm_prefix)
+        return (
+            np.asarray(sample_ids_raw, dtype=str),
+            None,
+            packed,
+            {
+                "chrom": np.asarray(chrom, dtype=object),
+                "pos": np.asarray(pos, dtype=np.int64),
+                "snp": np.asarray(snp, dtype=object),
+                "ref": np.asarray(ref, dtype=object),
+                "alt": np.asarray(alt, dtype=object),
+                "af": np.asarray(_maf, dtype=np.float32).reshape(-1),
+            },
+        )
+
+    sample_ids_raw, _n_source = inspect_genotype_file(
+        str(genotype_path),
+        snps_only=True,
+        maf=0.0,
+        missing_rate=1.0,
+        het=1.0,
+    )
+    blocks: list[np.ndarray] = []
+    sites_all: list[typing.Any] = []
+    chunks = load_genotype_chunks(
+        str(genotype_path),
+        chunk_size=50_000,
+        maf=0.0,
+        missing_rate=1.0,
+        impute=False,
+        het=1.0,
+        preserve_alt_orientation=True,
+    )
+    for geno_chunk, sites in chunks:
+        arr = np.asarray(geno_chunk, dtype=np.float32)
+        if arr.ndim != 2 or int(arr.shape[0]) == 0:
+            continue
+        site_list = list(sites)
+        if int(arr.shape[0]) != int(len(site_list)):
+            raise ValueError("Raw model-only genotype/site metadata length mismatch.")
+        blocks.append(arr)
+        sites_all.extend(site_list)
+    if len(blocks) == 0:
+        raise ValueError("No markers were loaded for model-only prediction.")
+    genotype = np.ascontiguousarray(np.concatenate(blocks, axis=0), dtype=np.float32)
+    if int(genotype.shape[0]) != int(len(sites_all)):
+        raise ValueError("Raw model-only genotype/site metadata count mismatch.")
+    chrom: list[str] = []
+    pos: list[int] = []
+    snp: list[str] = []
+    ref: list[str] = []
+    alt: list[str] = []
+    for i, site in enumerate(sites_all):
+        c = str(getattr(site, "chrom", "")).strip()
+        try:
+            p = int(getattr(site, "pos", -1))
+        except Exception:
+            p = -1
+        r = str(getattr(site, "ref_allele", "")).strip()
+        a = str(getattr(site, "alt_allele", "")).strip()
+        marker = str(getattr(site, "snp", "")).strip()
+        if marker == "":
+            marker = f"{c}_{p}" if c != "" and p >= 0 else f"SNP{i + 1}"
+        chrom.append(c)
+        pos.append(p)
+        snp.append(marker)
+        ref.append(r)
+        alt.append(a)
+    return (
+        np.asarray(sample_ids_raw, dtype=str),
+        genotype,
+        None,
+        {
+            "chrom": np.asarray(chrom, dtype=object),
+            "pos": np.asarray(pos, dtype=np.int64),
+            "snp": np.asarray(snp, dtype=object),
+            "ref": np.asarray(ref, dtype=object),
+            "alt": np.asarray(alt, dtype=object),
+        },
+    )
+
+
+def _decode_model_only_packed(
+    *,
+    packed: np.ndarray,
+    n_samples: int,
+    source_rows: np.ndarray,
+    row_flip: np.ndarray,
+    dosage_mean: np.ndarray,
+) -> np.ndarray:
+    if _jxrs is None or not hasattr(_jxrs, "bed_packed_decode_rows_f32"):
+        raise RuntimeError(
+            "Rust packed BED decoder is unavailable. Rebuild/install JanusX extension."
+        )
+    row_maf = np.ascontiguousarray(np.asarray(dosage_mean, dtype=np.float32) * 0.5, dtype=np.float32)
+    decoded = _jxrs.bed_packed_decode_rows_f32(
+        np.ascontiguousarray(np.asarray(packed, dtype=np.uint8), dtype=np.uint8),
+        int(n_samples),
+        np.ascontiguousarray(np.asarray(source_rows, dtype=np.int64), dtype=np.int64),
+        np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_), dtype=np.bool_),
+        row_maf,
+        None,
+    )
+    matrix = np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
+    expected = (int(source_rows.size), int(n_samples))
+    if matrix.shape != expected:
+        raise ValueError(f"Raw model-only decoder returned {matrix.shape}, expected {expected}.")
+    return matrix
+
+
+def _apply_model_only_dense_alignment(
+    *,
+    genotype: np.ndarray,
+    source_rows: np.ndarray,
+    row_flip: np.ndarray,
+    dosage_mean: np.ndarray,
+) -> np.ndarray:
+    matrix = np.ascontiguousarray(np.asarray(genotype, dtype=np.float32)[source_rows, :], dtype=np.float32)
+    valid = np.isfinite(matrix) & (matrix >= 0.0)
+    if np.any(row_flip):
+        flip_rows = np.flatnonzero(row_flip)
+        for row in flip_rows.tolist():
+            matrix[row, valid[row]] = 2.0 - matrix[row, valid[row]]
+    if np.any(~valid):
+        missing_rows, missing_cols = np.where(~valid)
+        matrix[missing_rows, missing_cols] = dosage_mean[missing_rows]
+    return matrix
+
+
+def _prepare_model_only_dense_matrix(
+    *,
+    model_state: typing.Mapping[str, typing.Any],
+    genotype: np.ndarray,
+    model_path: str,
+    row_mean: np.ndarray | None = None,
+    row_inv_sd: np.ndarray | None = None,
+) -> np.ndarray:
+    matrix = np.ascontiguousarray(np.asarray(genotype, dtype=np.float32), dtype=np.float32)
+    kind = str(model_state.get("kind", "")).strip().lower()
+    if kind not in {"rrblup_linear", "bayes_linear"}:
+        return matrix
+    if not bool(model_state.get("standardized", True)):
+        return matrix
+
+    row_mean_raw = model_state.get("row_mean", None) if row_mean is None else row_mean
+    row_inv_raw = model_state.get("row_inv_sd", None) if row_inv_sd is None else row_inv_sd
+    if row_mean_raw is None or row_inv_raw is None:
+        raise ValueError(
+            f"Loaded standardized model lacks row_mean/row_inv_sd: {model_path}. "
+            "Re-export the model with -save-model; prediction cannot infer the training scale safely."
+        )
+    row_mean = np.asarray(row_mean_raw, dtype=np.float32).reshape(-1)
+    row_inv = np.asarray(row_inv_raw, dtype=np.float32).reshape(-1)
+    if int(row_mean.size) != int(matrix.shape[0]) or int(row_inv.size) != int(matrix.shape[0]):
+        raise ValueError(
+            f"Loaded model scaling metadata does not match genotype markers for {model_path}: "
+            f"row_mean={row_mean.size}, row_inv_sd={row_inv.size}, genotype={matrix.shape[0]}"
+        )
+    return np.ascontiguousarray(
+        (matrix - row_mean[:, None]) * row_inv[:, None],
+        dtype=np.float32,
+    )
+
+
+def _run_gs_model_only_prediction(
+    *,
+    args: typing.Any,
+    gfile: str,
+    outprefix: str,
+    gs_model_dir: str,
+    log_path: str,
+    logger: logging.Logger,
+    t_start: float,
+    return_result: bool,
+) -> typing.Optional[dict[str, typing.Any]]:
+    model_files = _expand_model_only_paths(_gs_model_paths_from_args(args))
+    loaded: list[dict[str, typing.Any]] = []
+    for model_file in model_files:
+        try:
+            payload = _load_jxmodel(model_file)
+        except Exception as exc:
+            try:
+                payload = _load_legacy_text_effect_jxmodel(model_file)
+            except Exception:
+                raise ValueError(
+                    f"Cannot load .jxmodel for prediction-only mode: {model_file}: {exc}"
+                ) from exc
+        if _is_top_bundle_payload(payload):
+            raise ValueError(
+                f"TOP bundle prediction without phenotype is not supported: {model_file}. "
+                "Pass individual trait .jxmodel artifacts instead."
+            )
+        state_raw = payload.get("model_state", None)
+        if not isinstance(state_raw, dict) or len(state_raw) == 0:
+            raise ValueError(f"Model artifact has no loadable model_state: {model_file}")
+        state = typing.cast(dict[str, typing.Any], state_raw)
+        method = str(payload.get("method", state.get("method", ""))).strip()
+        if method == "":
+            method = str(_parse_jxmodel_method_from_name(model_file) or "model")
+        expected_markers = _loaded_model_feature_count(state)
+        if expected_markers is None:
+            raise ValueError(
+                f"Cannot determine the marker count expected by model: {model_file}."
+            )
+        trait = str(payload.get("trait", "")).strip()
+        if trait == "" or trait.upper() == "MULTI":
+            trait = os.path.basename(model_file)
+            if trait.lower().endswith(".jxmodel"):
+                trait = trait[: -len(".jxmodel")]
+        loaded.append(
+            {
+                "path": model_file,
+                "payload": payload,
+                "state": state,
+                "method": method,
+                "method_display": str(payload.get("method_display", _method_display_name(method))),
+                "trait": trait,
+                "expected_markers": int(expected_markers),
+                "artifact_format": str(payload.get("format", "legacy")),
+            }
+        )
+
+    if _is_plink_prefix(str(gfile)):
+        genotype_ok = ensure_plink_prefix_exists(logger, str(gfile), "Genotype PLINK prefix")
+    elif os.path.isfile(str(gfile)):
+        genotype_ok = ensure_file_exists(logger, str(gfile), "Genotype file")
+    else:
+        genotype_ok = ensure_file_input_exists(logger, str(gfile), "Genotype input")
+    if not genotype_ok:
+        raise SystemExit(1)
+
+    logger.info(
+        "Model-only prediction: loading all source markers for %d saved model(s); "
+        "prediction-side QC is disabled.",
+        int(len(loaded)),
+    )
+    with CliStatus("Loading genotype for model-only prediction...", enabled=stdout_is_tty()) as task:
+        sample_ids, raw_genotype, packed_genotype, source_meta = _load_model_only_raw_genotype(str(gfile))
+        raw_markers = int(
+            packed_genotype.shape[0]
+            if packed_genotype is not None
+            else raw_genotype.shape[0]
+        )
+        task.complete(
+            f"Loaded raw genotype (n={int(sample_ids.size)}, m={raw_markers}); "
+            "training marker mask/statistics will be applied"
+        )
+
+    observed_markers = int(raw_markers)
+    predictions: list[dict[str, typing.Any]] = []
+    for item in loaded:
+        model_file = str(item["path"])
+        model_state = typing.cast(typing.Mapping[str, typing.Any], item["state"])
+        marker_table = item["payload"].get("_jxmodel_marker_table", None)
+        if isinstance(marker_table, pd.DataFrame):
+            source_rows, row_flip, dosage_mean, row_inv = _model_only_marker_alignment(
+                marker_table=marker_table,
+                source_meta=source_meta,
+                model_state=model_state,
+                model_path=model_file,
+            )
+        else:
+            source_rows, row_flip, dosage_mean, row_inv = _model_only_training_alignment(
+                model_state=model_state,
+                model_path=model_file,
+                n_source=observed_markers,
+            )
+        missing_dosage = ~np.isfinite(dosage_mean)
+        if np.any(missing_dosage):
+            source_af = np.asarray(
+                source_meta.get("af", np.asarray([], dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)
+            for row in np.flatnonzero(missing_dosage).tolist():
+                source_row = int(source_rows[row])
+                if source_af.size == observed_markers and np.isfinite(source_af[source_row]):
+                    dosage_mean[row] = float(2.0 * source_af[source_row])
+                elif raw_genotype is not None:
+                    values = np.asarray(raw_genotype[source_row], dtype=np.float32)
+                    valid = values[np.isfinite(values) & (values >= 0.0)]
+                    if int(valid.size) > 0:
+                        mean_value = float(np.mean(valid))
+                        dosage_mean[row] = float(2.0 - mean_value) if bool(row_flip[row]) else mean_value
+        if np.any(~np.isfinite(dosage_mean)):
+            raise ValueError(
+                f"Model {model_file} lacks training imputation statistics and they "
+                "could not be recovered from the prediction genotype."
+            )
+        if packed_genotype is not None:
+            genotype = _decode_model_only_packed(
+                packed=packed_genotype,
+                n_samples=int(sample_ids.size),
+                source_rows=source_rows,
+                row_flip=row_flip,
+                dosage_mean=dosage_mean,
+            )
+        else:
+            genotype = _apply_model_only_dense_alignment(
+                genotype=raw_genotype,
+                source_rows=source_rows,
+                row_flip=row_flip,
+                dosage_mean=dosage_mean,
+            )
+        dense_matrix = _prepare_model_only_dense_matrix(
+            model_state=model_state,
+            genotype=genotype,
+            model_path=model_file,
+            row_mean=dosage_mean,
+            row_inv_sd=row_inv,
+        )
+        pred = _predict_from_loaded_model_state(
+            method=str(item["method"]),
+            model_state=typing.cast(dict[str, typing.Any], item["state"]),
+            dense_matrix=dense_matrix,
+            packed_ctx=None,
+            packed_sample_indices=None,
+        )
+        pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+        if int(pred.size) != int(sample_ids.size):
+            raise RuntimeError(
+                f"Prediction length mismatch for model {model_file}: "
+                f"got {pred.size}, expected {sample_ids.size}."
+            )
+        predictions.append({**item, "prediction": pred})
+
+    grouped: OrderedDict[str, list[dict[str, typing.Any]]] = OrderedDict()
+    for item in predictions:
+        grouped.setdefault(str(item["trait"]), []).append(item)
+    saved_result_paths: list[str] = []
+    summary_rows: list[dict[str, typing.Any]] = []
+    for trait, items in grouped.items():
+        columns: dict[str, np.ndarray] = {}
+        label_counts: dict[str, int] = {}
+        for item in items:
+            label = str(item["method_display"]).strip() or str(item["method"])
+            label_counts[label] = int(label_counts.get(label, 0)) + 1
+            if label_counts[label] > 1:
+                label = f"{label}_{label_counts[label]}"
+            columns[label] = np.asarray(item["prediction"], dtype=np.float64).reshape(-1)
+            payload = typing.cast(dict[str, typing.Any], item["payload"])
+            state = typing.cast(dict[str, typing.Any], item["state"])
+            try:
+                training_meta = payload.get("training", {})
+                if not isinstance(training_meta, dict):
+                    training_meta = payload.get("training_config", {})
+                pve_value = float(
+                    training_meta.get(
+                        "pve_final",
+                        payload.get("pve_final", state.get("pve", np.nan)),
+                    )
+                )
+            except Exception:
+                pve_value = float("nan")
+            summary_rows.append(
+                {
+                    "trait": str(trait),
+                    "model": str(item["method_display"]),
+                    "model_file": str(item["path"]),
+                    "cv_mode": "predict_only",
+                    "n_train": 0,
+                    "n_test": int(sample_ids.size),
+            "n_markers": int(item["expected_markers"]),
+                    "pve_final": pve_value,
+                }
+            )
+        out_tsv = f"{outprefix}.{_sanitize_artifact_token(trait)}.gebv.tsv"
+        pd.DataFrame(columns, index=np.asarray(sample_ids, dtype=str)).to_csv(
+            out_tsv,
+            sep="\t",
+            float_format="%.4f",
+            index_label="sample_id",
+        )
+        saved_result_paths.append(str(out_tsv))
+        log_success(logger, f"Saved predictions to {format_path_for_display(out_tsv)}")
+
+    summary_out = os.path.join(gs_model_dir, "summary.json")
+    summary_paths = _order_gs_saved_result_paths(saved_result_paths + [summary_out])
+    summary_payload = {
+        "format": "janusx.gs.summary.v1",
+        "status": "done",
+        "mode": "prediction_only",
+        "genotype_input": str(gfile),
+        "phenotype_input": None,
+        "n_samples": int(sample_ids.size),
+        "n_markers": int(observed_markers),
+        "model_artifacts": [str(x["path"]) for x in loaded],
+        "summary_rows": summary_rows,
+        "result_files": summary_paths,
+        "model_alignment": {
+            "policy": "training_site_keep_and_training_statistics",
+            "partial_matching": False,
+            "prediction_qc": False,
+            "raw_source_markers": int(observed_markers),
+            "reason": "prediction uses frozen training marker mask, allele orientation, "
+            "and imputation/standardization statistics",
+        },
+        "elapsed_sec": float(max(time.time() - t_start, 0.0)),
+    }
+    with open(summary_out, "w", encoding="utf-8") as sfh:
+        json.dump(_json_safe(summary_payload), sfh, indent=2, ensure_ascii=False)
+    resource_metrics = _collect_gs_resource_metrics()
+    _emit_gs_resource_report(logger, resource_metrics)
+    _emit_gs_finished_lines(
+        logger,
+        elapsed_sec=float(max(time.time() - t_start, 0.0)),
+        finished_unix=float(time.time()),
+    )
+    logger.info("Model-only prediction completed for %d model(s).", int(len(loaded)))
+    if not bool(return_result):
+        return None
+    return {
+        "status": "done",
+        "error": "",
+        "genofile": str(gfile),
+        "outprefix": str(outprefix),
+        "model_dir": str(gs_model_dir),
+        "summary_json": str(summary_out),
+        "log_file": str(log_path),
+        "summary_rows": [dict(x) for x in summary_rows],
+        "result_files": [str(x) for x in summary_paths],
+        "elapsed_sec": float(max(time.time() - t_start, 0.0)),
+        "traits": [str(x) for x in grouped.keys()],
+        "methods": [str(x["method_display"]) for x in loaded],
+        "resource": dict(resource_metrics),
     }
 
 
@@ -15820,8 +17832,11 @@ def _load_genotype_with_rust_gfreader(
     maf: float,
     missing_rate: float,
     het_threshold: float,
+    impute: bool = True,
+    preserve_alt_orientation: bool = False,
     chunk_size: int = 50_000,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_site_meta: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Load full genotype matrix with Rust gfreader chunk decoder.
 
@@ -15829,23 +17844,56 @@ def _load_genotype_with_rust_gfreader(
     -------
     sample_ids : np.ndarray[str], shape (n_samples,)
     geno : np.ndarray[float32], shape (n_snps_filtered, n_samples)
+    site_meta : pandas.DataFrame, optional
+        Returned when ``return_site_meta`` is true. Rows follow the filtered
+        genotype matrix and include chr/pos/snp/ref/alt metadata.
     """
-    sample_ids, _ = inspect_genotype_file(genotype_path)
+    sample_ids, _ = inspect_genotype_file(
+        genotype_path,
+        snps_only=False,
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        het=float(het_threshold),
+    )
     chunks = load_genotype_chunks(
         genotype_path,
         chunk_size=int(chunk_size),
         maf=float(maf),
         missing_rate=float(missing_rate),
-        impute=True,
+        impute=bool(impute),
         het=float(het_threshold),
+        preserve_alt_orientation=bool(preserve_alt_orientation),
     )
 
     blocks: list[np.ndarray] = []
-    for geno_chunk, _ in chunks:
+    site_rows: list[dict[str, typing.Any]] = []
+    for geno_chunk, sites in chunks:
         arr = np.asarray(geno_chunk, dtype=np.float32)
         if arr.ndim != 2 or arr.shape[0] == 0:
             continue
         blocks.append(arr)
+        if bool(return_site_meta):
+            site_list = list(sites)
+            if int(len(site_list)) != int(arr.shape[0]):
+                raise ValueError(
+                    "Genotype/site metadata length mismatch while loading "
+                    f"{genotype_path}: genotype_rows={arr.shape[0]}, sites={len(site_list)}."
+                )
+            for site in site_list:
+                chrom = str(getattr(site, "chrom", ""))
+                pos = int(getattr(site, "pos", -1))
+                snp = str(getattr(site, "snp", "") or "")
+                ref = str(getattr(site, "ref_allele", "") or "")
+                alt = str(getattr(site, "alt_allele", "") or "")
+                site_rows.append(
+                    {
+                        "chr": chrom,
+                        "pos": pos,
+                        "snp": snp or (f"{chrom}_{pos}" if chrom != "" and pos >= 0 else ""),
+                        "ref": ref,
+                        "alt": alt,
+                    }
+                )
 
     if len(blocks) == 0:
         raise ValueError(
@@ -15854,7 +17902,21 @@ def _load_genotype_with_rust_gfreader(
         )
 
     geno = np.concatenate(blocks, axis=0).astype(np.float32, copy=False)
-    return np.asarray(sample_ids, dtype=str), geno
+    sample_ids_out = np.asarray(sample_ids, dtype=str)
+    if bool(return_site_meta):
+        site_meta = pd.DataFrame(site_rows, columns=["chr", "pos", "snp", "ref", "alt"])
+        if int(site_meta.shape[0]) != int(geno.shape[0]):
+            raise ValueError(
+                "Genotype/site metadata count mismatch after loading "
+                f"{genotype_path}: genotype_rows={geno.shape[0]}, sites={site_meta.shape[0]}."
+            )
+        site_meta.insert(
+            0,
+            "source_index",
+            np.arange(int(site_meta.shape[0]), dtype=np.int64),
+        )
+        return sample_ids_out, geno, site_meta
+    return sample_ids_out, geno
 
 
 def _load_plink_packed_for_lmm(
@@ -17391,7 +19453,9 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     genotype_group = parser.add_argument_group("Genotype Arguments (Required: Select exactly one)")
     geno_group = genotype_group.add_mutually_exclusive_group(required=False)
     add_common_genotype_source_args(geno_group, include_file=True)
-    phenotype_group = parser.add_argument_group("Phenotype Arguments (Required)")
+    phenotype_group = parser.add_argument_group(
+        "Phenotype Arguments (Required: Provide Phenotype or Saved Model)"
+    )
     add_common_pheno_arg(
         phenotype_group,
         required=False,
@@ -17479,6 +19543,16 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help="Use the four-component BayesR mixture model with default pi/gamma priors.",
     )
     model_group.add_argument(
+        "-GARFIELD", "--GARFIELD",
+        action="store_true",
+        default=False,
+        help=(
+            "Experimental nested GARFIELD window search followed by pseudo-feature GBLUP; "
+            "requires a PLINK -bfile and -cv >= 2."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
+    model_group.add_argument(
         "-RF", "--RF",
         action="store_true",
         default=False,
@@ -17522,6 +19596,8 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     )
     model_group.add_argument(
         "-model", "--model",
+        dest="model_paths",
+        action="append",
         type=str,
         default=None,
         help=argparse.SUPPRESS,
@@ -17553,8 +19629,9 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         action="store_true",
         default=False,
         help=(
-            "Enable fitted-model saving (.jxmodel) and marker-effect output. "
-            "Disabled by default to save post-fit time and disk usage."
+            "Save each fitted model as a self-contained .jxmodel container with "
+            "embedded marker metadata. Disabled by default to save post-fit time "
+            "and disk usage."
         ),
     )
     # optional_group.add_argument(
@@ -17933,15 +20010,82 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     args, extras = parser.parse_known_args(argv)
     has_genotype = bool(args.vcf or args.hmp or args.bfile or args.file)
     has_pheno = bool(args.pheno)
-    if (not has_pheno) and (not has_genotype):
+    model_paths = [
+        os.path.expanduser(str(path).strip())
+        for path in list(getattr(args, "model_paths", None) or [])
+        if str(path).strip() != ""
+    ]
+    args.model_paths = model_paths
+    # Preserve the historical scalar attribute for the existing train/evaluate
+    # model-loading path. Multiple model files are handled only by prediction-only
+    # mode, where they are kept in args.model_paths.
+    args.model = (
+        model_paths[0]
+        if len(model_paths) == 1
+        else (list(model_paths) if len(model_paths) > 1 else None)
+    )
+    has_model = len(model_paths) > 0
+    if (not has_pheno) and (not has_model) and (not has_genotype):
         parser.error(
-            "the following arguments are required: -p/--pheno & "
+            "the following arguments are required: (-p/--pheno | -model/--model) & "
             "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
         )
-    if not has_pheno:
-        parser.error("the following arguments are required: -p/--pheno")
     if not has_genotype:
         parser.error("the following arguments are required: (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)")
+    if (not has_pheno) and (not has_model):
+        parser.error("the following arguments are required: (-p/--pheno | -model/--model)")
+    if has_pheno and len(model_paths) > 1:
+        parser.error("repeat -model/--model is supported only for prediction without -p/--pheno")
+    if (not has_pheno) and (args.ncol is not None):
+        parser.error("-n/--ncol requires -p/--pheno")
+    if (not has_pheno) and has_model:
+        training_flags = (
+            args.GBLUP,
+            args.adBLUP,
+            args.rrBLUP,
+            args.BLUP,
+            args.BayesA,
+            args.BayesB,
+            args.BayesC,
+            args.BayesR,
+            args.GARFIELD,
+            args.RF,
+            args.ET,
+            args.GBDT,
+            args.XGB,
+            args.SVM,
+            args.ENET,
+        )
+        if any(bool(value) for value in training_flags):
+            parser.error("model-only prediction cannot be combined with a training model flag")
+    if bool(args.GARFIELD):
+        if args.cv is None or int(args.cv) < 2:
+            parser.error("-GARFIELD requires -cv >= 2 for nested fold-local rule search.")
+        if not args.bfile or not _is_plink_prefix(str(args.bfile)):
+            parser.error("-GARFIELD currently requires a PLINK -bfile prefix with .bed/.bim/.fam files.")
+        if args.model is not None:
+            parser.error("-GARFIELD cannot be combined with --model; it must learn rules within each CV fold.")
+        other_models = any(
+            bool(value)
+            for value in (
+                args.GBLUP,
+                args.adBLUP,
+                args.rrBLUP,
+                args.BLUP,
+                args.BayesA,
+                args.BayesB,
+                args.BayesC,
+                args.BayesR,
+                args.RF,
+                args.ET,
+                args.GBDT,
+                args.XGB,
+                args.SVM,
+                args.ENET,
+            )
+        )
+        if other_models:
+            parser.error("-GARFIELD is a dedicated development mode and cannot be combined with another GS model.")
     if (args.GBLUP is not None) or bool(args.rrBLUP) or bool(args.adBLUP):
         parser.error(
             "-GBLUP/--GBLUP, -rrBLUP/--rrBLUP, and -adBLUP/--adBLUP have been retired. "
@@ -18032,17 +20176,13 @@ def parse_args(argv: typing.Optional[list[str]] = None):
 
     if (args.hash_dim is not None) and (int(args.hash_dim) <= 0):
         parser.error("--hash dim must be > 0.")
-    if args.model is not None:
-        model_path = str(args.model).strip()
-        if model_path == "":
-            parser.error("--model file must not be empty.")
+    for model_path in model_paths:
         if (not os.path.isfile(model_path)) and (not os.path.isdir(model_path)):
             parser.error(
                 f"--model must point to a .jxmodel file or model directory (got: {model_path})"
             )
         if os.path.isfile(model_path) and not str(model_path).lower().endswith(".jxmodel"):
             parser.error(f"--model must point to a .jxmodel file (got: {model_path})")
-        args.model = model_path
     # if args.select is not None:
     #     if str(args.select).strip() == _SELECT_INTERACTIVE_SENTINEL:
     #         args.select = _SELECT_INTERACTIVE_SENTINEL
@@ -18114,6 +20254,10 @@ def _run_gs_pipeline_impl(
     use_spinner = stdout_is_tty()
     if args is None:
         args = parse_args(argv)
+    # A loaded artifact owns the estimator and its training preprocessing.
+    # Resolve this before route selection so a CLI training flag cannot trigger
+    # an unrelated packed/QC path for model-plus-phenotype evaluation.
+    model_mode = bool(getattr(args, "model", None) is not None)
     def _resolve_bayes_cli_value(name: str) -> tuple[bool, float | None]:
         raw = getattr(args, name, False)
         if raw is False or raw is None:
@@ -18234,6 +20378,19 @@ def _run_gs_pipeline_impl(
         if text != "":
             _file_only_logger.info(text)
 
+    model_only_paths = _gs_model_paths_from_args(args)
+    if (len(model_only_paths) > 0) and (not bool(args.pheno)):
+        return _run_gs_model_only_prediction(
+            args=args,
+            gfile=str(gfile),
+            outprefix=str(outprefix),
+            gs_model_dir=str(gs_model_dir),
+            log_path=str(log_path),
+            logger=logger,
+            t_start=float(t_start),
+            return_result=bool(return_result),
+        )
+
     if bool(getattr(args, "verbose", False)):
         logger.info(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
         logger.info(
@@ -18291,16 +20448,17 @@ def _run_gs_pipeline_impl(
             or gfile_lower.endswith(".bin")
         )
     )
-    blup_requested = bool(args.BLUP)
+    blup_requested = bool(args.BLUP) and (not model_mode)
     pcg_requested = bool(blup_requested and (rr_solver_mode == "pcg"))
     bayes_requested = bool(
         bool(args.BayesA)
         or bayes_b_enabled
         or bayes_c_enabled
         or bayes_r_enabled
-    )
+    ) and (not model_mode)
+    garfield_requested = bool(getattr(args, "GARFIELD", False)) and (not model_mode)
     packed_model_requested = bool(
-        blup_requested or bayes_requested
+        blup_requested or bayes_requested or garfield_requested
     )
     if file_memmap_preferred and rr_solver_mode == "pcg" and (not packed_model_requested):
         rrblup_solver = "auto"
@@ -18424,6 +20582,8 @@ def _run_gs_pipeline_impl(
         methods.append("BayesC")
     if bayes_r_enabled:
         methods.append("BayesR")
+    if bool(getattr(args, "GARFIELD", False)):
+        methods.append(_GARFIELD_METHOD)
     if args.RF:
         methods.append("RF")
     if args.ET:
@@ -18446,12 +20606,17 @@ def _run_gs_pipeline_impl(
             _seen_methods.add(_m)
             _uniq_methods.append(_m)
         methods = _uniq_methods
-    model_mode = bool(args.model is not None)
     top_requested = bool(getattr(args, "select", None) is not None)
-    if model_mode and len(methods) == 0:
+    if model_mode:
         inferred = _discover_jxmodel_methods(str(args.model))
-        if len(inferred) > 0:
-            methods = inferred
+        if len(inferred) == 0:
+            raise ValueError(
+                "Cannot discover the method from loaded model: "
+                f"{args.model}"
+            )
+        # A loaded artifact is authoritative. Training-model flags such as
+        # --BLUP or --BayesA must not change which estimator is loaded.
+        methods = inferred
     loaded_bundle_file: str | None = None
     loaded_bundle_payload: dict[str, typing.Any] | None = None
     if model_mode:
@@ -18468,6 +20633,28 @@ def _run_gs_pipeline_impl(
         except Exception:
             loaded_bundle_file = None
             loaded_bundle_payload = None
+    loaded_model_file_for_preprocess: str | None = None
+    loaded_model_payload_for_preprocess: dict[str, typing.Any] | None = None
+    if model_mode and loaded_bundle_payload is None:
+        model_arg = str(args.model)
+        candidates: list[str] = []
+        if os.path.isfile(model_arg):
+            candidates = [model_arg]
+        elif os.path.isdir(model_arg):
+            candidates = sorted(glob.glob(os.path.join(model_arg, "*.jxmodel")))
+        # A direct artifact (or a directory containing one artifact) can use
+        # the strict frozen-preprocessing route.  Multi-artifact directories
+        # keep the existing trait dispatcher because each model may have a
+        # different marker set.
+        if len(candidates) == 1:
+            try:
+                loaded_model_payload_for_preprocess = _load_jxmodel(candidates[0])
+            except Exception:
+                loaded_model_payload_for_preprocess = _load_legacy_text_effect_jxmodel(candidates[0])
+            if _is_top_bundle_payload(loaded_model_payload_for_preprocess):
+                loaded_model_payload_for_preprocess = None
+            else:
+                loaded_model_file_for_preprocess = str(candidates[0])
     if len(methods) == 0:
         logger.error(
             "No model selected. Use "
@@ -18475,7 +20662,7 @@ def _run_gs_pipeline_impl(
             "or provide --model with discoverable *.jxmodel files."
         )
         raise SystemExit(1)
-    if args.BLUP:
+    if args.BLUP and (not model_mode):
         if getattr(args, "hash_dim", None) is not None:
             logger.error("GS BLUP no longer supports --hash. Use the direct packed path instead.")
             raise SystemExit(1)
@@ -19001,7 +21188,7 @@ def _run_gs_pipeline_impl(
     # Load genotype
     # ------------------------------------------------------------------
     gsrc = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
-    use_packed_lmm = bool(gfile_is_plink and len(methods) > 0)
+    use_packed_lmm = bool((not model_mode) and gfile_is_plink and len(methods) > 0)
     ldprune_spec = typing.cast(
         _GsLdPruneSpec | None,
         getattr(args, "ldprune_spec", None),
@@ -19046,7 +21233,126 @@ def _run_gs_pipeline_impl(
     packed_bayes_ctx: dict[str, typing.Any] | None = None
     packed_qc_baseline_ctx: dict[str, typing.Any] | None = None
     geno_is_memmap = False
-    if use_packed_lmm:
+    geno_marker_meta: pd.DataFrame | None = None
+    if model_mode and loaded_model_payload_for_preprocess is not None:
+        model_file = str(loaded_model_file_for_preprocess or args.model)
+        payload = typing.cast(dict[str, typing.Any], loaded_model_payload_for_preprocess)
+        model_state_raw = payload.get("model_state", None)
+        if not isinstance(model_state_raw, dict) or len(model_state_raw) == 0:
+            raise ValueError(f"Loaded model artifact missing model_state: {model_file}")
+        model_state = typing.cast(typing.Mapping[str, typing.Any], model_state_raw)
+        sample_ids, raw_genotype, packed_genotype, source_meta = _load_model_only_raw_genotype(str(gfile))
+        observed_markers = int(
+            packed_genotype.shape[0]
+            if packed_genotype is not None
+            else raw_genotype.shape[0]
+        )
+        marker_table = payload.get("_jxmodel_marker_table", None)
+        if isinstance(marker_table, pd.DataFrame):
+            source_rows, row_flip, dosage_mean, row_inv = _model_only_marker_alignment(
+                marker_table=marker_table,
+                source_meta=source_meta,
+                model_state=model_state,
+                model_path=model_file,
+            )
+        else:
+            source_rows, row_flip, dosage_mean, row_inv = _model_only_training_alignment(
+                model_state=model_state,
+                model_path=model_file,
+                n_source=observed_markers,
+            )
+
+        # Canonical marker tables print AF to four decimals, but prediction
+        # must use exact training statistics retained in the model state.
+        active_model_rows = np.arange(int(source_rows.size), dtype=np.int64)
+        for stat_name in ("export_training_dosage_mean", "marker_means"):
+            state_stat = _model_only_source_row_vector(
+                model_state.get(stat_name, None),
+                active_row_idx=active_model_rows,
+                n_source=int(source_rows.size),
+                name=stat_name,
+                dtype=np.float32,
+            )
+            if state_stat is not None and np.all(np.isfinite(state_stat)):
+                dosage_mean = np.ascontiguousarray(state_stat, dtype=np.float32)
+                break
+        for stat_name in ("export_training_row_inv_sd", "row_inv_sd"):
+            state_stat = _model_only_source_row_vector(
+                model_state.get(stat_name, None),
+                active_row_idx=active_model_rows,
+                n_source=int(source_rows.size),
+                name=stat_name,
+                dtype=np.float32,
+            )
+            if state_stat is not None:
+                row_inv = np.ascontiguousarray(state_stat, dtype=np.float32)
+                break
+
+        missing_dosage = ~np.isfinite(dosage_mean)
+        if np.any(missing_dosage):
+            source_af = np.asarray(
+                source_meta.get("af", np.asarray([], dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)
+            for row in np.flatnonzero(missing_dosage).tolist():
+                source_row = int(source_rows[row])
+                if source_af.size == observed_markers and np.isfinite(source_af[source_row]):
+                    dosage_mean[row] = float(2.0 * source_af[source_row])
+                elif raw_genotype is not None:
+                    values = np.asarray(raw_genotype[source_row], dtype=np.float32)
+                    valid = values[np.isfinite(values) & (values >= 0.0)]
+                    if int(valid.size) > 0:
+                        mean_value = float(np.mean(valid))
+                        dosage_mean[row] = float(2.0 - mean_value) if bool(row_flip[row]) else mean_value
+        if np.any(~np.isfinite(dosage_mean)):
+            raise ValueError(
+                f"Model {model_file} lacks training imputation statistics and they "
+                "could not be recovered from the genotype input."
+            )
+        if packed_genotype is not None:
+            genotype_aligned = _decode_model_only_packed(
+                packed=packed_genotype,
+                n_samples=int(sample_ids.size),
+                source_rows=source_rows,
+                row_flip=row_flip,
+                dosage_mean=dosage_mean,
+            )
+        else:
+            genotype_aligned = _apply_model_only_dense_alignment(
+                genotype=typing.cast(np.ndarray, raw_genotype),
+                source_rows=source_rows,
+                row_flip=row_flip,
+                dosage_mean=dosage_mean,
+            )
+        geno = _prepare_model_only_dense_matrix(
+            model_state=model_state,
+            genotype=genotype_aligned,
+            model_path=model_file,
+            row_mean=dosage_mean,
+            row_inv_sd=row_inv,
+        )
+        samples = np.asarray(sample_ids, dtype=str)
+        packed_lmm_ctx = None
+        packed_bayes_ctx = None
+        geno_is_memmap = False
+        geno_marker_meta = None
+        # The artifact has already fixed the marker mask, orientation,
+        # imputation and scale; do not normalize it again by deployment data.
+        geno_raw = geno
+        geno_add_raw = geno
+        geno_ml_raw = geno
+        n = int(samples.size)
+        m = int(np.asarray(geno).shape[0])
+        _ensure_gs_memory_and_config(int(n), int(m))
+        if bool(debug_mode):
+            logger.info(
+                "Loaded model preprocessing: raw_markers=%d active_markers=%d; "
+                "training marker mask, orientation, AF imputation and scale reused from %s",
+                int(observed_markers),
+                int(m),
+                model_file,
+            )
+    elif use_packed_lmm:
         defer_geno_load_status = not bool(gs_config_emitted)
         with CliStatus(
             genotype_load_status_open(gsrc),
@@ -19606,7 +21912,7 @@ def _run_gs_pipeline_impl(
             enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
         ) as task:
             try:
-                if file_memmap_preferred:
+                if file_memmap_preferred and (not bool(args.save_model)):
                     sample_ids, geno = _build_memmap_cache_from_chunks(
                         genotype_path=str(gfile),
                         maf=float(args.maf),
@@ -19617,12 +21923,23 @@ def _run_gs_pipeline_impl(
                     )
                     geno_is_memmap = isinstance(geno, np.memmap)
                 else:
-                    sample_ids, geno = _load_genotype_with_rust_gfreader(
+                    loaded_genotype = _load_genotype_with_rust_gfreader(
                         gfile,
                         maf=args.maf,
                         missing_rate=args.geno,
                         het_threshold=float(args.het),
+                        return_site_meta=bool(args.save_model),
                     )
+                    if bool(args.save_model):
+                        sample_ids, geno, geno_marker_meta = typing.cast(
+                            tuple[np.ndarray, np.ndarray, pd.DataFrame],
+                            loaded_genotype,
+                        )
+                    else:
+                        sample_ids, geno = typing.cast(
+                            tuple[np.ndarray, np.ndarray],
+                            loaded_genotype,
+                        )
             except Exception:
                 task.fail(genotype_load_status_fail(gsrc))
                 raise
@@ -20763,6 +23080,30 @@ def _run_gs_pipeline_impl(
                         rows.extend(_rows_for(eff_method))
                     return rows
 
+                if m == _GARFIELD_METHOD:
+                    nested = dict(
+                        typing.cast(
+                            dict[str, typing.Any] | None,
+                            res_obj.get("garfield_nested"),
+                        )
+                        or {}
+                    )
+                    fold_counts = list(nested.get("fold_rule_counts", []) or [])
+                    if len(fold_counts) > 0:
+                        rows.append(("search", "fold-local GARFIELD -> GBLUP"))
+                        rows.append(("folds", str(len(fold_counts))))
+                        rows.append(
+                            (
+                                "rules/fold",
+                                ",".join(str(int(x.get("rules_used", 0))) for x in fold_counts),
+                            )
+                        )
+                    rows.append(("pseudo_features", str(int(nested.get("final_pseudo_features", 0) or 0))))
+                    final_counts = dict(nested.get("final_rule_counts", {}) or {})
+                    if len(final_counts) > 0:
+                        rows.append(("final_rules", str(int(final_counts.get("rules_used", 0) or 0))))
+                    return rows
+
                 if _is_gblup_method(m):
                     mode = _gblup_method_kernel_mode(m)
                     rows.append(("kernel", _gblup_mode_label(mode)))
@@ -21249,7 +23590,38 @@ def _run_gs_pipeline_impl(
                         model_state=state_export,
                         packed_ctx=packed_ctx_for_export,
                         genotype_prefix_hint=genotype_prefix_hint,
+                        training_sample_indices=np.ascontiguousarray(
+                            np.asarray(train_sample_idx, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        ),
                     )
+                    if (
+                        str(state_export.get("kind", "")).strip().lower()
+                        == "gblup_kernel_projection"
+                        and not bool(state_export.get("standardized", False))
+                    ):
+                        projection_raw = state_export.get(
+                            "kernel_projection",
+                            state_export.get("beta", None),
+                        )
+                        training_mean_raw = state_export.get(
+                            "export_training_dosage_mean", None
+                        )
+                        if projection_raw is not None and training_mean_raw is not None:
+                            projection = np.asarray(projection_raw, dtype=np.float64).reshape(-1)
+                            training_mean = np.asarray(training_mean_raw, dtype=np.float64).reshape(-1)
+                            if (
+                                int(projection.size) == int(training_mean.size)
+                                and int(projection.size) > 0
+                                and np.all(np.isfinite(projection))
+                                and np.all(np.isfinite(training_mean))
+                            ):
+                                # Preserve the raw 0/1/2 projection intercept
+                                # explicitly for future model reloads.
+                                state_export["prediction_alpha_raw_012"] = float(
+                                    float(state_export.get("alpha", 0.0))
+                                    - float(np.dot(training_mean, projection))
+                                )
                     if str(effect_export_method) == _GBLUP_METHOD_ADD:
                         beta_backsolve, gblup_backsolve_meta = _try_backsolve_gblup_effect_beta_pcg(
                             model_state=state_export,
@@ -21299,6 +23671,7 @@ def _run_gs_pipeline_impl(
                             state_export["effect_kind"] = "signed_beta"
                             state_export["effect_source"] = "pcg_backsolve"
                     model_out = os.path.join(gs_model_dir, f"{trait_name}.{m_key}.jxmodel")
+                    marker_table_for_model: pd.DataFrame | None = None
                     fallback_marker_count = None
                     if _looks_like_packed_ctx(trait_packed_ctx):
                         fallback_marker_count = _packed_ctx_active_rows(
@@ -21308,13 +23681,15 @@ def _run_gs_pipeline_impl(
                         fallback_marker_count = int(np.asarray(train_snp).shape[0])
                     if want_effect_export:
                         try:
-                            effect_table, effect_meta = _build_method_effect_table(
+                            effect_table, effect_meta = _build_jxmodel_marker_table(
                                 model_state=dict(state_export),
                                 packed_ctx=packed_ctx_for_export,
                                 genotype_prefix_hint=genotype_prefix_hint,
                                 fallback_marker_count=fallback_marker_count,
+                                marker_meta=geno_marker_meta,
                             )
                             trait_effect_meta_by_method[str(m_key)] = dict(effect_meta or {})
+                            marker_table_for_model = effect_table
                             effect_out_export = str(model_out)
                             if artifact_kind == "text_effect":
                                 _save_effect_text_jxmodel(model_out, effect_table)
@@ -21341,29 +23716,29 @@ def _run_gs_pipeline_impl(
                                 "notes": [f"export_failed: {ex}"],
                             }
                             trait_effect_meta_by_method[str(m_key)] = dict(effect_meta)
-                            effect_out_export = (str(model_out) if artifact_kind == "text_effect" else None)
+                            effect_out_export = None
                     if want_model_export and artifact_kind == "binary_jxmodel":
                         payload = {
                             "format": _JXMODEL_FORMAT,
                             "method": str(m_key),
-                            "method_display": str(m_disp),
                             "trait": str(trait_name),
                             "created_at_unix": float(time.time()),
-                            "pve_final": float(res_obj.get("pve_final", np.nan)),
+                            "training": {
+                                "maf": float(args.maf),
+                                "geno": float(args.geno),
+                                "het": float(args.het),
+                                "n_samples": int(np.asarray(samples, dtype=str).reshape(-1).shape[0]),
+                                "n_train": int(np.asarray(train_sample_idx, dtype=np.int64).size),
+                                "pve_final": float(res_obj.get("pve_final", np.nan)),
+                            },
                             "model_state": dict(state_export),
                             "export_scale_meta": dict(model_export_meta or {}),
-                            "genotype_prefix_hint": (
-                                None
-                                if genotype_prefix_hint is None
-                                else str(genotype_prefix_hint)
-                            ),
-                            "fallback_marker_count": (
-                                None
-                                if fallback_marker_count is None
-                                else int(fallback_marker_count)
-                            ),
                         }
-                        _save_jxmodel(model_out, payload)
+                        _save_jxmodel(
+                            model_out,
+                            payload,
+                            marker_table=marker_table_for_model,
+                        )
                         saved_result_paths.append(str(model_out))
                         model_out_export = str(model_out)
                         if want_effect_export and effect_out_export is None:
@@ -21624,6 +23999,29 @@ def _run_gs_pipeline_impl(
                 method_results.append(res)
                 _emit_method_header(str(m))
                 _emit_method_block_and_artifacts(str(m), res)
+        elif _GARFIELD_METHOD in trait_methods:
+            if cv_splits is None or len(cv_splits) < 2:
+                raise RuntimeError("GARFIELD nested GS requires at least two CV folds.")
+            method_results = []
+            garfield_res = _run_garfield_nested_cv(
+                genotype_prefix=str(gfile),
+                sample_ids=np.asarray(samples, dtype=str).reshape(-1),
+                train_pheno=np.asarray(train_pheno, dtype=np.float64),
+                train_sample_indices=method_train_sample_idx,
+                test_sample_indices=method_test_sample_idx,
+                cv_splits=cv_splits,
+                outprefix=str(outprefix),
+                trait_name=str(trait_name),
+                n_jobs=max(1, int(args.thread)),
+                seed=int(args.seed),
+                maf=float(args.maf),
+                missing_rate=float(args.geno),
+                het_threshold=float(args.het),
+                logger=logger,
+            )
+            method_results.append(garfield_res)
+            _emit_method_header(_GARFIELD_METHOD)
+            _emit_method_block_and_artifacts(_GARFIELD_METHOD, garfield_res)
         else:
             method_results = _run_methods_parallel(
                 methods=trait_methods,
@@ -22185,7 +24583,6 @@ def _run_gs_pipeline_impl(
                     {
                         "format": _JXMODEL_FORMAT,
                         "method": _JXMODEL_TOP_BUNDLE_METHOD,
-                        "method_display": "GS_TOP_BUNDLE",
                         "trait": "MULTI",
                         "created_at_unix": float(time.time()),
                         "model_select_metric": str(args.model_select_metric).strip().lower(),
@@ -22304,9 +24701,8 @@ def _run_gs_pipeline_impl(
             "effect_file_pattern": "{trait}.{method}.jxmodel",
             "summary_file": "summary.json",
             "loaded_model_hint": (
-                "Use --model <model_dir> with loadable binary artifacts "
-                "(rrBLUP and ML methods). BLUP/Bayes .jxmodel files are effect-table text artifacts "
-                "for jx postgs."
+                "Use --model <model_dir> with self-contained .jxmodel artifacts. "
+                "Use `jx view -model <file> | less -S` to inspect the embedded marker table."
             ),
         },
     }

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import struct
 import sys
+import zipfile
 from pathlib import Path
 
 from ._common.binsidecar import (
@@ -58,6 +60,145 @@ def _detect_bin_kind(path: Path) -> str:
         "Expected JXBKMR1\\0 (.bkmer), JXBSIT1\\0 (kmerge .bsite), "
         "or JXBSIT02 (legacy .bsite)."
     )
+
+
+def _dump_legacy_model(path: Path) -> None:
+    """Read legacy text/v1 models without changing the new export format."""
+    try:
+        import pandas as pd
+
+        table = pd.read_csv(path, sep="\t")
+        if int(table.shape[1]) <= 1:
+            table = pd.read_csv(path, sep=None, engine="python")
+        columns = {str(c).strip().lower() for c in table.columns}
+        if {"chr", "pos", "beta"}.issubset(columns):
+            out = sys.stdout
+            out.write("##format=janusx.gs.jxmodel.legacy-text\n")
+            out.write("##container=plain-text\n")
+            out.write(f"##marker_count={int(table.shape[0])}\n")
+            out.write("#" + "\t".join(str(c) for c in table.columns) + "\n")
+            table.to_csv(out, sep="\t", index=False, lineterminator="\n")
+            return
+    except BrokenPipeError:
+        raise
+    except Exception:
+        pass
+
+    try:
+        from janusx.gs.workflow import (
+            _build_method_effect_table,
+            _load_jxmodel,
+        )
+
+        payload = _load_jxmodel(str(path))
+        state = payload.get("model_state", None)
+        if not isinstance(state, dict) or len(state) == 0:
+            raise RuntimeError("legacy model has no model_state")
+        prefix_hint = payload.get(
+            "genotype_prefix_hint",
+            state.get("genotype_prefix_hint", state.get("source_prefix", None)),
+        )
+        fallback_count = payload.get("fallback_marker_count", None)
+        table, _meta = _build_method_effect_table(
+            model_state=dict(state),
+            packed_ctx=None,
+            genotype_prefix_hint=(None if prefix_hint is None else str(prefix_hint)),
+            fallback_marker_count=(None if fallback_count is None else int(fallback_count)),
+        )
+        out = sys.stdout
+        out.write(f"##format={payload.get('format', 'legacy')}\n")
+        out.write("##container=legacy-pickle\n")
+        for key in ("trait", "method", "method_display", "pve_final"):
+            if key in payload and payload[key] is not None:
+                out.write(f"##{key}={payload[key]}\n")
+        out.write(f"##marker_count={int(table.shape[0])}\n")
+        out.write("#" + "\t".join(str(c) for c in table.columns) + "\n")
+        table.to_csv(out, sep="\t", index=False, lineterminator="\n")
+    except BrokenPipeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot decode legacy .jxmodel '{path}'. "
+            "Re-export it with the current `jx gs -save-model`."
+        ) from exc
+
+
+def _dump_model(path: Path) -> None:
+    """Decode a GS model, streaming v2 metadata without loading its payload."""
+    if not zipfile.is_zipfile(path):
+        _dump_legacy_model(path)
+        return
+    with zipfile.ZipFile(path, mode="r") as archive:
+        try:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        except KeyError as exc:
+            raise RuntimeError(f"Missing manifest.json in model: {path}") from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError(f"Invalid model manifest in: {path}")
+        if str(manifest.get("format", "")).strip() != "janusx.gs.jxmodel.v2":
+            raise RuntimeError(
+                f"Unsupported GS model format: {manifest.get('format', '')!r}"
+            )
+
+        scalar_keys = (
+            "format",
+            "container",
+            "trait",
+            "method",
+            "model_state_kind",
+            "n_markers",
+            "created_at_unix",
+        )
+        out = sys.stdout
+        for key in scalar_keys:
+            if key not in manifest or manifest[key] is None:
+                continue
+            out.write(f"##{key}={manifest[key]}\n")
+        if "n_markers" not in manifest and manifest.get("marker_count") is not None:
+            out.write(f"##n_markers={manifest['marker_count']}\n")
+        training_config = manifest.get("training", manifest.get("training_config", None))
+        if isinstance(training_config, dict):
+            out.write(
+                "##training="
+                + json.dumps(training_config, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            )
+
+        marker_name = "markers.tsv"
+        if marker_name not in archive.namelist():
+            out.write("##markers=none\n")
+            return
+        with archive.open(marker_name, mode="r") as marker_handle:
+            first = marker_handle.readline().decode("utf-8", errors="replace")
+            if first == "":
+                out.write("##markers=empty\n")
+                return
+            header = first.rstrip("\r\n").split("\t")
+            header_map = {
+                "ref": "REF",
+                "alt": "ALT",
+                "effect_allele": "EFFECT_ALLELE",
+                "train_af": "AF",
+                "train_miss": "MISS",
+                "train_het": "HET",
+                "row_flip": "ROW_FLIP",
+                "impute": "IMPUTE",
+                "row_mean": "ROW_MEAN",
+                "row_inv_sd": "ROW_INV_SD",
+                "af": "AF",
+                "inv_sd": "INV_SD",
+                "beta": "BETA",
+                "imp": "IMP",
+                "importance": "IMP",
+                "pip": "PIP",
+            }
+            pretty_header = [header_map.get(str(name).lower(), str(name)) for name in header]
+            out.write("#" + "\t".join(pretty_header) + "\n")
+            while True:
+                block = marker_handle.read(1024 * 1024)
+                if not block:
+                    break
+                out.write(block.decode("utf-8", errors="replace"))
 
 
 def _decode_kmer_code_u64(code: int, k: int) -> str:
@@ -208,21 +349,28 @@ def build_parser() -> argparse.ArgumentParser:
             [
                 "jx view -bin test.kmer/kmerge.bkmer | head",
                 "jx view -bin test.kmer/kmerge.bsite | head",
-                "jx view -bin test.kmer/kmerge.bsite | awk 'length($0) > 0' | head",
+                "jx view -model test.gs.model/trait.BayesA.jxmodel | less -S",
             ]
         ),
         description=(
-            "View JanusX binary files as plain text for shell pipelines. "
-            "Auto-detects `.bkmer`, kmerge `.bsite`, and legacy `.bsite`."
+            "View JanusX binary files and GS model containers as plain text. "
+        "Model output includes metadata and the embedded marker table. "
+        "Legacy .jxmodel files are read-only compatible."
         ),
     )
     required = parser.add_argument_group("Required arguments")
-    required.add_argument(
+    source = required.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "-bin",
         "--bin",
         nargs="+",
-        required=True,
         help="Input file(s): .bkmer or .bsite.",
+    )
+    source.add_argument(
+        "-model",
+        "--model",
+        nargs="+",
+        help="GS .jxmodel file(s); v2 files include embedded metadata and marker tables.",
     )
     return parser
 
@@ -230,6 +378,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.model is not None:
+        files = [Path(str(x)).expanduser().resolve() for x in args.model]
+        for p in files:
+            if not p.is_file():
+                parser.error(f"Input model not found: {p}")
+        try:
+            for p in files:
+                _dump_model(p)
+            return 0
+        except BrokenPipeError:
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, sys.stdout.fileno())
+            except Exception:
+                pass
+            return 0
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
     files = [Path(str(x)).expanduser().resolve() for x in args.bin]
     for p in files:
         if not p.is_file():
