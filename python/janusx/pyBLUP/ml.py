@@ -8,8 +8,12 @@ from typing import Any, Optional
 
 import numpy as np
 from joblib import Parallel, delayed, parallel_backend
-from janusx._optional_deps import format_missing_dependency_message
+from janusx._optional_deps import (
+    classify_import_failure,
+    format_missing_dependency_message,
+)
 
+_SKLEARN_IMPORT_STATUS = "available"
 try:
     from sklearn.cross_decomposition import PLSRegression
     from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
@@ -42,7 +46,9 @@ except Exception as _sklearn_exc:  # pragma: no cover - optional dependency path
 
     _HAS_SKLEARN = False
     _SKLEARN_IMPORT_ERROR = _sklearn_exc
+    _SKLEARN_IMPORT_STATUS = classify_import_failure(_sklearn_exc, "sklearn")
 
+_XGBOOST_IMPORT_STATUS = "available"
 try:
     from threadpoolctl import threadpool_limits
 except Exception:  # pragma: no cover - optional dependency path
@@ -57,11 +63,17 @@ except Exception as _xgb_exc:  # pragma: no cover - optional dependency
     XGBRegressor = None  # type: ignore[assignment]
     _HAS_XGBOOST = False
     _XGBOOST_IMPORT_ERROR = _xgb_exc
+    _XGBOOST_IMPORT_STATUS = classify_import_failure(_xgb_exc, "xgboost")
 
 
 def _require_sklearn(requirement: str) -> None:
     if _HAS_SKLEARN:
         return
+    if _SKLEARN_IMPORT_STATUS == "broken":
+        requirement = (
+            f"{requirement} scikit-learn is installed but failed to import; "
+            "this usually indicates an ABI or runtime-library mismatch."
+        )
     raise ImportError(
         format_missing_dependency_message(
             requirement,
@@ -567,9 +579,15 @@ class MLGS:
 
         if self.method == "xgb":
             if not _HAS_XGBOOST or XGBRegressor is None:
+                requirement = "XGBoost is required for method='xgb'."
+                if _XGBOOST_IMPORT_STATUS == "broken":
+                    requirement = (
+                        f"{requirement} xgboost is installed but failed to import; "
+                        "this usually indicates an ABI or runtime-library mismatch."
+                    )
                 raise ImportError(
                     format_missing_dependency_message(
-                        "XGBoost is required for method='xgb'.",
+                        requirement,
                         packages=("xgboost",),
                         extra="ml",
                         original_error=_XGBOOST_IMPORT_ERROR,
@@ -1363,6 +1381,8 @@ __all__ = [
     "MLGS",
     "_HAS_SKLEARN",
     "_SKLEARN_IMPORT_ERROR",
+    "_SKLEARN_IMPORT_STATUS",
     "_HAS_XGBOOST",
     "_XGBOOST_IMPORT_ERROR",
+    "_XGBOOST_IMPORT_STATUS",
 ]

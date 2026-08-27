@@ -216,30 +216,44 @@ from janusx.janusx import (
     fastlmm_reml_null_f32,
     fastlmm_assoc_chunk_f32,
 )
-try:
-    from janusx.janusx import (
-        lmm_reml_chunk_from_snp_f32 as _lmm_reml_chunk_from_snp_f32,
-        lmm_reml_lmm2_chunk_from_snp_f32 as _lmm_reml_lmm2_chunk_from_snp_f32,
-        lmm_assoc_chunk_from_snp_f32 as _lmm_assoc_chunk_from_snp_f32,
-        fvlmm_assoc_chunk_f32 as _fvlmm_assoc_chunk_f32,
-        fvlmm_assoc_chunk_from_snp_f32 as _fvlmm_assoc_chunk_from_snp_f32,
-        fvlmm_assoc_chunk_from_snp_to_tsv_f32 as _fvlmm_assoc_chunk_from_snp_to_tsv_f32,
-        fvlmm_assoc_bed_to_tsv_f32 as _fvlmm_assoc_bed_to_tsv_f32,
-        fvlmm_assoc_prepare_cache_f32 as _fvlmm_assoc_prepare_cache_f32,
-        fvlmm_assoc_chunk_with_cache_f32 as _fvlmm_assoc_chunk_with_cache_f32,
-        fvlmm_assoc_chunk_from_snp_with_cache_f32 as _fvlmm_assoc_chunk_from_snp_with_cache_f32,
-    )
-except Exception:
-    _lmm_reml_chunk_from_snp_f32 = None
-    _lmm_reml_lmm2_chunk_from_snp_f32 = None
-    _lmm_assoc_chunk_from_snp_f32 = None
-    _fvlmm_assoc_chunk_f32 = None
-    _fvlmm_assoc_chunk_from_snp_f32 = None
-    _fvlmm_assoc_chunk_from_snp_to_tsv_f32 = None
-    _fvlmm_assoc_bed_to_tsv_f32 = None
-    _fvlmm_assoc_prepare_cache_f32 = None
-    _fvlmm_assoc_chunk_with_cache_f32 = None
-    _fvlmm_assoc_chunk_from_snp_with_cache_f32 = None
+import janusx.janusx as _jxrs
+from janusx._optional_deps import load_optional_native_symbols
+
+_OPTIONAL_NATIVE = load_optional_native_symbols(
+    _jxrs,
+    (
+        "lmm_reml_chunk_from_snp_f32",
+        "lmm_reml_lmm2_chunk_from_snp_f32",
+        "lmm_assoc_chunk_from_snp_f32",
+        "fvlmm_assoc_chunk_f32",
+        "fvlmm_assoc_chunk_from_snp_f32",
+        "fvlmm_assoc_chunk_from_snp_to_tsv_f32",
+        "fvlmm_assoc_bed_to_tsv_f32",
+        "fvlmm_assoc_prepare_cache_f32",
+        "fvlmm_assoc_chunk_with_cache_f32",
+        "fvlmm_assoc_chunk_from_snp_with_cache_f32",
+    ),
+)
+_lmm_reml_chunk_from_snp_f32 = _OPTIONAL_NATIVE["lmm_reml_chunk_from_snp_f32"]
+_lmm_reml_lmm2_chunk_from_snp_f32 = _OPTIONAL_NATIVE[
+    "lmm_reml_lmm2_chunk_from_snp_f32"
+]
+_lmm_assoc_chunk_from_snp_f32 = _OPTIONAL_NATIVE["lmm_assoc_chunk_from_snp_f32"]
+_fvlmm_assoc_chunk_f32 = _OPTIONAL_NATIVE["fvlmm_assoc_chunk_f32"]
+_fvlmm_assoc_chunk_from_snp_f32 = _OPTIONAL_NATIVE[
+    "fvlmm_assoc_chunk_from_snp_f32"
+]
+_fvlmm_assoc_chunk_from_snp_to_tsv_f32 = _OPTIONAL_NATIVE[
+    "fvlmm_assoc_chunk_from_snp_to_tsv_f32"
+]
+_fvlmm_assoc_bed_to_tsv_f32 = _OPTIONAL_NATIVE["fvlmm_assoc_bed_to_tsv_f32"]
+_fvlmm_assoc_prepare_cache_f32 = _OPTIONAL_NATIVE["fvlmm_assoc_prepare_cache_f32"]
+_fvlmm_assoc_chunk_with_cache_f32 = _OPTIONAL_NATIVE[
+    "fvlmm_assoc_chunk_with_cache_f32"
+]
+_fvlmm_assoc_chunk_from_snp_with_cache_f32 = _OPTIONAL_NATIVE[
+    "fvlmm_assoc_chunk_from_snp_with_cache_f32"
+]
 try:
     from janusx.janusx import lmm_rotate_x_y_with_ut_f64 as _lmm_rotate_x_y_with_ut_f64
 except Exception:
@@ -258,16 +272,17 @@ try:
 except Exception:
     _rust_eigh_from_matrix_file_f64 = None
 
-try:
-    from janusx.janusx import (
-        lm_block_assoc_packed as _lm_block_assoc_packed,
-        bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
-        bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
-    )
-except Exception:
-    _lm_block_assoc_packed = None
-    _bed_packed_row_flip_mask = None
-    _bed_packed_decode_rows_f32 = None
+_OPTIONAL_PACKED_NATIVE = load_optional_native_symbols(
+    _jxrs,
+    (
+        "lm_block_assoc_packed",
+        "bed_packed_row_flip_mask",
+        "bed_packed_decode_rows_f32",
+    ),
+)
+_lm_block_assoc_packed = _OPTIONAL_PACKED_NATIVE["lm_block_assoc_packed"]
+_bed_packed_row_flip_mask = _OPTIONAL_PACKED_NATIVE["bed_packed_row_flip_mask"]
+_bed_packed_decode_rows_f32 = _OPTIONAL_PACKED_NATIVE["bed_packed_decode_rows_f32"]
 
 
 def _infer_blas_threads_from_env() -> Optional[int]:

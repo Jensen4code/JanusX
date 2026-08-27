@@ -129,8 +129,10 @@ from janusx.pyBLUP.ml import (
     MLGS,
     _HAS_SKLEARN,
     _SKLEARN_IMPORT_ERROR,
+    _SKLEARN_IMPORT_STATUS,
     _HAS_XGBOOST,
     _XGBOOST_IMPORT_ERROR,
+    _XGBOOST_IMPORT_STATUS,
     threadpool_limits as _ml_threadpool_limits,
 )
 try:
@@ -20777,9 +20779,16 @@ def _run_gs_pipeline_impl(
     if any(m in ml_methods for m in methods) and (not _HAS_SKLEARN):
         skipped_ml = [m for m in methods if m in ml_methods]
         methods = [m for m in methods if m not in ml_methods]
+        sklearn_state = (
+            "scikit-learn is installed but failed to import, likely due to an "
+            "ABI or runtime-library mismatch."
+            if _SKLEARN_IMPORT_STATUS == "broken"
+            else "scikit-learn is unavailable."
+        )
         logger.warning(
             format_missing_dependency_message(
-                "Skip ML models (RF/ET/GBDT/SVM/ENET/PLS/KRR/XGB) because scikit-learn is unavailable.",
+                "Skip ML models (RF/ET/GBDT/SVM/ENET/PLS/KRR/XGB) because "
+                + sklearn_state,
                 packages=("scikit-learn",),
                 extra="ml",
                 original_error=_SKLEARN_IMPORT_ERROR,
@@ -20789,9 +20798,15 @@ def _run_gs_pipeline_impl(
 
     if ("XGB" in methods) and (not _HAS_XGBOOST):
         methods = [m for m in methods if m != "XGB"]
+        xgboost_state = (
+            "xgboost is installed but failed to import, likely due to an ABI or "
+            "runtime-library mismatch."
+            if _XGBOOST_IMPORT_STATUS == "broken"
+            else "xgboost is unavailable."
+        )
         logger.warning(
             format_missing_dependency_message(
-                "Skip model XGB because xgboost could not be imported.",
+                "Skip model XGB because " + xgboost_state,
                 packages=("xgboost",),
                 extra="ml",
                 original_error=_XGBOOST_IMPORT_ERROR,
@@ -20800,7 +20815,8 @@ def _run_gs_pipeline_impl(
 
     if len(methods) == 0:
         logger.error(
-            "All selected models were skipped due to missing optional dependencies."
+            "All selected models were skipped because optional dependencies were "
+            "unavailable or failed to import."
         )
         raise SystemExit(1)
 

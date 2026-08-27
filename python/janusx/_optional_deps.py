@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import sys
-from typing import Sequence
+from typing import Any, Sequence
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,24 @@ def _top_module_name(module_name: str | None) -> str:
 
 def resolve_optional_dependency(module_name: str | None) -> OptionalDependencySpec | None:
     return _OPTIONAL_DEPENDENCIES.get(_top_module_name(module_name))
+
+
+def classify_import_failure(exc: Exception, module_name: str) -> str:
+    """Classify an optional import failure without hiding runtime breakage."""
+    if isinstance(exc, ModuleNotFoundError):
+        missing = str(getattr(exc, "name", None) or "").strip().lower()
+        expected = _top_module_name(module_name)
+        if missing == expected:
+            return "missing"
+    return "broken"
+
+
+def load_optional_native_symbols(
+    module: Any,
+    names: Sequence[str],
+) -> dict[str, Any]:
+    """Load extension symbols independently so one missing symbol is isolated."""
+    return {name: getattr(module, name, None) for name in names}
 
 
 def _python_executable_hint() -> str:

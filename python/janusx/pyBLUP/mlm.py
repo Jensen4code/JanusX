@@ -25,27 +25,33 @@ try:
 except Exception:
     _threadpool_limits = None
 from janusx.script._common.grmstable import build_dense_grm_f64
+from janusx._optional_deps import load_optional_native_symbols
 
-try:
-    from janusx.janusx import (
-        bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
-        bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
-        cross_grm_times_alpha_packed_f64 as _cross_grm_times_alpha_packed_f64,
-        packed_malpha_f64 as _packed_malpha_f64,
-        packed_mtm_f64 as _packed_mtm_f64,
-        grm_packed_f32 as _grm_packed_f32,
-        grm_packed_f32_with_stats as _grm_packed_f32_with_stats,
-        grm_packed_f64_with_stats as _grm_packed_f64_with_stats,
-    )
-except Exception:
-    _bed_packed_row_flip_mask = None
-    _bed_packed_decode_rows_f32 = None
-    _cross_grm_times_alpha_packed_f64 = None
-    _packed_malpha_f64 = None
-    _packed_mtm_f64 = None
-    _grm_packed_f32 = None
-    _grm_packed_f32_with_stats = None
-    _grm_packed_f64_with_stats = None
+import janusx.janusx as _jxrs
+
+_OPTIONAL_NATIVE = load_optional_native_symbols(
+    _jxrs,
+    (
+        "bed_packed_row_flip_mask",
+        "bed_packed_decode_rows_f32",
+        "cross_grm_times_alpha_packed_f64",
+        "packed_malpha_f64",
+        "packed_mtm_f64",
+        "grm_packed_f32",
+        "grm_packed_f32_with_stats",
+        "grm_packed_f64_with_stats",
+    ),
+)
+_bed_packed_row_flip_mask = _OPTIONAL_NATIVE["bed_packed_row_flip_mask"]
+_bed_packed_decode_rows_f32 = _OPTIONAL_NATIVE["bed_packed_decode_rows_f32"]
+_cross_grm_times_alpha_packed_f64 = _OPTIONAL_NATIVE[
+    "cross_grm_times_alpha_packed_f64"
+]
+_packed_malpha_f64 = _OPTIONAL_NATIVE["packed_malpha_f64"]
+_packed_mtm_f64 = _OPTIONAL_NATIVE["packed_mtm_f64"]
+_grm_packed_f32 = _OPTIONAL_NATIVE["grm_packed_f32"]
+_grm_packed_f32_with_stats = _OPTIONAL_NATIVE["grm_packed_f32_with_stats"]
+_grm_packed_f64_with_stats = _OPTIONAL_NATIVE["grm_packed_f64_with_stats"]
 
 try:
     from janusx.janusx import bed_packed_decode_stats_f64 as _bed_packed_decode_stats_f64
