@@ -1232,6 +1232,17 @@ def _dev_help_requested(argv: Optional[list[str]] = None) -> bool:
     return ("-dev" in tokens) or ("--dev" in tokens)
 
 
+def _diagnostics_requested(argv: Optional[list[str]] = None) -> bool:
+    """Return whether the opt-in GARFIELD P0 diagnostics flag is active.
+
+    Diagnostics are deliberately development-only: keeping ``--diagnostics``
+    behind ``-dev`` prevents a normal production scan from materializing the
+    per-window candidate/beam trace.
+    """
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    return "--diagnostics" in tokens and _dev_help_requested(tokens)
+
+
 def _parse_rule_null_penalty_spec(
     spec: object,
 ) -> tuple[str, float, bool, Optional[str]]:
@@ -1240,10 +1251,12 @@ def _parse_rule_null_penalty_spec(
     text = str(spec).strip().lower()
     if text == "":
         raise ValueError(
-            "-pm/--permutation requires one of: gev, g99, g99.9, q99, q99.9, or a float in (0, 1)."
+            "-pm/--permutation requires one of: gev, bayes, g99, g99.9, q99, q99.9, or a float in (0, 1)."
         )
     if text in {"gev", "gumbel", "auto"}:
         return "gev", 0.99, False, text
+    if text in {"bayes", "bayesian", "hbayes", "hierarchical"}:
+        return "bayes", 0.99, False, text
     if text.startswith("g"):
         digits = text[1:]
         try:
@@ -1270,7 +1283,7 @@ def _parse_rule_null_penalty_spec(
             quantile = float(text)
         except Exception as exc:
             raise ValueError(
-                "-pm/--permutation must look like gev, g99, g99.9, q99, q99.9, or a float in (0, 1)."
+                "-pm/--permutation must look like gev, bayes, g99, g99.9, q99, q99.9, or a float in (0, 1)."
             ) from exc
     if not np.isfinite(quantile) or not (0.0 < float(quantile) < 1.0):
         raise ValueError("-pm/--permutation quantile must be in (0, 1).")
@@ -1774,7 +1787,7 @@ def main() -> None:
         help=(
             "Set the GARFIELD bucket null-penalty method. Default uses `g99` "
             "(GEV/Gumbel-fit extreme-value threshold at target quantile 0.99). "
-            "You may also pass `gev`, `gumbel`, `g99`, `g99.9`, or an empirical quantile "
+            "You may also pass `gev`, `gumbel`, `bayes`, `g99`, `g99.9`, or an empirical quantile "
             "such as `q99`, `q99.9`, or `0.99`. "
             "This option only controls the null-penalty threshold; it does not append "
             "permutation p-value or FDR columns."
@@ -1823,6 +1836,17 @@ def main() -> None:
     optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 2).")
     dev_group = parser.add_argument_group("Development Arguments (show with -dev)")
     dev_group.add_argument(
+        "--diagnostics",
+        action="store_true",
+        default=False,
+        help=(
+            "Write per-window stage1/selected/beam recall diagnostics TSV. "
+            "Requires -dev."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
         "-gain",
         "--gain-layer",
         dest="gain_layer",
@@ -1832,6 +1856,18 @@ def main() -> None:
             "Start ranking beam candidates by interaction gain from this layer onward "
             "(default: 1; layer 1 gain is its own score, later layers use interaction "
             "gain, and the bucket null penalty remains active)."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--null-repeats",
+        dest="null_repeats",
+        type=int,
+        default=100,
+        help=(
+            "Number of full-scan null replicates used for rule-tail calibration "
+            "(default: 100; minimum: 50; 300-500 recommended for stable 4/5-way tails)."
             if show_dev_help
             else argparse.SUPPRESS
         ),
@@ -1895,6 +1931,12 @@ def main() -> None:
         parser.error("the following arguments are required: -p/--pheno")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    if bool(args.diagnostics) and not bool(args.dev):
+        parser.error("--diagnostics requires -dev")
+    if int(args.null_repeats) < 50:
+        parser.error("--null-repeats must be at least 50")
+    if int(args.null_repeats) != 100 and not bool(args.dev):
+        parser.error("--null-repeats requires -dev")
     args.xor_search_requested = bool(args.xor_search)
     args.xor_search = _resolve_garfield_xor_search(args.xor_search_requested)
     try:
@@ -2352,7 +2394,10 @@ def main() -> None:
                 ml_importance="imp",
                 ml_top_k=int(args.ml_top_k_runtime),
                 ml_top_frac=0.0,
-                permutation_repeats=100,
+                # Rust also enforces this lower bound, but normalizing it at
+                # the CLI keeps the requested and effective repeat counts
+                # aligned in the result manifest.
+                permutation_repeats=max(50, int(args.null_repeats)),
                 permutation_scoring="auto",
                 rule_null_penalty_method=str(args.rule_null_penalty_method_runtime),
                 rule_null_quantile=float(args.rule_null_quantile_runtime),
@@ -2399,6 +2444,7 @@ def main() -> None:
                 logic_mem_budget_bytes=int(
                     max(0.0, float(args.logic_memory_mb)) * 1024.0 * 1024.0
                 ),
+                diagnostics=bool(args.diagnostics),
             ),
         )
         rust_memory_debug = result.get("memory_debug")
@@ -2623,10 +2669,14 @@ def main() -> None:
             "logic_memory_mb": float(args.logic_memory_mb),
             "logic_bits_backend": str(result.get("logic_bits_backend", "resident")),
             "logic_bits_bytes": int(result.get("logic_bits_bytes", 0)),
+            "ld_clump_r2": float(result.get("ld_clump_r2", 0.8)),
+            "ld_clump_rows_compressed": int(result.get("ld_clump_rows_compressed", 0)),
+            "ld_clump_units": int(result.get("ld_clump_units", 0)),
             "pure_line_missing_rule": "na_only",
             "pure_line_het_rule": "drop_if_het_rate_gt_threshold",
             "simbench_path": args.simbench,
             "simbench_rows": int(result.get("n_simbench", 0)),
+            "diagnostics_enabled": bool(args.diagnostics),
             "seed": trait_seed,
             "n_samples": len(common_ids),
             "full_n": int(result.get("full_n", result.get("n_samples", 0))),
@@ -2639,6 +2689,8 @@ def main() -> None:
             "memory_debug": trait_memory_debug,
             "outputs": {
                 "rules_tsv": result.get("rules_tsv"),
+                "diagnostics_tsv": result.get("diagnostics_tsv"),
+                "frontier_diagnostics_tsv": result.get("frontier_diagnostics_tsv"),
                 "pseudo_fvlmm_raw_tsv": None,
                 "pseudo_fvlmm_tsv": (
                     None
@@ -2703,7 +2755,11 @@ def main() -> None:
                 "route": "rust-bed",
             }
         )
-        trait_saved_paths: list[object] = [result.get("rules_tsv")]
+        trait_saved_paths: list[object] = [
+            result.get("rules_tsv"),
+            result.get("diagnostics_tsv"),
+            result.get("frontier_diagnostics_tsv"),
+        ]
         if pseudo_gwas_payload is not None:
             trait_saved_paths.extend(pseudo_gwas_payload.get("tsv_paths") or [])
             trait_saved_paths.extend(pseudo_gwas_payload.get("figure_paths") or [])

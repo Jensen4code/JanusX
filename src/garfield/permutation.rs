@@ -12,7 +12,10 @@ use super::bs::BeamRule;
 pub const DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS: usize = 32;
 pub const DEFAULT_RULE_NULL_PHYSICAL_CHUNKS: usize = 150;
 pub const DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK: usize = 50;
-pub const DEFAULT_RULE_NULL_MAX_REPEATS: usize = 100;
+// Upper bound for production null calibration. The default Python path still
+// requests 100 repeats; development runs may raise this to 300--500 for
+// stable 4/5-way tail estimates.
+pub const DEFAULT_RULE_NULL_MAX_REPEATS: usize = 500;
 pub const DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS: usize = 50;
 pub const DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS: usize = 5;
 pub const DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS: usize = 5;
@@ -23,13 +26,18 @@ pub const DEFAULT_RULE_STRUCTURE_DENSITY_TOPK: usize = 10;
 const DEFAULT_RULE_NULL_QUANTILE: f64 = 0.99;
 pub const DEFAULT_RULE_NULL_GEV_FWER_ALPHA: f64 = 0.01;
 const DEFAULT_RULE_NULL_Q99_REL_TOL: f64 = 0.02;
+// Empirical-Bayes tail calibration constants. The prior strength is expressed
+// as an equivalent number of neighbouring high-order maxima. A 95% upper
+// posterior margin avoids treating a sparse point estimate as a hard cutoff.
+const BAYES_TAIL_PRIOR_STRENGTH: f64 = 50.0;
+const BAYES_TAIL_UPPER_Z: f64 = 1.644_853_626_951_472_2;
+const BAYES_TAIL_MIN_POOL_SAMPLES: usize = 10;
 // Minimum samples per exact bucket before falling back to the global null.
 const NULL_EXACT_MIN_SAMPLES: usize = 10;
 // Top-k per repeat: keep a single best null score for every bucket / repeat.
 const DEFAULT_RULE_NULL_TOPK_ALL: usize = 1;
 const DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN: usize = 5;
 const DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT: usize = 3;
-const DEFAULT_RULE_NULL_LEN_BUCKET_COUNT: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Bucket types
@@ -81,6 +89,7 @@ pub struct RuleNullDistributionSummary {
 pub enum RuleNullPenaltyMethod {
     Quantile { quantile: f64 },
     GevGumbel { fwer_alpha: f64 },
+    BayesHierarchical { fwer_alpha: f64 },
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +100,7 @@ pub struct RuleNullCalibrator {
     max_rule_len: usize,
     unit_group_bin_count: usize,
     global: RuleNullScores,
+    family_4plus: RuleNullScores,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +123,12 @@ pub struct RuleNullPenaltyLookup {
     global_test: Option<f64>,
     global_train_stats: Option<RuleNullGlobalStats>,
     global_test_stats: Option<RuleNullGlobalStats>,
+    family_4plus_train: Option<f64>,
+    family_4plus_test: Option<f64>,
+    delta_len_train: Vec<Option<f64>>,
+    delta_len_test: Vec<Option<f64>>,
+    delta_family_4plus_train: Option<f64>,
+    delta_family_4plus_test: Option<f64>,
 }
 
 impl Default for RuleNullPenaltyLookup {
@@ -142,6 +158,7 @@ impl RuleNullPenaltyMethod {
         match self {
             Self::Quantile { .. } => "quantile",
             Self::GevGumbel { .. } => "gev",
+            Self::BayesHierarchical { .. } => "bayes",
         }
     }
 
@@ -152,12 +169,23 @@ impl RuleNullPenaltyMethod {
             Self::GevGumbel { fwer_alpha } => {
                 sanitize_rule_null_quantile(1.0 - sanitize_rule_null_quantile(fwer_alpha))
             }
+            Self::BayesHierarchical { fwer_alpha } => {
+                sanitize_rule_null_quantile(1.0 - sanitize_rule_null_quantile(fwer_alpha))
+            }
         }
     }
 
     #[inline]
     pub fn uses_gev(self) -> bool {
         matches!(self, Self::GevGumbel { .. })
+    }
+
+    #[inline]
+    pub fn uses_tail_model(self) -> bool {
+        matches!(
+            self,
+            Self::GevGumbel { .. } | Self::BayesHierarchical { .. }
+        )
     }
 }
 
@@ -256,19 +284,19 @@ pub fn rule_null_bucket_count(max_rule_len: usize) -> usize {
 
 #[inline]
 pub(crate) fn rule_null_len_bucket_count(max_rule_len: usize) -> usize {
-    max_rule_len.max(1).min(DEFAULT_RULE_NULL_LEN_BUCKET_COUNT)
+    // Keep a separate fallback bucket for every supported rule length.  The
+    // old three-bucket layout pooled lengths 3..5 as `layer3+`, which made a
+    // length-4/5 rule inherit the same calibration as a length-3 rule.
+    max_rule_len
+        .max(1)
+        .min(DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN)
 }
 
 #[inline]
 pub(crate) fn rule_null_len_bucket_index(rule_len: usize, max_rule_len: usize) -> usize {
-    let count = rule_null_len_bucket_count(max_rule_len);
-    if count <= 1 {
-        0
-    } else if count == 2 {
-        rule_len.saturating_sub(1).min(1)
-    } else {
-        rule_len.saturating_sub(1).min(2)
-    }
+    rule_len
+        .saturating_sub(1)
+        .min(rule_null_len_bucket_count(max_rule_len).saturating_sub(1))
 }
 
 #[inline]
@@ -334,6 +362,7 @@ impl RuleNullCalibrator {
             max_rule_len: max_rule_len.max(1),
             unit_group_bin_count,
             global: RuleNullScores::default(),
+            family_4plus: RuleNullScores::default(),
         }
     }
 
@@ -406,6 +435,18 @@ impl RuleNullCalibrator {
         self.global.test.push(score);
     }
 
+    /// Insert one complete-scan 4+ maximum for a null repeat.  Keeping this
+    /// separate from the per-length buckets prevents the family statistic
+    /// from contaminating layer-specific penalties.
+    pub fn insert_family_4plus(&mut self, train_score: f64, test_score: f64) {
+        if train_score.is_finite() {
+            self.family_4plus.train.push(train_score);
+        }
+        if test_score.is_finite() {
+            self.family_4plus.test.push(test_score);
+        }
+    }
+
     #[cfg(test)]
     pub fn finalize_with_quantile(&self, quantile: f64) -> RuleNullPenaltyLookup {
         self.finalize_with_method(RuleNullPenaltyMethod::quantile(quantile))
@@ -417,19 +458,57 @@ impl RuleNullCalibrator {
             RuleNullPenaltyLookup::with_layout(self.max_rule_len, self.unit_group_bin_count);
         out.method = method;
         out.quantile = q;
+        let bayes = matches!(method, RuleNullPenaltyMethod::BayesHierarchical { .. });
+        let bayes_bucket_train = bayes
+            .then(|| bayesian_penalties_for_layout(&self.by_bucket, self.max_rule_len, true, q));
+        let bayes_bucket_test = bayes
+            .then(|| bayesian_penalties_for_layout(&self.by_bucket, self.max_rule_len, false, q));
+        let bayes_group_len_train = bayes
+            .then(|| bayesian_penalties_for_layout(&self.by_group_len, self.max_rule_len, true, q));
+        let bayes_group_len_test = bayes.then(|| {
+            bayesian_penalties_for_layout(&self.by_group_len, self.max_rule_len, false, q)
+        });
+        let bayes_len_train =
+            bayes.then(|| bayesian_penalties_for_layout(&self.by_len, self.max_rule_len, true, q));
+        let bayes_len_test =
+            bayes.then(|| bayesian_penalties_for_layout(&self.by_len, self.max_rule_len, false, q));
         for (idx, scores) in self.by_bucket.iter().enumerate() {
-            out.bucket_train[idx] = sample_penalty_from_method(scores.train.as_slice(), method);
-            out.bucket_test[idx] = sample_penalty_from_method(scores.test.as_slice(), method);
+            out.bucket_train[idx] = if let Some(values) = bayes_bucket_train.as_ref() {
+                values.get(idx).copied().flatten()
+            } else {
+                sample_penalty_from_method(scores.train.as_slice(), method)
+            };
+            out.bucket_test[idx] = if let Some(values) = bayes_bucket_test.as_ref() {
+                values.get(idx).copied().flatten()
+            } else {
+                sample_penalty_from_method(scores.test.as_slice(), method)
+            };
         }
         for (idx, scores) in self.by_group_len.iter().enumerate() {
-            out.group_len_train[idx] = sample_penalty_from_method(scores.train.as_slice(), method);
-            out.group_len_test[idx] = sample_penalty_from_method(scores.test.as_slice(), method);
+            out.group_len_train[idx] = if let Some(values) = bayes_group_len_train.as_ref() {
+                values.get(idx).copied().flatten()
+            } else {
+                sample_penalty_from_method(scores.train.as_slice(), method)
+            };
+            out.group_len_test[idx] = if let Some(values) = bayes_group_len_test.as_ref() {
+                values.get(idx).copied().flatten()
+            } else {
+                sample_penalty_from_method(scores.test.as_slice(), method)
+            };
             out.group_len_train_stats[idx] = summarize_scores(scores.train.as_slice());
             out.group_len_test_stats[idx] = summarize_scores(scores.test.as_slice());
         }
         for (idx, scores) in self.by_len.iter().enumerate() {
-            out.len_train[idx] = sample_penalty_from_method(scores.train.as_slice(), method);
-            out.len_test[idx] = sample_penalty_from_method(scores.test.as_slice(), method);
+            out.len_train[idx] = if let Some(values) = bayes_len_train.as_ref() {
+                values.get(idx).copied().flatten()
+            } else {
+                sample_penalty_from_method(scores.train.as_slice(), method)
+            };
+            out.len_test[idx] = if let Some(values) = bayes_len_test.as_ref() {
+                values.get(idx).copied().flatten()
+            } else {
+                sample_penalty_from_method(scores.test.as_slice(), method)
+            };
             out.len_train_stats[idx] = summarize_scores(scores.train.as_slice());
             out.len_test_stats[idx] = summarize_scores(scores.test.as_slice());
         }
@@ -437,6 +516,10 @@ impl RuleNullCalibrator {
         out.global_test = sample_penalty_from_method(self.global.test.as_slice(), method);
         out.global_train_stats = summarize_scores(self.global.train.as_slice());
         out.global_test_stats = summarize_scores(self.global.test.as_slice());
+        out.family_4plus_train =
+            sample_penalty_from_method(self.family_4plus.train.as_slice(), method);
+        out.family_4plus_test =
+            sample_penalty_from_method(self.family_4plus.test.as_slice(), method);
         out
     }
 
@@ -454,6 +537,150 @@ fn sample_min_safe(scores: &[f64], q: f64) -> Option<f64> {
     quantile_nearest_rank(scores, q)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RunningMoments {
+    n: usize,
+    mean: f64,
+    m2: f64,
+}
+
+impl RunningMoments {
+    #[inline]
+    fn add(&mut self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        self.n = self.n.saturating_add(1);
+        let n = self.n as f64;
+        let delta = value - self.mean;
+        self.mean += delta / n;
+        self.m2 += delta * (value - self.mean);
+    }
+
+    #[inline]
+    fn merge(&mut self, other: Self) {
+        if other.n == 0 {
+            return;
+        }
+        if self.n == 0 {
+            *self = other;
+            return;
+        }
+        let n_left = self.n as f64;
+        let n_right = other.n as f64;
+        let n_total = n_left + n_right;
+        let delta = other.mean - self.mean;
+        self.mean += delta * (n_right / n_total);
+        self.m2 += other.m2 + delta * delta * (n_left * n_right / n_total);
+        self.n = self.n.saturating_add(other.n);
+    }
+
+    #[inline]
+    fn sample_std(self) -> f64 {
+        if self.n >= 2 {
+            (self.m2 / ((self.n - 1) as f64)).sqrt()
+        } else {
+            0.0
+        }
+    }
+}
+
+#[inline]
+fn running_moments(scores: &[f64]) -> RunningMoments {
+    let mut out = RunningMoments::default();
+    for value in scores.iter().copied() {
+        out.add(value);
+    }
+    out
+}
+
+#[inline]
+fn bayes_tail_stratum(rule_len: usize) -> usize {
+    usize::from(rule_len >= 3)
+}
+
+/// Estimate a conservative Gumbel q-quantile with partial pooling across
+/// neighbouring rule lengths. This is an empirical-Bayes approximation: the
+/// pooled moments define a normal prior for the location and log-scale, while
+/// the target bucket contributes its own likelihood weight. It deliberately
+/// avoids a per-bucket MCMC chain in the hot calibration path.
+#[inline]
+fn bayesian_gumbel_penalty(
+    target: RunningMoments,
+    pooled: RunningMoments,
+    quantile: f64,
+) -> Option<f64> {
+    if target.n == 0 || !target.mean.is_finite() {
+        return None;
+    }
+    let pooled = if pooled.n >= BAYES_TAIL_MIN_POOL_SAMPLES {
+        pooled
+    } else {
+        target
+    };
+    let prior_n = BAYES_TAIL_PRIOR_STRENGTH;
+    let weight = (target.n as f64) / ((target.n as f64) + prior_n);
+    let location = weight * target.mean + (1.0 - weight) * pooled.mean;
+    let scale_floor = location.abs().max(1.0) * 1e-6;
+    // For a Gumbel distribution, sd = pi * scale / sqrt(6).  Convert the
+    // running sample standard deviations before treating them as the Gumbel
+    // scale parameter; using sd directly would inflate the tail threshold by
+    // roughly 28 percent.
+    let gumbel_scale_factor = (6.0_f64).sqrt() / PI;
+    let target_scale = (target.sample_std() * gumbel_scale_factor).max(scale_floor);
+    let pooled_scale = (pooled.sample_std() * gumbel_scale_factor).max(scale_floor);
+    let log_scale = weight * target_scale.ln() + (1.0 - weight) * pooled_scale.ln();
+    let scale = log_scale.exp();
+    if !(location.is_finite() && scale.is_finite() && scale > 0.0) {
+        return None;
+    }
+    let q = sanitize_rule_null_quantile(quantile);
+    let tail = -(-q.ln()).ln();
+    if !tail.is_finite() {
+        return None;
+    }
+    // RunningMoments::mean is the arithmetic mean, not the Gumbel location.
+    // Convert it with E[GEV] = location + gamma * scale before evaluating the
+    // requested tail quantile.
+    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+    let gumbel_location = location - EULER_GAMMA * scale;
+    let estimate = gumbel_location + scale * tail;
+    // The posterior location uncertainty is approximately scale/sqrt(n) for
+    // a Gumbel maximum. Keep this small, explicit upper margin so sparse
+    // 4/5-way buckets are not assigned an overconfident threshold.
+    let margin = BAYES_TAIL_UPPER_Z * scale / (target.n as f64).sqrt();
+    let penalty = estimate + margin;
+    penalty.is_finite().then_some(penalty)
+}
+
+fn bayesian_penalties_for_layout(
+    vectors: &[RuleNullScores],
+    len_count: usize,
+    is_train: bool,
+    quantile: f64,
+) -> Vec<Option<f64>> {
+    let len_count = len_count.max(1);
+    let mut pooled = [RunningMoments::default(); 2];
+    let mut target_moments = Vec::with_capacity(vectors.len());
+    for (idx, scores) in vectors.iter().enumerate() {
+        let values = if is_train {
+            scores.train.as_slice()
+        } else {
+            scores.test.as_slice()
+        };
+        let moments = running_moments(values);
+        let rule_len = (idx % len_count).saturating_add(1);
+        pooled[bayes_tail_stratum(rule_len)].merge(moments);
+        target_moments.push((rule_len, moments));
+    }
+    target_moments
+        .into_iter()
+        .map(|(rule_len, target)| {
+            bayesian_gumbel_penalty(target, pooled[bayes_tail_stratum(rule_len)], quantile)
+        })
+        .collect()
+}
+
 #[inline]
 fn sample_penalty_from_method(scores: &[f64], method: RuleNullPenaltyMethod) -> Option<f64> {
     match method {
@@ -462,6 +689,14 @@ fn sample_penalty_from_method(scores: &[f64], method: RuleNullPenaltyMethod) -> 
         }
         RuleNullPenaltyMethod::GevGumbel { fwer_alpha } => {
             gumbel_penalty_from_maxima(scores, sanitize_rule_null_alpha(fwer_alpha))
+        }
+        RuleNullPenaltyMethod::BayesHierarchical { fwer_alpha } => {
+            let moments = running_moments(scores);
+            bayesian_gumbel_penalty(
+                moments,
+                moments,
+                sanitize_rule_null_quantile(1.0 - sanitize_rule_null_alpha(fwer_alpha)),
+            )
         }
     }
 }
@@ -637,6 +872,12 @@ impl RuleNullPenaltyLookup {
             global_test: None,
             global_train_stats: None,
             global_test_stats: None,
+            family_4plus_train: None,
+            family_4plus_test: None,
+            delta_len_train: vec![None; rule_null_len_bucket_count(max_rule_len)],
+            delta_len_test: vec![None; rule_null_len_bucket_count(max_rule_len)],
+            delta_family_4plus_train: None,
+            delta_family_4plus_test: None,
         }
     }
 
@@ -714,7 +955,19 @@ impl RuleNullPenaltyLookup {
             || prev.len_train.iter().any(|x| x.is_some())
             || self.len_train.iter().any(|x| x.is_some())
             || prev.len_test.iter().any(|x| x.is_some())
-            || self.len_test.iter().any(|x| x.is_some());
+            || self.len_test.iter().any(|x| x.is_some())
+            || prev.family_4plus_train.is_some()
+            || self.family_4plus_train.is_some()
+            || prev.family_4plus_test.is_some()
+            || self.family_4plus_test.is_some()
+            || prev.delta_len_train.iter().any(|x| x.is_some())
+            || self.delta_len_train.iter().any(|x| x.is_some())
+            || prev.delta_len_test.iter().any(|x| x.is_some())
+            || self.delta_len_test.iter().any(|x| x.is_some())
+            || prev.delta_family_4plus_train.is_some()
+            || self.delta_family_4plus_train.is_some()
+            || prev.delta_family_4plus_test.is_some()
+            || self.delta_family_4plus_test.is_some();
         let bucket_train_converged = self
             .bucket_train
             .iter()
@@ -754,6 +1007,20 @@ impl RuleNullPenaltyLookup {
             && len_test_converged
             && penalty_value_converged(prev.global_train, self.global_train)
             && penalty_value_converged(prev.global_test, self.global_test)
+            && penalty_value_converged(prev.family_4plus_train, self.family_4plus_train)
+            && penalty_value_converged(prev.family_4plus_test, self.family_4plus_test)
+            && prev
+                .delta_len_train
+                .iter()
+                .zip(self.delta_len_train.iter())
+                .all(|(old, curr)| penalty_value_converged(*old, *curr))
+            && prev
+                .delta_len_test
+                .iter()
+                .zip(self.delta_len_test.iter())
+                .all(|(old, curr)| penalty_value_converged(*old, *curr))
+            && penalty_value_converged(prev.delta_family_4plus_train, self.delta_family_4plus_train)
+            && penalty_value_converged(prev.delta_family_4plus_test, self.delta_family_4plus_test)
     }
 
     pub fn q99_converged_against(&self, prev: &Self) -> bool {
@@ -767,6 +1034,12 @@ impl RuleNullPenaltyLookup {
             || self.group_len_test.iter().any(|x| x.is_some())
             || self.global_train.is_some()
             || self.global_test.is_some()
+            || self.family_4plus_train.is_some()
+            || self.family_4plus_test.is_some()
+            || self.delta_len_train.iter().any(|x| x.is_some())
+            || self.delta_len_test.iter().any(|x| x.is_some())
+            || self.delta_family_4plus_train.is_some()
+            || self.delta_family_4plus_test.is_some()
             || self.len_train.iter().any(|x| x.is_some())
             || self.len_test.iter().any(|x| x.is_some())
     }
@@ -776,6 +1049,38 @@ impl RuleNullPenaltyLookup {
     }
     pub fn test_penalty(&self, bucket: RuleNullBucket) -> Option<f64> {
         self.penalty_with_fallback(bucket, false)
+    }
+
+    pub fn four_plus_family_penalty(&self, is_train: bool) -> Option<f64> {
+        if is_train {
+            self.family_4plus_train
+        } else {
+            self.family_4plus_test
+        }
+    }
+
+    pub fn delta_penalty(&self, rule_len: usize, is_train: bool) -> Option<f64> {
+        let idx = rule_null_len_bucket_index(rule_len, self.max_rule_len);
+        if is_train {
+            self.delta_len_train.get(idx).copied().flatten()
+        } else {
+            self.delta_len_test.get(idx).copied().flatten()
+        }
+    }
+
+    pub fn delta_four_plus_family_penalty(&self, is_train: bool) -> Option<f64> {
+        if is_train {
+            self.delta_family_4plus_train
+        } else {
+            self.delta_family_4plus_test
+        }
+    }
+
+    pub fn attach_delta_penalties_from(&mut self, delta: &Self) {
+        self.delta_len_train = delta.len_train.clone();
+        self.delta_len_test = delta.len_test.clone();
+        self.delta_family_4plus_train = delta.family_4plus_train;
+        self.delta_family_4plus_test = delta.family_4plus_test;
     }
 
     #[cfg(test)]
@@ -1300,7 +1605,7 @@ mod tests {
 
     #[test]
     fn test_default_null_calibration_is_tail_stable() {
-        assert_eq!(DEFAULT_RULE_NULL_MAX_REPEATS, 100);
+        assert_eq!(DEFAULT_RULE_NULL_MAX_REPEATS, 500);
         assert_eq!(DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS, 50);
         assert_eq!(DEFAULT_RULE_NULL_ADAPTIVE_STABLE_REPEATS, 5);
         assert!((DEFAULT_RULE_NULL_Q99_REL_TOL - 0.02).abs() < f64::EPSILON);
@@ -1372,6 +1677,50 @@ mod tests {
     }
 
     #[test]
+    fn test_bayes_hierarchical_penalty_pools_sparse_high_order_layers() {
+        let mut cal = RuleNullCalibrator::new();
+        let layer3 = b(3);
+        let layer4 = b(4);
+        let layer5 = b(5);
+        for value in 10..=109 {
+            cal.insert(layer3, value as f64, value as f64);
+        }
+        // High-order maxima are deliberately sparse.  Bayesian calibration
+        // must still return a finite layer-specific penalty by borrowing the
+        // neighboring 3+ layers instead of dropping to an unrelated global
+        // bucket.
+        cal.insert(layer4, 30.0, 30.0);
+        cal.insert(layer4, 31.0, 31.0);
+        cal.insert(layer5, 32.0, 32.0);
+        cal.insert(layer5, 33.0, 33.0);
+
+        let lookup =
+            cal.finalize_with_method(RuleNullPenaltyMethod::BayesHierarchical { fwer_alpha: 0.01 });
+        let penalty4 = lookup.train_penalty(layer4).unwrap();
+        let penalty5 = lookup.train_penalty(layer5).unwrap();
+        assert!(penalty4.is_finite() && penalty5.is_finite());
+        assert!(penalty4 > 31.0);
+        assert!(penalty5 > penalty4);
+        assert_eq!(lookup.summary(true).unwrap().method, "bayes");
+    }
+
+    #[test]
+    fn test_bayes_gumbel_uses_mean_to_location_correction() {
+        let moments = RunningMoments {
+            n: 100,
+            mean: 10.0,
+            m2: 99.0 * 4.0,
+        };
+        let penalty = bayesian_gumbel_penalty(moments, moments, 0.99).unwrap();
+        const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+        let scale = 2.0 * (6.0_f64).sqrt() / PI;
+        let tail = -(-0.99_f64.ln()).ln();
+        let expected =
+            10.0 - EULER_GAMMA * scale + scale * tail + BAYES_TAIL_UPPER_Z * scale / 10.0;
+        assert!((penalty - expected).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_test_score_pvalue_greater_is_monotonic() {
         let mut cal = RuleNullCalibrator::new();
         let bk = b(1);
@@ -1407,6 +1756,19 @@ mod tests {
     }
 
     #[test]
+    fn test_len_buckets_are_distinct_through_max_rule_len() {
+        assert_eq!(rule_null_len_bucket_count(5), 5);
+        let indices = (1..=5)
+            .map(|rule_len| rule_null_len_bucket_index(rule_len, 5))
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+        let grouped = (1..=5)
+            .map(|rule_len| rule_null_group_len_bucket_index(0, rule_len, 5, 1))
+            .collect::<Vec<_>>();
+        assert_eq!(grouped, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
     fn test_len_bucket_summary_returns_penalty_mean_and_n() {
         let mut cal = RuleNullCalibrator::new();
         let len3 = b(3);
@@ -1415,15 +1777,25 @@ mod tests {
             cal.insert(len3, (200 + v) as f64, (200 + v) as f64);
             cal.insert(len4, (300 + v) as f64, (300 + v) as f64);
         }
-        let summary = cal.finalize().len_bucket_summary_by_index(2, true).unwrap();
-        assert_eq!(summary.penalty, 320.0);
-        assert!((summary.mean - 260.5).abs() < 1e-12);
-        assert_eq!(summary.n, 40);
-        assert_eq!(summary.min, 201.0);
-        assert_eq!(summary.q25, 210.0);
-        assert_eq!(summary.median, 220.0);
-        assert_eq!(summary.q75, 310.0);
-        assert_eq!(summary.max, 320.0);
+        let len3_summary = cal.finalize().len_bucket_summary_by_index(2, true).unwrap();
+        assert_eq!(len3_summary.penalty, 220.0);
+        assert!((len3_summary.mean - 210.5).abs() < 1e-12);
+        assert_eq!(len3_summary.n, 20);
+        assert_eq!(len3_summary.min, 201.0);
+        assert_eq!(len3_summary.q25, 205.0);
+        assert_eq!(len3_summary.median, 210.0);
+        assert_eq!(len3_summary.q75, 215.0);
+        assert_eq!(len3_summary.max, 220.0);
+
+        let len4_summary = cal.finalize().len_bucket_summary_by_index(3, true).unwrap();
+        assert_eq!(len4_summary.penalty, 320.0);
+        assert!((len4_summary.mean - 310.5).abs() < 1e-12);
+        assert_eq!(len4_summary.n, 20);
+        assert_eq!(len4_summary.min, 301.0);
+        assert_eq!(len4_summary.q25, 305.0);
+        assert_eq!(len4_summary.median, 310.0);
+        assert_eq!(len4_summary.q75, 315.0);
+        assert_eq!(len4_summary.max, 320.0);
     }
 
     #[test]

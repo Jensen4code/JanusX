@@ -98,6 +98,45 @@ def _parse_bimrange(text: str) -> tuple[str, int, int]:
     return chrom, start, end
 
 
+def _parse_logic_ld_range(text: Optional[str], *, default_max: float = 0.2) -> tuple[float, float]:
+    """Parse a pairwise-LD r² range written as ``MIN:MAX``.
+
+    An omitted lower or upper bound defaults to 0 or 1 respectively.  When
+    the option is omitted entirely, retain the historical upper bound of
+    0.2 so existing simulation behavior is unchanged.
+    """
+    if text is None:
+        raw = f":{float(default_max):g}"
+    else:
+        raw = str(text).strip()
+        if raw == "":
+            raise ValueError(
+                "Invalid --logic-ld-range ''. Expected MIN:MAX, :MAX, or MIN:."
+            )
+    parts = raw.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid --logic-ld-range '{raw}'. Expected MIN:MAX, :MAX, or MIN:."
+        )
+    lower_text, upper_text = (part.strip() for part in parts)
+    if lower_text == "" and upper_text == "":
+        raise ValueError("--logic-ld-range requires at least one bound.")
+    try:
+        lower = 0.0 if lower_text == "" else float(lower_text)
+        upper = 1.0 if upper_text == "" else float(upper_text)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --logic-ld-range '{raw}': bounds must be numeric."
+        ) from exc
+    if not (np.isfinite(lower) and np.isfinite(upper)):
+        raise ValueError("--logic-ld-range bounds must be finite.")
+    if not (0.0 <= lower <= 1.0 and 0.0 <= upper <= 1.0):
+        raise ValueError("--logic-ld-range bounds must be within [0, 1].")
+    if lower > upper:
+        raise ValueError("--logic-ld-range requires MIN <= MAX.")
+    return float(lower), float(upper)
+
+
 def _parse_nonnegative_int(text: str, *, label: str) -> int:
     try:
         value = int(str(text).strip())
@@ -1184,7 +1223,9 @@ def _run_rust_simulation(
     logic_gate_count: Optional[int],
     logic_k_min: int,
     logic_k_max: int,
+    logic_ld_min: float,
     logic_ld_max: float,
+    logic_ld_range_explicit: bool,
     logic_het_max: float,
     logic_af_min: float,
     logic_af_max: float,
@@ -1251,7 +1292,9 @@ def _run_rust_simulation(
             logic_gate_count=None if logic_gate_count is None else int(logic_gate_count),
             logic_k_min=int(logic_k_min),
             logic_k_max=int(logic_k_max),
+            logic_ld_min=float(logic_ld_min),
             logic_ld_max=float(logic_ld_max),
+            logic_ld_range_explicit=bool(logic_ld_range_explicit),
             logic_het_max=float(logic_het_max),
             logic_af_min=float(logic_af_min),
             logic_af_max=float(logic_af_max),
@@ -1292,6 +1335,7 @@ def simulate_phenotype_from_genofile(
     and_k_min: int = 2,
     and_k_max: int = 4,
     and_ld_max: float = 0.2,
+    and_ld_min: float = 0.0,
     and_het_max: float = 0.05,
     and_af_min: float = 0.02,
     and_af_max: float = 0.98,
@@ -1356,7 +1400,9 @@ def simulate_phenotype_from_genofile(
         logic_gate_count=None,
         logic_k_min=int(and_k_min),
         logic_k_max=int(and_k_max),
+        logic_ld_min=float(and_ld_min),
         logic_ld_max=float(and_ld_max),
+        logic_ld_range_explicit=bool(and_ld_min > 0.0 or and_ld_max != 0.2),
         logic_het_max=float(and_het_max),
         logic_af_min=float(and_af_min),
         logic_af_max=float(and_af_max),
@@ -1821,6 +1867,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     causal_group.add_argument(
+        "--logic-ld-range",
+        dest="logic_ld_range",
+        default=None,
+        metavar="MIN:MAX",
+        help=(
+            "Pairwise LD r² range required between members of a logic term. "
+            "Use MIN:MAX, :MAX, or MIN:. If omitted, the historical default "
+            ":0.2 is used."
+        ),
+    )
+    causal_group.add_argument(
         "--pure-epistasis-only",
         action="store_true",
         help=(
@@ -1905,7 +1962,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         float(args.maf),
         float(args.lmaf) if args.lmaf is not None else float(args.maf),
     )
-    logic_ld_max = 1.0
+    try:
+        logic_ld_min, logic_ld_max = _parse_logic_ld_range(args.logic_ld_range)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
+    logic_ld_range_explicit = args.logic_ld_range is not None
     logic_het_max = 1.0
     logic_af_min = 0.0
     logic_af_max = 1.0
@@ -1976,6 +2038,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Logic gate", "None" if logic_mode is None else logic_mode),
                     ("Logic sizes", logic_enabled_sizes),
                     ("Logic size weights", logic_weight_text),
+                    ("Logic LD r² range", f"{logic_ld_min:g}:{logic_ld_max:g}"),
                     ("Logic realized delta", logic_delta),
                     ("Background dist", "gaussian sample-space"),
                     ("Sampling scale", "expectation-scale"),
@@ -2324,7 +2387,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logic_gate_count=logic_gate_count,
                 logic_k_min=int(logic_k_min),
                 logic_k_max=int(logic_k_max),
+                logic_ld_min=float(logic_ld_min),
                 logic_ld_max=float(logic_ld_max),
+                logic_ld_range_explicit=bool(logic_ld_range_explicit),
                 logic_het_max=float(logic_het_max),
                 logic_af_min=float(logic_af_min),
                 logic_af_max=float(logic_af_max),
@@ -2487,6 +2552,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         res.get("causal_pve"),
         res.get("ve"),
     )
+    causal_ld_r2 = [
+        float(value)
+        for value in list(res.get("causal_ld_r2", []))
+        if np.isfinite(float(value))
+    ]
+    if causal_ld_r2:
+        logger.info(
+            "Causal term max pairwise LD r²: %s.",
+            ", ".join(f"{value:.6g}" for value in causal_ld_r2),
+        )
     background_factorization = str(res.get("background_factorization", "none")).strip().lower()
     if background_factorization not in {"", "none"}:
         logger.info("GRM factorization: %s.", background_factorization)

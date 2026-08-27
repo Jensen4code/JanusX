@@ -33,6 +33,7 @@ use crate::stats_common::{
     check_ctrlc, format_bytes, interrupt_requested, process_memory_usage, INTERRUPTED_MSG,
 };
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -53,6 +54,12 @@ const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
 const GARFIELD_LITERAL_BATCH_MAX_ROWS_DEFAULT: usize = 16_384;
 const GARFIELD_LITERAL_BATCH_MAX_WORK_WORDS_DEFAULT: usize = 1_048_576;
+const GARFIELD_CONDITIONAL_SPLIT_FRAC_DEFAULT: f64 = 0.02;
+const GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT: usize = 20;
+/// Sentinel carried by ordinary beam states.  A finite value means that the
+/// state came from the bounded optimistic rescue path and has that many
+/// further rescue descents available.
+const BEAM_NO_RESCUE_BUDGET: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GarfieldBeamProfileSnapshot {
@@ -103,6 +110,46 @@ fn check_interrupt_fast() -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Return the minimum number of observations required on each side of a
+/// proposed literal split within its current parent support.  The default is
+/// max(20, 2% of the active sample), capped at half the sample so small test
+/// fixtures remain usable.  An environment override is intentionally kept
+/// internal for development calibration and does not expand the CLI surface.
+#[inline]
+pub(crate) fn conditional_split_min_support(n_samples: usize) -> usize {
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    let configured = *OVERRIDE.get_or_init(|| {
+        env::var("JX_GARFIELD_CONDITIONAL_MIN_SUPPORT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    });
+    let default = ((n_samples as f64) * GARFIELD_CONDITIONAL_SPLIT_FRAC_DEFAULT)
+        .ceil()
+        .max(GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT as f64) as usize;
+    configured.unwrap_or(default).min(n_samples / 2)
+}
+
+/// Check that adding a literal genuinely partitions the parent's support.
+/// `literal_in_parent` is the number of parent observations satisfying the
+/// (possibly negated) literal.  Both conditional branches must be populated;
+/// otherwise a tiny phenotype-extreme subset can manufacture a high-order
+/// gain without representing a real split of the parent.
+#[inline]
+pub(crate) fn conditional_split_support_passes(
+    parent_n_hit: usize,
+    literal_in_parent: usize,
+    _n_samples: usize,
+    min_support: usize,
+) -> bool {
+    if min_support == 0 {
+        return true;
+    }
+    let literal_in_parent = literal_in_parent.min(parent_n_hit);
+    parent_n_hit >= min_support.saturating_mul(2)
+        && literal_in_parent >= min_support
+        && parent_n_hit.saturating_sub(literal_in_parent) >= min_support
 }
 
 pub(crate) fn reset_garfield_beam_profile() {
@@ -252,7 +299,7 @@ impl BeamRule {
     }
 
     #[inline]
-    fn lexical_key(&self) -> Vec<(usize, bool, u8)> {
+    pub(crate) fn lexical_key(&self) -> Vec<(usize, bool, u8)> {
         let mut out = Vec::with_capacity(self.len());
         out.push((self.first.row_index, self.first.negated, 0u8));
         for (op, lit) in self.rest.iter() {
@@ -400,6 +447,7 @@ struct BeamState {
     train_score: f64,
     max_singleton_train_raw: f64,
     max_singleton_test_raw: f64,
+    rescue_budget: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -410,6 +458,7 @@ struct BeamStateLite {
     train_score: f64,
     max_singleton_train_raw: f64,
     max_singleton_test_raw: f64,
+    rescue_budget: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -527,6 +576,38 @@ const GARFIELD_LAYER_DEBUG_MAX_LAYERS: usize = 64;
 const GARFIELD_LAYER_DEBUG_FAMILY_COUNT: usize = 3;
 const GARFIELD_LAYER_DEBUG_METRIC_COUNT: usize = 7;
 
+/// Development-only per-expansion trace.  The trace is deliberately kept out
+/// of the normal Beam return type so production callers and allocations are
+/// unchanged when `JX_GARFIELD_FRONTIER_TRACE` is not set.
+#[derive(Clone, Debug)]
+pub(crate) struct BeamFrontierTraceRecord {
+    pub(crate) layer: usize,
+    /// `None` is used for depth-one singleton seeds, which have no parent.
+    pub(crate) parent: Option<BeamRule>,
+    pub(crate) child: BeamRule,
+    pub(crate) raw_score: f64,
+    pub(crate) search_score: f64,
+    pub(crate) frontier_rank: usize,
+    /// Rank among children that pass the current-parent support check.
+    /// Zero means the child was rejected by that check or had no finite score.
+    pub(crate) frontier_rank_before: usize,
+    /// Rank after optional alternative-parent rescue and normal Beam sorting.
+    pub(crate) frontier_rank_after: usize,
+    pub(crate) beam_cutoff_score: f64,
+    pub(crate) retained: bool,
+    pub(crate) support: bool,
+    pub(crate) support_current_parent: bool,
+    pub(crate) support_any_parent: bool,
+    pub(crate) n_feasible_parents: usize,
+    pub(crate) rescued_by_alt_parent: bool,
+    pub(crate) best_feasible_parent: Option<BeamRule>,
+    pub(crate) best_parent_delta: f64,
+}
+
+thread_local! {
+    static GARFIELD_FRONTIER_TRACE: RefCell<Vec<BeamFrontierTraceRecord>> = const { RefCell::new(Vec::new()) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldLayerDebugFamily {
     Singleton = 0,
@@ -590,6 +671,351 @@ fn parse_env_bool(name: &str) -> bool {
         let t = v.trim().to_ascii_lowercase();
         matches!(t.as_str(), "1" | "true" | "yes" | "y" | "on")
     })
+}
+
+#[inline]
+fn frontier_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_env_bool("JX_GARFIELD_FRONTIER_TRACE"))
+}
+
+/// Development-only rescue mode for commutative AND rules. The production
+/// search keeps the historical directional parent support check; this flag
+/// asks the serial diagnostic path to accept a child when at least one of its
+/// immediate parents satisfies the same support threshold.
+#[inline]
+fn alternative_parent_rescue_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_env_bool("JX_GARFIELD_ALT_PARENT_RESCUE"))
+}
+
+/// Development-only optimistic rescue.  The normal production path remains
+/// unchanged unless this fraction is explicitly set.  A value such as `0.1`
+/// reserves ten percent of each higher-order frontier for candidates rejected
+/// only by positive-gain pruning.
+#[inline]
+fn optimistic_rescue_fraction() -> f64 {
+    static FRACTION: OnceLock<f64> = OnceLock::new();
+    *FRACTION.get_or_init(|| {
+        env::var("JX_GARFIELD_OPTIMISTIC_RESCUE_FRAC")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+            .unwrap_or(0.0)
+    })
+}
+
+#[inline]
+fn optimistic_rescue_depth() -> u8 {
+    static DEPTH: OnceLock<u8> = OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        env::var("JX_GARFIELD_OPTIMISTIC_RESCUE_DEPTH")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u8>().ok())
+            .filter(|value| (1..=2).contains(value))
+            .unwrap_or(1)
+    })
+}
+
+#[inline]
+fn optimistic_rescue_enabled() -> bool {
+    optimistic_rescue_fraction() > 0.0
+}
+
+#[inline]
+fn optimistic_rescue_slot_count(width: usize, fraction: f64) -> usize {
+    if width <= 1 || !(fraction.is_finite() && fraction > 0.0) {
+        return 0;
+    }
+    ((width as f64 * fraction).ceil() as usize).min(width.saturating_sub(1))
+}
+
+#[inline]
+fn rescue_budget_for_child(parent_budget: u8, depth: u8) -> Option<u8> {
+    if parent_budget == BEAM_NO_RESCUE_BUDGET {
+        Some(depth.clamp(1, 2))
+    } else if parent_budget > 0 {
+        Some(parent_budget - 1)
+    } else {
+        None
+    }
+}
+
+/// A safe, intentionally conservative upper bound for any AND descendant of
+/// a current child.  Every descendant hit set is a subset of the current hit
+/// set.  By Cauchy--Schwarz, `(sum_H z)^2 <= |H| * sum(z^2)`, so the centered
+/// score of a descendant with at most `n_hit` hits is bounded by
+/// `n * centered_ss / (n - n_hit)`.  This bound is used only to rank a small
+/// rescue pool; it never decides formal significance.
+#[inline]
+fn optimistic_raw_score_upper_bound(n_samples: usize, n_hit: usize, centered_ss: f64) -> f64 {
+    if n_samples == 0 || n_hit == 0 || !centered_ss.is_finite() || centered_ss <= 0.0 {
+        return 0.0;
+    }
+    let h = n_hit.min(n_samples.saturating_sub(1));
+    if h == 0 {
+        return 0.0;
+    }
+    (n_samples as f64) * centered_ss / ((n_samples - h) as f64)
+}
+
+/// Development-only search diagnostic: enumerate the complete pair layer
+/// before handing a bounded set of pair seeds to the ordinary higher-order
+/// expansion.  This is intentionally controlled by an environment variable
+/// rather than the public CLI so production GARFIELD semantics stay frozen
+/// while weak-prefix loss is being measured.
+#[inline]
+fn exhaustive_pair_refinement_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_env_bool("JX_GARFIELD_EXHAUSTIVE_PAIR_REFINEMENT"))
+}
+
+/// Optional pair-seed cap for the exhaustive-pair diagnostic.  The harness
+/// runs this separately at 20, 50, and 100; invalid values are ignored so
+/// that a typo cannot silently change the normal production path.
+#[inline]
+fn exhaustive_pair_seed_top_k() -> Option<usize> {
+    static TOP_K: OnceLock<Option<usize>> = OnceLock::new();
+    *TOP_K.get_or_init(|| {
+        std::env::var("JX_GARFIELD_PAIR_SEED_TOP_K")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| matches!(*value, 20 | 50 | 100))
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConditionalSupportSummary {
+    current_parent: bool,
+    any_parent: bool,
+    n_feasible_parents: usize,
+    best_feasible_parent: Option<BeamRule>,
+}
+
+pub(crate) fn take_garfield_frontier_trace() -> Vec<BeamFrontierTraceRecord> {
+    if !frontier_trace_enabled() {
+        return Vec::new();
+    }
+    GARFIELD_FRONTIER_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
+
+#[inline]
+fn reset_garfield_frontier_trace() {
+    if !frontier_trace_enabled() {
+        return;
+    }
+    GARFIELD_FRONTIER_TRACE.with(|trace| trace.borrow_mut().clear());
+}
+
+#[inline]
+fn frontier_trace_len() -> usize {
+    if !frontier_trace_enabled() {
+        return 0;
+    }
+    GARFIELD_FRONTIER_TRACE.with(|trace| trace.borrow().len())
+}
+
+#[inline]
+fn frontier_trace_push(
+    layer: usize,
+    parent: Option<&BeamRule>,
+    child: &BeamRule,
+    raw_score: f64,
+    search_score: f64,
+    support: bool,
+    best_parent_delta: f64,
+) {
+    let support_summary = ConditionalSupportSummary {
+        current_parent: support,
+        any_parent: support,
+        n_feasible_parents: usize::from(support),
+        best_feasible_parent: None,
+    };
+    frontier_trace_push_with_support(
+        layer,
+        parent,
+        child,
+        raw_score,
+        search_score,
+        support,
+        best_parent_delta,
+        support_summary,
+    );
+}
+
+#[inline]
+fn frontier_trace_push_with_support(
+    layer: usize,
+    parent: Option<&BeamRule>,
+    child: &BeamRule,
+    raw_score: f64,
+    search_score: f64,
+    support: bool,
+    best_parent_delta: f64,
+    support_summary: ConditionalSupportSummary,
+) {
+    if !frontier_trace_enabled() {
+        return;
+    }
+    GARFIELD_FRONTIER_TRACE.with(|trace| {
+        trace.borrow_mut().push(BeamFrontierTraceRecord {
+            layer,
+            parent: parent.cloned(),
+            child: child.clone(),
+            raw_score,
+            search_score,
+            frontier_rank: 0,
+            frontier_rank_before: 0,
+            frontier_rank_after: 0,
+            beam_cutoff_score: f64::NAN,
+            retained: false,
+            support,
+            support_current_parent: support_summary.current_parent,
+            support_any_parent: support_summary.any_parent,
+            n_feasible_parents: support_summary.n_feasible_parents,
+            rescued_by_alt_parent: !support_summary.current_parent && support_summary.any_parent,
+            best_feasible_parent: support_summary.best_feasible_parent,
+            best_parent_delta,
+        });
+    });
+}
+
+#[inline]
+fn frontier_trace_finalize(layer: usize, start: usize, retained: &[BeamState]) {
+    if !frontier_trace_enabled() {
+        return;
+    }
+    let retained_keys = retained
+        .iter()
+        .map(|state| state.rule.lexical_key())
+        .collect::<HashSet<_>>();
+    GARFIELD_FRONTIER_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let end = trace.len();
+        let has_dropped = (start..end)
+            .filter(|&idx| trace[idx].layer == layer)
+            .any(|idx| !retained_keys.contains(&trace[idx].child.lexical_key()));
+        let cutoff = if has_dropped {
+            retained
+                .iter()
+                .map(|state| state.train_score)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(f64::NAN)
+        } else {
+            f64::NAN
+        };
+        let mut order = (start..end)
+            .filter(|&idx| trace[idx].layer == layer)
+            .collect::<Vec<_>>();
+        order.sort_by(|&a, &b| {
+            score_key(trace[b].search_score)
+                .partial_cmp(&score_key(trace[a].search_score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    trace[a]
+                        .child
+                        .lexical_key()
+                        .cmp(&trace[b].child.lexical_key())
+                })
+        });
+        for (rank, idx) in order.into_iter().enumerate() {
+            let record = &mut trace[idx];
+            record.frontier_rank = rank + 1;
+            record.frontier_rank_after = rank + 1;
+            record.beam_cutoff_score = cutoff;
+            record.retained = retained_keys.contains(&record.child.lexical_key());
+        }
+        let mut before_order = (start..end)
+            .filter(|&idx| {
+                trace[idx].layer == layer
+                    && trace[idx].support_current_parent
+                    && trace[idx].search_score.is_finite()
+            })
+            .collect::<Vec<_>>();
+        before_order.sort_by(|&a, &b| {
+            score_key(trace[b].search_score)
+                .partial_cmp(&score_key(trace[a].search_score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    trace[a]
+                        .child
+                        .lexical_key()
+                        .cmp(&trace[b].child.lexical_key())
+                })
+        });
+        for (rank, idx) in before_order.into_iter().enumerate() {
+            trace[idx].frontier_rank_before = rank + 1;
+        }
+    });
+}
+
+#[inline]
+fn frontier_trace_finalize_fuzzy(layer: usize, start: usize, retained: &[FuzzyBeamState]) {
+    if !frontier_trace_enabled() {
+        return;
+    }
+    let retained_keys = retained
+        .iter()
+        .map(|state| state.rule.lexical_key())
+        .collect::<HashSet<_>>();
+    GARFIELD_FRONTIER_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let end = trace.len();
+        let has_dropped = (start..end)
+            .filter(|&idx| trace[idx].layer == layer)
+            .any(|idx| !retained_keys.contains(&trace[idx].child.lexical_key()));
+        let cutoff = if has_dropped {
+            retained
+                .iter()
+                .map(|state| state.train_score)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(f64::NAN)
+        } else {
+            f64::NAN
+        };
+        let mut order = (start..end)
+            .filter(|&idx| trace[idx].layer == layer)
+            .collect::<Vec<_>>();
+        order.sort_by(|&a, &b| {
+            score_key(trace[b].search_score)
+                .partial_cmp(&score_key(trace[a].search_score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    trace[a]
+                        .child
+                        .lexical_key()
+                        .cmp(&trace[b].child.lexical_key())
+                })
+        });
+        for (rank, idx) in order.into_iter().enumerate() {
+            let record = &mut trace[idx];
+            record.frontier_rank = rank + 1;
+            record.frontier_rank_after = rank + 1;
+            record.beam_cutoff_score = cutoff;
+            record.retained = retained_keys.contains(&record.child.lexical_key());
+        }
+        let mut before_order = (start..end)
+            .filter(|&idx| {
+                trace[idx].layer == layer
+                    && trace[idx].support_current_parent
+                    && trace[idx].search_score.is_finite()
+            })
+            .collect::<Vec<_>>();
+        before_order.sort_by(|&a, &b| {
+            score_key(trace[b].search_score)
+                .partial_cmp(&score_key(trace[a].search_score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    trace[a]
+                        .child
+                        .lexical_key()
+                        .cmp(&trace[b].child.lexical_key())
+                })
+        });
+        for (rank, idx) in before_order.into_iter().enumerate() {
+            trace[idx].frontier_rank_before = rank + 1;
+        }
+    });
 }
 
 #[inline]
@@ -1722,7 +2148,7 @@ fn rank_rule_score_components_base(
     rule_len: usize,
     not_count: usize,
     raw_score: f64,
-    direct_parent_raw: f64,
+    best_parent_raw: f64,
     params: &BeamSearchParams,
 ) -> f64 {
     let use_gain = rank_mode_uses_gain(rule_len, params);
@@ -1730,7 +2156,7 @@ fn rank_rule_score_components_base(
     // schedule its gain is therefore defined as its own score; interaction
     // gain starts when the second literal is added.
     let base = if use_gain && rule_len > 1 {
-        raw_score - direct_parent_raw
+        raw_score - best_parent_raw
     } else {
         raw_score
     };
@@ -1750,10 +2176,10 @@ pub fn rank_rule_score_components(
     rule_len: usize,
     not_count: usize,
     raw_score: f64,
-    direct_parent_raw: f64,
+    best_parent_raw: f64,
     params: &BeamSearchParams,
 ) -> f64 {
-    rank_rule_score_components_base(rule_len, not_count, raw_score, direct_parent_raw, params)
+    rank_rule_score_components_base(rule_len, not_count, raw_score, best_parent_raw, params)
 }
 
 #[inline]
@@ -1778,11 +2204,11 @@ pub fn rank_rule_score_components_with_bucket(
     rule_len: usize,
     not_count: usize,
     raw_score: f64,
-    direct_parent_raw: f64,
+    best_parent_raw: f64,
     params: &BeamSearchParams,
     is_train: bool,
 ) -> f64 {
-    rank_rule_score_components_base(rule_len, not_count, raw_score, direct_parent_raw, params)
+    rank_rule_score_components_base(rule_len, not_count, raw_score, best_parent_raw, params)
         - null_penalty_for_bucket(bucket, params, is_train)
 }
 
@@ -1798,7 +2224,7 @@ fn use_parent_delta(rule_len: usize, params: &BeamSearchParams) -> bool {
 fn train_scores_for_rule(
     rule: &BeamRule,
     train_raw: ContinuousRuleScore,
-    direct_parent_raw: f64,
+    best_parent_raw: f64,
     _parent_abs_score: Option<f64>,
     _parent_raw_score: Option<f64>,
     params: &BeamSearchParams,
@@ -1809,7 +2235,7 @@ fn train_scores_for_rule(
         rule.len(),
         rule.not_count(),
         train_raw.raw_score,
-        direct_parent_raw,
+        best_parent_raw,
         params,
     );
     let threshold = null_penalty_for_bucket(bucket, params, true);
@@ -2193,6 +2619,81 @@ fn score_sum_hit(sc: &ContinuousRuleScore) -> f64 {
 }
 
 #[inline]
+fn centered_y_sum_squares(y: &[f64], n_samples: usize) -> f64 {
+    if n_samples == 0 {
+        return 0.0;
+    }
+    let n = n_samples.min(y.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mean = y[..n].iter().copied().sum::<f64>() / n as f64;
+    y[..n]
+        .iter()
+        .map(|value| {
+            let centered = *value - mean;
+            centered * centered
+        })
+        .sum()
+}
+
+#[inline]
+fn centered_abs_sum_for_and_child(
+    parent_bits: &[u64],
+    row: &[u64],
+    negated: bool,
+    y: &[f64],
+    mean: f64,
+    n_samples: usize,
+) -> f64 {
+    let mut total = 0.0;
+    let words = parent_bits.len().min(row.len());
+    for word_idx in 0..words {
+        let selected = if negated {
+            parent_bits[word_idx] & !row[word_idx]
+        } else {
+            parent_bits[word_idx] & row[word_idx]
+        };
+        let mut bits = selected;
+        while bits != 0 {
+            let offset = bits.trailing_zeros() as usize;
+            let sample_idx = word_idx * 64 + offset;
+            if sample_idx < n_samples && sample_idx < y.len() {
+                total += (y[sample_idx] - mean).abs();
+            }
+            bits &= bits - 1;
+        }
+    }
+    total
+}
+
+#[inline]
+fn optimistic_raw_score_upper_bound_with_l1(
+    n_samples: usize,
+    n_hit: usize,
+    centered_ss: f64,
+    centered_abs_sum: f64,
+    centered_abs_max: f64,
+) -> f64 {
+    let basic = optimistic_raw_score_upper_bound(n_samples, n_hit, centered_ss);
+    if n_samples <= 1
+        || n_hit == 0
+        || !centered_abs_sum.is_finite()
+        || centered_abs_sum <= 0.0
+        || !centered_abs_max.is_finite()
+        || centered_abs_max <= 0.0
+    {
+        return basic;
+    }
+    let h = n_hit.min(n_samples - 1);
+    let n = n_samples as f64;
+    let l1_at_one = n * centered_abs_sum * centered_abs_sum / ((n_samples - 1) as f64);
+    let l1_at_h = n * centered_abs_sum * centered_abs_sum / ((h * (n_samples - h)) as f64);
+    let max_at_h = n * h as f64 * centered_abs_max * centered_abs_max / ((n_samples - h) as f64);
+    basic.max(l1_at_one.max(l1_at_h).max(max_at_h))
+}
+
+#[inline]
 fn binary_pair_intersection(
     parent_bits: &[u64],
     row: &[u64],
@@ -2243,10 +2744,85 @@ fn evaluate_child_train_from_parent_virtual_with_intersection(
     negated: bool,
     params: &BeamSearchParams,
 ) -> Option<ContinuousRuleScore> {
+    evaluate_child_train_from_parent_virtual_with_intersection_impl(
+        parent_train,
+        row_train,
+        intersection,
+        sum_y_train,
+        n_train,
+        _child_rule_len,
+        op,
+        negated,
+        params,
+        true,
+    )
+}
+
+#[inline]
+fn evaluate_child_train_from_parent_virtual_with_intersection_rescued(
+    parent_train: &ContinuousRuleScore,
+    row_train: &ContinuousRuleScore,
+    intersection: BinaryPairIntersection,
+    sum_y_train: f64,
+    n_train: usize,
+    child_rule_len: usize,
+    op: BeamBinaryOp,
+    negated: bool,
+    params: &BeamSearchParams,
+) -> Option<ContinuousRuleScore> {
+    evaluate_child_train_from_parent_virtual_with_intersection_impl(
+        parent_train,
+        row_train,
+        intersection,
+        sum_y_train,
+        n_train,
+        child_rule_len,
+        op,
+        negated,
+        params,
+        false,
+    )
+}
+
+#[inline]
+fn evaluate_child_train_from_parent_virtual_with_intersection_impl(
+    parent_train: &ContinuousRuleScore,
+    row_train: &ContinuousRuleScore,
+    intersection: BinaryPairIntersection,
+    sum_y_train: f64,
+    n_train: usize,
+    _child_rule_len: usize,
+    op: BeamBinaryOp,
+    negated: bool,
+    params: &BeamSearchParams,
+    enforce_conditional_support: bool,
+) -> Option<ContinuousRuleScore> {
     let parent_n_hit = parent_train.n_hit;
     let parent_sum_hit = score_sum_hit(parent_train);
     let row_n_hit = row_train.n_hit;
     let row_sum_hit = score_sum_hit(row_train);
+    let literal_in_parent = if negated {
+        parent_n_hit.saturating_sub(intersection.n)
+    } else {
+        intersection.n
+    };
+    // The conditional split guard targets the default AND expansion.  XOR
+    // has its own directional-substate/MAF filter (and a disjoint XOR split
+    // legitimately has zero overlap with its parent), so applying this
+    // parent-overlap test there would reject valid XOR candidates before the
+    // existing XOR-specific checks run.
+    if enforce_conditional_support
+        && matches!(op, BeamBinaryOp::And)
+        && n_train >= GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT.saturating_mul(2)
+        && !conditional_split_support_passes(
+            parent_n_hit,
+            literal_in_parent,
+            n_train,
+            conditional_split_min_support(n_train),
+        )
+    {
+        return None;
+    }
     let (inter_n_hit, inter_sum_hit) = if negated {
         (
             parent_n_hit.saturating_sub(intersection.n),
@@ -2537,6 +3113,10 @@ fn best_ancestor_raw_baseline_cached(
     ancestor_cache: &mut RuleAncestorBaselineCache,
     disable_parent_delta: bool,
 ) -> Result<f64, String> {
+    // The incremental baseline is deliberately the best *immediate* parent:
+    // remove exactly one literal and score every resulting rule of length
+    // `rule.len() - 1`.  Do not recurse to grandparents or singleton
+    // ancestors; for ABCD this must be max(ABC, ABD, ACD, BCD).
     let t_profile = beam_detail_profile_start();
     let key = rule.lexical_key();
     if let Some(score) = ancestor_cache.get(&key) {
@@ -2562,21 +3142,7 @@ fn best_ancestor_raw_baseline_cached(
                 base_cache,
                 raw_cache,
             )?;
-            let parent_ancestor = best_ancestor_raw_baseline_cached(
-                &parent_rule,
-                y,
-                bits_flat,
-                row_words,
-                n_rows,
-                n_samples,
-                literal_scores,
-                is_train,
-                base_cache,
-                raw_cache,
-                ancestor_cache,
-                disable_parent_delta,
-            )?;
-            best = best.max(parent_raw.max(parent_ancestor));
+            best = best.max(parent_raw);
         }
         if best.is_finite() {
             Ok(best)
@@ -2631,6 +3197,143 @@ fn sort_truncate_states(mut nodes: Vec<BeamState>, k: usize) -> Vec<BeamState> {
         nodes.truncate(keep);
     }
     nodes
+}
+
+#[inline]
+fn cmp_rescue_state(a: &(f64, BeamState), b: &(f64, BeamState)) -> std::cmp::Ordering {
+    score_key(b.0)
+        .partial_cmp(&score_key(a.0))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| cmp_state(&a.1, &b.1))
+}
+
+#[inline]
+fn push_top_k_rescue(nodes: &mut Vec<(f64, BeamState)>, candidate: (f64, BeamState), k: usize) {
+    if k == 0 {
+        return;
+    }
+    if nodes.len() < k {
+        nodes.push(candidate);
+        return;
+    }
+    let mut worst_idx = 0usize;
+    for idx in 1..nodes.len() {
+        if cmp_rescue_state(&nodes[idx], &nodes[worst_idx]) == std::cmp::Ordering::Greater {
+            worst_idx = idx;
+        }
+    }
+    if cmp_rescue_state(&candidate, &nodes[worst_idx]) == std::cmp::Ordering::Less {
+        nodes[worst_idx] = candidate;
+    }
+}
+
+/// Reserve a small rescue slice while allowing unused rescue capacity to fall
+/// back to ordinary main-beam states.  Rescue states are ranked by the
+/// optimistic bound, not by their currently negative search score.
+fn merge_main_and_rescue_states(
+    main: Vec<BeamState>,
+    mut rescue: Vec<(f64, BeamState)>,
+    width: usize,
+    rescue_slots: usize,
+) -> Vec<BeamState> {
+    if rescue_slots == 0 || rescue.is_empty() {
+        return sort_truncate_states(main, width.max(1));
+    }
+    let mut main_sorted = sort_truncate_states(main, width.max(1));
+    let main_cap = width.saturating_sub(rescue_slots);
+    let reserved_main = sort_truncate_states(main_sorted.clone(), main_cap.max(1));
+    rescue.sort_by(cmp_rescue_state);
+
+    let mut out = Vec::with_capacity(width.max(1));
+    let mut seen = HashSet::<RuleLexKey>::with_capacity(width.saturating_mul(2));
+    for state in reserved_main {
+        seen.insert(state.rule.lexical_key());
+        out.push(state);
+    }
+    for (_, state) in rescue.into_iter() {
+        if out.len() >= width {
+            break;
+        }
+        if seen.insert(state.rule.lexical_key()) {
+            out.push(state);
+        }
+    }
+    // If the rescue pool had duplicates (or fewer candidates than its
+    // reservation), return the unused main slots rather than shrinking the
+    // frontier unnecessarily.
+    if out.len() < width {
+        for state in main_sorted.drain(..) {
+            if out.len() >= width {
+                break;
+            }
+            if seen.insert(state.rule.lexical_key()) {
+                out.push(state);
+            }
+        }
+    }
+    out
+}
+
+/// Keep the best `k` unordered pair families for the exhaustive-pair
+/// diagnostic, retaining every polarity state belonging to a selected pair.
+/// A BeamState is a literal expression (for example `A AND B` or
+/// `NOT A AND B`), whereas the diagnostic is about pair seeds.  Truncating
+/// states directly would therefore spend the budget on polarity variants and
+/// could discard the positive causal expression even when its pair family is
+/// highly ranked.
+fn truncate_exhaustive_pair_seed_families(nodes: Vec<BeamState>, k: usize) -> Vec<BeamState> {
+    if nodes.is_empty() {
+        return nodes;
+    }
+    let mut best_by_pair = HashMap::<(usize, usize), f64>::new();
+    for state in nodes.iter() {
+        if state.rule.len() != 2 {
+            continue;
+        }
+        let Some((_, second)) = state.rule.rest.first() else {
+            continue;
+        };
+        let pair = (
+            state.rule.first.row_index.min(second.row_index),
+            state.rule.first.row_index.max(second.row_index),
+        );
+        let entry = best_by_pair.entry(pair).or_insert(f64::NEG_INFINITY);
+        *entry = entry.max(state.train_score);
+    }
+    if best_by_pair.len() <= k.max(1) {
+        let node_count = nodes.len();
+        return sort_truncate_states(nodes, node_count);
+    }
+    let mut ranked_pairs = best_by_pair.into_iter().collect::<Vec<_>>();
+    ranked_pairs.sort_by(|a, b| {
+        score_key(b.1)
+            .partial_cmp(&score_key(a.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let keep_pairs = ranked_pairs
+        .into_iter()
+        .take(k.max(1))
+        .map(|(pair, _)| pair)
+        .collect::<HashSet<_>>();
+    let mut selected = nodes
+        .into_iter()
+        .filter(|state| {
+            if state.rule.len() != 2 {
+                return false;
+            }
+            let Some((_, second)) = state.rule.rest.first() else {
+                return false;
+            };
+            let pair = (
+                state.rule.first.row_index.min(second.row_index),
+                state.rule.first.row_index.max(second.row_index),
+            );
+            keep_pairs.contains(&pair)
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by(cmp_state);
+    selected
 }
 
 fn filter_beam_candidates(
@@ -2718,6 +3421,7 @@ fn beam_state_into_lite_and_bits(state: BeamState) -> (Vec<u64>, BeamStateLite) 
         train_score,
         max_singleton_train_raw,
         max_singleton_test_raw,
+        rescue_budget,
     } = state;
     (
         combined_train,
@@ -2728,6 +3432,7 @@ fn beam_state_into_lite_and_bits(state: BeamState) -> (Vec<u64>, BeamStateLite) 
             train_score,
             max_singleton_train_raw,
             max_singleton_test_raw,
+            rescue_budget,
         },
     )
 }
@@ -2742,6 +3447,7 @@ fn beam_state_from_lite_and_bits(combined_train: Vec<u64>, cand: BeamStateLite) 
         train_score: cand.train_score,
         max_singleton_train_raw: cand.max_singleton_train_raw,
         max_singleton_test_raw: cand.max_singleton_test_raw,
+        rescue_budget: cand.rescue_budget,
     }
 }
 
@@ -3241,6 +3947,123 @@ pub fn materialize_rule_bits(
 }
 
 #[inline]
+fn and_rule_without_literal(rule: &BeamRule, remove_index: usize) -> Option<BeamRule> {
+    if rule.len() < 2 || remove_index >= rule.len() {
+        return None;
+    }
+    if rule
+        .rest
+        .iter()
+        .any(|(op, _)| !matches!(op, BeamBinaryOp::And))
+    {
+        return None;
+    }
+    let mut literals = Vec::with_capacity(rule.len());
+    literals.push(rule.first);
+    literals.extend(rule.rest.iter().map(|(_, lit)| *lit));
+    literals.remove(remove_index);
+    let first = *literals.first()?;
+    let rest = literals
+        .into_iter()
+        .skip(1)
+        .map(|lit| (BeamBinaryOp::And, lit))
+        .collect();
+    Some(BeamRule { first, rest })
+}
+
+/// Check conditional split support for every immediate parent of an AND
+/// child.  This is intentionally only used by the development trace/rescue
+/// path: the default search remains directional and does not materialize
+/// additional parent bitsets.
+#[inline]
+fn conditional_support_summary_for_child(
+    child: &BeamRule,
+    current_parent: Option<&BeamRule>,
+    current_support: bool,
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    n_train: usize,
+) -> ConditionalSupportSummary {
+    let mut summary = ConditionalSupportSummary {
+        current_parent: current_support,
+        any_parent: current_support,
+        ..ConditionalSupportSummary::default()
+    };
+    if child.len() < 2
+        || child
+            .rest
+            .iter()
+            .any(|(op, _)| !matches!(op, BeamBinaryOp::And))
+        || n_train < GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT.saturating_mul(2)
+    {
+        return summary;
+    }
+    let min_support = conditional_split_min_support(n_train);
+    let mut current_parent_seen = false;
+    let mut best_parent_n_hit = 0usize;
+    for remove_index in 0..child.len() {
+        let Some(parent) = and_rule_without_literal(child, remove_index) else {
+            continue;
+        };
+        let Ok(parent_bits) =
+            materialize_rule_bits(&parent, bits_train, row_words_train, n_rows, n_train)
+        else {
+            continue;
+        };
+        let parent_n_hit = popcount(&parent_bits) as usize;
+        let child_literal = if remove_index == 0 {
+            child.first
+        } else {
+            child.rest[remove_index - 1].1
+        };
+        let row = row_prefix(
+            bits_train,
+            row_words_train,
+            child_literal.row_index,
+            words_for_samples(n_train),
+        );
+        let overlap = and_popcount(&parent_bits, row) as usize;
+        let literal_in_parent = if child_literal.negated {
+            parent_n_hit.saturating_sub(overlap)
+        } else {
+            overlap
+        };
+        let feasible =
+            conditional_split_support_passes(parent_n_hit, literal_in_parent, n_train, min_support);
+        let is_current = current_parent
+            .map(|current| current.lexical_key() == parent.lexical_key())
+            .unwrap_or(false);
+        if is_current {
+            current_parent_seen = true;
+            summary.current_parent = feasible;
+        }
+        if !feasible {
+            continue;
+        }
+        summary.n_feasible_parents = summary.n_feasible_parents.saturating_add(1);
+        summary.any_parent = true;
+        let replace_best = summary.best_feasible_parent.is_none()
+            || parent_n_hit > best_parent_n_hit
+            || (parent_n_hit == best_parent_n_hit
+                && parent.lexical_key()
+                    < summary
+                        .best_feasible_parent
+                        .as_ref()
+                        .map(BeamRule::lexical_key)
+                        .unwrap_or_default());
+        if replace_best {
+            best_parent_n_hit = parent_n_hit;
+            summary.best_feasible_parent = Some(parent);
+        }
+    }
+    if current_parent.is_some() && !current_parent_seen {
+        summary.current_parent = current_support;
+    }
+    summary
+}
+
+#[inline]
 fn score_rule_continuous_from_bits(
     rule: &BeamRule,
     y: &[f64],
@@ -3299,6 +4122,7 @@ fn build_initial_beam(
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
     let layer_cap = params.beam_width.min(n_rows);
     let total_cands = n_rows;
     let beam = if should_parallel(total_cands, params.allow_parallel) {
@@ -3360,6 +4184,7 @@ fn build_initial_beam(
                                 train_score,
                                 max_singleton_train_raw: single.train.raw_score,
                                 max_singleton_test_raw: single.test.raw_score,
+                                rescue_budget: BEAM_NO_RESCUE_BUDGET,
                             },
                             layer_cap,
                         );
@@ -3397,6 +4222,15 @@ fn build_initial_beam(
                 let train = single.train;
                 let (train_abs_score, train_score) =
                     train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+                frontier_trace_push(
+                    1,
+                    None,
+                    &rule,
+                    train.raw_score,
+                    train_score,
+                    true,
+                    train.raw_score,
+                );
                 if !keep_initial_literal_after_seed_pruning(&train) {
                     continue;
                 }
@@ -3413,6 +4247,7 @@ fn build_initial_beam(
                         train_score,
                         max_singleton_train_raw: single.train.raw_score,
                         max_singleton_test_raw: single.test.raw_score,
+                        rescue_budget: BEAM_NO_RESCUE_BUDGET,
                     },
                     layer_cap,
                 );
@@ -3423,7 +4258,9 @@ fn build_initial_beam(
     if beam.is_empty() {
         return Err("garfield::build_initial_beam: no valid initial literals".to_string());
     }
-    Ok(filter_beam_candidates(beam, layer_cap, params))
+    let out = filter_beam_candidates(beam, layer_cap, params);
+    frontier_trace_finalize(1, trace_start, out.as_slice());
+    Ok(out)
 }
 
 fn build_initial_states_exhaustive(
@@ -3438,6 +4275,7 @@ fn build_initial_states_exhaustive(
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
     let total_cands = n_rows.saturating_mul(initial_singleton_negations(params).len());
     let all = if should_parallel_exhaustive(total_cands, params.allow_parallel) {
         let mut work = Vec::<(usize, usize)>::new();
@@ -3492,6 +4330,7 @@ fn build_initial_states_exhaustive(
                             train_score,
                             max_singleton_train_raw: single.train.raw_score,
                             max_singleton_test_raw: single.test.raw_score,
+                            rescue_budget: BEAM_NO_RESCUE_BUDGET,
                         });
                     }
                 }
@@ -3525,6 +4364,15 @@ fn build_initial_states_exhaustive(
                 let train = single.train;
                 let (train_abs_score, train_score) =
                     train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+                frontier_trace_push(
+                    1,
+                    None,
+                    &rule,
+                    train.raw_score,
+                    train_score,
+                    true,
+                    train.raw_score,
+                );
                 if !keep_initial_literal_after_seed_pruning(&train) {
                     continue;
                 }
@@ -3536,6 +4384,7 @@ fn build_initial_states_exhaustive(
                     train_score,
                     max_singleton_train_raw: single.train.raw_score,
                     max_singleton_test_raw: single.test.raw_score,
+                    rescue_budget: BEAM_NO_RESCUE_BUDGET,
                 });
             }
         }
@@ -3547,6 +4396,7 @@ fn build_initial_states_exhaustive(
             "garfield::build_initial_states_exhaustive: no valid initial literals".to_string(),
         );
     }
+    frontier_trace_finalize(1, trace_start, out.as_slice());
     Ok(out)
 }
 
@@ -3590,6 +4440,7 @@ fn whole_genome_layer2_parent_variants(
             train_score,
             max_singleton_train_raw: single.train.raw_score,
             max_singleton_test_raw: single.test.raw_score,
+            rescue_budget: BEAM_NO_RESCUE_BUDGET,
         });
     }
     out
@@ -3702,6 +4553,54 @@ fn expand_beam_once_whole_genome_target_range(
             );
             for &op in beam_binary_ops_for_rule(&parent.rule, params.xor_search_enabled).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
+                    // Keep support-rejected children visible in the
+                    // development frontier trace.  The normal scorer
+                    // returns None for this case, so without this explicit
+                    // record the whole-genome blind-scan route would make a
+                    // support loss look like a missing expansion.
+                    let support_pass = if matches!(op, BeamBinaryOp::And)
+                        && n_train >= GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT.saturating_mul(2)
+                    {
+                        let literal_in_parent = if negated {
+                            parent.train.n_hit.saturating_sub(intersection.n)
+                        } else {
+                            intersection.n
+                        };
+                        conditional_split_support_passes(
+                            parent.train.n_hit,
+                            literal_in_parent,
+                            n_train,
+                            conditional_split_min_support(n_train),
+                        )
+                    } else {
+                        true
+                    };
+                    if !support_pass {
+                        if frontier_trace_enabled() {
+                            let literal = BeamLiteral {
+                                row_index: cand,
+                                group_id: gid,
+                                negated,
+                            };
+                            let trace_rule =
+                                canonical_commutative_child_rule(&parent.rule, op, literal)
+                                    .unwrap_or_else(|| {
+                                        let mut rule = parent.rule.clone();
+                                        rule.rest.push((op, literal));
+                                        rule
+                                    });
+                            frontier_trace_push(
+                                parent.rule.len().saturating_add(1),
+                                Some(&parent.rule),
+                                &trace_rule,
+                                f64::NAN,
+                                f64::NAN,
+                                false,
+                                f64::NAN,
+                            );
+                        }
+                        continue;
+                    }
                     let literal = BeamLiteral {
                         row_index: cand,
                         group_id: gid,
@@ -3760,6 +4659,15 @@ fn expand_beam_once_whole_genome_target_range(
                         None,
                         params,
                     );
+                    frontier_trace_push(
+                        rule.len(),
+                        Some(&parent.rule),
+                        &rule,
+                        train.raw_score,
+                        train_score,
+                        support_pass,
+                        train.raw_score - direct_parent_train_raw,
+                    );
                     if !keep_child_after_parent_abs_improvement_pruning(
                         parent.train_abs_score,
                         rule.len(),
@@ -3781,6 +4689,7 @@ fn expand_beam_once_whole_genome_target_range(
                         train_score,
                         max_singleton_train_raw,
                         max_singleton_test_raw,
+                        rescue_budget: BEAM_NO_RESCUE_BUDGET,
                     };
                     let key = state.rule.lexical_key();
                     match local_best.entry(key) {
@@ -3818,6 +4727,11 @@ fn expand_beam_once_whole_genome_target_parallel(
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
+    let layer = parents
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
     let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
     if parents.is_empty() {
         return Ok(Vec::new());
@@ -3888,7 +4802,9 @@ fn expand_beam_once_whole_genome_target_parallel(
             n_train,
         )?);
     }
-    Ok(filter_beam_candidates(materialized, next_cap, params))
+    let out = filter_beam_candidates(materialized, next_cap, params);
+    frontier_trace_finalize(layer, trace_start, out.as_slice());
+    Ok(out)
 }
 
 fn expand_beam_once_whole_genome_layer2(
@@ -4068,6 +4984,7 @@ fn expand_beam_once_parallel_deferred(
                             train_score,
                             max_singleton_train_raw,
                             max_singleton_test_raw,
+                            rescue_budget: BEAM_NO_RESCUE_BUDGET,
                         };
                         let key = state.rule.lexical_key();
                         match local_best.entry(key) {
@@ -4136,7 +5053,35 @@ fn expand_beam_once(
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
+    let layer = beam
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
     let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
+    let rescue_slots = optimistic_rescue_slot_count(next_cap, optimistic_rescue_fraction());
+    let (centered_ss, centered_mean, centered_abs_max) = if rescue_slots > 0 {
+        let n = n_train.min(y_train.len());
+        let mean = if n > 0 {
+            y_train[..n].iter().copied().sum::<f64>() / n as f64
+        } else {
+            0.0
+        };
+        let ss = y_train[..n]
+            .iter()
+            .map(|value| {
+                let centered = *value - mean;
+                centered * centered
+            })
+            .sum::<f64>();
+        let max_abs = y_train[..n]
+            .iter()
+            .map(|value| (*value - mean).abs())
+            .fold(0.0, f64::max);
+        (ss, mean, max_abs)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores(beam));
     let total_expand = beam
         .iter()
@@ -4169,11 +5114,13 @@ fn expand_beam_once(
     let next = {
         let mut seen_commutative_children = HashSet::<Vec<(usize, bool, u8)>>::new();
         let mut seq = Vec::<BeamState>::with_capacity(next_cap);
+        let mut rescue = Vec::<(f64, BeamState)>::with_capacity(rescue_slots);
         let mut parent_raw_cache = RuleRawScoreCache::new();
         let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
         for node in beam.iter() {
             let (start, end) = expansion_row_bounds(&node.rule, n_rows);
-            let blind_scan = child_rule_uses_blind_scan(node.rule.len());
+            let blind_scan = child_rule_uses_blind_scan(node.rule.len())
+                || (alternative_parent_rescue_enabled() && node.rule.len() == 1);
             for cand in start..end {
                 if ((cand - start) & 127) == 0 {
                     check_interrupt_fast()?;
@@ -4200,6 +5147,53 @@ fn expand_beam_once(
                         let single = literal_scores[literal_score_index(cand, negated)];
                         let canonical_rule =
                             canonical_commutative_child_rule(&node.rule, op, literal);
+                        let trace_rule = canonical_rule.clone().unwrap_or_else(|| {
+                            let mut rule = node.rule.clone();
+                            rule.rest.push((op, literal));
+                            rule
+                        });
+                        let support_pass = if matches!(op, BeamBinaryOp::And)
+                            && n_train >= GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT.saturating_mul(2)
+                        {
+                            let literal_in_parent = if negated {
+                                node.train.n_hit.saturating_sub(intersection.n)
+                            } else {
+                                intersection.n
+                            };
+                            conditional_split_support_passes(
+                                node.train.n_hit,
+                                literal_in_parent,
+                                n_train,
+                                conditional_split_min_support(n_train),
+                            )
+                        } else {
+                            true
+                        };
+                        let support_summary = if matches!(op, BeamBinaryOp::And)
+                            && (frontier_trace_enabled() || alternative_parent_rescue_enabled())
+                        {
+                            conditional_support_summary_for_child(
+                                &trace_rule,
+                                Some(&node.rule),
+                                support_pass,
+                                bits_train,
+                                row_words_train,
+                                n_rows,
+                                n_train,
+                            )
+                        } else {
+                            ConditionalSupportSummary {
+                                current_parent: support_pass,
+                                any_parent: support_pass,
+                                n_feasible_parents: usize::from(support_pass),
+                                best_feasible_parent: None,
+                            }
+                        };
+                        let rescued = alternative_parent_rescue_enabled()
+                            && matches!(op, BeamBinaryOp::And)
+                            && !support_summary.current_parent
+                            && support_summary.any_parent;
+                        let effective_support_pass = support_pass || rescued;
                         if blind_scan {
                             if let Some(rule) = canonical_rule.as_ref() {
                                 if !seen_commutative_children.insert(rule.lexical_key()) {
@@ -4207,7 +5201,34 @@ fn expand_beam_once(
                                 }
                             }
                         }
-                        let Some(train) =
+                        if !effective_support_pass {
+                            if frontier_trace_enabled() {
+                                frontier_trace_push_with_support(
+                                    trace_rule.len(),
+                                    Some(&node.rule),
+                                    &trace_rule,
+                                    f64::NAN,
+                                    f64::NAN,
+                                    support_summary.current_parent,
+                                    f64::NAN,
+                                    support_summary,
+                                );
+                            }
+                            continue;
+                        }
+                        let Some(train) = (if rescued {
+                            evaluate_child_train_from_parent_virtual_with_intersection_rescued(
+                                &node.train,
+                                &single.train,
+                                intersection,
+                                sum_y_train,
+                                n_train,
+                                node.rule.len() + 1,
+                                op,
+                                negated,
+                                params,
+                            )
+                        } else {
                             evaluate_child_train_from_parent_virtual_with_intersection(
                                 &node.train,
                                 &single.train,
@@ -4219,7 +5240,7 @@ fn expand_beam_once(
                                 negated,
                                 params,
                             )
-                        else {
+                        }) else {
                             continue;
                         };
                         let rule = if let Some(rule) = canonical_rule {
@@ -4259,6 +5280,16 @@ fn expand_beam_once(
                             None,
                             params,
                         );
+                        frontier_trace_push_with_support(
+                            rule.len(),
+                            Some(&node.rule),
+                            &rule,
+                            train.raw_score,
+                            train_score,
+                            support_summary.current_parent,
+                            train.raw_score - direct_parent_train_raw,
+                            support_summary,
+                        );
                         if !keep_child_after_parent_abs_improvement_pruning(
                             node.train_abs_score,
                             rule.len(),
@@ -4267,7 +5298,46 @@ fn expand_beam_once(
                         ) {
                             continue;
                         }
-                        if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                        let pass_gain =
+                            keep_state_after_min_gain_pruning(rule.len(), train_score, params);
+                        if !pass_gain && matches!(op, BeamBinaryOp::And) {
+                            if let Some(rescue_budget) = rescue_budget_for_child(
+                                node.rescue_budget,
+                                optimistic_rescue_depth(),
+                            ) {
+                                let mut combined = node.combined_train.clone();
+                                apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                                let rescue_state = BeamState {
+                                    rule,
+                                    combined_train: combined,
+                                    train,
+                                    train_abs_score,
+                                    train_score,
+                                    max_singleton_train_raw,
+                                    max_singleton_test_raw,
+                                    rescue_budget,
+                                };
+                                let centered_abs_sum = centered_abs_sum_for_and_child(
+                                    &node.combined_train,
+                                    row,
+                                    negated,
+                                    y_train,
+                                    centered_mean,
+                                    n_train,
+                                );
+                                let upper_bound = optimistic_raw_score_upper_bound_with_l1(
+                                    n_train,
+                                    train.n_hit,
+                                    centered_ss,
+                                    centered_abs_sum,
+                                    centered_abs_max,
+                                );
+                                push_top_k_rescue(
+                                    &mut rescue,
+                                    (upper_bound, rescue_state),
+                                    rescue_slots,
+                                );
+                            }
                             continue;
                         }
                         if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
@@ -4285,6 +5355,7 @@ fn expand_beam_once(
                                 train_score,
                                 max_singleton_train_raw,
                                 max_singleton_test_raw,
+                                rescue_budget: BEAM_NO_RESCUE_BUDGET,
                             },
                             next_cap,
                         );
@@ -4292,9 +5363,15 @@ fn expand_beam_once(
                 }
             }
         }
-        seq
+        if rescue_slots > 0 {
+            merge_main_and_rescue_states(seq, rescue, next_cap, rescue_slots)
+        } else {
+            filter_beam_candidates(seq, next_cap, params)
+        }
     };
-    Ok(filter_beam_candidates(next, next_cap, params))
+    let out = next;
+    frontier_trace_finalize(layer, trace_start, out.as_slice());
+    Ok(out)
 }
 
 /// Dedup by canonical rule key.  Safer than train-bits dedup for the
@@ -4535,6 +5612,7 @@ fn expand_states_exhaustive_parallel_deferred(
                             train_score,
                             max_singleton_train_raw,
                             max_singleton_test_raw,
+                            rescue_budget: BEAM_NO_RESCUE_BUDGET,
                         };
                         // Exhaustive expansion appends a strictly larger row index to a
                         // unique parent rule. The parent, candidate, operation, and
@@ -4584,6 +5662,11 @@ fn expand_states_exhaustive(
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
+    let layer = frontier
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
     let total_expand = frontier
         .iter()
         .map(|node| {
@@ -4733,6 +5816,7 @@ fn expand_states_exhaustive(
                                     train_score,
                                     max_singleton_train_raw,
                                     max_singleton_test_raw,
+                                    rescue_budget: BEAM_NO_RESCUE_BUDGET,
                                 };
                                 match local_best.entry(state.rule.lexical_key()) {
                                     std::collections::hash_map::Entry::Vacant(slot) => {
@@ -4792,6 +5876,49 @@ fn expand_states_exhaustive(
                 );
                 for &op in beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
+                        // `evaluate_child_*` returns None for an AND child
+                        // that fails conditional split support.  Preserve
+                        // that rejected expansion in the development trace
+                        // so frontier loss can be attributed to support
+                        // rather than a later score/beam prune.
+                        let support_pass = if matches!(op, BeamBinaryOp::And)
+                            && n_train >= GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT.saturating_mul(2)
+                        {
+                            let literal_in_parent = if negated {
+                                node.train.n_hit.saturating_sub(intersection.n)
+                            } else {
+                                intersection.n
+                            };
+                            conditional_split_support_passes(
+                                node.train.n_hit,
+                                literal_in_parent,
+                                n_train,
+                                conditional_split_min_support(n_train),
+                            )
+                        } else {
+                            true
+                        };
+                        if !support_pass {
+                            if frontier_trace_enabled() {
+                                let literal = BeamLiteral {
+                                    row_index: cand,
+                                    group_id: gid,
+                                    negated,
+                                };
+                                let mut rule = node.rule.clone();
+                                rule.rest.push((op, literal));
+                                frontier_trace_push(
+                                    layer,
+                                    Some(&node.rule),
+                                    &rule,
+                                    f64::NAN,
+                                    f64::NAN,
+                                    false,
+                                    f64::NAN,
+                                );
+                            }
+                            continue;
+                        }
                         let single = literal_scores[literal_score_index(cand, negated)];
                         let Some(train) =
                             evaluate_child_train_from_parent_virtual_with_intersection(
@@ -4845,6 +5972,15 @@ fn expand_states_exhaustive(
                             None,
                             params,
                         );
+                        frontier_trace_push(
+                            layer,
+                            Some(&node.rule),
+                            &rule,
+                            train.raw_score,
+                            train_score,
+                            support_pass,
+                            train.raw_score - direct_parent_train_raw,
+                        );
                         if !keep_child_after_parent_abs_improvement_pruning(
                             node.train_abs_score,
                             rule.len(),
@@ -4869,6 +6005,7 @@ fn expand_states_exhaustive(
                             train_score,
                             max_singleton_train_raw,
                             max_singleton_test_raw,
+                            rescue_budget: BEAM_NO_RESCUE_BUDGET,
                         };
                         match best.entry(state.rule.lexical_key()) {
                             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -4888,6 +6025,7 @@ fn expand_states_exhaustive(
     };
     let mut out = out;
     out.sort_by(cmp_state);
+    frontier_trace_finalize(layer, trace_start, out.as_slice());
     Ok(out)
 }
 
@@ -4940,7 +6078,7 @@ fn rule_abs_score_for_eval(
     is_train: bool,
     params: &BeamSearchParams,
 ) -> Result<f64, String> {
-    let direct_parent_raw = best_ancestor_raw_baseline(
+    let best_parent_raw = best_ancestor_raw_baseline(
         rule,
         y,
         bits,
@@ -4955,7 +6093,7 @@ fn rule_abs_score_for_eval(
         rule.len(),
         rule.not_count(),
         raw.raw_score,
-        direct_parent_raw,
+        best_parent_raw,
         params,
     ))
 }
@@ -4977,7 +6115,7 @@ fn rule_abs_score_for_eval_cached(
 ) -> Result<f64, String> {
     cache_rule_raw_score(local_cache, rule, raw.raw_score);
     let mut ancestor_cache = RuleAncestorBaselineCache::new();
-    let direct_parent_raw = best_ancestor_raw_baseline_cached(
+    let best_parent_raw = best_ancestor_raw_baseline_cached(
         rule,
         y,
         bits,
@@ -4995,7 +6133,7 @@ fn rule_abs_score_for_eval_cached(
         rule.len(),
         rule.not_count(),
         raw.raw_score,
-        direct_parent_raw,
+        best_parent_raw,
         params,
     ))
 }
@@ -5571,6 +6709,25 @@ fn beam_search_train_test_continuous_impl(
     literal_scores_override: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
     let beam_t0 = Instant::now();
+    let mut params = params;
+    if exhaustive_pair_refinement_enabled() {
+        // The diagnostic deliberately makes the pair layer exhaustive and
+        // ranks those pairs by their raw score.  Ordinary gain ranking starts
+        // only after pair seeds have been selected, which is the behaviour we
+        // want to measure for pair-seeded higher-order refinement.
+        params.exhaustive_depth = params.max_pick.min(2).max(1);
+        params.rank_mode = BeamRankMode::ExhaustiveThenGain;
+    }
+    if frontier_trace_enabled()
+        || alternative_parent_rescue_enabled()
+        || optimistic_rescue_enabled()
+    {
+        // The trace/rescue path uses thread-local diagnostics and deliberately
+        // materializes alternate parent bitsets; keep it deterministic and
+        // serial for development-only experiments.
+        params.allow_parallel = false;
+    }
+    reset_garfield_frontier_trace();
     let out = (|| {
         check_ctrlc()?;
         let (needed_words_train, needed_words_test) = validate_search_inputs(
@@ -5642,8 +6799,12 @@ fn beam_search_train_test_continuous_impl(
             )?;
             kept_all.extend(exhaustive_initial.iter().cloned());
             let mut frontier = exhaustive_initial;
+            let mut exhaustive_pair_trace_start = None;
             for _depth in 2..=exhaustive_depth {
                 check_ctrlc()?;
+                if exhaustive_pair_refinement_enabled() && _depth == 2 {
+                    exhaustive_pair_trace_start = Some(frontier_trace_len());
+                }
                 let next = expand_states_exhaustive(
                     frontier.as_slice(),
                     y_train,
@@ -5664,7 +6825,22 @@ fn beam_search_train_test_continuous_impl(
                 kept_all.extend(next.iter().cloned());
                 frontier = next;
             }
-            sort_truncate_states(frontier, params.beam_width.max(1))
+            let beam = if exhaustive_pair_refinement_enabled() && exhaustive_depth >= 2 {
+                truncate_exhaustive_pair_seed_families(
+                    frontier,
+                    exhaustive_pair_seed_top_k().unwrap_or(params.beam_width.max(1)),
+                )
+            } else {
+                sort_truncate_states(frontier, params.beam_width.max(1))
+            };
+            if let Some(start) = exhaustive_pair_trace_start {
+                // The pair expansion retains every valid seed by design. The
+                // actual diagnostic frontier is the bounded top-k pair set
+                // handed to the higher-order search, so update the trace once
+                // more after truncation.
+                frontier_trace_finalize(2, start, beam.as_slice());
+            }
+            beam
         } else {
             let beam = build_initial_beam(
                 y_train,
@@ -5777,6 +6953,11 @@ fn beam_search_train_test_continuous_impl(
             HashMap::<Vec<(usize, bool, u8)>, BeamRuleCandidate>::with_capacity(retained.len());
         for state in retained.into_iter() {
             check_interrupt_fast()?;
+            // A rescued state has already passed support/validity checks and
+            // was retained solely for future-potential exploration.  Do not
+            // discard it again on the ordinary positive test-gain gate before
+            // the final absolute/delta inference layer sees it.
+            let rescued_state = state.rescue_budget != BEAM_NO_RESCUE_BUDGET;
             let cand = canonicalize_singleton_output_candidate(
                 collapse_surrogate_candidate(
                     &state,
@@ -5798,7 +6979,9 @@ fn beam_search_train_test_continuous_impl(
             if !keep_rule_after_dosage_maf_pruning(&cand.test, &params) {
                 continue;
             }
-            if !keep_child_after_parent_gain_pruning(&cand.rule, cand.test_score, &params) {
+            if !rescued_state
+                && !keep_child_after_parent_gain_pruning(&cand.rule, cand.test_score, &params)
+            {
                 continue;
             }
             let key = cand.rule.lexical_key();
@@ -6750,6 +7933,7 @@ fn best_ancestor_raw_baseline_fuzzy_cached(
     ancestor_cache: &mut RuleAncestorBaselineCache,
     disable_parent_delta: bool,
 ) -> Result<f64, String> {
+    // The fuzzy backend follows the same best-immediate-parent definition.
     let t_profile = beam_detail_profile_start();
     let key = rule.lexical_key();
     if let Some(score) = ancestor_cache.get(&key) {
@@ -6777,23 +7961,7 @@ fn best_ancestor_raw_baseline_fuzzy_cached(
                 base_cache,
                 raw_cache,
             )?;
-            let parent_ancestor = best_ancestor_raw_baseline_fuzzy_cached(
-                &parent_rule,
-                y,
-                total_sum_y,
-                ge1_flat,
-                ge2_flat,
-                row_words,
-                n_rows,
-                n_samples,
-                literal_scores,
-                is_train,
-                base_cache,
-                raw_cache,
-                ancestor_cache,
-                disable_parent_delta,
-            )?;
-            best = best.max(parent_raw.max(parent_ancestor));
+            best = best.max(parent_raw);
         }
         if best.is_finite() {
             Ok(best)
@@ -6938,6 +8106,7 @@ fn build_initial_fuzzy_beam(
     params: &BeamSearchParams,
 ) -> Result<Vec<FuzzyBeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
     let n_rows = literal_summaries.len();
     let layer_cap = params.beam_width.min(n_rows);
     let mut seq = Vec::<FuzzyBeamState>::with_capacity(layer_cap);
@@ -6976,6 +8145,15 @@ fn build_initial_fuzzy_beam(
             let train = single.train;
             let (train_abs_score, train_score) =
                 train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+            frontier_trace_push(
+                1,
+                None,
+                &rule,
+                train.raw_score,
+                train_score,
+                true,
+                train.raw_score,
+            );
             let pass_seed_basic = keep_initial_literal_after_seed_pruning(&train);
             let pass_gain = pass_seed_basic
                 && keep_state_after_min_gain_pruning(rule.len(), train_score, params);
@@ -7032,6 +8210,7 @@ fn build_initial_fuzzy_beam(
     }
     let out = filter_fuzzy_beam_candidates(seq, layer_cap, params);
     garfield_layer_debug_record_fuzzy_states(1, GarfieldLayerDebugMetric::Retained, out.as_slice());
+    frontier_trace_finalize_fuzzy(1, trace_start, out.as_slice());
     Ok(out)
 }
 
@@ -7048,6 +8227,7 @@ fn build_initial_fuzzy_states_exhaustive(
     params: &BeamSearchParams,
 ) -> Result<Vec<FuzzyBeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
     let n_rows = literal_summaries.len();
     let mut all = Vec::<FuzzyBeamState>::with_capacity(n_rows);
     let mut diag = FuzzyInitialLiteralStats {
@@ -7085,6 +8265,15 @@ fn build_initial_fuzzy_states_exhaustive(
             let train = single.train;
             let (train_abs_score, train_score) =
                 train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+            frontier_trace_push(
+                1,
+                None,
+                &rule,
+                train.raw_score,
+                train_score,
+                true,
+                train.raw_score,
+            );
             let pass_seed_basic = keep_initial_literal_after_seed_pruning(&train);
             update_fuzzy_initial_literal_stats(&mut diag, &train, pass_seed_basic, pass_seed_basic);
             if !pass_seed_basic {
@@ -7132,6 +8321,7 @@ fn build_initial_fuzzy_states_exhaustive(
         ));
     }
     garfield_layer_debug_record_fuzzy_states(1, GarfieldLayerDebugMetric::Retained, out.as_slice());
+    frontier_trace_finalize_fuzzy(1, trace_start, out.as_slice());
     Ok(out)
 }
 
@@ -7364,6 +8554,32 @@ fn expand_fuzzy_beam_once_whole_genome_target_range(
                         None,
                         params,
                     );
+                    let support_pass = if matches!(op, BeamBinaryOp::And)
+                        && n_train >= GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT.saturating_mul(2)
+                    {
+                        let literal_in_parent = if negated {
+                            parent.train.n_hit.saturating_sub(intersections.p1_r2_n)
+                        } else {
+                            intersections.p1_r1_n
+                        };
+                        conditional_split_support_passes(
+                            parent.train.n_hit,
+                            literal_in_parent,
+                            n_train,
+                            conditional_split_min_support(n_train),
+                        )
+                    } else {
+                        true
+                    };
+                    frontier_trace_push(
+                        rule.len(),
+                        Some(&parent.rule),
+                        &rule,
+                        train.raw_score,
+                        train_score,
+                        support_pass,
+                        train.raw_score - direct_parent_train_raw,
+                    );
                     if !keep_child_after_parent_abs_improvement_pruning(
                         parent.train_abs_score,
                         rule.len(),
@@ -7452,6 +8668,11 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
     params: &BeamSearchParams,
 ) -> Result<Vec<FuzzyBeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
+    let layer = parents
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
     let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
     if parents.is_empty() {
         return Ok(Vec::new());
@@ -7527,16 +8748,13 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
             n_train,
         )?);
     }
-    let layer = parents
-        .first()
-        .map(|p| p.rule.len().saturating_add(1))
-        .unwrap_or(0);
     let out = filter_fuzzy_beam_candidates(materialized, next_cap, params);
     garfield_layer_debug_record_fuzzy_states(
         layer,
         GarfieldLayerDebugMetric::Retained,
         out.as_slice(),
     );
+    frontier_trace_finalize_fuzzy(layer, trace_start, out.as_slice());
     Ok(out)
 }
 
@@ -7604,6 +8822,7 @@ fn expand_fuzzy_beam_once(
     params: &BeamSearchParams,
 ) -> Result<Vec<FuzzyBeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
     let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
     if beam.is_empty() {
         return Ok(Vec::new());
@@ -7648,6 +8867,23 @@ fn expand_fuzzy_beam_once(
                         GarfieldLayerDebugMetric::Considered,
                         1,
                     );
+                    let support_pass = if matches!(op, BeamBinaryOp::And)
+                        && n_train >= GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT.saturating_mul(2)
+                    {
+                        let literal_in_parent = if negated {
+                            node.train.n_hit.saturating_sub(intersections.p1_r2_n)
+                        } else {
+                            intersections.p1_r1_n
+                        };
+                        conditional_split_support_passes(
+                            node.train.n_hit,
+                            literal_in_parent,
+                            n_train,
+                            conditional_split_min_support(n_train),
+                        )
+                    } else {
+                        true
+                    };
                     let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
                         evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
                             node,
@@ -7722,6 +8958,15 @@ fn expand_fuzzy_beam_once(
                         None,
                         params,
                     );
+                    frontier_trace_push(
+                        rule.len(),
+                        Some(&node.rule),
+                        &rule,
+                        train.raw_score,
+                        train_score,
+                        support_pass,
+                        train.raw_score - direct_parent_train_raw,
+                    );
                     garfield_layer_debug_add(
                         layer,
                         garfield_layer_debug_op_family(op),
@@ -7788,6 +9033,7 @@ fn expand_fuzzy_beam_once(
         GarfieldLayerDebugMetric::Retained,
         out.as_slice(),
     );
+    frontier_trace_finalize_fuzzy(layer, trace_start, out.as_slice());
     Ok(out)
 }
 
@@ -8062,6 +9308,7 @@ fn expand_fuzzy_states_exhaustive(
     params: &BeamSearchParams,
 ) -> Result<Vec<FuzzyBeamState>, String> {
     check_interrupt_fast()?;
+    let trace_start = frontier_trace_len();
     let layer = frontier
         .first()
         .map(|p| p.rule.len().saturating_add(1))
@@ -8161,6 +9408,32 @@ fn expand_fuzzy_states_exhaustive(
                         None,
                         params,
                     );
+                    let support_pass = if matches!(op, BeamBinaryOp::And)
+                        && n_train >= GARFIELD_CONDITIONAL_SPLIT_MIN_DEFAULT.saturating_mul(2)
+                    {
+                        let literal_in_parent = if negated {
+                            node.train.n_hit.saturating_sub(intersections.p1_r2_n)
+                        } else {
+                            intersections.p1_r1_n
+                        };
+                        conditional_split_support_passes(
+                            node.train.n_hit,
+                            literal_in_parent,
+                            n_train,
+                            conditional_split_min_support(n_train),
+                        )
+                    } else {
+                        true
+                    };
+                    frontier_trace_push(
+                        layer,
+                        Some(&node.rule),
+                        &rule,
+                        train.raw_score,
+                        train_score,
+                        support_pass,
+                        train.raw_score - direct_parent_train_raw,
+                    );
                     // The exhaustive prefix is deliberately unpruned by
                     // gain/parent-improvement thresholds.  Those candidates
                     // are retained for the final rerank; otherwise a valid
@@ -8259,6 +9532,7 @@ fn expand_fuzzy_states_exhaustive(
         GarfieldLayerDebugMetric::Retained,
         out.as_slice(),
     );
+    frontier_trace_finalize_fuzzy(layer, trace_start, out.as_slice());
     Ok(out)
 }
 
@@ -8287,6 +9561,12 @@ fn beam_search_train_test_continuous_fuzzy_impl(
     literal_scores_override: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
     let beam_t0 = Instant::now();
+    let mut params = params;
+    if frontier_trace_enabled() {
+        // See the standard path above.  This only affects opt-in diagnostics.
+        params.allow_parallel = false;
+    }
+    reset_garfield_frontier_trace();
     garfield_layer_debug_reset();
     let out = (|| {
         let (needed_words_train, _needed_words_test) = validate_search_inputs_fuzzy(
@@ -8963,6 +10243,7 @@ mod tests {
             train_score: train.raw_score,
             max_singleton_train_raw: rule_max_singleton_raw(&rule, literal_scores, true),
             max_singleton_test_raw: rule_max_singleton_raw(&rule, literal_scores, false),
+            rescue_budget: BEAM_NO_RESCUE_BUDGET,
         }
     }
 
@@ -10291,6 +11572,70 @@ mod tests {
     }
 
     #[test]
+    fn test_exhaustive_pair_seed_cap_keeps_polarity_family_together() {
+        init_python_for_tests();
+        let rows = vec![
+            vec![1, 1, 0, 0, 0, 0, 0, 0],
+            vec![1, 0, 1, 0, 0, 0, 0, 0],
+            vec![1, 0, 0, 1, 0, 0, 0, 0],
+        ];
+        let y = vec![3.0, 2.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let literal_scores = literal_scores_for_test(&y, &bits, row_words, rows.len());
+        let polarity_pairs = |a: usize, b: usize, score: f64| {
+            [false, true]
+                .into_iter()
+                .map(|negated| {
+                    let rule = BeamRule {
+                        first: BeamLiteral {
+                            row_index: a,
+                            group_id: a,
+                            negated,
+                        },
+                        rest: vec![(
+                            BeamBinaryOp::And,
+                            BeamLiteral {
+                                row_index: b,
+                                group_id: b,
+                                negated,
+                            },
+                        )],
+                    };
+                    let mut state = beam_state_from_rule_for_test(
+                        rule,
+                        &y,
+                        &bits,
+                        row_words,
+                        rows.len(),
+                        &literal_scores,
+                    );
+                    state.train_score = score;
+                    state
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut states = Vec::new();
+        states.extend(polarity_pairs(0, 1, 3.0));
+        states.extend(polarity_pairs(0, 2, 2.0));
+        states.extend(polarity_pairs(1, 2, 1.0));
+        let selected = truncate_exhaustive_pair_seed_families(states, 2);
+        let families = selected
+            .iter()
+            .map(|state| {
+                let second = state.rule.rest[0].1.row_index;
+                (
+                    state.rule.first.row_index.min(second),
+                    state.rule.first.row_index.max(second),
+                )
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(families.len(), 2);
+        assert_eq!(selected.len(), 4);
+        assert!(families.contains(&(0, 1)));
+        assert!(families.contains(&(0, 2)));
+    }
+
+    #[test]
     fn test_interaction_gain_scoring_tempers_and_pair_singleton_baseline() {
         let rule = BeamRule {
             first: BeamLiteral {
@@ -10475,7 +11820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interaction_gain_scoring_uses_ancestor_baseline_with_null_penalty() {
+    fn test_interaction_gain_scoring_uses_best_parent_with_null_penalty() {
         let rule = BeamRule {
             first: BeamLiteral {
                 row_index: 1,
@@ -10522,7 +11867,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ancestor_baseline_prefers_stronger_grandparent_over_direct_parent() {
+    fn test_best_parent_baseline_uses_only_immediate_subrules() {
         let rule = BeamRule {
             first: BeamLiteral {
                 row_index: 0,
@@ -10769,7 +12114,86 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!((best - 0.90).abs() < 1e-12);
+        // The best parent of ABC is max(AB, AC, BC)=0.60.  A singleton
+        // ancestor with score 0.90 must not be used as the baseline.
+        assert!((best - 0.60).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_best_parent_baseline_for_quad_uses_all_four_triples() {
+        let and_rule = |rows: &[usize]| BeamRule {
+            first: BeamLiteral {
+                row_index: rows[0],
+                group_id: rows[0],
+                negated: false,
+            },
+            rest: rows[1..]
+                .iter()
+                .copied()
+                .map(|row_index| {
+                    (
+                        BeamBinaryOp::And,
+                        BeamLiteral {
+                            row_index,
+                            group_id: row_index,
+                            negated: false,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let rule = and_rule(&[0, 1, 2, 3]);
+        let mut base_cache = RuleRawScoreCache::new();
+        for (rows, score) in [
+            (&[0, 1, 2][..], 0.61),
+            (&[0, 1, 3][..], 0.65),
+            (&[0, 2, 3][..], 0.64),
+            (&[1, 2, 3][..], 0.63),
+            // These stronger lower-order scores must not be used.
+            (&[0, 1][..], 0.99),
+            (&[0][..], 0.98),
+        ] {
+            cache_rule_raw_score(&mut base_cache, &and_rule(rows), score);
+        }
+        let mut raw_cache = RuleRawScoreCache::new();
+        let mut ancestor_cache = RuleAncestorBaselineCache::new();
+        let best = best_ancestor_raw_baseline_cached(
+            &rule,
+            &[],
+            &[],
+            0,
+            4,
+            0,
+            &[],
+            true,
+            Some(&base_cache),
+            &mut raw_cache,
+            &mut ancestor_cache,
+            false,
+        )
+        .unwrap();
+        assert!((best - 0.65).abs() < 1e-12);
+
+        let mut fuzzy_raw_cache = RuleRawScoreCache::new();
+        let mut fuzzy_ancestor_cache = RuleAncestorBaselineCache::new();
+        let fuzzy_best = best_ancestor_raw_baseline_fuzzy_cached(
+            &rule,
+            &[],
+            0.0,
+            &[],
+            &[],
+            0,
+            4,
+            0,
+            &[],
+            true,
+            Some(&base_cache),
+            &mut fuzzy_raw_cache,
+            &mut fuzzy_ancestor_cache,
+            false,
+        )
+        .unwrap();
+        assert!((fuzzy_best - 0.65).abs() < 1e-12);
     }
 
     #[test]
@@ -10788,7 +12212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interaction_gain_scoring_uses_ancestor_baseline_for_triple() {
+    fn test_interaction_gain_scoring_uses_best_parent_for_triple() {
         let params = BeamSearchParams {
             rank_mode: BeamRankMode::InteractionGain,
             null_penalties: Some(Arc::new(
@@ -10801,7 +12225,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pure_and_triple_with_null_penalty_uses_ancestor_baseline() {
+    fn test_pure_and_triple_with_null_penalty_uses_best_parent() {
         let rule = BeamRule {
             first: BeamLiteral {
                 row_index: 0,
@@ -10860,7 +12284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_or_rule_uses_ancestor_baseline_under_gain_mode() {
+    fn test_or_rule_uses_best_parent_under_gain_mode() {
         let rule = BeamRule {
             first: BeamLiteral {
                 row_index: 1,
@@ -10955,7 +12379,7 @@ mod tests {
     }
 
     #[test]
-    fn test_higher_order_and_gain_uses_ancestor_baseline() {
+    fn test_higher_order_and_gain_uses_best_parent() {
         let params = BeamSearchParams {
             rank_mode: BeamRankMode::InteractionGain,
             ..BeamSearchParams::default()
@@ -11584,6 +13008,60 @@ mod tests {
     }
 
     #[test]
+    fn test_optimistic_rescue_slots_are_small_and_bounded() {
+        assert_eq!(optimistic_rescue_slot_count(0, 0.2), 0);
+        assert_eq!(optimistic_rescue_slot_count(1, 0.2), 0);
+        assert_eq!(optimistic_rescue_slot_count(100, 0.0), 0);
+        assert_eq!(optimistic_rescue_slot_count(100, 0.1), 10);
+        assert_eq!(optimistic_rescue_slot_count(101, 0.1), 11);
+        assert_eq!(optimistic_rescue_slot_count(5, 1.0), 4);
+    }
+
+    #[test]
+    fn test_optimistic_rescue_budget_allows_only_bounded_descents() {
+        assert_eq!(rescue_budget_for_child(BEAM_NO_RESCUE_BUDGET, 1), Some(1));
+        assert_eq!(rescue_budget_for_child(BEAM_NO_RESCUE_BUDGET, 2), Some(2));
+        assert_eq!(rescue_budget_for_child(2, 2), Some(1));
+        assert_eq!(rescue_budget_for_child(1, 2), Some(0));
+        assert_eq!(rescue_budget_for_child(0, 2), None);
+    }
+
+    #[test]
+    fn test_optimistic_rescue_raw_upper_bound_is_safe_and_monotone() {
+        let low = optimistic_raw_score_upper_bound(100, 10, 100.0);
+        let high = optimistic_raw_score_upper_bound(100, 20, 100.0);
+        assert!(low.is_finite() && low > 0.0);
+        assert!(high >= low);
+        assert_eq!(optimistic_raw_score_upper_bound(100, 0, 100.0), 0.0);
+        assert_eq!(optimistic_raw_score_upper_bound(0, 10, 100.0), 0.0);
+    }
+
+    #[test]
+    fn test_optimistic_rescue_l1_bound_is_at_least_observed_score() {
+        let y = [-2.0, -1.0, 0.0, 4.0, 1.0, -3.0, 2.0, 0.0];
+        let parent = [0b1111_1111u64];
+        let row = [0b0001_1111u64];
+        let mean = y.iter().copied().sum::<f64>() / y.len() as f64;
+        let l1 = centered_abs_sum_for_and_child(&parent, &row, false, &y, mean, y.len());
+        let ss = centered_y_sum_squares(&y, y.len());
+        let observed = score_cont_centered_gain_from_sum_and_n_hit(
+            y.iter().copied().sum(),
+            y[..5].iter().copied().sum(),
+            y.len(),
+            5,
+        )
+        .raw_score;
+        let bound = optimistic_raw_score_upper_bound_with_l1(
+            y.len(),
+            5,
+            ss,
+            l1,
+            y.iter().map(|v| (*v - mean).abs()).fold(0.0, f64::max),
+        );
+        assert!(bound + 1e-12 >= observed);
+    }
+
+    #[test]
     fn test_exhaustive_seed_still_allows_singleton_to_win() {
         init_python_for_tests();
         let rows = vec![
@@ -11789,6 +13267,7 @@ mod tests {
             train_score: child_score,
             max_singleton_train_raw,
             max_singleton_test_raw,
+            rescue_budget: BEAM_NO_RESCUE_BUDGET,
         };
         let collapsed = collapse_surrogate_candidate(
             &state,
@@ -11904,6 +13383,7 @@ mod tests {
             train_score: child_score,
             max_singleton_train_raw,
             max_singleton_test_raw,
+            rescue_budget: BEAM_NO_RESCUE_BUDGET,
         };
         let collapsed = collapse_surrogate_candidate(
             &state,
@@ -12000,6 +13480,7 @@ mod tests {
             train_score: child_score,
             max_singleton_train_raw,
             max_singleton_test_raw,
+            rescue_budget: BEAM_NO_RESCUE_BUDGET,
         };
         let collapsed = collapse_surrogate_candidate(
             &state,
@@ -12127,6 +13608,7 @@ mod tests {
             train_score: child_score,
             max_singleton_train_raw,
             max_singleton_test_raw,
+            rescue_budget: BEAM_NO_RESCUE_BUDGET,
         };
         let collapsed = collapse_surrogate_candidate(
             &state,
@@ -12260,6 +13742,7 @@ mod tests {
             train_score: child_score,
             max_singleton_train_raw,
             max_singleton_test_raw,
+            rescue_budget: BEAM_NO_RESCUE_BUDGET,
         };
         let collapsed = collapse_surrogate_candidate(
             &state,
@@ -12353,6 +13836,62 @@ mod tests {
                 y.as_slice(),
                 y.len(),
                 &params,
+            )
+        );
+    }
+
+    #[test]
+    fn alternative_parent_support_rescues_directional_and_split() {
+        let n_samples = 100usize;
+        let row_words = words_for_samples(n_samples);
+        let mut bits = vec![0u64; 2 * row_words];
+        for sample in 0..n_samples {
+            bits[sample >> 6] |= 1u64 << (sample & 63);
+            if sample < 30 {
+                bits[row_words + (sample >> 6)] |= 1u64 << (sample & 63);
+            }
+        }
+        let a = BeamLiteral {
+            row_index: 0,
+            group_id: 0,
+            negated: false,
+        };
+        let b = BeamLiteral {
+            row_index: 1,
+            group_id: 1,
+            negated: false,
+        };
+        let child = BeamRule {
+            first: a,
+            rest: vec![(BeamBinaryOp::And, b)],
+        };
+        let current_parent = BeamRule {
+            first: b,
+            rest: Vec::new(),
+        };
+        let summary = conditional_support_summary_for_child(
+            &child,
+            Some(&current_parent),
+            false,
+            bits.as_slice(),
+            row_words,
+            2,
+            n_samples,
+        );
+        assert!(!summary.current_parent);
+        assert!(summary.any_parent);
+        assert_eq!(summary.n_feasible_parents, 1);
+        assert_eq!(
+            summary
+                .best_feasible_parent
+                .as_ref()
+                .map(BeamRule::lexical_key),
+            Some(
+                BeamRule {
+                    first: a,
+                    rest: Vec::new(),
+                }
+                .lexical_key()
             )
         );
     }

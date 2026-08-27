@@ -3151,6 +3151,7 @@ pub struct BedChunkReader {
     fill_missing: bool,
     apply_het_filter: bool,
     het_threshold: f32,
+    preserve_alt_orientation: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3189,6 +3190,43 @@ fn bed_apply_coding_value(v: f32, mode: BedPreparedCodingMode) -> f32 {
     }
 }
 
+#[inline]
+fn process_bed_chunk_row(
+    row: &mut [f32],
+    site: &mut core::SiteInfo,
+    maf: f32,
+    miss: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
+    preserve_alt_orientation: bool,
+) -> bool {
+    let keep = if preserve_alt_orientation {
+        core::process_snp_row_with_stats_preserve_alt(
+            row,
+            &mut site.ref_allele,
+            &mut site.alt_allele,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        )
+    } else {
+        core::process_snp_row_with_stats(
+            row,
+            &mut site.ref_allele,
+            &mut site.alt_allele,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        )
+    };
+    keep.is_some()
+}
+
 #[pymethods]
 impl BedChunkReader {
     #[new]
@@ -3210,6 +3248,7 @@ impl BedChunkReader {
         ranges=None,
         model=None,
         het_threshold=None,
+        preserve_alt_orientation=None,
     ))]
     fn new(
         prefix: String,
@@ -3229,6 +3268,7 @@ impl BedChunkReader {
         ranges: Option<Vec<(String, i32, i32)>>,
         model: Option<String>,
         het_threshold: Option<f32>,
+        preserve_alt_orientation: Option<bool>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
@@ -3240,6 +3280,7 @@ impl BedChunkReader {
             ));
         }
         let het = het_threshold.unwrap_or(1.0);
+        let preserve_alt_orientation = preserve_alt_orientation.unwrap_or(false);
         if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "het_threshold must be within [0, 1.0]",
@@ -3298,6 +3339,7 @@ impl BedChunkReader {
             fill_missing: fill,
             apply_het_filter,
             het_threshold: het,
+            preserve_alt_orientation,
         })
     }
 
@@ -3356,6 +3398,7 @@ impl BedChunkReader {
                     let fill_missing = self.fill_missing;
                     let apply_het_filter = self.apply_het_filter;
                     let het_threshold = self.het_threshold;
+                    let preserve_alt_orientation = self.preserve_alt_orientation;
                     let decoded: Vec<Option<(Vec<f32>, SiteInfo)>> = batch
                         .par_iter()
                         .map(|&snp_idx| {
@@ -3364,15 +3407,15 @@ impl BedChunkReader {
                             } else {
                                 it.get_snp_row_selected_raw(snp_idx, sample_indices)?
                             };
-                            let keep = core::process_snp_row(
+                            let keep = process_bed_chunk_row(
                                 &mut row_sub,
-                                &mut site.ref_allele,
-                                &mut site.alt_allele,
+                                &mut site,
                                 maf,
                                 miss,
                                 fill_missing,
                                 apply_het_filter,
                                 het_threshold,
+                                preserve_alt_orientation,
                             );
                             if keep {
                                 Some((row_sub, site.into()))
@@ -3396,15 +3439,15 @@ impl BedChunkReader {
                                 .get_snp_row_selected_raw(snp_idx, &self.sample_indices)
                         };
                         if let Some((mut row_sub, mut site)) = maybe {
-                            let keep = core::process_snp_row(
+                            let keep = process_bed_chunk_row(
                                 &mut row_sub,
-                                &mut site.ref_allele,
-                                &mut site.alt_allele,
+                                &mut site,
                                 self.maf,
                                 self.miss,
                                 self.fill_missing,
                                 self.apply_het_filter,
                                 self.het_threshold,
+                                self.preserve_alt_orientation,
                             );
                             if keep {
                                 data.extend_from_slice(&row_sub);
@@ -3429,6 +3472,7 @@ impl BedChunkReader {
                     let fill_missing = self.fill_missing;
                     let apply_het_filter = self.apply_het_filter;
                     let het_threshold = self.het_threshold;
+                    let preserve_alt_orientation = self.preserve_alt_orientation;
                     let decoded: Vec<Option<(Vec<f32>, SiteInfo)>> = (start..end)
                         .into_par_iter()
                         .map(|snp_idx| {
@@ -3437,15 +3481,15 @@ impl BedChunkReader {
                             } else {
                                 it.get_snp_row_selected_raw(snp_idx, sample_indices)?
                             };
-                            let keep = core::process_snp_row(
+                            let keep = process_bed_chunk_row(
                                 &mut row_sub,
-                                &mut site.ref_allele,
-                                &mut site.alt_allele,
+                                &mut site,
                                 maf,
                                 miss,
                                 fill_missing,
                                 apply_het_filter,
                                 het_threshold,
+                                preserve_alt_orientation,
                             );
                             if keep {
                                 Some((row_sub, site.into()))
@@ -3486,20 +3530,21 @@ impl BedChunkReader {
                     let fill_missing = self.fill_missing;
                     let apply_het_filter = self.apply_het_filter;
                     let het_threshold = self.het_threshold;
+                    let preserve_alt_orientation = self.preserve_alt_orientation;
 
                     let decoded: Vec<Option<(Vec<f32>, SiteInfo)>> = if raw_rows.len() >= 64 {
                         raw_rows
                             .into_par_iter()
                             .map(|(mut row_sub, mut site)| {
-                                let keep = core::process_snp_row(
+                                let keep = process_bed_chunk_row(
                                     &mut row_sub,
-                                    &mut site.ref_allele,
-                                    &mut site.alt_allele,
+                                    &mut site,
                                     maf,
                                     miss,
                                     fill_missing,
                                     apply_het_filter,
                                     het_threshold,
+                                    preserve_alt_orientation,
                                 );
                                 if keep {
                                     Some((row_sub, site.into()))
@@ -3512,15 +3557,15 @@ impl BedChunkReader {
                         raw_rows
                             .into_iter()
                             .map(|(mut row_sub, mut site)| {
-                                let keep = core::process_snp_row(
+                                let keep = process_bed_chunk_row(
                                     &mut row_sub,
-                                    &mut site.ref_allele,
-                                    &mut site.alt_allele,
+                                    &mut site,
                                     maf,
                                     miss,
                                     fill_missing,
                                     apply_het_filter,
                                     het_threshold,
+                                    preserve_alt_orientation,
                                 );
                                 if keep {
                                     Some((row_sub, site.into()))
@@ -3547,15 +3592,15 @@ impl BedChunkReader {
                     };
                     match maybe {
                         Some((mut row_sub, mut site)) => {
-                            let keep = core::process_snp_row(
+                            let keep = process_bed_chunk_row(
                                 &mut row_sub,
-                                &mut site.ref_allele,
-                                &mut site.alt_allele,
+                                &mut site,
                                 self.maf,
                                 self.miss,
                                 self.fill_missing,
                                 self.apply_het_filter,
                                 self.het_threshold,
+                                self.preserve_alt_orientation,
                             );
                             if keep {
                                 data.extend_from_slice(&row_sub);
@@ -4000,6 +4045,7 @@ pub struct HmpChunkReader {
     fill_missing: bool,
     apply_het_filter: bool,
     het_threshold: f32,
+    preserve_alt_orientation: bool,
 }
 
 #[pymethods]
@@ -4020,6 +4066,7 @@ impl HmpChunkReader {
         bp_min=None,
         bp_max=None,
         ranges=None,
+        preserve_alt_orientation=None,
     ))]
     fn new(
         path: String,
@@ -4036,6 +4083,7 @@ impl HmpChunkReader {
         bp_min: Option<i32>,
         bp_max: Option<i32>,
         ranges: Option<Vec<(String, i32, i32)>>,
+        preserve_alt_orientation: Option<bool>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
@@ -4053,6 +4101,7 @@ impl HmpChunkReader {
             ));
         }
         let apply_het_filter = het < 1.0_f32;
+        let preserve_alt_orientation = preserve_alt_orientation.unwrap_or(false);
         let it = HmpSnpIter::new_with_fill(&path, 0.0, 1.0, false, false, het)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         let (sample_indices, sample_ids) =
@@ -4071,6 +4120,7 @@ impl HmpChunkReader {
             fill_missing: fill,
             apply_het_filter,
             het_threshold: het,
+            preserve_alt_orientation,
         })
     }
 
@@ -4107,16 +4157,30 @@ impl HmpChunkReader {
                     } else {
                         self.sample_indices.iter().map(|&i| row[i]).collect()
                     };
-                    let keep = core::process_snp_row(
-                        &mut row_sub,
-                        &mut site.ref_allele,
-                        &mut site.alt_allele,
-                        self.maf,
-                        self.miss,
-                        self.fill_missing,
-                        self.apply_het_filter,
-                        self.het_threshold,
-                    );
+                    let keep = if self.preserve_alt_orientation {
+                        core::process_snp_row_with_stats_preserve_alt(
+                            &mut row_sub,
+                            &mut site.ref_allele,
+                            &mut site.alt_allele,
+                            self.maf,
+                            self.miss,
+                            self.fill_missing,
+                            self.apply_het_filter,
+                            self.het_threshold,
+                        )
+                        .is_some()
+                    } else {
+                        core::process_snp_row(
+                            &mut row_sub,
+                            &mut site.ref_allele,
+                            &mut site.alt_allele,
+                            self.maf,
+                            self.miss,
+                            self.fill_missing,
+                            self.apply_het_filter,
+                            self.het_threshold,
+                        )
+                    };
                     if keep {
                         data.extend_from_slice(&row_sub);
                         sites.push(site.into());
