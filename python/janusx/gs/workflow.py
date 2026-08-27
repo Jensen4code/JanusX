@@ -4911,6 +4911,13 @@ _THREAD_ENV_KEYS = (
     "VECLIB_MAXIMUM_THREADS",
 )
 
+_THREAD_MAX_ENV_KEYS = (
+    "OMP_MAX_THREADS",
+    "MKL_MAX_THREADS",
+    "OPENBLAS_MAX_THREADS",
+    "NUMEXPR_MAX_THREADS",
+)
+
 
 def _parse_nonnegative_int(raw: object) -> int | None:
     try:
@@ -4999,6 +5006,8 @@ def configure_thread_runtime(
     text_blas = str(int(blas_threads))
     text_rust = str(int(rust_threads))
     for key in _THREAD_ENV_KEYS:
+        os.environ[key] = text_blas
+    for key in _THREAD_MAX_ENV_KEYS:
         os.environ[key] = text_blas
     os.environ["JX_MLM_BLAS_THREADS"] = text_blas
     os.environ["JX_MLM_RUST_THREADS"] = text_rust
@@ -13818,6 +13827,7 @@ def _predict_from_loaded_model_state(
     dense_matrix: np.ndarray | None,
     packed_ctx: dict[str, typing.Any] | None,
     packed_sample_indices: np.ndarray | None,
+    thread_limit: int | None = None,
 ) -> np.ndarray:
     kind = str(model_state.get("kind", "")).strip().lower()
     m = str(method)
@@ -14048,11 +14058,15 @@ def _predict_from_loaded_model_state(
             idx = np.where(np.isnan(x))
             x = x.copy()
             x[idx] = marker_means[idx[1]]
-        if (m in {"PLS", "KRR"}) and (_ml_threadpool_limits is not None):
-            # Keep loaded nonlinear estimators safe on runtimes where the
-            # process already contains another OpenMP/BLAS runtime (notably
-            # macOS OpenBLAS alongside the Rust extension).
-            with _ml_threadpool_limits(limits=1):
+        predict_limit = (
+            max(1, int(thread_limit))
+            if thread_limit is not None
+            else (1 if m in {"PLS", "KRR"} else None)
+        )
+        if (predict_limit is not None) and (_ml_threadpool_limits is not None):
+            # Keep loaded estimators bounded on runtimes where the process
+            # already contains multiple OpenMP/BLAS implementations.
+            with _ml_threadpool_limits(limits=predict_limit):
                 predicted = estimator.predict(x)
         else:
             predicted = estimator.predict(x)
@@ -14076,6 +14090,7 @@ def _run_loaded_model_task(
     test_sample_indices: np.ndarray | None,
     cv_splits: list[tuple[np.ndarray, np.ndarray]] | None,
     limit_predtrain: int | None,
+    prediction_threads: int | None = None,
 ) -> dict[str, typing.Any]:
     _t_loaded_begin = time.time()
     fold_rows: list[tuple[str, int, float, float, float, float, float, float, float]] = []
@@ -14107,6 +14122,7 @@ def _run_loaded_model_task(
                 dense_matrix=np.asarray(x, dtype=np.float32),
                 packed_ctx=None,
                 packed_sample_indices=None,
+                thread_limit=prediction_threads,
             )
         if packed_ctx is not None and train_sample_indices is not None:
             if use_test:
@@ -14128,6 +14144,7 @@ def _run_loaded_model_task(
                 dense_matrix=None,
                 packed_ctx=packed_ctx,
                 packed_sample_indices=abs_idx,
+                thread_limit=prediction_threads,
             )
         base_dense = test_snp if use_test else train_snp
         if base_dense is None:
@@ -14146,6 +14163,7 @@ def _run_loaded_model_task(
             dense_matrix=np.asarray(x_dense, dtype=np.float32),
             packed_ctx=None,
             packed_sample_indices=None,
+            thread_limit=prediction_threads,
         )
 
     if cv_splits is not None:
@@ -15008,6 +15026,7 @@ def _run_gs_model_only_prediction(
             dense_matrix=dense_matrix,
             packed_ctx=None,
             packed_sample_indices=None,
+            thread_limit=max(1, int(args.thread)),
         )
         pred = np.asarray(pred, dtype=np.float64).reshape(-1)
         if int(pred.size) != int(sample_ids.size):
@@ -20419,16 +20438,23 @@ def _run_gs_pipeline_impl(
 
     model_only_paths = _gs_model_paths_from_args(args)
     if (len(model_only_paths) > 0) and (not bool(args.pheno)):
-        return _run_gs_model_only_prediction(
-            args=args,
-            gfile=str(gfile),
-            outprefix=str(outprefix),
-            gs_model_dir=str(gs_model_dir),
-            log_path=str(log_path),
-            logger=logger,
-            t_start=float(t_start),
-            return_result=bool(return_result),
-        )
+        # Model-only prediction returns before the normal phenotype-driven
+        # runtime setup below.  Use a stage context so already-loaded BLAS
+        # and OpenMP runtimes are capped, not only their environment hints.
+        with runtime_thread_stage(
+            blas_threads=int(args.thread),
+            rayon_threads=int(args.thread),
+        ):
+            return _run_gs_model_only_prediction(
+                args=args,
+                gfile=str(gfile),
+                outprefix=str(outprefix),
+                gs_model_dir=str(gs_model_dir),
+                log_path=str(log_path),
+                logger=logger,
+                t_start=float(t_start),
+                return_result=bool(return_result),
+            )
 
     if bool(getattr(args, "verbose", False)):
         logger.info(f"Thread detect: {format_thread_budget_summary(thread_budget)}")
@@ -24063,6 +24089,7 @@ def _run_gs_pipeline_impl(
                     test_sample_indices=method_test_sample_idx,
                     cv_splits=None,
                     limit_predtrain=args.limit_predtrain,
+                    prediction_threads=max(1, int(args.thread)),
                 )
                 res["model_file"] = str(model_file)
                 method_results.append(res)

@@ -104,6 +104,13 @@ _BLAS_THREAD_ENV_KEYS = (
     "VECLIB_MAXIMUM_THREADS",
 )
 
+_BLAS_MAX_THREAD_ENV_KEYS = (
+    "OMP_MAX_THREADS",
+    "MKL_MAX_THREADS",
+    "OPENBLAS_MAX_THREADS",
+    "NUMEXPR_MAX_THREADS",
+)
+
 
 def _parse_positive_env_int(name: str) -> Optional[int]:
     raw = str(os.getenv(name, "")).strip()
@@ -135,8 +142,9 @@ def _resolve_eigh_threads() -> int:
 @contextmanager
 def _force_full_blas_threads_for_eigh():
     """
-    Temporarily pin BLAS thread count during eigh to the full `-t` budget.
-    This keeps eigendecomposition throughput independent from Rayon split settings.
+    Temporarily pin numeric runtime thread counts during eigh to the full
+    `-t` budget.  This keeps eigendecomposition throughput independent from
+    Rayon split settings without leaving a second OpenMP runtime uncapped.
     """
     if not _env_truthy("JX_MLM_EIGH_USE_ALL_THREADS", "1"):
         yield
@@ -149,12 +157,15 @@ def _force_full_blas_threads_for_eigh():
     for key in _BLAS_THREAD_ENV_KEYS:
         old_env[key] = os.environ.get(key)
         os.environ[key] = thr_text
+    for key in _BLAS_MAX_THREAD_ENV_KEYS:
+        old_env[key] = os.environ.get(key)
+        os.environ[key] = thr_text
     old_env["JX_MLM_BLAS_THREADS"] = os.environ.get("JX_MLM_BLAS_THREADS")
     os.environ["JX_MLM_BLAS_THREADS"] = thr_text
 
     try:
         if _threadpool_limits is not None:
-            with _threadpool_limits(limits=int(n_thr), user_api="blas"):
+            with _threadpool_limits(limits=int(n_thr)):
                 yield
         else:
             yield

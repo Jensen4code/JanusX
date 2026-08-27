@@ -373,16 +373,18 @@ def apply_outer_thread_cap(
 @contextmanager
 def native_blas_thread_limit(limit: int):
     """
-    Best-effort BLAS threadpool limit context (threadpoolctl-backed).
+    Best-effort numerical-runtime threadpool limit context.
+
+    Do not restrict this to ``user_api="blas"``: scikit-learn, XGBoost,
+    and some BLAS builds may load separate OpenMP runtimes.  A BLAS-only
+    limit leaves those runtimes at their previous width and can multiply
+    threads when an outer joblib/Rayon stage is active.
     """
     lim = max(1, int(limit))
     if _threadpool_limits is None:
         yield
         return
-    try:
-        stage_ctx = _threadpool_limits(limits=lim, user_api="blas")
-    except TypeError:
-        stage_ctx = _threadpool_limits(limits=lim)
+    stage_ctx = _threadpool_limits(limits=lim)
     with stage_ctx:
         yield
 
@@ -403,6 +405,8 @@ def runtime_thread_stage(
     if blas_threads is not None:
         bt = str(max(1, int(blas_threads)))
         for key in _BLAS_THREAD_ENV_KEYS:
+            updates[key] = bt
+        for key in _BLAS_MAX_THREAD_ENV_KEYS:
             updates[key] = bt
         updates["JX_MLM_BLAS_THREADS"] = bt
     if rayon_threads is not None:

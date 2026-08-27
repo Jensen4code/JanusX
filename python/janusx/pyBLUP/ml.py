@@ -372,7 +372,7 @@ class MLGS:
 
     def _thread_context(self):
         use_joblib_backend = self.parallel_mode_ == "model" and self.method in {"rf", "et"}
-        use_threadpool_limit = self.parallel_mode_ == "model" and threadpool_limits is not None
+        use_threadpool_limit = threadpool_limits is not None
         if (not use_joblib_backend) and (not use_threadpool_limit):
             return nullcontext()
 
@@ -380,7 +380,11 @@ class MLGS:
         if use_joblib_backend:
             stack.enter_context(parallel_backend("threading", n_jobs=self._model_n_jobs()))
         if use_threadpool_limit:
-            stack.enter_context(threadpool_limits(limits=self._model_n_jobs()))
+            # Search-mode candidates run concurrently in joblib workers, so
+            # each worker must install its own serial numerical-runtime cap.
+            # Model-mode fits can use the requested width directly.
+            limit = self._model_n_jobs() if self.parallel_mode_ == "model" else 1
+            stack.enter_context(threadpool_limits(limits=limit))
         return stack
 
     @staticmethod
@@ -1176,6 +1180,8 @@ class MLGS:
         if eval_fn is None:
             eval_fn = lambda params: self._evaluate_candidate(params, stage=stage)
         if self.parallel_mode_ == "search" and self.n_jobs > 1 and len(candidates) > 1:
+            # SVM/ENET use candidate-level parallelism.  The evaluator's
+            # _thread_context() serializes each worker's numeric runtime.
             rows = Parallel(n_jobs=self.n_jobs, prefer="threads")(
                 delayed(eval_fn)(params)
                 for params in candidates
