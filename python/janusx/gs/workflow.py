@@ -18,6 +18,8 @@ Supported models
   - XGB    : XGBoost regression with compact inner tuning
   - SVM    : RBF-support vector regression with compact inner tuning
   - ENET   : ElasticNet regression with compact inner tuning
+  - PLS    : Partial least-squares regression with compact component tuning
+  - KRR    : RBF kernel ridge regression via Nystroem features
 
 Genotype input formats
 ----------------------
@@ -129,6 +131,7 @@ from janusx.pyBLUP.ml import (
     _SKLEARN_IMPORT_ERROR,
     _HAS_XGBOOST,
     _XGBOOST_IMPORT_ERROR,
+    threadpool_limits as _ml_threadpool_limits,
 )
 try:
     from janusx.pyBLUP.blup import BLUP as KernelBLUP, Gmatrix
@@ -253,6 +256,8 @@ _ML_METHOD_MAP: dict[str, str] = {
     "XGB": "xgb",
     "SVM": "svm",
     "ENET": "enet",
+    "PLS": "pls",
+    "KRR": "krr",
 }
 
 
@@ -2055,7 +2060,7 @@ def _is_effect_export_supported(method: str) -> bool:
         or _is_gblup_method(m)
         or (m == "rrBLUP")
         or (m in {"BayesA", "BayesB", "BayesC", "BayesR"})
-        or (m in _ML_METHOD_MAP)
+        or (m in _ML_METHOD_MAP and m != "KRR")
     )
 
 
@@ -8843,7 +8848,7 @@ def GSapi(
     Y: np.ndarray,
     Xtrain: typing.Any,
     Xtest: typing.Any,
-    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesC", "BayesR", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
+    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesC", "BayesR", "RF", "ET", "GBDT", "XGB", "SVM", "ENET", "PLS", "KRR"],
     PCAdec: bool = False,
     n_jobs: int = 1,
     seed: int = 42,
@@ -8876,7 +8881,7 @@ def GSapi(
         Genotype matrix for training individuals, shape (m_markers, n_train).
     Xtest : np.ndarray
         Genotype matrix for test individuals, shape (m_markers, n_test).
-    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesC', 'BayesR', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET'}
+    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesC', 'BayesR', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET', 'PLS', 'KRR'}
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
@@ -13070,7 +13075,7 @@ def _run_method_task(
             )
     want_export_state = bool(
         bool(save_model_artifact)
-        and _is_effect_export_supported(method)
+        and _is_binary_jxmodel_artifact_supported(method)
     )
     if want_export_state:
         skip_final_fit = False
@@ -14041,7 +14046,15 @@ def _predict_from_loaded_model_state(
             idx = np.where(np.isnan(x))
             x = x.copy()
             x[idx] = marker_means[idx[1]]
-        pred = np.asarray(estimator.predict(x), dtype=np.float64).reshape(-1, 1)
+        if (m in {"PLS", "KRR"}) and (_ml_threadpool_limits is not None):
+            # Keep loaded nonlinear estimators safe on runtimes where the
+            # process already contains another OpenMP/BLAS runtime (notably
+            # macOS OpenBLAS alongside the Rust extension).
+            with _ml_threadpool_limits(limits=1):
+                predicted = estimator.predict(x)
+        else:
+            predicted = estimator.predict(x)
+        pred = np.asarray(predicted, dtype=np.float64).reshape(-1, 1)
         return pred
 
     raise ValueError(f"Unsupported loaded model kind for method={m}: {kind!r}")
@@ -15527,6 +15540,12 @@ def _run_methods_parallel(
                 "XGB": ["n_estimators", "learning_rate", "max_depth"],
                 "SVM": ["C", "gamma", "epsilon"],
                 "ENET": ["alpha", "l1_ratio"],
+                "PLS": ["n_components"],
+                "KRR": [
+                    "nystroem__n_components",
+                    "nystroem__gamma",
+                    "ridge__alpha",
+                ],
             }
             shown = 0
             for k in key_pref.get(m, []):
@@ -19441,7 +19460,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
             "jx gs -hmp geno.hmp.gz -p pheno.tsv -BLUP -cv 5",
             "jx gs -file geno_prefix -p pheno.tsv -BLUP -cv 5",
             "jx gs -bfile geno_prefix -p pheno.tsv -BLUP -cv 5",
-            "jx gs -vcf geno.vcf.gz -p pheno.tsv -RF -ET -GBDT -SVM -ENET -cv 5",
+            "jx gs -vcf geno.vcf.gz -p pheno.tsv -RF -ET -GBDT -SVM -ENET -PLS -KRR -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -BLUP -BayesA -cv 5",
             "jx gs -h -dev",
         ]),
@@ -19593,6 +19612,20 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         default=False,
         help="Use ElasticNet genomic selection with compact inner tuning "
              "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-PLS", "--PLS",
+        action="store_true",
+        default=False,
+        help="Use partial least-squares genomic selection with compact component tuning "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-KRR", "--KRR",
+        action="store_true",
+        default=False,
+        help="Use RBF kernel-ridge genomic selection with a Nystroem approximation "
+             "and compact tuning (default: %(default)s).",
     )
     model_group.add_argument(
         "-model", "--model",
@@ -20055,6 +20088,8 @@ def parse_args(argv: typing.Optional[list[str]] = None):
             args.XGB,
             args.SVM,
             args.ENET,
+            args.PLS,
+            args.KRR,
         )
         if any(bool(value) for value in training_flags):
             parser.error("model-only prediction cannot be combined with a training model flag")
@@ -20082,6 +20117,8 @@ def parse_args(argv: typing.Optional[list[str]] = None):
                 args.XGB,
                 args.SVM,
                 args.ENET,
+                args.PLS,
+                args.KRR,
             )
         )
         if other_models:
@@ -20476,6 +20513,8 @@ def _run_gs_pipeline_impl(
         and (not bool(args.XGB))
         and (not bool(args.SVM))
         and (not bool(args.ENET))
+        and (not bool(args.PLS))
+        and (not bool(args.KRR))
     )
     auto_packed_lmm_requested = False
     probe_n_samples: int | None = None
@@ -20596,6 +20635,10 @@ def _run_gs_pipeline_impl(
         methods.append("SVM")
     if args.ENET:
         methods.append("ENET")
+    if args.PLS:
+        methods.append("PLS")
+    if args.KRR:
+        methods.append("KRR")
     # keep order, drop duplicates
     if len(methods) > 1:
         _seen_methods: set[str] = set()
@@ -20658,7 +20701,7 @@ def _run_gs_pipeline_impl(
     if len(methods) == 0:
         logger.error(
             "No model selected. Use "
-            "--BLUP/--BayesA/--BayesB/--BayesC/--BayesR/--RF/--ET/--GBDT/--XGB/--SVM/--ENET "
+            "--BLUP/--BayesA/--BayesB/--BayesC/--BayesR/--RF/--ET/--GBDT/--XGB/--SVM/--ENET/--PLS/--KRR "
             "or provide --model with discoverable *.jxmodel files."
         )
         raise SystemExit(1)
@@ -20685,7 +20728,7 @@ def _run_gs_pipeline_impl(
         if len(unsupported) > 0:
             logger.error(
                 "Loaded-model mode currently supports additive GBLUP, rrBLUP, "
-                "RF/ET/GBDT/XGB/SVM/ENET and BLUP inside TOP bundles. "
+                "RF/ET/GBDT/XGB/SVM/ENET/PLS/KRR and BLUP inside TOP bundles. "
                 "Unsupported: " + ", ".join(unsupported)
             )
             raise SystemExit(1)
@@ -20719,7 +20762,7 @@ def _run_gs_pipeline_impl(
     if top_enabled and (not model_mode) and (not hasattr(_jxrs, "top_fit_model")):
         logger.error("Rust backend missing top_fit_model export. Please rebuild JanusX.")
         raise SystemExit(1)
-    ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}
+    ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET", "PLS", "KRR"}
     gblup_ad_methods = [
         m for m in methods
         if _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) == "ad")
@@ -20736,7 +20779,7 @@ def _run_gs_pipeline_impl(
         methods = [m for m in methods if m not in ml_methods]
         logger.warning(
             format_missing_dependency_message(
-                "Skip ML models (RF/ET/GBDT/SVM/ENET/XGB) because scikit-learn is unavailable.",
+                "Skip ML models (RF/ET/GBDT/SVM/ENET/PLS/KRR/XGB) because scikit-learn is unavailable.",
                 packages=("scikit-learn",),
                 extra="ml",
                 original_error=_SKLEARN_IMPORT_ERROR,
@@ -20819,7 +20862,7 @@ def _run_gs_pipeline_impl(
                     else:
                         solver_txt = "auto"
                 detail = f"solver={solver_txt}"
-            elif str(m) in {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}:
+            elif str(m) in {"RF", "ET", "GBDT", "XGB", "SVM", "ENET", "PLS", "KRR"}:
                 detail = "compact tuning=on"
             elif str(m) in {"BayesA", "BayesB", "BayesC", "BayesR"}:
                 detail = "bayesian marker model"
@@ -22381,8 +22424,11 @@ def _run_gs_pipeline_impl(
             logger.info(f"[GS-DEBUG][{trait_name}] stage=trait_start")
 
         t_stage = time.time()
-        p = pheno[trait_name]
-        namark = p.isna()
+        # Treat NaN, +/-inf, and non-numeric phenotype tokens uniformly as
+        # missing. ML estimators cannot train on non-finite targets.
+        p = pd.to_numeric(pheno[trait_name], errors="coerce")
+        p_values = np.asarray(p.to_numpy(dtype=float), dtype=float)
+        namark = ~np.isfinite(p_values)
         if _GS_DEBUG_STAGE:
             logger.info(
                 f"[GS-DEBUG][{trait_name}] stage=build_na_mask "
@@ -23679,7 +23725,13 @@ def _run_gs_pipeline_impl(
                         )
                     elif train_snp is not None:
                         fallback_marker_count = int(np.asarray(train_snp).shape[0])
-                    if want_effect_export:
+                    # Binary model artifacts always carry the canonical marker
+                    # audit table.  KRR has no marker-space coefficient vector,
+                    # so it embeds metadata only and does not emit an effect
+                    # table alongside the .jxmodel.
+                    if want_effect_export or (
+                        want_model_export and artifact_kind == "binary_jxmodel"
+                    ):
                         try:
                             effect_table, effect_meta = _build_jxmodel_marker_table(
                                 model_state=dict(state_export),
@@ -23688,13 +23740,14 @@ def _run_gs_pipeline_impl(
                                 fallback_marker_count=fallback_marker_count,
                                 marker_meta=geno_marker_meta,
                             )
-                            trait_effect_meta_by_method[str(m_key)] = dict(effect_meta or {})
                             marker_table_for_model = effect_table
-                            effect_out_export = str(model_out)
-                            if artifact_kind == "text_effect":
-                                _save_effect_text_jxmodel(model_out, effect_table)
-                                saved_result_paths.append(str(model_out))
-                                model_out_export = str(model_out)
+                            if want_effect_export:
+                                trait_effect_meta_by_method[str(m_key)] = dict(effect_meta or {})
+                                effect_out_export = str(model_out)
+                                if artifact_kind == "text_effect":
+                                    _save_effect_text_jxmodel(model_out, effect_table)
+                                    saved_result_paths.append(str(model_out))
+                                    model_out_export = str(model_out)
                         except Exception as ex:
                             logger.warning(
                                 f"Effect table build failed for trait={trait_name}, method={m_key}: {ex}"

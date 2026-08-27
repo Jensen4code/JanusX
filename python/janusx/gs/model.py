@@ -83,6 +83,8 @@ class GenomicSelection:
             xgb=False,
             svm=False,
             enet=False,
+            pls=False,
+            krr=False,
         )
         payload = run_gs_config(cfg, out=out, prefix=prefix, log=bool(log))
         return GsResult.from_payload(payload)
@@ -109,6 +111,8 @@ class GenomicSelection:
             xgb=False,
             svm=False,
             enet=False,
+            pls=False,
+            krr=False,
         )
         payload = run_gs_config(cfg, out=out, prefix=prefix, log=bool(log))
         return GsResult.from_payload(payload)
@@ -135,6 +139,64 @@ class GenomicSelection:
             xgb=False,
             svm=False,
             enet=False,
+            pls=False,
+            krr=False,
+        )
+        payload = run_gs_config(cfg, out=out, prefix=prefix, log=bool(log))
+        return GsResult.from_payload(payload)
+
+    def pls(
+        self,
+        *,
+        out: Optional[str] = None,
+        prefix: Optional[str] = None,
+        log: bool = True,
+    ) -> GsResult:
+        cfg = replace(
+            self.config,
+            gblup_kernels=tuple(),
+            blup=False,
+            rrblup=False,
+            bayesa=False,
+            bayesb=False,
+            bayesc=False,
+            bayesr=False,
+            rf=False,
+            et=False,
+            gbdt=False,
+            xgb=False,
+            svm=False,
+            enet=False,
+            pls=True,
+            krr=False,
+        )
+        payload = run_gs_config(cfg, out=out, prefix=prefix, log=bool(log))
+        return GsResult.from_payload(payload)
+
+    def krr(
+        self,
+        *,
+        out: Optional[str] = None,
+        prefix: Optional[str] = None,
+        log: bool = True,
+    ) -> GsResult:
+        cfg = replace(
+            self.config,
+            gblup_kernels=tuple(),
+            blup=False,
+            rrblup=False,
+            bayesa=False,
+            bayesb=False,
+            bayesc=False,
+            bayesr=False,
+            rf=False,
+            et=False,
+            gbdt=False,
+            xgb=False,
+            svm=False,
+            enet=False,
+            pls=False,
+            krr=True,
         )
         payload = run_gs_config(cfg, out=out, prefix=prefix, log=bool(log))
         return GsResult.from_payload(payload)

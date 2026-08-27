@@ -11,8 +11,10 @@ from joblib import Parallel, delayed, parallel_backend
 from janusx._optional_deps import format_missing_dependency_message
 
 try:
+    from sklearn.cross_decomposition import PLSRegression
     from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
-    from sklearn.linear_model import ElasticNet
+    from sklearn.kernel_approximation import Nystroem
+    from sklearn.linear_model import ElasticNet, Ridge
     from sklearn.exceptions import ConvergenceWarning
     from sklearn.model_selection import KFold, ParameterSampler
     from sklearn.pipeline import Pipeline
@@ -22,10 +24,13 @@ try:
     _HAS_SKLEARN = True
     _SKLEARN_IMPORT_ERROR: Exception | None = None
 except Exception as _sklearn_exc:  # pragma: no cover - optional dependency path
+    PLSRegression = None  # type: ignore[assignment]
     ExtraTreesRegressor = None  # type: ignore[assignment]
     HistGradientBoostingRegressor = None  # type: ignore[assignment]
     RandomForestRegressor = None  # type: ignore[assignment]
+    Nystroem = None  # type: ignore[assignment]
     ElasticNet = None  # type: ignore[assignment]
+    Ridge = None  # type: ignore[assignment]
     KFold = None  # type: ignore[assignment]
     ParameterSampler = None  # type: ignore[assignment]
     Pipeline = None  # type: ignore[assignment]
@@ -68,7 +73,7 @@ def _require_sklearn(requirement: str) -> None:
 
 
 ScoreName = typing.Literal["pearson", "r2", "neg_rmse"]
-MethodName = typing.Literal["rf", "et", "gbdt", "xgb", "svm", "enet"]
+MethodName = typing.Literal["rf", "et", "gbdt", "xgb", "svm", "enet", "pls", "krr"]
 FeatureAxisName = typing.Literal["auto", "marker_by_sample", "sample_by_marker"]
 SearchSchemeName = typing.Literal["legacy", "multicenter"]
 
@@ -121,12 +126,18 @@ def _score_value(y_true: np.ndarray, y_pred: np.ndarray, scoring: ScoreName) -> 
     raise ValueError(f"Unsupported scoring method: {scoring}")
 
 
-def _as_1d_y(y: np.ndarray) -> np.ndarray:
+def _as_1d_y(y: np.ndarray, *, require_finite: bool = False) -> np.ndarray:
     arr = np.asarray(y, dtype=float).reshape(-1)
     if arr.size == 0:
         raise ValueError("Phenotype y is empty.")
     if not np.isfinite(arr).any():
         raise ValueError("Phenotype y contains no finite value.")
+    if require_finite and not np.isfinite(arr).all():
+        bad = int(np.count_nonzero(~np.isfinite(arr)))
+        raise ValueError(
+            f"Phenotype y contains {bad} non-finite value(s). "
+            "Remove missing/invalid samples before fitting."
+        )
     return arr
 
 
@@ -182,10 +193,17 @@ def _resolve_marker_matrix(
 
 def _impute_matrix_with_means(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     mat = np.asarray(X, dtype=np.float32)
-    means = np.nanmean(mat, axis=0)
-    means = np.where(np.isfinite(means), means, 0.0).astype(np.float32, copy=False)
-    if np.isnan(mat).any():
-        idx = np.where(np.isnan(mat))
+    finite = np.isfinite(mat)
+    counts = np.sum(finite, axis=0, dtype=np.int64)
+    sums = np.sum(np.where(finite, mat, 0.0), axis=0, dtype=np.float64)
+    means = np.divide(
+        sums,
+        counts,
+        out=np.zeros_like(sums, dtype=np.float64),
+        where=counts > 0,
+    ).astype(np.float32, copy=False)
+    if not np.all(finite):
+        idx = np.where(~finite)
         mat = mat.copy()
         mat[idx] = means[idx[1]]
     return mat, means
@@ -197,8 +215,9 @@ def _apply_column_means(X: np.ndarray, means: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"Feature number mismatch during prediction. X.shape={mat.shape}, means.shape={means.shape}"
         )
-    if np.isnan(mat).any():
-        idx = np.where(np.isnan(mat))
+    finite = np.isfinite(mat)
+    if not np.all(finite):
+        idx = np.where(~finite)
         mat = mat.copy()
         mat[idx] = means[idx[1]]
     return mat
@@ -260,7 +279,7 @@ class MLGS:
     ):
         self.method = str(method)
         _require_sklearn(
-            "scikit-learn is required for MLGS models (RF/ET/GBDT/SVM/ENET/XGB)."
+            "scikit-learn is required for MLGS models (RF/ET/GBDT/SVM/ENET/PLS/KRR/XGB)."
         )
         self.seed = 0 if seed is None else int(seed)
         self.cv = max(2, int(cv))
@@ -280,7 +299,7 @@ class MLGS:
         )
         self.confirm_repeats = max(1, int(confirm_repeats))
 
-        self.y = _as_1d_y(y)
+        self.y = _as_1d_y(y, require_finite=True)
         self.X_marker, self.feature_axis_ = _resolve_marker_matrix(M, self.y.size, feature_axis)
         self.cov = _prepare_covariates(cov, self.y.size)
         self.marker_count_ = int(self.X_marker.shape[1])
@@ -327,6 +346,9 @@ class MLGS:
             return
 
     def _parallel_mode(self) -> typing.Literal["model", "search"]:
+        # PLS/KRR use dense SVD/solve kernels.  Their BLAS/OpenMP kernels
+        # already use the requested thread budget, and concurrent candidate
+        # fits can produce numerical failures or crash with multiple runtimes.
         if self.method in {"svm", "enet"}:
             return "search"
         return "model"
@@ -472,6 +494,14 @@ class MLGS:
             if medium_n or large_p:
                 return 4
             return 6
+        if self.method == "pls":
+            if stage == "coarse":
+                return 4 if (large_n or huge_p) else 6
+            return 2 if (large_n or huge_p) else 4
+        if self.method == "krr":
+            if stage == "coarse":
+                return 4 if (large_n or huge_p) else 6
+            return 2 if (large_n or huge_p) else 4
         return 8 if stage == "coarse" else 4
 
     def planned_search_steps(self) -> int:
@@ -588,7 +618,48 @@ class MLGS:
                 est.set_params(**params)
             return est
 
+        if self.method == "pls":
+            base = dict(
+                scale=True,
+                max_iter=500,
+                tol=1e-06,
+            )
+            base.update(params)
+            return PLSRegression(**base)
+
+        if self.method == "krr":
+            est = Pipeline(
+                [
+                    ("scale", StandardScaler(with_mean=True, with_std=True)),
+                    (
+                        "nystroem",
+                        Nystroem(
+                            kernel="rbf",
+                            random_state=self.seed,
+                        ),
+                    ),
+                    ("ridge", Ridge()),
+                ]
+            )
+            if params:
+                est.set_params(**params)
+            return est
+
         raise ValueError(f"Unsupported MLGS method: {self.method}")
+
+    def _minimum_cv_train_size(self) -> int:
+        """Return a conservative training-fold size for bounded components."""
+        n_splits = min(max(2, int(self.cv)), max(2, int(self.sample_count_)))
+        return max(
+            1,
+            int(self.sample_count_) - int(np.ceil(self.sample_count_ / n_splits)),
+        )
+
+    def _max_pls_components(self) -> int:
+        return max(1, min(int(self.marker_count_), self._minimum_cv_train_size()))
+
+    def _max_nystroem_components(self) -> int:
+        return max(1, min(512, self._minimum_cv_train_size()))
 
     def _coarse_space(self) -> dict[str, list[Any]]:
         n = self.sample_count_
@@ -683,6 +754,40 @@ class MLGS:
                 "enet__alpha": [1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0, 2.0, 5.0],
                 "enet__l1_ratio": [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95],
                 "enet__tol": [5e-4, 1e-3, 5e-3, 1e-2],
+            }
+
+        if self.method == "pls":
+            max_components = self._max_pls_components()
+            components = [
+                value
+                for value in (1, 2, 4, 8, 16, 32, 64)
+                if value <= max_components
+            ]
+            if not components:
+                components = [max_components]
+            return {"n_components": components}
+
+        if self.method == "krr":
+            max_nystroem = self._max_nystroem_components()
+            nystroem_components = [
+                value
+                for value in (16, 32, 64, 128, 256, 512)
+                if value <= max_nystroem
+            ]
+            if not nystroem_components:
+                nystroem_components = [max_nystroem]
+            gamma_base = max(1.0 / max(1, int(self.marker_count_)), 1e-6)
+            return {
+                "nystroem__n_components": nystroem_components,
+                "nystroem__gamma": _unique_sorted(
+                    [
+                        round(gamma_base / 4.0, 8),
+                        round(gamma_base, 8),
+                        round(gamma_base * 4.0, 8),
+                        round(gamma_base * 16.0, 8),
+                    ]
+                ),
+                "ridge__alpha": [0.1, 1.0, 10.0, 100.0],
             }
 
         raise ValueError(f"Unsupported MLGS method: {self.method}")
@@ -868,6 +973,51 @@ class MLGS:
                 ),
                 "enet__tol": _unique_sorted(
                     [5e-4, 1e-3, 5e-3, 1e-2, round(best_tol, 6)]
+                ),
+            }
+
+        if self.method == "pls":
+            best_components = int(best.get("n_components", 2))
+            max_components = self._max_pls_components()
+            return {
+                "n_components": _unique_sorted(
+                    [
+                        max(1, best_components // 2),
+                        best_components,
+                        min(max_components, best_components + 1),
+                        min(max_components, best_components * 2),
+                    ]
+                )
+            }
+
+        if self.method == "krr":
+            best_components = int(best.get("nystroem__n_components", 64))
+            best_gamma = float(best.get("nystroem__gamma", 1.0 / max(1, int(p))))
+            best_alpha = float(best.get("ridge__alpha", 1.0))
+            max_components = self._max_nystroem_components()
+            return {
+                "nystroem__n_components": _unique_sorted(
+                    [
+                        max(1, best_components // 2),
+                        min(max_components, best_components),
+                        min(max_components, best_components * 2),
+                    ]
+                ),
+                "nystroem__gamma": _unique_sorted(
+                    [
+                        round(max(1e-8, best_gamma / 4.0), 8),
+                        round(max(1e-8, best_gamma), 8),
+                        round(max(1e-8, best_gamma * 4.0), 8),
+                    ]
+                ),
+                "ridge__alpha": _unique_sorted(
+                    [
+                        max(1e-6, best_alpha / 10.0),
+                        max(1e-6, best_alpha / 2.0),
+                        best_alpha,
+                        best_alpha * 2.0,
+                        best_alpha * 10.0,
+                    ]
                 ),
             }
 

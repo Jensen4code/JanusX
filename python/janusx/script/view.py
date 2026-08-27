@@ -175,6 +175,8 @@ def _dump_model(path: Path) -> None:
                 return
             header = first.rstrip("\r\n").split("\t")
             header_map = {
+                "allele0": "ALLELE0",
+                "allele1": "ALLELE1",
                 "ref": "REF",
                 "alt": "ALT",
                 "effect_allele": "EFFECT_ALLELE",

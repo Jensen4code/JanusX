@@ -60,6 +60,8 @@ class GsConfig:
     xgb: bool = False
     svm: bool = False
     enet: bool = False
+    pls: bool = False
+    krr: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -110,6 +112,8 @@ class GsConfig:
         n += int(bool(self.xgb))
         n += int(bool(self.svm))
         n += int(bool(self.enet))
+        n += int(bool(self.pls))
+        n += int(bool(self.krr))
         return int(n)
 
     def build_gs_argv(
@@ -170,6 +174,10 @@ class GsConfig:
             argv.append("-SVM")
         if bool(self.enet):
             argv.append("-ENET")
+        if bool(self.pls):
+            argv.append("-PLS")
+        if bool(self.krr):
+            argv.append("-KRR")
 
         if self.traits is not None:
             for t in self.traits:
