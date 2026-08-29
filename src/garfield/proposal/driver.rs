@@ -8,6 +8,104 @@ use super::types::{
     MergedSitePool, ProposalChannel, ProposalChannelId, ProposalContext, SiteProposal,
 };
 
+fn dosage_maf(rows: &[Vec<u8>]) -> Vec<f64> {
+    rows.iter()
+        .map(|row| {
+            if row.is_empty() {
+                0.0
+            } else {
+                let allele_frequency = row.iter().map(|&value| f64::from(value)).sum::<f64>()
+                    / (2.0 * row.len() as f64);
+                allele_frequency.min(1.0 - allele_frequency).clamp(0.0, 0.5)
+            }
+        })
+        .collect()
+}
+
+/// Build a Corr+RF pool when Corr scores were computed from packed bitplanes
+/// and RF is intentionally restricted to a Corr-ranked shortlist.  The RF
+/// channel keeps its normal local ranking/evidence semantics; only the input
+/// feature matrix is reduced before tree fitting.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_corr_rf_site_pool_from_ranked_corr(
+    config: ProposalConfig,
+    window_id: &str,
+    marker_ids: &[usize],
+    corr_scores: &[f64],
+    rf_marker_ids: &[usize],
+    rf_genotype_rows: &[Vec<u8>],
+    residual: &[f64],
+    ld_r2: f64,
+    replicate_seed: u64,
+    replicate_id: usize,
+    is_null: bool,
+) -> Result<MergedSitePool, String> {
+    if !matches!(config.mode, ProposalMode::CorrRf) {
+        return Err("packed Corr+RF proposal pool requires CorrRf mode".to_string());
+    }
+    if marker_ids.len() != corr_scores.len() {
+        return Err(format!(
+            "packed Corr score length mismatch: {} markers vs {} scores",
+            marker_ids.len(),
+            corr_scores.len()
+        ));
+    }
+    if rf_marker_ids.len() != rf_genotype_rows.len() {
+        return Err(format!(
+            "RF shortlist marker/row length mismatch: {} vs {}",
+            rf_marker_ids.len(),
+            rf_genotype_rows.len()
+        ));
+    }
+    let corr_proposals = CorrChannel::ranked_proposals(marker_ids, corr_scores, config.k_site);
+    let rf_maf = dosage_maf(rf_genotype_rows);
+    let context = ProposalContext {
+        window_id,
+        marker_ids: rf_marker_ids,
+        genotype_rows: rf_genotype_rows,
+        residual,
+        maf: rf_maf.as_slice(),
+        ld_r2,
+        max_order: config.max_order,
+        replicate_seed,
+        replicate_id,
+        is_null,
+        provenance_token: replicate_seed
+            ^ (replicate_id as u64).rotate_left(11)
+            ^ u64::from(is_null).wrapping_mul(0xD1B5_4A32_D192_ED03),
+    };
+    let rf_proposals = RfChannel::default().propose(&context)?.site_proposals;
+    let mut proposals =
+        Vec::<SiteProposal>::with_capacity(corr_proposals.len().saturating_add(rf_proposals.len()));
+    proposals.extend(corr_proposals);
+    proposals.extend(rf_proposals);
+    let marker_rows = rf_marker_ids
+        .iter()
+        .copied()
+        .zip(rf_genotype_rows.iter().cloned())
+        .collect::<BTreeMap<_, _>>();
+    // Corr's top-k must be contained in the RF shortlist.  Keep the check
+    // explicit so a future shortlist policy cannot silently drop an LD row.
+    for proposal in proposals.iter() {
+        if !marker_rows.contains_key(&proposal.marker_id) {
+            return Err(format!(
+                "RF shortlist does not contain Corr proposal marker {}",
+                proposal.marker_id
+            ));
+        }
+    }
+    // The map is intentionally mutable above to make the ownership contract
+    // obvious: clustering receives rows for every union proposal and no
+    // dense full-window matrix is retained after this function returns.
+    merge_and_select_site_pool(
+        proposals,
+        &marker_rows,
+        ld_r2,
+        default_channel_quotas(config.mode, config.k_site),
+        config.k_site,
+    )
+}
+
 /// Execute development proposal channels and return the final LD-
 /// representative site pool. This module owns channel dispatch so the scan
 /// code only sees a stable pool contract.

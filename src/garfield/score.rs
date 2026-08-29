@@ -456,7 +456,7 @@ impl PackedYSumLookup {
     }
 
     #[inline]
-    fn sum_word(&self, word_idx: usize, word: u64) -> f64 {
+    pub(crate) fn sum_word(&self, word_idx: usize, word: u64) -> f64 {
         debug_assert!(word_idx < self.n_words);
         let stride = SUM_Y_LOOKUP_SEGMENTS_PER_WORD * SUM_Y_LOOKUP_VALUES_PER_SEGMENT;
         let word_base = word_idx.saturating_mul(stride);

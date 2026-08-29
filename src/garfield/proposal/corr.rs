@@ -1,6 +1,7 @@
 use super::adapter::{normalize_binary_rows, ranked_site_proposals, validate_context};
 use super::types::{
     ChannelEvidence, ChannelProposalBatch, ProposalChannel, ProposalChannelId, ProposalContext,
+    SiteProposal,
 };
 use crate::ml::univariate::feature_scores_abs_corr_dosage_x;
 
@@ -12,6 +13,25 @@ pub(crate) struct CorrChannel {
 impl CorrChannel {
     pub(crate) const fn new(top_k: usize) -> Self {
         Self { top_k }
+    }
+
+    /// Rank precomputed absolute-correlation scores using the same stable
+    /// ordering and evidence representation as the dense Corr channel.
+    ///
+    /// Packed proposal callers use this entry point after computing scores
+    /// directly from genotype bitplanes, avoiding a temporary dense matrix.
+    pub(crate) fn ranked_proposals(
+        marker_ids: &[usize],
+        scores: &[f64],
+        top_k: usize,
+    ) -> Vec<SiteProposal> {
+        ranked_site_proposals(
+            marker_ids,
+            scores,
+            ProposalChannelId::Corr,
+            top_k,
+            |score| ChannelEvidence::Corr { score },
+        )
     }
 }
 
@@ -30,13 +50,8 @@ impl ProposalChannel for CorrChannel {
         validate_context(context)?;
         let rows = normalize_binary_rows(context.genotype_rows)?;
         let scores = feature_scores_abs_corr_dosage_x(rows.as_slice(), context.residual);
-        let site_proposals = ranked_site_proposals(
-            context.marker_ids,
-            scores.as_slice(),
-            self.id(),
-            self.top_k,
-            |score| ChannelEvidence::Corr { score },
-        );
+        let site_proposals =
+            Self::ranked_proposals(context.marker_ids, scores.as_slice(), self.top_k);
         Ok(ChannelProposalBatch {
             channel: self.id(),
             window_id: context.window_id.to_string(),

@@ -15,7 +15,7 @@ mod score_backend;
 //   targeted debugging, but are not accepted as active search modes.
 // - Active beam expansion is AND/XOR-only; negation remains supported.
 
-use self::all_pair::scan_all_pairs_continuous_packed;
+use self::all_pair::scan_all_pairs_continuous_packed_with_parallel;
 use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use self::bs::{
     beam_search_train_test_continuous_fuzzy,
@@ -40,8 +40,9 @@ use self::permutation::{
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
 };
 use self::proposal::{
-    build_proposal_site_pool_for_replicate, resolve_proposal_config, ProposalConfig,
-    ProposalFamily, ProposalMode, SharedMaxTAccumulator,
+    build_proposal_site_pool_for_replicate, merge_and_select_site_pool, resolve_proposal_config,
+    ChannelQuota, CorrChannel, ProposalChannelId, ProposalConfig, ProposalFamily, ProposalMode,
+    SharedMaxTAccumulator,
 };
 use crate::bedmath::packed_byte_lut;
 use crate::bincore::{
@@ -100,7 +101,8 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -172,6 +174,38 @@ static GARFIELD_CORR_STAGE1_SCORE_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_CORR_STAGE1_POOL_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_CORR_STAGE1_POOL_PRIORITY_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_CORR_STAGE1_POOL_LD_NS: AtomicU64 = AtomicU64::new(0);
+
+const GARFIELD_PROPOSAL_ROW_CACHE_DEFAULT_ROWS: usize = 4_096;
+const GARFIELD_PROPOSAL_ROW_CACHE_MAX_ROWS: usize = 65_536;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ProposalRowCacheKey {
+    source_ptr: usize,
+    source_len: usize,
+    source_hi_ptr: usize,
+    source_hi_len: usize,
+    row_idx: usize,
+    sample_ptr: usize,
+    sample_len: usize,
+}
+
+#[derive(Default)]
+struct ProposalRowCache {
+    rows: HashMap<ProposalRowCacheKey, Vec<u8>>,
+    order: VecDeque<ProposalRowCacheKey>,
+}
+
+thread_local! {
+    static GARFIELD_PROPOSAL_ROW_CACHE: RefCell<ProposalRowCache> =
+        RefCell::new(ProposalRowCache::default());
+}
+
+#[inline]
+fn garfield_proposal_row_cache_capacity() -> usize {
+    parse_env_usize_allow_zero("JX_GARFIELD_PROPOSAL_ROW_CACHE_ROWS")
+        .unwrap_or(GARFIELD_PROPOSAL_ROW_CACHE_DEFAULT_ROWS)
+        .min(GARFIELD_PROPOSAL_ROW_CACHE_MAX_ROWS)
+}
 static GARFIELD_LD_SUPPORT_CACHE: OnceLock<
     Mutex<HashMap<(usize, u64), Arc<GarfieldLdSupportCacheEntry>>>,
 > = OnceLock::new();
@@ -3180,13 +3214,14 @@ fn pair_triple_search_train_test_continuous(
         return Ok(candidates);
     }
 
-    let pair_scan = scan_all_pairs_continuous_packed(
+    let pair_scan = scan_all_pairs_continuous_packed_with_parallel(
         prepared_bits.train_bits(),
         prepared_bits.row_words_train,
         n_rows,
         y_train,
         y_train.len(),
         GARFIELD_PAIR_TRIPLE_K2,
+        params.allow_parallel,
     )?;
     let mut pair_seeds = Vec::<PairTripleSeed>::with_capacity(pair_scan.candidates.len());
     for (rank, pair) in pair_scan.candidates.iter().enumerate() {
@@ -8848,6 +8883,136 @@ fn dense_dosage_rows_from_full_bits(
     Ok(out)
 }
 
+/// Decode a small set of proposal rows with a bounded per-worker cache.  Scan
+/// windows are generated in genomic order and overlap heavily; a thread-local
+/// cache therefore reuses rows shared by neighbouring windows without a
+/// cross-thread lock or unbounded resident matrix.  Cache keys include both
+/// bitplane allocations and the sample-index allocation so separate scans
+/// cannot silently reuse incompatible rows.
+fn dense_dosage_rows_from_full_bits_cached(
+    bits_flat: &[u64],
+    bits_hi_flat: Option<&[u64]>,
+    row_words: usize,
+    row_indices: &[usize],
+    sample_indices: &[usize],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<Vec<Vec<u8>>, String> {
+    if row_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    if row_words != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "row_words mismatch for cached densifying: got {row_words}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
+        return Err("full bit matrix length mismatch".to_string());
+    }
+    if let Some(bits_hi_flat) = bits_hi_flat {
+        if bits_hi_flat.len() != n_rows_all.saturating_mul(row_words) {
+            return Err("full high-bit matrix length mismatch".to_string());
+        }
+    }
+    if let Some(&row_idx) = row_indices.iter().find(|&&row_idx| row_idx >= n_rows_all) {
+        return Err(format!(
+            "row index out of range while cached densifying: {row_idx}"
+        ));
+    }
+    if let Some(&sid) = sample_indices.iter().find(|&&sid| sid >= n_samples_all) {
+        return Err(format!(
+            "sample index out of range while cached densifying: {sid}"
+        ));
+    }
+    let cache_capacity = garfield_proposal_row_cache_capacity();
+    if cache_capacity == 0 {
+        return dense_dosage_rows_from_full_bits(
+            bits_flat,
+            bits_hi_flat,
+            row_words,
+            row_indices,
+            sample_indices,
+            n_rows_all,
+            n_samples_all,
+        );
+    }
+    let key_base = (
+        bits_flat.as_ptr() as usize,
+        bits_flat.len(),
+        bits_hi_flat.map_or(0, |bits| bits.as_ptr() as usize),
+        bits_hi_flat.map_or(0, <[u64]>::len),
+        sample_indices.as_ptr() as usize,
+        sample_indices.len(),
+    );
+    let mut out = vec![None::<Vec<u8>>; row_indices.len()];
+    let mut missing = Vec::<usize>::new();
+    let mut missing_positions = Vec::<usize>::new();
+    GARFIELD_PROPOSAL_ROW_CACHE.with(|cache_cell| {
+        let cache = cache_cell.borrow();
+        for (position, &row_idx) in row_indices.iter().enumerate() {
+            let key = ProposalRowCacheKey {
+                source_ptr: key_base.0,
+                source_len: key_base.1,
+                source_hi_ptr: key_base.2,
+                source_hi_len: key_base.3,
+                row_idx,
+                sample_ptr: key_base.4,
+                sample_len: key_base.5,
+            };
+            if let Some(row) = cache.rows.get(&key) {
+                out[position] = Some(row.clone());
+            } else {
+                missing.push(row_idx);
+                missing_positions.push(position);
+            }
+        }
+    });
+    if !missing.is_empty() {
+        let decoded = dense_dosage_rows_from_full_bits(
+            bits_flat,
+            bits_hi_flat,
+            row_words,
+            missing.as_slice(),
+            sample_indices,
+            n_rows_all,
+            n_samples_all,
+        )?;
+        GARFIELD_PROPOSAL_ROW_CACHE.with(|cache_cell| {
+            let mut cache = cache_cell.borrow_mut();
+            for ((&row_idx, &position), row) in missing
+                .iter()
+                .zip(missing_positions.iter())
+                .zip(decoded.into_iter())
+            {
+                let key = ProposalRowCacheKey {
+                    source_ptr: key_base.0,
+                    source_len: key_base.1,
+                    source_hi_ptr: key_base.2,
+                    source_hi_len: key_base.3,
+                    row_idx,
+                    sample_ptr: key_base.4,
+                    sample_len: key_base.5,
+                };
+                if !cache.rows.contains_key(&key) {
+                    cache.order.push_back(key);
+                }
+                cache.rows.insert(key, row.clone());
+                out[position] = Some(row);
+                while cache.rows.len() > cache_capacity {
+                    let Some(oldest) = cache.order.pop_front() else {
+                        break;
+                    };
+                    cache.rows.remove(&oldest);
+                }
+            }
+        });
+    }
+    out.into_iter()
+        .map(|row| row.ok_or_else(|| "cached proposal row was not materialized".to_string()))
+        .collect()
+}
+
 #[inline]
 fn should_parallel_dense_decode(n_rows: usize, n_samples: usize) -> bool {
     rayon::current_num_threads() > 1
@@ -9110,6 +9275,60 @@ fn dosage_stage1_raw_scores_from_dual_summaries(
             .map(|summary| {
                 dosage_stage1_positive_score_from_summary(*summary, total_sum_y, n_samples)
                     .raw_score
+            })
+            .collect()
+    }
+}
+
+/// Compute the dense Corr proposal statistic directly from packed stage-1
+/// summaries.  The dense proposal channel first maps every non-zero dosage to
+/// a binary carrier indicator, so only the GE1 count/sum are needed here;
+/// GE2 remains available to the caller for dosage/MAF bookkeeping.
+#[inline]
+fn corr_score_from_dual_summary(
+    summary: DosageStage1DualSummary,
+    total_sum_y: f64,
+    total_sum_y2: f64,
+    n_samples: usize,
+) -> f64 {
+    if n_samples == 0 {
+        return 0.0;
+    }
+    let n = n_samples as f64;
+    let mean_y = total_sum_y / n;
+    let var_y = total_sum_y2 / n - mean_y * mean_y;
+    if !var_y.is_finite() || var_y <= 0.0 {
+        return 0.0;
+    }
+    let hit = summary.n_ge1 as f64;
+    let mean_x = hit / n;
+    let var_x = hit / n - mean_x * mean_x;
+    if !var_x.is_finite() || var_x <= 0.0 {
+        return 0.0;
+    }
+    let covariance = summary.sum_ge1 / n - mean_x * mean_y;
+    (covariance / (var_x * var_y).sqrt()).abs()
+}
+
+fn corr_scores_from_dual_summaries(
+    summaries: &[DosageStage1DualSummary],
+    total_sum_y: f64,
+    total_sum_y2: f64,
+    n_samples: usize,
+    allow_parallel: bool,
+) -> Vec<f64> {
+    if allow_parallel && should_parallel_dense_decode(summaries.len(), n_samples) {
+        summaries
+            .par_iter()
+            .map(|summary| {
+                corr_score_from_dual_summary(*summary, total_sum_y, total_sum_y2, n_samples)
+            })
+            .collect()
+    } else {
+        summaries
+            .iter()
+            .map(|summary| {
+                corr_score_from_dual_summary(*summary, total_sum_y, total_sum_y2, n_samples)
             })
             .collect()
     }
@@ -10106,6 +10325,175 @@ fn proposal_pool_for_rows(
     )
 }
 
+/// Build a Corr-only proposal pool from genotype bitplanes.  Corr's dense
+/// implementation binarizes every non-zero dosage, so the GE1 stage-1
+/// summaries are sufficient for the statistic.  Only the ranked proposals
+/// (at most `k_site`) are densified afterwards for LD credit-set clustering;
+/// the full window never materializes as `Vec<Vec<u8>>`.
+#[allow(clippy::too_many_arguments)]
+fn packed_corr_proposal_pool(
+    proposal_config: ProposalConfig,
+    candidate_global_rows: &[usize],
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    y_train: &[f64],
+    stage1_y_lookup: Option<&PackedYSumLookup>,
+    allow_parallel: bool,
+) -> Result<proposal::MergedSitePool, String> {
+    if !matches!(proposal_config.mode, ProposalMode::Corr) {
+        return Err("packed Corr proposal pool requires Corr mode".to_string());
+    }
+    if candidate_global_rows.is_empty() {
+        return Ok(proposal::MergedSitePool {
+            representatives: Vec::new(),
+            clusters: Vec::new(),
+            proxy_to_representative: BTreeMap::new(),
+            k_pre: 0,
+            k_site: 0,
+        });
+    }
+    let scores = packed_corr_scores_from_full_bits(
+        candidate_global_rows,
+        logic_bits,
+        train_idx_local,
+        y_train,
+        stage1_y_lookup,
+        allow_parallel,
+    )?;
+    let proposals = CorrChannel::ranked_proposals(
+        candidate_global_rows,
+        scores.as_slice(),
+        proposal_config.k_site,
+    );
+    if proposals.is_empty() {
+        return Ok(proposal::MergedSitePool {
+            representatives: Vec::new(),
+            clusters: Vec::new(),
+            proxy_to_representative: BTreeMap::new(),
+            k_pre: 0,
+            k_site: 0,
+        });
+    }
+    let proposal_rows = proposals
+        .iter()
+        .map(|proposal| proposal.marker_id)
+        .collect::<Vec<_>>();
+    let genotype_rows = dense_dosage_rows_from_full_bits_cached(
+        logic_bits.bits(),
+        logic_bits.bits_hi_flat.as_deref(),
+        logic_bits.row_words,
+        proposal_rows.as_slice(),
+        train_idx_local,
+        logic_bits.sites.len(),
+        logic_bits.n_samples,
+    )?;
+    let marker_rows = proposal_rows
+        .iter()
+        .copied()
+        .zip(genotype_rows)
+        .collect::<BTreeMap<_, _>>();
+    merge_and_select_site_pool(
+        proposals,
+        &marker_rows,
+        GARFIELD_LD_CLUMP_R2_DEFAULT,
+        ChannelQuota::new([(ProposalChannelId::Corr, proposal_config.k_site)]),
+        proposal_config.k_site,
+    )
+}
+
+fn packed_corr_scores_from_full_bits(
+    candidate_global_rows: &[usize],
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    y_train: &[f64],
+    stage1_y_lookup: Option<&PackedYSumLookup>,
+    allow_parallel: bool,
+) -> Result<Vec<f64>, String> {
+    let summary_t0 = garfield_stage_profile_start();
+    let summaries = dosage_stage1_dual_summaries_from_full_bits(
+        logic_bits.bits(),
+        logic_bits.bits_hi_flat.as_deref(),
+        logic_bits.row_words,
+        candidate_global_rows,
+        train_idx_local,
+        y_train,
+        logic_bits.sites.len(),
+        logic_bits.n_samples,
+        stage1_y_lookup,
+        allow_parallel,
+    )?;
+    garfield_stage_profile_end(summary_t0, &GARFIELD_CORR_STAGE1_SUMMARY_NS);
+    let total_sum_y = y_train.iter().copied().sum::<f64>();
+    let total_sum_y2 = y_train.iter().map(|value| value * value).sum::<f64>();
+    let score_t0 = garfield_stage_profile_start();
+    let scores = corr_scores_from_dual_summaries(
+        summaries.as_slice(),
+        total_sum_y,
+        total_sum_y2,
+        y_train.len(),
+        allow_parallel,
+    );
+    garfield_stage_profile_end(score_t0, &GARFIELD_CORR_STAGE1_SCORE_NS);
+    Ok(scores)
+}
+
+/// Packed Corr+RF proposal path: calculate Corr over the full packed window,
+/// decode only a Corr-ranked shortlist, then fit RF on that shortlist.
+#[allow(clippy::too_many_arguments)]
+fn packed_corr_rf_proposal_pool(
+    proposal_config: ProposalConfig,
+    candidate_global_rows: &[usize],
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    y_train: &[f64],
+    stage1_y_lookup: Option<&PackedYSumLookup>,
+    allow_parallel: bool,
+    replicate_seed: u64,
+    replicate_id: usize,
+    is_null: bool,
+    window_id: &str,
+) -> Result<proposal::MergedSitePool, String> {
+    if !matches!(proposal_config.mode, ProposalMode::CorrRf) {
+        return Err("packed Corr+RF proposal pool requires CorrRf mode".to_string());
+    }
+    let scores = packed_corr_scores_from_full_bits(
+        candidate_global_rows,
+        logic_bits,
+        train_idx_local,
+        y_train,
+        stage1_y_lookup,
+        allow_parallel,
+    )?;
+    let shortlist_k = proposal_config.k_site.min(candidate_global_rows.len());
+    let shortlist_local = topk_indices(scores.as_slice(), shortlist_k);
+    let rf_marker_ids = shortlist_local
+        .iter()
+        .map(|&local_idx| candidate_global_rows[local_idx])
+        .collect::<Vec<_>>();
+    let rf_genotype_rows = dense_dosage_rows_from_full_bits_cached(
+        logic_bits.bits(),
+        logic_bits.bits_hi_flat.as_deref(),
+        logic_bits.row_words,
+        rf_marker_ids.as_slice(),
+        train_idx_local,
+        logic_bits.sites.len(),
+        logic_bits.n_samples,
+    )?;
+    self::proposal::build_corr_rf_site_pool_from_ranked_corr(
+        proposal_config,
+        window_id,
+        candidate_global_rows,
+        scores.as_slice(),
+        rf_marker_ids.as_slice(),
+        rf_genotype_rows.as_slice(),
+        y_train,
+        GARFIELD_LD_CLUMP_R2_DEFAULT,
+        replicate_seed,
+        replicate_id,
+        is_null,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn select_logic_unit_global_rows(
@@ -10179,6 +10567,57 @@ fn select_logic_unit_global_rows_with_ld_cache(
     let stage1_candidate_global_rows = diagnostics.then(|| candidate_global_rows.clone());
     let proposal_config = proposal_config_override.unwrap_or(resolve_proposal_config()?);
     if !matches!(proposal_config.mode, ProposalMode::Off) {
+        if matches!(proposal_config.mode, ProposalMode::Corr) {
+            let pool_t0 = garfield_stage_profile_start();
+            let pool = packed_corr_proposal_pool(
+                proposal_config,
+                candidate_global_rows.as_slice(),
+                logic_bits,
+                train_idx_local,
+                y_train,
+                stage1_y_lookup,
+                allow_parallel,
+            )?;
+            garfield_stage_profile_end(pool_t0, &GARFIELD_CORR_STAGE1_POOL_NS);
+            if pool.representatives.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(GarfieldSelectedRows {
+                selected_global_rows: pool.representatives,
+                stage1_candidate_global_rows,
+                // Proposal clusters retain a complete proxy map inside the
+                // proposal contract.  The legacy compression record is left
+                // empty here until diagnostics gain a source-aware schema.
+                ld_compression: Vec::new(),
+                train_literal_scores: None,
+            }));
+        }
+        if matches!(proposal_config.mode, ProposalMode::CorrRf) {
+            let pool_t0 = garfield_stage_profile_start();
+            let pool = packed_corr_rf_proposal_pool(
+                proposal_config,
+                candidate_global_rows.as_slice(),
+                logic_bits,
+                train_idx_local,
+                y_train,
+                stage1_y_lookup,
+                allow_parallel,
+                proposal_config.k_site as u64 ^ tree_cfg.seed,
+                0,
+                false,
+                unit.label.as_str(),
+            )?;
+            garfield_stage_profile_end(pool_t0, &GARFIELD_CORR_STAGE1_POOL_NS);
+            if pool.representatives.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(GarfieldSelectedRows {
+                selected_global_rows: pool.representatives,
+                stage1_candidate_global_rows,
+                ld_compression: Vec::new(),
+                train_literal_scores: None,
+            }));
+        }
         // Proposal mode intentionally starts from the complete unit.  It
         // creates its own Corr/RF union and LD credit-set pool, so the legacy
         // engine-specific stage-1 ranking is not silently mixed into the
@@ -10649,6 +11088,67 @@ fn prepare_logic_chunk_continuous(
         effective_proposal_config(beam_params.search_backend, beam_params.max_pick)?;
     if !matches!(proposal_config.mode, ProposalMode::Off) {
         let candidate_global_rows = (row_start..row_end).collect::<Vec<_>>();
+        if matches!(proposal_config.mode, ProposalMode::Corr) {
+            let pool = packed_corr_proposal_pool(
+                proposal_config,
+                candidate_global_rows.as_slice(),
+                logic_bits,
+                train_idx_local,
+                y_train,
+                None,
+                beam_params.allow_parallel,
+            )?;
+            if pool.representatives.is_empty() {
+                return Ok(None);
+            }
+            let local_groups = pool
+                .representatives
+                .iter()
+                .map(|&idx| logic_bits.group_ids[idx])
+                .collect::<Vec<_>>();
+            return Ok(Some(GarfieldUnitPrepared {
+                selected_global_rows: pool.representatives,
+                stage1_candidate_global_rows: None,
+                ld_compression: Vec::new(),
+                local_groups,
+                geneset_stage_group_target: None,
+                null_unit_group_bin: 0,
+                train_literal_scores: None,
+            }));
+        }
+        if matches!(proposal_config.mode, ProposalMode::CorrRf) {
+            let window_id = format!("null-chunk-{}", chunk.window_id);
+            let pool = packed_corr_rf_proposal_pool(
+                proposal_config,
+                candidate_global_rows.as_slice(),
+                logic_bits,
+                train_idx_local,
+                y_train,
+                None,
+                beam_params.allow_parallel,
+                selection_seed,
+                selection_seed as usize,
+                true,
+                window_id.as_str(),
+            )?;
+            if pool.representatives.is_empty() {
+                return Ok(None);
+            }
+            let local_groups = pool
+                .representatives
+                .iter()
+                .map(|&idx| logic_bits.group_ids[idx])
+                .collect::<Vec<_>>();
+            return Ok(Some(GarfieldUnitPrepared {
+                selected_global_rows: pool.representatives,
+                stage1_candidate_global_rows: None,
+                ld_compression: Vec::new(),
+                local_groups,
+                geneset_stage_group_target: None,
+                null_unit_group_bin: 0,
+                train_literal_scores: None,
+            }));
+        }
         let genotype_rows = dense_dosage_rows_from_full_bits_range(
             logic_bits.bits(),
             logic_bits.bits_hi_flat.as_deref(),
@@ -15476,24 +15976,24 @@ fn garfield_logic_search_bed_owned(
         train_fit.residualized_y.as_slice(),
         train_idx_local.len(),
     )?);
-    // A window scan already has many independent units in the outer pool.
-    // Nested row/beam Rayon loops make each unit repeatedly split tiny jobs
-    // and compete with sibling units, which lowers sustained CPU utilization.
-    // Keep inner parallelism only when the scan has too few units to fill the
-    // requested pool; this changes scheduling only, not scoring or pruning.
-    let allow_nested_scan_parallel = unit_parallel_threads <= 1
-        || scanned_units < unit_parallel_threads.saturating_mul(4).max(1);
-    let scan_beam_params = BeamSearchParams {
-        allow_parallel: allow_nested_scan_parallel,
-        y_sum_lookup: Some(scan_stage1_y_lookup.clone()),
-        ..beam_params.clone()
-    };
     let scan_unit_chunks = garfield_scan_task_chunks(
         scan_unit_indices.as_slice(),
         units.as_slice(),
         unit_parallel_threads,
         garfield_scan_task_coalesce_max_units(),
     );
+    // A window scan already has many independent units in the outer pool.
+    // Nested row/beam Rayon loops make each unit repeatedly split tiny jobs
+    // and compete with sibling units, which lowers sustained CPU utilization.
+    // Base the decision on coalesced task count rather than raw unit count:
+    // small scans may be one task even when they contain dozens of windows.
+    let allow_nested_scan_parallel =
+        unit_parallel_threads <= 1 || scan_unit_chunks.len() < unit_parallel_threads;
+    let scan_beam_params = BeamSearchParams {
+        allow_parallel: allow_nested_scan_parallel,
+        y_sum_lookup: Some(scan_stage1_y_lookup.clone()),
+        ..beam_params.clone()
+    };
     let skipped_units = Arc::new(Mutex::new(Vec::<GarfieldSkippedUnitInfo>::new()));
     let unit_results = if unit_parallel_threads > 1 {
         let pool = ThreadPoolBuilder::new()
@@ -17339,6 +17839,7 @@ pub fn garfield_eval_rule_bin_py(
 mod tests {
     use super::bs::conditional_split_support_passes;
     use super::*;
+    use crate::ml::univariate::feature_scores_abs_corr_dosage_x;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -17351,6 +17852,108 @@ mod tests {
         assert!(conditional_split_support_passes(100, 40, 100, 20));
         assert!(!conditional_split_support_passes(100, 2, 100, 20));
         assert!(!conditional_split_support_passes(100, 98, 100, 20));
+    }
+
+    #[test]
+    fn packed_corr_scores_match_dense_binary_corr() {
+        let n_samples = 137usize;
+        let marker_rows = vec![
+            (0..n_samples)
+                .map(|i| u8::from(i % 3 == 0 || i % 11 == 1))
+                .collect::<Vec<_>>(),
+            (0..n_samples)
+                .map(|i| u8::from(i % 5 < 2))
+                .collect::<Vec<_>>(),
+            (0..n_samples)
+                .map(|i| u8::from(i % 7 == 3 || i >= 96))
+                .collect::<Vec<_>>(),
+        ];
+        let y = (0..n_samples)
+            .map(|i| ((i as f64) * 0.03125) - 2.0 + ((i % 9) as f64) * 0.17)
+            .collect::<Vec<_>>();
+        let row_words = words_for_samples(n_samples);
+        let mut bits = vec![0u64; marker_rows.len() * row_words];
+        for (row_idx, row) in marker_rows.iter().enumerate() {
+            for (sample_idx, &value) in row.iter().enumerate() {
+                if value != 0 {
+                    bits[row_idx * row_words + (sample_idx >> 6)] |= 1u64 << (sample_idx & 63);
+                }
+            }
+        }
+        let row_indices = vec![0usize, 1, 2];
+        let sample_indices = (0..n_samples).collect::<Vec<_>>();
+        let summaries = dosage_stage1_dual_summaries_from_full_bits(
+            &bits,
+            None,
+            row_words,
+            &row_indices,
+            &sample_indices,
+            &y,
+            marker_rows.len(),
+            n_samples,
+            None,
+            false,
+        )
+        .unwrap();
+        let packed = corr_scores_from_dual_summaries(
+            &summaries,
+            y.iter().copied().sum::<f64>(),
+            y.iter().map(|value| value * value).sum::<f64>(),
+            n_samples,
+            false,
+        );
+        let dense = feature_scores_abs_corr_dosage_x(&marker_rows, &y);
+        for (packed_score, dense_score) in packed.iter().zip(dense.iter()) {
+            assert!((packed_score - dense_score).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn cached_proposal_decode_matches_uncached_rows() {
+        let n_samples = 73usize;
+        let row_words = words_for_samples(n_samples);
+        let mut bits = vec![0u64; 3 * row_words];
+        for row in 0..3usize {
+            for sample in 0..n_samples {
+                if (sample + row * 3) % (row + 3) == 0 {
+                    bits[row * row_words + (sample >> 6)] |= 1u64 << (sample & 63);
+                }
+            }
+        }
+        let rows = vec![2usize, 0, 2, 1];
+        let sample_indices = (0..n_samples).collect::<Vec<_>>();
+        let uncached = dense_dosage_rows_from_full_bits(
+            &bits,
+            None,
+            row_words,
+            &rows,
+            &sample_indices,
+            3,
+            n_samples,
+        )
+        .unwrap();
+        let cached_first = dense_dosage_rows_from_full_bits_cached(
+            &bits,
+            None,
+            row_words,
+            &rows,
+            &sample_indices,
+            3,
+            n_samples,
+        )
+        .unwrap();
+        let cached_second = dense_dosage_rows_from_full_bits_cached(
+            &bits,
+            None,
+            row_words,
+            &rows,
+            &sample_indices,
+            3,
+            n_samples,
+        )
+        .unwrap();
+        assert_eq!(cached_first, uncached);
+        assert_eq!(cached_second, uncached);
     }
 
     #[test]

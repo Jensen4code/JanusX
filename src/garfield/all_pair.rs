@@ -11,13 +11,13 @@ use crate::bstats::{tail_mask, words_for_samples};
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use super::score::{
-    and_popcount_sum_y_where_both1_with_lookup, score_cont_centered_gain_from_sum_and_n_hit,
-    validate_continuous_y, PackedYSumLookup,
+    score_cont_centered_gain_from_sum_and_n_hit, validate_continuous_y, PackedYSumLookup,
 };
 
 /// The best signed AND interpretation for one unordered marker pair.
@@ -111,6 +111,71 @@ fn row_slice<'a>(bits_flat: &'a [u64], row_words: usize, row: usize, words: usiz
     &bits_flat[start..start + words]
 }
 
+#[inline]
+fn best_pair_candidate_fused(
+    first: usize,
+    second: usize,
+    bits_flat: &[u64],
+    negated: &[u64],
+    row_words: usize,
+    needed_words: usize,
+    tail: Option<u64>,
+    n_samples: usize,
+    lookup: &PackedYSumLookup,
+    total_sum: f64,
+) -> AllPairCandidate {
+    let first_pos = row_slice(bits_flat, row_words, first, needed_words);
+    let second_pos = row_slice(bits_flat, row_words, second, needed_words);
+    let first_neg = row_slice(negated, needed_words, first, needed_words);
+    let second_neg = row_slice(negated, needed_words, second, needed_words);
+    let mut counts = [0usize; 4];
+    let mut sums = [0.0f64; 4];
+    for word_idx in 0..needed_words {
+        let mut lhs = first_pos[word_idx];
+        let mut rhs = second_pos[word_idx];
+        if word_idx + 1 == needed_words {
+            if let Some(mask) = tail {
+                lhs &= mask;
+                rhs &= mask;
+            }
+        }
+        let words = [
+            lhs & rhs,
+            first_neg[word_idx] & rhs,
+            lhs & second_neg[word_idx],
+            first_neg[word_idx] & second_neg[word_idx],
+        ];
+        for (variant, word) in words.into_iter().enumerate() {
+            counts[variant] = counts[variant].saturating_add(word.count_ones() as usize);
+            sums[variant] += lookup.sum_word(word_idx, word);
+        }
+    }
+    let mut best: Option<AllPairCandidate> = None;
+    for polarity in 0u8..4 {
+        let score = score_cont_centered_gain_from_sum_and_n_hit(
+            total_sum,
+            sums[polarity as usize],
+            n_samples,
+            counts[polarity as usize],
+        );
+        let candidate = AllPairCandidate {
+            first,
+            second,
+            polarity,
+            raw_score: score.raw_score,
+            support: counts[polarity as usize],
+        };
+        if best
+            .as_ref()
+            .map(|current| candidate_cmp(&candidate, current) == Ordering::Greater)
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+    best.expect("pair has four polarity variants")
+}
+
 fn validate_scan_inputs(
     bits_flat: &[u64],
     row_words: usize,
@@ -162,6 +227,24 @@ pub(crate) fn scan_all_pairs_continuous_packed(
     n_samples: usize,
     top_k: usize,
 ) -> Result<AllPairScanResult, String> {
+    scan_all_pairs_continuous_packed_with_parallel(
+        bits_flat, row_words, n_rows, y, n_samples, top_k, true,
+    )
+}
+
+/// Internal variant used by the window scanner to avoid nested Rayon pools.
+/// When many windows already run in parallel, callers pass `false` and let
+/// the outer scheduler provide the parallelism; standalone callers retain
+/// the historical parallel default through [`scan_all_pairs_continuous_packed`].
+pub(crate) fn scan_all_pairs_continuous_packed_with_parallel(
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    y: &[f64],
+    n_samples: usize,
+    top_k: usize,
+    allow_parallel: bool,
+) -> Result<AllPairScanResult, String> {
     let needed_words = validate_scan_inputs(bits_flat, row_words, n_rows, y, n_samples)?;
     let tail = tail_mask(n_samples);
 
@@ -187,59 +270,73 @@ pub(crate) fn scan_all_pairs_continuous_packed(
 
     let lookup = PackedYSumLookup::build(y, n_samples)?;
     let total_sum = y.iter().take(n_samples).copied().sum::<f64>();
-    let mut heap = BinaryHeap::<Reverse<HeapEntry>>::with_capacity(top_k.min(1024));
-    let mut pairs_evaluated = 0usize;
-    let mut polarity_evaluated = 0usize;
-
-    for first in 0..n_rows.saturating_sub(1) {
-        let first_pos = row_slice(bits_flat, row_words, first, needed_words);
-        let first_neg = row_slice(&negated, needed_words, first, needed_words);
-        for second in (first + 1)..n_rows {
-            let second_pos = row_slice(bits_flat, row_words, second, needed_words);
-            let second_neg = row_slice(&negated, needed_words, second, needed_words);
-
-            let variants = [
-                (first_pos, second_pos),
-                (first_neg, second_pos),
-                (first_pos, second_neg),
-                (first_neg, second_neg),
-            ];
-            let mut best: Option<AllPairCandidate> = None;
-            for (polarity, (lhs, rhs)) in variants.into_iter().enumerate() {
-                let (n_hit, sum_hit) =
-                    and_popcount_sum_y_where_both1_with_lookup(lhs, rhs, y, n_samples, &lookup);
-                let score = score_cont_centered_gain_from_sum_and_n_hit(
-                    total_sum,
-                    sum_hit,
-                    n_samples,
-                    n_hit as usize,
-                );
-                let candidate = AllPairCandidate {
+    let first_rows = 0..n_rows.saturating_sub(1);
+    let heap_capacity = top_k.min(1024);
+    let heap = if allow_parallel && rayon::current_num_threads() > 1 && n_rows >= 32 {
+        // Fold into one bounded heap per Rayon worker rather than one heap per
+        // first-row index.  The latter scales as O(n_rows * top_k) in peak
+        // intermediate storage and can dominate the actual pair scan for
+        // large windows.
+        first_rows
+            .into_par_iter()
+            .fold(
+                || BinaryHeap::<Reverse<HeapEntry>>::with_capacity(heap_capacity),
+                |mut local_heap, first| {
+                    for second in (first + 1)..n_rows {
+                        let candidate = best_pair_candidate_fused(
+                            first,
+                            second,
+                            bits_flat,
+                            &negated,
+                            row_words,
+                            needed_words,
+                            tail,
+                            n_samples,
+                            &lookup,
+                            total_sum,
+                        );
+                        push_top_k(&mut local_heap, candidate, top_k);
+                    }
+                    local_heap
+                },
+            )
+            .reduce(
+                || BinaryHeap::<Reverse<HeapEntry>>::with_capacity(heap_capacity),
+                |mut left, right| {
+                    for Reverse(entry) in right {
+                        push_top_k(&mut left, entry.0, top_k);
+                    }
+                    left
+                },
+            )
+    } else {
+        let mut serial_heap = BinaryHeap::<Reverse<HeapEntry>>::with_capacity(heap_capacity);
+        for first in first_rows {
+            for second in (first + 1)..n_rows {
+                let candidate = best_pair_candidate_fused(
                     first,
                     second,
-                    polarity: polarity as u8,
-                    raw_score: score.raw_score,
-                    support: n_hit as usize,
-                };
-                if best
-                    .as_ref()
-                    .map(|current| candidate_cmp(&candidate, current) == Ordering::Greater)
-                    .unwrap_or(true)
-                {
-                    best = Some(candidate);
-                }
-            }
-            pairs_evaluated = pairs_evaluated
-                .checked_add(1)
-                .ok_or_else(|| "garfield_all_pair_scan: pair counter overflow".to_string())?;
-            polarity_evaluated = polarity_evaluated
-                .checked_add(4)
-                .ok_or_else(|| "garfield_all_pair_scan: polarity counter overflow".to_string())?;
-            if let Some(candidate) = best {
-                push_top_k(&mut heap, candidate, top_k);
+                    bits_flat,
+                    &negated,
+                    row_words,
+                    needed_words,
+                    tail,
+                    n_samples,
+                    &lookup,
+                    total_sum,
+                );
+                push_top_k(&mut serial_heap, candidate, top_k);
             }
         }
-    }
+        serial_heap
+    };
+    let pairs_evaluated = n_rows
+        .checked_mul(n_rows.saturating_sub(1))
+        .and_then(|value| value.checked_div(2))
+        .ok_or_else(|| "garfield_all_pair_scan: pair counter overflow".to_string())?;
+    let polarity_evaluated = pairs_evaluated
+        .checked_mul(4)
+        .ok_or_else(|| "garfield_all_pair_scan: polarity counter overflow".to_string())?;
 
     let mut candidates = heap
         .into_iter()
@@ -410,6 +507,36 @@ mod tests {
             .candidates
             .iter()
             .all(|candidate| candidate.support <= n_samples));
+    }
+
+    #[test]
+    fn parallel_all_pair_matches_serial_results() {
+        let n_samples = 137;
+        let bits = [
+            row(n_samples, &[0, 1, 4, 65, 100]),
+            row(n_samples, &[1, 2, 5, 70, 100]),
+            row(n_samples, &[0, 2, 3, 66, 101]),
+            row(n_samples, &[3, 4, 6, 67, 102]),
+            row(n_samples, &[10, 20, 30, 90, 120]),
+            row(n_samples, &[11, 21, 31, 91, 121]),
+        ]
+        .concat();
+        let y = (0..n_samples)
+            .map(|idx| (idx as f64) * 0.17 - 4.0 + ((idx % 11) as f64) * 0.03)
+            .collect::<Vec<_>>();
+        let serial_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let parallel_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let serial = serial_pool
+            .install(|| scan_all_pairs_continuous_packed(&bits, 3, 6, &y, n_samples, 8).unwrap());
+        let parallel = parallel_pool
+            .install(|| scan_all_pairs_continuous_packed(&bits, 3, 6, &y, n_samples, 8).unwrap());
+        assert_eq!(serial, parallel);
     }
 
     fn reference_all_pairs(
