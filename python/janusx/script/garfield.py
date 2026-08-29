@@ -1847,6 +1847,19 @@ def main() -> None:
         ),
     )
     dev_group.add_argument(
+        "--search-backend",
+        dest="search_backend",
+        choices=["legacy", "pair-triple"],
+        default="legacy",
+        help=(
+            "Experimental rule-search backend. `pair-triple` runs exhaustive pair "
+            "scanning followed by pair-seeded triple refinement; it is not a formal "
+            "production-calibrated path yet."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
         "-gain",
         "--gain-layer",
         dest="gain_layer",
@@ -1933,6 +1946,8 @@ def main() -> None:
         parser.error("unrecognized arguments: " + " ".join(extras))
     if bool(args.diagnostics) and not bool(args.dev):
         parser.error("--diagnostics requires -dev")
+    if str(args.search_backend) != "legacy" and not bool(args.dev):
+        parser.error("--search-backend requires -dev")
     if int(args.null_repeats) < 50:
         parser.error("--null-repeats must be at least 50")
     if int(args.null_repeats) != 100 and not bool(args.dev):
@@ -2113,6 +2128,7 @@ def main() -> None:
         ("Width", int(args.width)),
         ("Layer", int(args.layer)),
         ("Pair seed depth", int(args.exhaustive_depth_runtime)),
+        ("Search backend", str(args.search_backend)),
         ("Rule ranking", rank_schedule_runtime),
         ("Seed", int(args.seed)),
     ]
@@ -2432,6 +2448,7 @@ def main() -> None:
                 top_rules_per_unit=int(args.top_rules_runtime),
                 max_output_rules=int(args.max_output_rules_runtime),
                 max_output_ratio=float(args.max_output_ratio_runtime),
+                search_backend=str(args.search_backend),
                 rule_permutation=True,
                 prior_len=None,
                 no_clean=bool(args.no_clean),
@@ -2640,6 +2657,7 @@ def main() -> None:
             "top_rules_per_unit": int(args.top_rules_runtime),
             "layer": int(args.layer),
             "pair_seed_depth": int(args.exhaustive_depth_runtime),
+            "search_backend": str(args.search_backend),
             "beam_width": int(args.beam_width),
             "not_control": "null_penalty_only",
             "rank_schedule_source": rank_schedule_source,
@@ -2793,6 +2811,7 @@ def main() -> None:
                 "rank_score_runtime": rank_score_runtime,
                 "rank_schedule_runtime": rank_schedule_runtime,
                 "rank_schedule_source": rank_schedule_source,
+                "search_backend": str(args.search_backend),
                 "xor_search_requested": bool(args.xor_search_requested),
                 "xor_search_enabled": bool(args.xor_search),
                 "evaluation_mode": "full_exploratory",

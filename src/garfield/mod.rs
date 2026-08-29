@@ -1,5 +1,8 @@
+mod all_pair;
 pub(crate) mod bs;
+mod pair_triple;
 mod permutation;
+mod proposal;
 mod residual;
 mod sampling;
 mod score;
@@ -12,6 +15,7 @@ mod score_backend;
 //   targeted debugging, but are not accepted as active search modes.
 // - Active beam expansion is AND/XOR-only; negation remains supported.
 
+use self::all_pair::scan_all_pairs_continuous_packed;
 use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use self::bs::{
     beam_search_train_test_continuous_fuzzy,
@@ -21,6 +25,7 @@ use self::bs::{
     LiteralScoreBatchRequest, LiteralSingletonScore,
 };
 use self::bs::{reset_garfield_beam_profile, snapshot_garfield_beam_profile};
+use self::pair_triple::{scan_pair_seeded_triples_continuous_packed, PairTripleSeed};
 use self::permutation::{
     bucket_from_rule_with_complexity, choose_representative_indices,
     null_topk_per_repeat_for_bucket, rule_null_complexity_bin, rule_null_context_bin,
@@ -33,6 +38,10 @@ use self::permutation::{
     DEFAULT_RULE_PERMUTATION_REPRESENTATIVE_UNITS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_KL_THRESHOLD,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
+};
+use self::proposal::{
+    build_proposal_site_pool_for_replicate, resolve_proposal_config, ProposalConfig,
+    ProposalFamily, ProposalMode, SharedMaxTAccumulator,
 };
 use crate::bedmath::packed_byte_lut;
 use crate::bincore::{
@@ -102,13 +111,15 @@ use std::time::Instant;
 
 use self::bs::cmp_candidate;
 use self::bs::{take_garfield_frontier_trace, BeamFrontierTraceRecord};
+pub use all_pair::garfield_all_pair_scan_bin_py;
 #[allow(unused_imports)]
 pub use bs::{
     beam_search_train_test_continuous, evaluate_rule_continuous, materialize_rule_bits,
     rank_rule_score_components, rank_rule_score_components_with_bucket, BeamBinaryOp,
     BeamGroupConstraintMode, BeamLiteral, BeamRankMode, BeamRule, BeamRuleCandidate,
-    BeamSearchParams,
+    BeamSearchParams, GarfieldSearchBackend,
 };
+pub use pair_triple::garfield_pair_triple_refine_bin_py;
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
 use residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult};
 #[allow(unused_imports)]
@@ -139,6 +150,10 @@ const GARFIELD_GENESET_CORR_PRESCREEN_SLACK_MAX: usize = 32;
 const GARFIELD_SINGLE_WINDOW_CANDIDATE_MULTIPLIER: usize = 4;
 const GARFIELD_SINGLE_WINDOW_CANDIDATE_ADD: usize = 32;
 const GARFIELD_LD_BLOCK_WORDS_DEFAULT: usize = 8;
+/// Fixed seed budget for the experimental pair-to-triple backend.  This is
+/// intentionally not a normal user parameter: changing it changes the
+/// candidate space and therefore invalidates any matched null calibration.
+const GARFIELD_PAIR_TRIPLE_K2: usize = 50;
 // Poll the native interrupt flag in the LD candidate loop instead of
 // reacquiring the Python GIL for every candidate. Set the interval to 1 to
 // reproduce the previous full check_ctrlc behavior for A/B benchmarks.
@@ -2997,6 +3012,257 @@ impl GarfieldUnitBitMatrices<'_> {
     }
 }
 
+#[inline]
+fn pair_triple_rule_from_indices(
+    indices: &[usize],
+    polarity: u8,
+    group_ids: &[usize],
+) -> Result<BeamRule, String> {
+    if indices.is_empty() {
+        return Err("pair-triple backend cannot build an empty rule".to_string());
+    }
+    let first_idx = *indices
+        .first()
+        .ok_or_else(|| "pair-triple backend missing first rule index".to_string())?;
+    let first_group = *group_ids.get(first_idx).ok_or_else(|| {
+        format!(
+            "pair-triple backend first row {} is outside group_ids={}",
+            first_idx,
+            group_ids.len()
+        )
+    })?;
+    let first = BeamLiteral {
+        row_index: first_idx,
+        group_id: first_group,
+        negated: polarity & 1 != 0,
+    };
+    let mut rest = Vec::with_capacity(indices.len().saturating_sub(1));
+    for (offset, &row_index) in indices.iter().enumerate().skip(1) {
+        let group_id = *group_ids.get(row_index).ok_or_else(|| {
+            format!(
+                "pair-triple backend row {} is outside group_ids={}",
+                row_index,
+                group_ids.len()
+            )
+        })?;
+        rest.push((
+            BeamBinaryOp::And,
+            BeamLiteral {
+                row_index,
+                group_id,
+                negated: polarity & (1u8 << offset) != 0,
+            },
+        ));
+    }
+    Ok(BeamRule { first, rest })
+}
+
+#[inline]
+fn pair_triple_candidate_from_rule(
+    rule: BeamRule,
+    y_train: &[f64],
+    bits_train: &[u64],
+    row_words_train: usize,
+    y_test: &[f64],
+    bits_test: &[u64],
+    row_words_test: usize,
+    n_rows: usize,
+    params: &BeamSearchParams,
+) -> Result<Option<BeamRuleCandidate>, String> {
+    let train = evaluate_rule_continuous(
+        &rule,
+        y_train,
+        bits_train,
+        row_words_train,
+        n_rows,
+        y_train.len(),
+        params.lambda_len,
+        params.lambda_not,
+    )?;
+    if !train.raw_score.is_finite()
+        || (params.maf_threshold > 0.0 && train.dosage_maf < params.maf_threshold)
+    {
+        return Ok(None);
+    }
+    let test = evaluate_rule_continuous(
+        &rule,
+        y_test,
+        bits_test,
+        row_words_test,
+        n_rows,
+        y_test.len(),
+        params.lambda_len,
+        params.lambda_not,
+    )?;
+    if !test.raw_score.is_finite() {
+        return Ok(None);
+    }
+    // The scanners rank by exact raw centered gain.  Keep that raw score in
+    // the BeamRuleCandidate fields so the existing output/gate layer can
+    // apply null penalties and best-parent deltas without changing its
+    // semantics.
+    Ok(Some(BeamRuleCandidate {
+        rule,
+        train_score: train.raw_score,
+        test_score: test.raw_score,
+        train,
+        test,
+    }))
+}
+
+fn pair_triple_search_train_test_continuous(
+    y_train: &[f64],
+    prepared_bits: &GarfieldUnitBitMatrices<'_>,
+    n_rows: usize,
+    y_test: &[f64],
+    group_ids: &[usize],
+    params: BeamSearchParams,
+    literal_scores: Option<&[LiteralSingletonScore]>,
+) -> Result<Vec<BeamRuleCandidate>, String> {
+    if prepared_bits.has_fuzzy_bin() {
+        return Err(
+            "GARFIELD pair-triple backend currently supports only binary 0/2 BIN rows; "
+                .to_string()
+                + "use the legacy backend for fuzzy/dosage rows",
+        );
+    }
+    if n_rows == 0 || group_ids.len() != n_rows {
+        return Err(format!(
+            "GARFIELD pair-triple backend row/group mismatch: n_rows={}, group_ids={}",
+            n_rows,
+            group_ids.len()
+        ));
+    }
+    let max_order = params.max_pick.min(3);
+    let mut candidates = Vec::<BeamRuleCandidate>::new();
+    let singleton_negations = [false, true];
+    for row_index in 0..n_rows {
+        for &negated in singleton_negations.iter() {
+            let rule = pair_triple_rule_from_indices(&[row_index], u8::from(negated), group_ids)?;
+            let candidate = if let Some(scores) = literal_scores
+                .and_then(|scores| scores.get(row_index.saturating_mul(2) + usize::from(negated)))
+            {
+                if !scores.train.raw_score.is_finite()
+                    || !scores.test.raw_score.is_finite()
+                    || scores.train.n_hit == 0
+                {
+                    None
+                } else {
+                    Some(BeamRuleCandidate {
+                        rule,
+                        train_score: scores.train.raw_score,
+                        test_score: scores.test.raw_score,
+                        train: scores.train,
+                        test: scores.test,
+                    })
+                }
+            } else {
+                pair_triple_candidate_from_rule(
+                    rule,
+                    y_train,
+                    prepared_bits.train_bits(),
+                    prepared_bits.row_words_train,
+                    y_test,
+                    prepared_bits.test_bits(),
+                    prepared_bits.row_words_test,
+                    n_rows,
+                    &params,
+                )?
+            };
+            if let Some(candidate) = candidate {
+                candidates.push(candidate);
+            }
+        }
+    }
+    if max_order < 2 || n_rows < 2 {
+        candidates.sort_by(cmp_candidate);
+        candidates.truncate(params.beam_width.max(1));
+        return Ok(candidates);
+    }
+
+    let pair_scan = scan_all_pairs_continuous_packed(
+        prepared_bits.train_bits(),
+        prepared_bits.row_words_train,
+        n_rows,
+        y_train,
+        y_train.len(),
+        GARFIELD_PAIR_TRIPLE_K2,
+    )?;
+    let mut pair_seeds = Vec::<PairTripleSeed>::with_capacity(pair_scan.candidates.len());
+    for (rank, pair) in pair_scan.candidates.iter().enumerate() {
+        let rule =
+            pair_triple_rule_from_indices(&[pair.first, pair.second], pair.polarity, group_ids)?;
+        if let Some(candidate) = pair_triple_candidate_from_rule(
+            rule,
+            y_train,
+            prepared_bits.train_bits(),
+            prepared_bits.row_words_train,
+            y_test,
+            prepared_bits.test_bits(),
+            prepared_bits.row_words_test,
+            n_rows,
+            &params,
+        )? {
+            candidates.push(candidate);
+            pair_seeds.push(PairTripleSeed {
+                first: pair.first,
+                second: pair.second,
+                pair_rank: rank + 1,
+            });
+        }
+    }
+    if max_order >= 3 && !pair_seeds.is_empty() && n_rows >= 3 {
+        let triple_scan = scan_pair_seeded_triples_continuous_packed(
+            prepared_bits.train_bits(),
+            prepared_bits.row_words_train,
+            n_rows,
+            y_train,
+            y_train.len(),
+            pair_seeds.as_slice(),
+            &[],
+            params.beam_width.max(1),
+        )?;
+        for triple in triple_scan.candidates {
+            let rule = pair_triple_rule_from_indices(
+                &[triple.first, triple.second, triple.third],
+                triple.polarity,
+                group_ids,
+            )?;
+            if let Some(candidate) = pair_triple_candidate_from_rule(
+                rule,
+                y_train,
+                prepared_bits.train_bits(),
+                prepared_bits.row_words_train,
+                y_test,
+                prepared_bits.test_bits(),
+                prepared_bits.row_words_test,
+                n_rows,
+                &params,
+            )? {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    // The scanners can return a pair/triple that is also present through a
+    // different seed.  Keep one canonical signed rule before handing the
+    // candidates to the existing gate/output code.
+    let mut dedup = HashMap::<Vec<(usize, bool, u8)>, BeamRuleCandidate>::new();
+    for candidate in candidates {
+        let key = candidate.rule.lexical_key();
+        match dedup.get(&key) {
+            Some(current) if cmp_candidate(&candidate, current) != std::cmp::Ordering::Less => {}
+            _ => {
+                dedup.insert(key, candidate);
+            }
+        }
+    }
+    let mut candidates = dedup.into_values().collect::<Vec<_>>();
+    candidates.sort_by(cmp_candidate);
+    candidates.truncate(params.beam_width.max(1).saturating_mul(2));
+    Ok(candidates)
+}
+
 fn beam_search_train_test_continuous_dispatch(
     y_train: &[f64],
     prepared_bits: &GarfieldUnitBitMatrices<'_>,
@@ -3006,6 +3272,17 @@ fn beam_search_train_test_continuous_dispatch(
     params: BeamSearchParams,
     literal_scores: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
+    if matches!(params.search_backend, GarfieldSearchBackend::PairTriple) {
+        return pair_triple_search_train_test_continuous(
+            y_train,
+            prepared_bits,
+            n_rows,
+            y_test,
+            group_ids,
+            params,
+            literal_scores,
+        );
+    }
     if let Some(train_hi) = prepared_bits.train_bits_hi() {
         let test_hi = prepared_bits.test_bits_hi().ok_or_else(|| {
             "internal error: fuzzy GARFIELD prepared bits are missing test high bitplane"
@@ -3753,6 +4030,7 @@ struct GarfieldRecallDiagnosticRecord {
     output_score: Option<f64>,
     best_parent_raw: Option<f64>,
     best_parent_delta: Option<f64>,
+    formal_eligible: bool,
     reported: bool,
 }
 
@@ -3819,6 +4097,7 @@ fn append_ld_compression_diagnostics(
             output_score: None,
             best_parent_raw: None,
             best_parent_delta: None,
+            formal_eligible: false,
             reported: false,
         });
     }
@@ -6079,6 +6358,53 @@ fn beam_params_for_prepared(
             ..beam_params
         }
     }
+}
+
+#[inline]
+fn apply_proposal_search_config(
+    params: BeamSearchParams,
+    proposal_config: ProposalConfig,
+) -> BeamSearchParams {
+    if matches!(proposal_config.mode, ProposalMode::Off) {
+        return params;
+    }
+    if matches!(params.search_backend, GarfieldSearchBackend::PairTriple) {
+        // PairTriple has its own exhaustive-pair/pair-seeded-triple scanner;
+        // do not silently turn it back into the historical Beam by applying
+        // the legacy proposal-mode width/rank overrides here.
+        return BeamSearchParams {
+            max_pick: params.max_pick.max(1).min(3),
+            ..params
+        };
+    }
+    let max_pick = params.max_pick.max(proposal_config.max_order).min(5);
+    BeamSearchParams {
+        // Proposal mode starts with an exhaustive pair layer and then lets the
+        // existing Beam expander refine those seeds up to the configured
+        // order.  A larger width avoids spending the pair budget on one
+        // polarity of the same site family.
+        max_pick,
+        beam_width: params.beam_width.max(proposal_config.k2),
+        exhaustive_depth: proposal_config.max_order.min(max_pick).max(2),
+        rank_mode: BeamRankMode::ExhaustiveThenGain,
+        ..params
+    }
+}
+
+fn effective_proposal_config(
+    search_backend: GarfieldSearchBackend,
+    max_pick: usize,
+) -> Result<ProposalConfig, String> {
+    let mut proposal_config = resolve_proposal_config()?;
+    if matches!(search_backend, GarfieldSearchBackend::PairTriple)
+        && matches!(proposal_config.mode, ProposalMode::Off)
+    {
+        proposal_config.mode = ProposalMode::CorrRf;
+    }
+    if matches!(search_backend, GarfieldSearchBackend::PairTriple) {
+        proposal_config.max_order = if max_pick >= 3 { 3 } else { 2 };
+    }
+    Ok(proposal_config)
 }
 
 #[inline]
@@ -9744,6 +10070,42 @@ fn select_ml_top_local_indices(
     Ok(selected)
 }
 
+fn proposal_pool_for_rows(
+    proposal_config: ProposalConfig,
+    window_id: &str,
+    marker_ids: &[usize],
+    genotype_rows: &[Vec<u8>],
+    residual: &[f64],
+    replicate_seed: u64,
+    replicate_id: usize,
+    is_null: bool,
+) -> Result<proposal::MergedSitePool, String> {
+    let maf = genotype_rows
+        .iter()
+        .map(|row| {
+            if row.is_empty() {
+                0.0
+            } else {
+                let allele_frequency = row.iter().map(|&value| f64::from(value)).sum::<f64>()
+                    / (2.0 * row.len() as f64);
+                allele_frequency.min(1.0 - allele_frequency).clamp(0.0, 0.5)
+            }
+        })
+        .collect::<Vec<_>>();
+    build_proposal_site_pool_for_replicate(
+        proposal_config,
+        window_id,
+        marker_ids,
+        genotype_rows,
+        residual,
+        maf.as_slice(),
+        GARFIELD_LD_CLUMP_R2_DEFAULT,
+        replicate_seed,
+        replicate_id,
+        is_null,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn select_logic_unit_global_rows(
@@ -9779,6 +10141,7 @@ fn select_logic_unit_global_rows(
         allow_parallel,
         None,
         false,
+        None,
     )
 }
 
@@ -9800,6 +10163,7 @@ fn select_logic_unit_global_rows_with_ld_cache(
     allow_parallel: bool,
     support_cache: Option<&GarfieldLdSupportCache>,
     diagnostics: bool,
+    proposal_config_override: Option<ProposalConfig>,
 ) -> Result<Option<GarfieldSelectedRows>, String> {
     check_ctrlc()?;
     if unit.indices.is_empty() {
@@ -9813,6 +10177,44 @@ fn select_logic_unit_global_rows_with_ld_cache(
         return Ok(None);
     }
     let stage1_candidate_global_rows = diagnostics.then(|| candidate_global_rows.clone());
+    let proposal_config = proposal_config_override.unwrap_or(resolve_proposal_config()?);
+    if !matches!(proposal_config.mode, ProposalMode::Off) {
+        // Proposal mode intentionally starts from the complete unit.  It
+        // creates its own Corr/RF union and LD credit-set pool, so the legacy
+        // engine-specific stage-1 ranking is not silently mixed into the
+        // development comparison.
+        let genotype_rows = dense_dosage_rows_from_full_bits(
+            logic_bits.bits(),
+            logic_bits.bits_hi_flat.as_deref(),
+            logic_bits.row_words,
+            candidate_global_rows.as_slice(),
+            train_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?;
+        let pool = proposal_pool_for_rows(
+            proposal_config,
+            unit.label.as_str(),
+            candidate_global_rows.as_slice(),
+            genotype_rows.as_slice(),
+            y_train,
+            proposal_config.k_site as u64 ^ tree_cfg.seed,
+            0,
+            false,
+        )?;
+        if pool.representatives.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(GarfieldSelectedRows {
+            selected_global_rows: pool.representatives,
+            stage1_candidate_global_rows,
+            // Proposal clusters retain a complete proxy map inside the new
+            // proposal contract.  The legacy compression record is left
+            // empty here until diagnostics gain a source-aware schema.
+            ld_compression: Vec::new(),
+            train_literal_scores: None,
+        }));
+    }
     let selected_global_rows = if let Some(engine_one) = engine {
         let n_region = candidate_global_rows.len();
         let beam_keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac)
@@ -10162,6 +10564,10 @@ fn prepare_logic_unit_continuous_with_ld_cache(
         beam_params.allow_parallel,
         support_cache,
         diagnostics,
+        Some(effective_proposal_config(
+            beam_params.search_backend,
+            beam_params.max_pick,
+        )?),
     )?
     else {
         return Ok(None);
@@ -10238,6 +10644,50 @@ fn prepare_logic_chunk_continuous(
         top_frac: GARFIELD_NULL_ML_TOP_FRAC,
     };
     let selection_seed = perm_cfg.seed ^ chunk.window_id ^ 0x94D0_49BB_1331_11EB;
+
+    let proposal_config =
+        effective_proposal_config(beam_params.search_backend, beam_params.max_pick)?;
+    if !matches!(proposal_config.mode, ProposalMode::Off) {
+        let candidate_global_rows = (row_start..row_end).collect::<Vec<_>>();
+        let genotype_rows = dense_dosage_rows_from_full_bits_range(
+            logic_bits.bits(),
+            logic_bits.bits_hi_flat.as_deref(),
+            logic_bits.row_words,
+            row_start,
+            row_end,
+            train_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?;
+        let window_id = format!("null-chunk-{}", chunk.window_id);
+        let pool = proposal_pool_for_rows(
+            proposal_config,
+            window_id.as_str(),
+            candidate_global_rows.as_slice(),
+            genotype_rows.as_slice(),
+            y_train,
+            selection_seed,
+            selection_seed as usize,
+            true,
+        )?;
+        if pool.representatives.is_empty() {
+            return Ok(None);
+        }
+        let local_groups = pool
+            .representatives
+            .iter()
+            .map(|&idx| logic_bits.group_ids[idx])
+            .collect::<Vec<_>>();
+        return Ok(Some(GarfieldUnitPrepared {
+            selected_global_rows: pool.representatives,
+            stage1_candidate_global_rows: None,
+            ld_compression: Vec::new(),
+            local_groups,
+            geneset_stage_group_target: None,
+            null_unit_group_bin: 0,
+            train_literal_scores: None,
+        }));
+    }
 
     let selected_global_rows = if let Some(engine_one) = engine {
         // ---- PairwiseAnd fast path: packed subset + cached stage-1 stats ----
@@ -10909,7 +11359,42 @@ fn collect_rule_structure_posterior_for_repeat(
         )
     };
 
-    let perm_hits = if let Some(boot_train_hi) = boot_train_bits_hi.as_ref() {
+    // Keep structure-prior bootstrap searches on the same backend as the
+    // observed/null scan.  The old code called the historical Beam directly
+    // here, which meant `--search-backend pair-triple` was only partially
+    // applied and mixed null/observed search spaces.  Build a short-lived bit
+    // matrix around the bootstrap buffers so the common dispatch can select
+    // PairTriple (or retain the legacy fuzzy path) without copying them.
+    let perm_hits = if matches!(
+        beam_params.search_backend,
+        GarfieldSearchBackend::PairTriple
+    ) {
+        let boot_matrices = GarfieldUnitBitMatrices {
+            train_bits: Cow::Borrowed(boot_train_bits.as_slice()),
+            train_bits_hi: boot_train_bits_hi
+                .as_ref()
+                .map(|bits| Cow::Borrowed(bits.as_slice())),
+            row_words_train: boot_row_words_train,
+            test_bits: Some(Cow::Borrowed(boot_test_bits.as_slice())),
+            test_bits_hi: boot_test_bits_hi
+                .as_ref()
+                .map(|bits| Cow::Borrowed(bits.as_slice())),
+            row_words_test: boot_row_words_test,
+            selected_bits_full: None,
+            selected_bits_full_hi: None,
+            selected_bits_full_alias_train: false,
+            selected_bits_full_hi_alias_train: false,
+        };
+        beam_search_train_test_continuous_dispatch(
+            boot_y_train.as_slice(),
+            &boot_matrices,
+            prepared.selected_global_rows.len(),
+            boot_y_test.as_slice(),
+            prepared.local_groups.as_slice(),
+            beam_params,
+            None,
+        )?
+    } else if let Some(boot_train_hi) = boot_train_bits_hi.as_ref() {
         let boot_test_hi = boot_test_bits_hi
             .as_ref()
             .ok_or_else(|| "internal error: fuzzy bootstrap test bitplane missing".to_string())?;
@@ -11249,6 +11734,7 @@ fn evaluate_logic_unit_prepared_continuous(
                 output_score: None,
                 best_parent_raw: None,
                 best_parent_delta: None,
+                formal_eligible: false,
                 reported: false,
             });
         }
@@ -11266,6 +11752,7 @@ fn evaluate_logic_unit_prepared_continuous(
             output_score: None,
             best_parent_raw: None,
             best_parent_delta: None,
+            formal_eligible: false,
             reported: false,
         });
         return Ok(GarfieldUnitEvaluationOutput {
@@ -11368,6 +11855,7 @@ fn evaluate_logic_unit_prepared_continuous(
                 output_score: None,
                 best_parent_raw: None,
                 best_parent_delta: None,
+                formal_eligible: false,
                 reported: false,
             });
         }
@@ -11385,6 +11873,7 @@ fn evaluate_logic_unit_prepared_continuous(
             output_score: None,
             best_parent_raw: None,
             best_parent_delta: None,
+            formal_eligible: false,
             reported: false,
         });
         for (beam_rank, (cand_idx, output_score)) in ranked_hits.iter().enumerate() {
@@ -11432,6 +11921,10 @@ fn evaluate_logic_unit_prepared_continuous(
                 output_score: Some(*output_score),
                 best_parent_raw,
                 best_parent_delta,
+                formal_eligible: !raw_design
+                    && gated_ranked_hits
+                        .iter()
+                        .any(|(eligible_idx, _)| *eligible_idx == *cand_idx),
                 reported: reported_indices.contains(cand_idx)
                     || reported_rule_keys.contains(&cand.rule.lexical_key()),
             });
@@ -12727,6 +13220,14 @@ fn format_optional_sci4(value: Option<f64>) -> String {
     }
 }
 
+#[inline]
+fn format_optional_score(value: Option<f64>) -> String {
+    value
+        .filter(|score| score.is_finite())
+        .map(|score| format!("{score:.6}"))
+        .unwrap_or_else(|| "NA".to_string())
+}
+
 fn attach_logic_rule_permutation_fdr(records: &mut [GarfieldLogicRuleRecord]) {
     let mut ranked = records
         .iter()
@@ -12836,7 +13337,7 @@ fn write_garfield_recall_diagnostics(
     let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
     writeln!(
         w,
-        "unit_name\tunit_index\tregion_size\tstage\trank\tn_rows\tglobal_rows\tsnp_name\texpr\traw_score\toutput_score\tbest_parent_raw\tbest_parent_delta\treported"
+        "unit_name\tunit_index\tregion_size\tstage\trank\tn_rows\tglobal_rows\tsnp_name\texpr\traw_score\toutput_score\tbest_parent_raw\tbest_parent_delta\tformal_eligible\treported"
     )
     .map_err(|e| e.to_string())?;
     let mut ordered = records.iter().collect::<Vec<_>>();
@@ -12865,7 +13366,7 @@ fn write_garfield_recall_diagnostics(
             .unwrap_or_default();
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             rec.unit_name,
             rec.unit_index,
             rec.region_size,
@@ -12879,6 +13380,7 @@ fn write_garfield_recall_diagnostics(
             output,
             best_parent_raw,
             best_parent_delta,
+            rec.formal_eligible,
             rec.reported,
         )
         .map_err(|e| e.to_string())?;
@@ -13092,6 +13594,7 @@ fn garfield_logic_search_bed_owned(
     top_rules_per_unit: usize,
     max_output_rules: usize,
     max_output_ratio: f64,
+    search_backend: String,
     rule_permutation: bool,
     prior_len: Option<Vec<f64>>,
     no_clean: bool,
@@ -13106,6 +13609,23 @@ fn garfield_logic_search_bed_owned(
     diagnostics: bool,
 ) -> Result<GarfieldLogicPipelineResult, String> {
     let total_wall_t0 = Instant::now();
+    let search_backend = GarfieldSearchBackend::parse(search_backend.as_str())?;
+    // Resolve hidden proposal settings before any BED/GRM work.  The default
+    // is Off, which leaves the historical scan path untouched; malformed
+    // development settings fail early instead of partially scanning data.
+    let proposal_config = effective_proposal_config(search_backend, max_pick)?;
+    if !matches!(proposal_config.mode, ProposalMode::Off) {
+        garfield_prepare_breakpoint(
+            "proposal_mode_ready",
+            Some(&format!(
+                "mode={:?} k_site={} k2={} max_order={}",
+                proposal_config.mode,
+                proposal_config.k_site,
+                proposal_config.k2,
+                proposal_config.max_order
+            )),
+        )?;
+    }
     let rss_debug_enabled = garfield_rss_debug_enabled();
     let mut memory_debug = if rss_debug_enabled {
         Some(GarfieldMemoryDebugSummary::default())
@@ -13653,33 +14173,37 @@ fn garfield_logic_search_bed_owned(
     };
     let structure_prior_cfg = RuleStructurePriorConfig::from_len_alpha_values(prior_len.as_deref());
     let structure_prior_display_len = max_pick.clamp(1, 5);
-    let beam_params = BeamSearchParams {
-        max_pick: max_pick.max(1),
-        beam_width: beam_width.max(1),
-        min_gain: 0.0,
-        min_parent_abs_gain: 0.0,
-        surrogate_test_gain_max: 0.0,
-        surrogate_hamming_frac_max: 0.0,
-        maf_threshold: logic_maf_threshold.clamp(0.0, 0.5) as f64,
-        lambda_len: 0.0,
-        lambda_not: 0.0,
-        exhaustive_depth: if whole_genome_dev_mode {
-            1
-        } else {
-            exhaustive_depth.max(1)
+    let beam_params = apply_proposal_search_config(
+        BeamSearchParams {
+            search_backend,
+            max_pick: max_pick.max(1),
+            beam_width: beam_width.max(1),
+            min_gain: 0.0,
+            min_parent_abs_gain: 0.0,
+            surrogate_test_gain_max: 0.0,
+            surrogate_hamming_frac_max: 0.0,
+            maf_threshold: logic_maf_threshold.clamp(0.0, 0.5) as f64,
+            lambda_len: 0.0,
+            lambda_not: 0.0,
+            exhaustive_depth: if whole_genome_dev_mode {
+                1
+            } else {
+                exhaustive_depth.max(1)
+            },
+            rank_mode,
+            null_penalties: None,
+            structure_prior: None,
+            y_sum_lookup: None,
+            disable_parent_delta: false,
+            null_complexity_bin: 0,
+            group_constraint: BeamGroupConstraintMode::AlwaysExclude,
+            allow_parallel: true,
+            whole_genome_dev_mode,
+            filter_xor_substates,
+            xor_search_enabled,
         },
-        rank_mode,
-        null_penalties: None,
-        structure_prior: None,
-        y_sum_lookup: None,
-        disable_parent_delta: false,
-        null_complexity_bin: 0,
-        group_constraint: BeamGroupConstraintMode::AlwaysExclude,
-        allow_parallel: true,
-        whole_genome_dev_mode,
-        filter_xor_substates,
-        xor_search_enabled,
-    };
+        proposal_config,
+    );
     let total_units = units.len();
     let scan_unit_indices = if grouped_active_mode {
         (0..total_units).collect::<Vec<_>>()
@@ -14239,6 +14763,14 @@ fn garfield_logic_search_bed_owned(
             RuleNullCalibrator::with_layout(effective_null_max_rule_len, max_null_unit_group_count);
         let mut output_delta_bucket_scores =
             RuleNullCalibrator::with_layout(effective_null_max_rule_len, max_null_unit_group_count);
+        // Development-only reducer for a shared-inner maxT diagnostic.  The
+        // normal calibrators above remain unchanged; when enabled, one
+        // maximum is recorded per family for each inner replicate after all
+        // prepared windows have been evaluated.  This keeps the null draw
+        // shared across windows without retaining candidate-level rows.
+        let shared_max_t_enabled = !matches!(proposal_config.mode, ProposalMode::Off)
+            && env_truthy("JX_GARFIELD_PROPOSAL_SHARED_MAXT");
+        let mut proposal_shared_max_t = shared_max_t_enabled.then(SharedMaxTAccumulator::default);
         let min_perm_repeats =
             DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS.min(perm_cfg.n_repeats.max(1));
         let mut stable_rounds = 0usize;
@@ -14258,7 +14790,9 @@ fn garfield_logic_search_bed_owned(
         // Window nulls must repeat the phenotype-driven ML selection for each
         // permutation.  Reuse the fixed prepared pool only for grouped
         // synthetic units, whose layout is part of the grouping null model.
-        let null_reselection = if !grouped_null_mode && engine.is_some() {
+        let null_reselection = if !grouped_null_mode
+            && (engine.is_some() || !matches!(proposal_config.mode, ProposalMode::Off))
+        {
             Some(GarfieldNullReselectionConfig {
                 row_mul: logic_row_mul,
                 response,
@@ -14538,7 +15072,21 @@ fn garfield_logic_search_bed_owned(
                 }
             }
             for (rep_offset, rep_vals) in by_rep.into_iter().enumerate() {
+                if let Some(accumulator) = proposal_shared_max_t.as_mut() {
+                    accumulator.begin_replicate();
+                }
                 for vals in rep_vals.iter() {
+                    if let Some(accumulator) = proposal_shared_max_t.as_mut() {
+                        // Full-sample GARFIELD uses the train statistic as its
+                        // primary output.  Keep this reducer max-only and
+                        // finite-value aware; test statistics are calibrated
+                        // by the existing split-aware lookup when applicable.
+                        accumulator.observe_rule(
+                            vals.bucket.rule_len,
+                            vals.output_train_raw_score,
+                            vals.delta_train_score,
+                        );
+                    }
                     search_bucket_scores.insert(
                         vals.bucket,
                         vals.search_train_score,
@@ -14594,6 +15142,9 @@ fn garfield_logic_search_bed_owned(
                 {
                     output_delta_bucket_scores.insert_family_4plus(f64::NAN, score);
                 }
+                if let Some(accumulator) = proposal_shared_max_t.as_mut() {
+                    accumulator.finish_replicate();
+                }
                 permutation_null_repeats_used = rep_start + rep_offset + 1;
                 if permutation_null_repeats_used < min_perm_repeats {
                     continue;
@@ -14642,6 +15193,20 @@ fn garfield_logic_search_bed_owned(
         }
         if let Some(debug) = memory_debug.as_mut() {
             debug.null_penalty = null_mem_tracker.finish_stage(null_mem_start);
+        }
+        if let Some(accumulator) = proposal_shared_max_t.as_ref() {
+            let singleton_n = accumulator.values(ProposalFamily::Singleton, false).len();
+            let two_plus_n = accumulator.values(ProposalFamily::TwoPlus, false).len();
+            let three_plus_n = accumulator.values(ProposalFamily::ThreePlus, false).len();
+            eprintln!(
+                "[GARFIELD-PROPOSAL] shared_inner_maxT ready: n={{1:{singleton_n},2+:{two_plus_n},3+:{three_plus_n}}} q99={{1:{},2+:{},3+:{}}} delta_q99={{1:{},2+:{},3+:{}}}",
+                format_optional_score(accumulator.q99(ProposalFamily::Singleton, false)),
+                format_optional_score(accumulator.q99(ProposalFamily::TwoPlus, false)),
+                format_optional_score(accumulator.q99(ProposalFamily::ThreePlus, false)),
+                format_optional_score(accumulator.q99(ProposalFamily::Singleton, true)),
+                format_optional_score(accumulator.q99(ProposalFamily::TwoPlus, true)),
+                format_optional_score(accumulator.q99(ProposalFamily::ThreePlus, true)),
+            );
         }
         let search_lookup = prev_search_lookup
             .unwrap_or_else(|| search_bucket_scores.finalize_with_method(rule_null_penalty_method));
@@ -15446,6 +16011,7 @@ pub fn garfield_debug_probe_single_group_from_files(
         100usize,
         0usize,
         0.0,
+        "legacy".to_string(),
         true,
         None,
         false,
@@ -15518,6 +16084,7 @@ pub fn garfield_debug_probe_single_group_from_files(
     top_rules_per_unit=1,
     max_output_rules=0,
     max_output_ratio=0.0,
+    search_backend="legacy",
     rule_permutation=true,
     prior_len=None,
     no_clean=false,
@@ -15586,6 +16153,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     top_rules_per_unit: usize,
     max_output_rules: usize,
     max_output_ratio: f64,
+    search_backend: &str,
     rule_permutation: bool,
     prior_len: Option<Vec<f64>>,
     no_clean: bool,
@@ -15701,6 +16269,7 @@ pub fn garfield_logic_search_bed_py<'py>(
                 top_rules_per_unit,
                 max_output_rules,
                 max_output_ratio,
+                search_backend.to_string(),
                 rule_permutation,
                 prior_len,
                 no_clean,
@@ -16782,6 +17351,31 @@ mod tests {
         assert!(conditional_split_support_passes(100, 40, 100, 20));
         assert!(!conditional_split_support_passes(100, 2, 100, 20));
         assert!(!conditional_split_support_passes(100, 98, 100, 20));
+    }
+
+    #[test]
+    fn proposal_search_config_off_preserves_legacy_parameters() {
+        let params = BeamSearchParams::default();
+        let configured = apply_proposal_search_config(params.clone(), ProposalConfig::default());
+        assert_eq!(configured, params);
+    }
+
+    #[test]
+    fn proposal_search_config_enables_bounded_pair_refinement() {
+        let params = BeamSearchParams::default();
+        let configured = apply_proposal_search_config(
+            params,
+            ProposalConfig {
+                mode: ProposalMode::CorrRf,
+                k_site: 64,
+                k2: 17,
+                max_order: 3,
+            },
+        );
+        assert_eq!(configured.beam_width, 17);
+        assert_eq!(configured.exhaustive_depth, 3);
+        assert_eq!(configured.rank_mode, BeamRankMode::ExhaustiveThenGain);
+        assert_eq!(configured.max_pick, 3);
     }
 
     #[test]

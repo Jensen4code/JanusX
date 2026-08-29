@@ -726,6 +726,38 @@ pub fn and_popcount_sum_y_where_both1_with_lookup(
     (n, sum)
 }
 
+/// Count and sum phenotype values for a three-way packed intersection.
+///
+/// This is kept beside the existing two-way helper so pair-seeded triple
+/// diagnostics can score a candidate without materializing an intermediate
+/// bitset.  Unused tail bits are masked before counting/summing.
+#[inline]
+pub fn and3_popcount_sum_y_where_all1_with_lookup(
+    first: &[u64],
+    second: &[u64],
+    third: &[u64],
+    y: &[f64],
+    n_samples: usize,
+    lookup: &PackedYSumLookup,
+) -> (u64, f64) {
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+    let mut n = 0u64;
+    let mut sum = 0.0_f64;
+    for word_idx in 0..full_words {
+        let word = first[word_idx] & second[word_idx] & third[word_idx];
+        n += word.count_ones() as u64;
+        sum += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, word);
+    }
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        let word = (first[full_words] & second[full_words] & third[full_words]) & mask;
+        n += word.count_ones() as u64;
+        sum += sum_y_from_word_lookup_hybrid(lookup, y, full_words, word);
+    }
+    (n, sum)
+}
+
 /// Sum phenotype values for four packed intersections in one word traversal.
 ///
 /// Each output keeps the same word and bit accumulation order as

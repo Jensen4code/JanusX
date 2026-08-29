@@ -253,6 +253,32 @@ pub enum BeamGroupConstraintMode {
     ExcludeUntilDistinctGroups(usize),
 }
 
+/// Search backend selected for the GARFIELD development path.
+///
+/// `Legacy` is the historical Beam search and remains the default.  The
+/// `PairTriple` backend is deliberately opt-in: it evaluates all signed
+/// order-2 site pairs and refines a bounded pair seed set to order-3 rules.
+/// Keeping the selector in `BeamSearchParams` lets observed scans and their
+/// null scans share the same backend contract without adding another long
+/// argument list to every internal helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GarfieldSearchBackend {
+    Legacy,
+    PairTriple,
+}
+
+impl GarfieldSearchBackend {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "legacy" | "beam" => Ok(Self::Legacy),
+            "pair-triple" | "pair_triple" | "pairtriple" => Ok(Self::PairTriple),
+            other => Err(format!(
+                "GARFIELD search backend must be legacy or pair-triple, got '{other}'"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BeamLiteral {
     pub row_index: usize,
@@ -353,6 +379,7 @@ fn candidate_group_is_excluded(
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BeamSearchParams {
+    pub search_backend: GarfieldSearchBackend,
     pub max_pick: usize,
     pub beam_width: usize,
     pub min_gain: f64,
@@ -380,6 +407,7 @@ pub struct BeamSearchParams {
 impl Default for BeamSearchParams {
     fn default() -> Self {
         Self {
+            search_backend: GarfieldSearchBackend::Legacy,
             max_pick: 3,
             beam_width: 5,
             min_gain: 0.0,
@@ -7062,6 +7090,51 @@ pub(crate) fn beam_search_train_test_continuous_with_literal_scores(
         params,
         Some(literal_scores),
     )
+}
+
+/// Convert already exact-scored AND pair candidates into the proposal-layer
+/// seed contract.  This deliberately does not alter Beam expansion: callers
+/// can use it to hand a bounded exact-rank list to a later refinement stage,
+/// while `PairSeedReason::ProposalRescue` remains available for a separate
+/// proposal-only queue.
+pub(crate) fn exact_pair_seeds_from_candidates(
+    candidates: &[BeamRuleCandidate],
+    k2: usize,
+    sources: super::proposal::SourceMask,
+) -> Result<Vec<super::proposal::PairSeed>, String> {
+    let mut best_by_pair = HashMap::<[usize; 2], f64>::new();
+    for candidate in candidates {
+        if candidate.rule.len() != 2 {
+            continue;
+        }
+        let Some((op, second)) = candidate.rule.rest.first() else {
+            continue;
+        };
+        if *op != BeamBinaryOp::And {
+            continue;
+        }
+        let pair = [
+            candidate.rule.first.row_index.min(second.row_index),
+            candidate.rule.first.row_index.max(second.row_index),
+        ];
+        best_by_pair
+            .entry(pair)
+            .and_modify(|score| {
+                if candidate.train_score > *score {
+                    *score = candidate.train_score;
+                }
+            })
+            .or_insert(candidate.train_score);
+    }
+    let mut pairs = Vec::with_capacity(best_by_pair.len());
+    let mut scores = Vec::with_capacity(best_by_pair.len());
+    let mut ranked = best_by_pair.into_iter().collect::<Vec<_>>();
+    ranked.sort_unstable_by_key(|(pair, _)| *pair);
+    for (pair, score) in ranked {
+        pairs.push(pair);
+        scores.push(score);
+    }
+    super::proposal::rank_exact_pair_seeds(&pairs, &scores, k2, sources)
 }
 
 #[inline]
