@@ -11042,9 +11042,10 @@ def GSapi(
                     "sample_indices": train_abs,
                     "x": None,
                     "n_iter": int(bayes_n_iter),
-                    # Kept for native API compatibility; the sampler uses a
-                    # fixed 1000-sample posterior window after monitoring.
-                    "burnin": int(bayes_posterior_target),
+                    # None selects the 500-update auto warm-up followed by
+                    # R-hat monitoring; explicit user burn-in is handled by
+                    # the Python Bayes API before reaching this route.
+                    "burnin": None,
                     "r2": float(r2_used),
                     "threads": int(max(0, int(n_jobs))),
                     "chains": int(max(1, int(bayes_chains))),

@@ -15,6 +15,7 @@ from janusx.pyBLUP.mlm import BLUP
 
 _BAYESA_MIN_ABS_BETA_WARNED = False
 BAYES_POSTERIOR_SAMPLE_TARGET = 1000
+BAYES_AUTO_BURNIN_MIN = 500
 # BayesB/BayesC use the inclusion-probability convention: `prob_in` is the
 # probability that a marker has a non-zero effect.  BayesB keeps this prior
 # fixed; BayesC uses it as the starting value when pi is not fixed explicitly.
@@ -43,6 +44,29 @@ BAYES_MCMC_DEFAULTS: dict[str, tuple[int, int]] = {
     "BayesC": (10000, 1000),
     "BayesR": (10000, 1000),
 }
+
+
+def _normalize_burnin(value: int | str | None) -> int | None:
+    """Normalize the public burn-in mode for the native sampler.
+
+    ``None`` and ``"auto"`` select the adaptive schedule.  An integer is a
+    fixed warm-up count and intentionally disables R-hat stopping.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip().lower() == "auto":
+            return None
+        raise ValueError("burnin must be 'auto' or a non-negative integer")
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError("burnin must be 'auto' or a non-negative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("burnin must be 'auto' or a non-negative integer") from exc
+    if parsed < 0:
+        raise ValueError("burnin must be >= 0")
+    return parsed
 
 
 def bayes_mcmc_defaults(method: str) -> tuple[int, int]:
@@ -226,7 +250,7 @@ def _call_bayesa(
     m: np.ndarray,
     x: Optional[np.ndarray],
     n_iter: int,
-    burnin: int,
+    burnin: int | str | None,
     r2: float,
     df0_b: float,
     shape0: float,
@@ -252,7 +276,7 @@ def _call_bayesa(
     Mapping[str, float],
 ]:
     n_iter = int(n_iter)
-    burnin = int(burnin)
+    burnin = _normalize_burnin(burnin)
     thin = 1
     if n_iter <= 0:
         raise ValueError("n_iter must be > 0")
@@ -325,7 +349,7 @@ def _call_bayesb(
     m: np.ndarray,
     x: Optional[np.ndarray],
     n_iter: int,
-    burnin: int,
+    burnin: int | str | None,
     r2: float,
     df0_b: float,
     shape0: float,
@@ -356,7 +380,7 @@ def _call_bayesb(
     Mapping[str, float],
 ]:
     n_iter = int(n_iter)
-    burnin = int(burnin)
+    burnin = _normalize_burnin(burnin)
     thin = 1
     if n_iter <= 0:
         raise ValueError("n_iter must be > 0")
@@ -418,7 +442,7 @@ def _call_bayesc(
     m: np.ndarray,
     x: Optional[np.ndarray],
     n_iter: int,
-    burnin: int,
+    burnin: int | str | None,
     r2: float,
     df0_b: float,
     s0_b: Optional[float],
@@ -447,7 +471,7 @@ def _call_bayesc(
     Mapping[str, float],
 ]:
     n_iter = int(n_iter)
-    burnin = int(burnin)
+    burnin = _normalize_burnin(burnin)
     thin = 1
     if n_iter <= 0:
         raise ValueError("n_iter must be > 0")
@@ -497,20 +521,20 @@ def _call_bayesr(
     m: np.ndarray,
     x: Optional[np.ndarray],
     n_iter: int,
-    burnin: int,
+    burnin: int | str | None,
     r2: float,
     df0_e: float,
     prior_ss_e: Optional[float],
     pi: Optional[np.ndarray],
     gamma: Optional[np.ndarray],
     df0_lambda: float,
-    s0_lambda2: float,
+    s0_lambda2: Optional[float],
     seed: Optional[int],
     chains: int = 1,
     threads: int = 1,
 ) -> dict[str, object]:
     n_iter = int(n_iter)
-    burnin = int(burnin)
+    burnin = _normalize_burnin(burnin)
     if n_iter <= 0:
         raise ValueError("n_iter must be > 0")
     if not (0.0 < r2 < 1.0):
@@ -519,8 +543,10 @@ def _call_bayesr(
         raise ValueError("df0_e and df0_lambda must be > 0")
     if prior_ss_e is not None and prior_ss_e <= 0.0:
         raise ValueError("prior_ss_e must be > 0")
-    if s0_lambda2 <= 0.0:
-        raise ValueError("s0_lambda2 must be > 0")
+    if s0_lambda2 is not None and (
+        not np.isfinite(float(s0_lambda2)) or float(s0_lambda2) <= 0.0
+    ):
+        raise ValueError("s0_lambda2 must be finite and > 0")
     if seed is not None:
         seed = int(seed)
         if seed < 0:
@@ -555,7 +581,7 @@ def _call_bayesr(
             pi=pi_arr,
             gamma=gamma_arr,
             df0_lambda=float(df0_lambda),
-            s0_lambda2=float(s0_lambda2),
+            s0_lambda2=(None if s0_lambda2 is None else float(s0_lambda2)),
             seed=seed,
             chains=int(chains),
             threads=int(threads),
@@ -569,7 +595,7 @@ def BayesA(
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
     n_iter: int = 10000,
-    burnin: int = 1000,
+    burnin: int | str | None = "auto",
     r2: float = 0.5,
     prob_in: float = 0.5,
     counts: float = 5.0,
@@ -617,9 +643,11 @@ def BayesA(
         Maximum iterations used for R-hat monitoring. After convergence, the
         sampler collects exactly 1000 posterior samples; without convergence,
         it collects a fallback 1000 samples after this limit.
-    burnin : int, default=1000
-        Deprecated compatibility argument; the production sampler no longer
-        performs a second burn-in stage.
+    burnin : {"auto", int}, default="auto"
+        With ``"auto"``, reserve at least 500 initial updates, then monitor
+        R-hat and collect 1000 posterior samples after convergence. With a
+        non-negative integer, use that many warm-up updates and collect 1000
+        posterior samples immediately afterward without R-hat stopping.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.5
@@ -674,8 +702,9 @@ def BayesA(
     posterior_samples : int
         Number of posterior samples retained (normally exactly 1000).
     rhat_metrics : Mapping[str, float]
-        Split-chain R-hat for every monitored scalar (for example ``h2``,
-        ``var_g``, ``var_e`` and model-specific hyperparameters).
+        Split-chain R-hat for the final posterior report scalars (for example
+        ``h2``, ``var_g``, ``var_e`` and model-specific hyperparameters).
+        Adaptive multi-chain stopping uses a separate predictive-state monitor.
     Raises
     ------
     ValueError
@@ -717,7 +746,7 @@ def BayesB(
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
     n_iter: int = 10000,
-    burnin: int = 1000,
+    burnin: int | str | None = "auto",
     r2: float = 0.5,
     prob_in: float = BAYES_DEFAULT_PROB_IN,
     counts: float = 5.0,
@@ -763,8 +792,11 @@ def BayesB(
     n_iter : int, default=10000
         Maximum iterations used for R-hat monitoring, followed by a fixed
         1000-sample posterior window.
-    burnin : int, default=1000
-        Deprecated compatibility argument; ignored by the production sampler.
+    burnin : {"auto", int}, default="auto"
+        With ``"auto"``, reserve at least 500 initial updates, then monitor
+        R-hat and collect 1000 posterior samples after convergence. With a
+        non-negative integer, use that many warm-up updates and collect 1000
+        posterior samples immediately afterward without R-hat stopping.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.05
@@ -826,8 +858,9 @@ def BayesB(
     posterior_samples : int
         Number of posterior samples retained (normally exactly 1000).
     rhat_metrics : Mapping[str, float]
-        Split-chain R-hat for every monitored scalar; convergence is based on
-        the maximum value across this mapping.
+        Split-chain R-hat for the final posterior report scalars. Adaptive
+        multi-chain stopping uses a separate predictive-state monitor rather
+        than the maximum value across this mapping.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
@@ -862,7 +895,7 @@ def BayesC(
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
     n_iter: int = 10000,
-    burnin: int = 1000,
+    burnin: int | str | None = "auto",
     r2: float = 0.5,
     prob_in: float = BAYES_DEFAULT_PROB_IN,
     counts: float = 5.0,
@@ -906,8 +939,11 @@ def BayesC(
     n_iter : int, default=10000
         Maximum iterations used for R-hat monitoring, followed by a fixed
         1000-sample posterior window.
-    burnin : int, default=1000
-        Deprecated compatibility argument; ignored by the production sampler.
+    burnin : {"auto", int}, default="auto"
+        With ``"auto"``, reserve at least 500 initial updates, then monitor
+        R-hat and collect 1000 posterior samples after convergence. With a
+        non-negative integer, use that many warm-up updates and collect 1000
+        posterior samples immediately afterward without R-hat stopping.
     r2 : float, default=0.5
         Proportion of variance explained by markers; must be in (0, 1).
     prob_in : float, default=0.05
@@ -965,8 +1001,9 @@ def BayesC(
     posterior_samples : int
         Number of posterior samples retained (normally exactly 1000).
     rhat_metrics : Mapping[str, float]
-        Split-chain R-hat for every monitored scalar; convergence is based on
-        the maximum value across this mapping.
+        Split-chain R-hat for the final posterior report scalars. Adaptive
+        multi-chain stopping uses a separate predictive-state monitor rather
+        than the maximum value across this mapping.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_marker_mxn(M, "M", y_arr.shape[0])
@@ -999,12 +1036,12 @@ def BayesR(
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
     n_iter: int = 10000,
-    burnin: int = 1000,
+    burnin: int | str | None = "auto",
     r2: float = 0.5,
     pi: Optional[np.ndarray] = None,
     gamma: Optional[np.ndarray] = None,
-    df0_lambda: float = 1.0,
-    s0_lambda2: float = 1.0,
+    df0_lambda: float = 4.0,
+    s0_lambda2: Optional[float] = None,
     df0_e: float = 5.0,
     prior_ss_e: Optional[float] = None,
     seed: Optional[int] = None,
@@ -1034,8 +1071,18 @@ def BayesR(
     parameters; the GS CLI keeps these defaults and does not expose separate
     command-line flags.
 
-    ``prior_ss_e`` is the residual prior sum-of-squares ``nu_0 * S_0^2``;
-    it is not ``S_0^2`` alone.
+    ``s0_lambda2`` is the scaled-inverse-chi-square scale for the global
+    marker variance. If omitted, it is calibrated from the residualized
+    phenotype variance, marker variance, ``r2``, ``pi``, and ``gamma`` so the
+    prior mode matches the target marker variance. An explicit value is used
+    unchanged. ``prior_ss_e`` is the residual prior sum-of-squares
+    ``nu_0 * S_0^2``; it is not ``S_0^2`` alone.
+
+    With ``burnin="auto"`` (the default), at least 500 initial updates are
+    excluded from R-hat monitoring, after which R-hat controls entry into a
+    1000-sample posterior window. A non-negative integer uses a fixed warm-up
+    and enters the 1000-sample posterior window immediately without R-hat
+    stopping.
 
     Returns ``(beta, alpha, varbeta, vare, h2, varh2, pip,
     component_prob, pi_mean, sigma_lambda2, rhat_h2, actual_iterations,
@@ -1093,7 +1140,7 @@ class BAYES:
         cov: np.ndarray | None = None,
         method: typing.Literal["BayesA", "BayesB", "BayesC", "BayesR"] = "BayesA",
         n_iter: Optional[int] = None,
-        burnin: Optional[int] = None,
+        burnin: int | str | None = "auto",
         r2: Optional[float] = None,
         prob_in: float = BAYES_DEFAULT_PROB_IN,
         counts: float = 5.0,
@@ -1116,6 +1163,12 @@ class BAYES:
             Fixed-effect design matrix of shape (n, p).
         method : {"BayesA","BayesB","BayesC","BayesR"}
             Bayesian model to fit.
+        n_iter : int, optional
+            Maximum iterations for auto burn-in R-hat monitoring.
+        burnin : {"auto", int}, default="auto"
+            ``"auto"`` reserves at least 500 warm-up updates and then uses
+            R-hat to start a 1000-sample posterior window. An integer uses a
+            fixed warm-up and skips R-hat stopping.
         r2 : float, optional
             Proportion of variance explained by markers. If None, estimated
             via GBLUP (BLUP with kinship=1).
@@ -1154,7 +1207,7 @@ class BAYES:
         rhat_h2 : float
             Split-chain R-hat of the retained posterior h2 samples.
         rhat_max_iterations : int
-            Hard upper bound for R-hat monitoring.
+            Auto-mode R-hat monitoring upper bound, or 0 for fixed burn-in.
         convergence_iteration : int
             Iteration at which R-hat converged, or 0 when the fallback window
             was used.
@@ -1173,13 +1226,10 @@ class BAYES:
             raise ValueError(f"Unsupported Bayes method: {method}")
         requested_chains = int(chains)
         effective_chains = _resolve_bayes_chain_count(requested_chains, threads)
-        default_n_iter, default_posterior_samples = bayes_mcmc_defaults(method)
+        default_n_iter, _ = bayes_mcmc_defaults(method)
         if n_iter is None:
             n_iter = int(default_n_iter)
-        if burnin is None:
-            # Keep the public argument for compatibility. The native sampler
-            # uses its fixed 1000-sample posterior target instead.
-            burnin = int(default_posterior_samples)
+        burnin = _normalize_burnin(burnin)
 
         r2_blup_pheno_scale: float | None = None
         if r2 is None:
@@ -1209,7 +1259,10 @@ class BAYES:
         self.rhat_metrics: dict[str, float] = {}
         self.rhat_max: float = float("nan")
         self.rhat: float = float("nan")
-        self.rhat_max_iterations: int = int(n_iter)
+        self.burnin: str | int = "auto" if burnin is None else int(burnin)
+        self.rhat_max_iterations: int = (
+            max(int(n_iter), BAYES_AUTO_BURNIN_MIN + 1) if burnin is None else 0
+        )
         self.posterior_sample_target: int = BAYES_POSTERIOR_SAMPLE_TARGET
         self.actual_iterations: int = 0
         self.convergence_iteration: int = 0

@@ -28,11 +28,12 @@
 //! for GS. Each MCMC iteration updates fixed effects, residual variance, marker
 //! effects, and inclusion/variance hyperparameters. Production kernels monitor
 //! split-chain R-hat for a single chain and pool native chain summaries for
-//! multi-chain calls up to a hard iteration limit, discard pre-convergence
-//! samples once the threshold is reached, and return means from the next 1000
-//! posterior samples. If the limit is reached without convergence, the next
-//! 1000 iterations form the fallback posterior window. Trace-only kernels
-//! retain explicit thinning for diagnostic plots.
+//! multi-chain calls using a recent retained-state window of predictive
+//! summaries, discard pre-convergence samples once the threshold is reached,
+//! and return means from the next 1000 posterior samples. If the limit is
+//! reached without convergence, the next 1000 iterations form the fallback
+//! posterior window. Trace-only kernels retain explicit thinning for
+//! diagnostic plots.
 
 use nalgebra::{DMatrix, DVector};
 use numpy::ndarray::Array2;
@@ -45,7 +46,7 @@ use rand::{Rng, SeedableRng, TryRngCore};
 use rand_distr::{Beta, ChiSquared, Gamma, StandardNormal};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, OnceLock};
@@ -239,17 +240,42 @@ fn posterior_keep_iters(n_iter: usize, burnin: usize, thin: usize) -> Vec<i64> {
     out
 }
 
+pub(crate) const BAYES_AUTO_BURNIN: usize = 500;
+
+#[inline]
+fn resolve_burnin(burnin: Option<usize>) -> (usize, bool) {
+    match burnin {
+        Some(value) => (value, false),
+        None => (BAYES_AUTO_BURNIN, true),
+    }
+}
+
+#[inline]
+fn monitor_end_iteration(n_iter: usize, burnin: usize, thin: usize, adaptive: bool) -> usize {
+    let first_retained = burnin.saturating_add(1);
+    if !adaptive {
+        return first_retained;
+    }
+    let lower_bound = n_iter.max(first_retained);
+    let delta = lower_bound.saturating_sub(first_retained);
+    let steps = delta / thin + usize::from(delta % thin != 0);
+    first_retained.saturating_add(steps.saturating_mul(thin))
+}
+
 // A single MCMC chain does not support the classical multi-chain Gelman--Rubin
 // diagnostic.  We therefore report the standard split-chain R-hat calculated
-// from each retained scalar monitor (h2, variance components, and model
+// from each retained scalar report metric (h2, variance components, and model
 // hyperparameters).  The two consecutive halves are treated as two chains;
-// convergence uses the maximum finite scalar R-hat.
+// single-chain convergence uses the maximum finite scalar R-hat.  Adaptive
+// multi-chain stopping uses the predictive monitor declared below instead.
 // Keep the early-stop criterion aligned with the GS user-facing contract.
 // Keep the conventional conservative convergence cutoff for split-chain R-hat.
 const BAYES_RHAT_THRESHOLD: f64 = 1.10;
-const BAYES_RHAT_MIN_KEEP: usize = 500;
+const BAYES_RHAT_WINDOW: usize = 500;
+const BAYES_RHAT_MIN_KEEP: usize = BAYES_RHAT_WINDOW;
 const BAYES_RHAT_CHECK_EVERY: usize = 50;
 const BAYES_RHAT_STABLE_CHECKS: usize = 3;
+const BAYES_MAX_POSTERIOR_RESTARTS: usize = 1;
 pub(crate) const BAYES_POSTERIOR_SAMPLES: usize = 1000;
 
 // BayesA/B use marker-specific latent variances.  Their mean `var_b` is an
@@ -273,6 +299,26 @@ pub(crate) const BAYES_RHAT_R_NAMES: &[&str] = &[
     "n_active",
 ];
 
+// Adaptive stopping targets predictive state rather than mixture-architecture
+// parameters.  The latter remain in the final report, but can mix much more
+// slowly than GEBV without materially changing prediction.
+pub(crate) const BAYES_PREDICTIVE_MONITOR_NAMES: &[&str] = &[
+    "h2",
+    "var_g",
+    "var_e",
+    "gebv_mean",
+    "gebv_var",
+    "gebv_cov_y",
+    "gebv_sketch_0",
+    "gebv_sketch_1",
+    "gebv_sketch_2",
+    "gebv_sketch_3",
+    "gebv_sketch_4",
+    "gebv_sketch_5",
+    "gebv_sketch_6",
+    "gebv_sketch_7",
+];
+
 #[inline]
 pub(crate) fn finite_rhat_max(values: &[f64]) -> f64 {
     // A positive infinite R-hat is a useful diagnostic (zero within-chain
@@ -288,8 +334,9 @@ pub(crate) fn finite_rhat_max(values: &[f64]) -> f64 {
 /// Convert the native scalar R-hat vector to a Python mapping.  The mapping
 /// is intentionally flat so callers can print `Rhat(h2)`, `Rhat(var_g)`, …
 /// without knowing the model-specific tuple layout.  `rhat_max` is the
-/// convergence statistic used by the controller; the individual entries are
-/// retained for diagnostics and backwards-compatible `rhat_h2` handling.
+/// maximum of the reported diagnostics; adaptive multi-chain stopping uses a
+/// separate predictive monitor, while these entries remain available for
+/// diagnostics and backwards-compatible `rhat_h2` handling.
 pub(crate) fn rhat_metrics_to_py<'py>(
     py: Python<'py>,
     names: &[&str],
@@ -431,6 +478,33 @@ pub(crate) fn bayes_chain_seeds(seed: Option<u64>, chains: usize) -> Vec<Option<
         .collect()
 }
 
+const BAYES_ADAPTIVE_CHAIN_START_SCALES: [f64; 4] = [0.7, 1.0, 1.4, 2.0];
+
+/// Return a deterministic overdispersed initial-state scale for adaptive
+/// multi-chain sampling. This changes only the starting latent state; the
+/// prior calibration and all full-conditionals remain unchanged.
+pub(crate) fn bayes_chain_start_scale(chain_index: usize, chains: usize, adaptive: bool) -> f64 {
+    if !adaptive || chains <= 1 {
+        return 1.0;
+    }
+    match chains {
+        2 => [0.7, 2.0][chain_index.min(1)],
+        3 => [0.7, 1.0, 2.0][chain_index.min(2)],
+        _ => BAYES_ADAPTIVE_CHAIN_START_SCALES[chain_index.min(3)],
+    }
+}
+
+/// Scale a Bernoulli inclusion probability through its odds, keeping it in
+/// (0, 1) while preserving the requested base probability at scale 1.
+#[inline]
+pub(crate) fn bayes_chain_start_probability(base: f64, scale: f64) -> f64 {
+    if scale == 1.0 {
+        return base;
+    }
+    let odds = (base / (1.0 - base)) * scale;
+    odds / (1.0 + odds)
+}
+
 /// Pool scalar posterior summaries from native chains. The within-chain
 /// variance follows the population-moment convention used by the existing
 /// kernels; the between-chain term is then added using total variance.
@@ -485,52 +559,45 @@ pub(crate) fn aggregate_bayes_h2(
 
 #[derive(Debug)]
 struct BayesRhatState {
-    // Prefix sums let us evaluate the two split-chain moments in O(1) at
-    // each check.  Keeping the prefix moments rather than rescanning all
-    // retained samples avoids O(n_iter^2) work for long, non-converging runs.
     names: &'static [&'static str],
-    sum: Vec<Vec<f64>>,
-    sq_sum: Vec<Vec<f64>>,
+    window: usize,
+    history: Vec<VecDeque<f64>>,
+    sum: Vec<f64>,
+    sq_sum: Vec<f64>,
+    invalid_count: Vec<usize>,
     valid: Vec<bool>,
+    observed: usize,
     stable_checks: usize,
 }
 
 impl BayesRhatState {
-    fn with_capacity(names: &'static [&'static str], capacity: usize) -> Self {
+    fn with_window(names: &'static [&'static str], window: usize) -> Self {
         Self {
             names,
-            sum: names
+            window: window.max(1),
+            history: names
                 .iter()
-                .map(|_| {
-                    let mut values = Vec::with_capacity(capacity + 1);
-                    values.push(0.0);
-                    values
-                })
+                .map(|_| VecDeque::with_capacity(window.max(1)))
                 .collect(),
-            sq_sum: names
-                .iter()
-                .map(|_| {
-                    let mut values = Vec::with_capacity(capacity + 1);
-                    values.push(0.0);
-                    values
-                })
-                .collect(),
+            sum: vec![0.0; names.len()],
+            sq_sum: vec![0.0; names.len()],
+            invalid_count: vec![0; names.len()],
             valid: vec![true; names.len()],
+            observed: 0,
             stable_checks: 0,
         }
     }
 
     #[inline]
     fn reset(&mut self) {
-        for values in &mut self.sum {
+        for values in &mut self.history {
             values.clear();
-            values.push(0.0);
         }
-        for values in &mut self.sq_sum {
-            values.clear();
-            values.push(0.0);
-        }
+        self.sum.fill(0.0);
+        self.sq_sum.fill(0.0);
+        self.invalid_count.fill(0);
         self.valid.fill(true);
+        self.observed = 0;
         self.stable_checks = 0;
     }
 
@@ -541,23 +608,30 @@ impl BayesRhatState {
             return false;
         }
         for (index, value) in values.iter().copied().enumerate() {
-            let sum = *self.sum[index].last().unwrap_or(&0.0);
-            let sq_sum = *self.sq_sum[index].last().unwrap_or(&0.0);
-            if value.is_finite() {
-                self.sum[index].push(sum + value);
-                self.sq_sum[index].push(sq_sum + value * value);
+            let old = if self.history[index].len() >= self.window {
+                self.history[index].pop_front()
             } else {
-                self.valid[index] = false;
-                self.sum[index].push(sum);
-                self.sq_sum[index].push(sq_sum);
+                None
+            };
+            if let Some(old) = old {
+                if old.is_finite() {
+                    self.sum[index] -= old;
+                    self.sq_sum[index] -= old * old;
+                } else {
+                    self.invalid_count[index] = self.invalid_count[index].saturating_sub(1);
+                }
             }
+            if value.is_finite() {
+                self.sum[index] += value;
+                self.sq_sum[index] += value * value;
+            } else {
+                self.invalid_count[index] += 1;
+            }
+            self.history[index].push_back(value);
         }
-        let n = self
-            .sum
-            .first()
-            .map(|values| values.len().saturating_sub(1))
-            .unwrap_or(0);
-        if n < BAYES_RHAT_MIN_KEEP || n % BAYES_RHAT_CHECK_EVERY != 0 {
+        self.observed = self.observed.saturating_add(1);
+        let n = self.history.first().map(VecDeque::len).unwrap_or(0);
+        if n < BAYES_RHAT_MIN_KEEP || self.observed % BAYES_RHAT_CHECK_EVERY != 0 {
             return false;
         }
         let rhat = self.rhat_max();
@@ -576,13 +650,15 @@ impl BayesRhatState {
 
     #[inline]
     fn values(&self) -> Vec<f64> {
-        self.sum
+        self.history
             .iter()
+            .zip(self.sum.iter())
             .zip(self.sq_sum.iter())
+            .zip(self.invalid_count.iter())
             .zip(self.valid.iter())
-            .map(|((sum, sq_sum), valid)| {
-                if *valid {
-                    split_rhat_from_prefix(sum, sq_sum)
+            .map(|((((history, sum), sq_sum), invalid), valid)| {
+                if *valid && *invalid == 0 {
+                    split_rhat_from_window(history, *sum, *sq_sum)
                 } else {
                     f64::NAN
                 }
@@ -596,39 +672,55 @@ impl BayesRhatState {
     }
 }
 
-/// Controls R-hat monitoring and posterior collection. `n_iter` is the upper
-/// bound for the monitoring phase. Once R-hat stabilizes, the pre-trigger
-/// summaries are discarded and exactly `BAYES_POSTERIOR_SAMPLES` subsequent
-/// samples are retained. If the monitoring phase reaches `n_iter` without
-/// convergence, the same posterior collection phase starts as a fallback.
+/// Controls burn-in, R-hat monitoring, and posterior collection. `None` for
+/// `burnin` selects adaptive mode with `BAYES_AUTO_BURNIN` warm-up updates;
+/// `Some(n)` selects fixed mode with exactly `n` warm-up updates and no R-hat
+/// stopping. The first warm-up updates are excluded from both R-hat and the
+/// posterior. In adaptive mode, `n_iter` is the monitoring upper bound, but it
+/// is extended when necessary to finish warm-up and reach a retained
+/// iteration. Once R-hat stabilizes, the pre-trigger summaries are discarded
+/// and exactly `BAYES_POSTERIOR_SAMPLES` subsequent samples are retained. If
+/// monitoring reaches its upper bound without convergence, the same posterior
+/// collection phase starts as a fallback. An adaptively triggered posterior
+/// window is validated once; failed validation gets one bounded retry, and a
+/// second failure clears `convergence_iteration` while retaining the samples
+/// as a fallback result.
 #[derive(Debug)]
 pub(crate) struct BayesSamplingController {
-    n_iter: usize,
+    monitor_end: usize,
+    burnin: usize,
+    adaptive: bool,
     thin: usize,
     actual_iterations: usize,
     posterior_samples: usize,
-    rhat_state: BayesRhatState,
+    monitor_rhat_state: BayesRhatState,
+    posterior_rhat_state: BayesRhatState,
     convergence_iteration: usize,
     collecting_posterior: bool,
+    posterior_validation_restarts: usize,
 }
 
 impl BayesSamplingController {
     pub(crate) fn new(
         n_iter: usize,
-        _burnin: usize,
+        burnin: Option<usize>,
         thin: usize,
         rhat_names: &'static [&'static str],
     ) -> Self {
+        let (burnin, adaptive) = resolve_burnin(burnin);
         let thin = thin.max(1);
-        let target_keep = BAYES_POSTERIOR_SAMPLES / thin + 1;
         Self {
-            n_iter,
+            monitor_end: monitor_end_iteration(n_iter, burnin, thin, adaptive),
+            burnin,
+            adaptive,
             thin,
             actual_iterations: 0,
             posterior_samples: 0,
-            rhat_state: BayesRhatState::with_capacity(rhat_names, target_keep + 1),
+            monitor_rhat_state: BayesRhatState::with_window(rhat_names, BAYES_RHAT_WINDOW),
+            posterior_rhat_state: BayesRhatState::with_window(rhat_names, BAYES_POSTERIOR_SAMPLES),
             convergence_iteration: 0,
             collecting_posterior: false,
+            posterior_validation_restarts: 0,
         }
     }
 
@@ -637,13 +729,7 @@ impl BayesSamplingController {
         if self.collecting_posterior {
             self.posterior_samples < BAYES_POSTERIOR_SAMPLES
         } else {
-            // A low-level caller may request `thin > 1`. Allow the monitor
-            // to reach the first retained iteration at or after `n_iter`, so
-            // the fallback transition is still observed instead of exiting
-            // with zero posterior samples. Production GS fixes thin=1.
-            let remainder = self.n_iter.saturating_sub(1) % self.thin;
-            let monitor_end = self.n_iter + (self.thin - remainder) % self.thin;
-            self.actual_iterations < monitor_end
+            self.actual_iterations < self.monitor_end
         }
     }
 
@@ -652,7 +738,12 @@ impl BayesSamplingController {
     pub(crate) fn begin_iteration(&mut self) -> bool {
         self.actual_iterations += 1;
         let it = self.actual_iterations - 1;
-        it % self.thin == 0
+        let retained = it >= self.burnin && ((it - self.burnin) % self.thin == 0);
+        if retained && !self.adaptive && !self.collecting_posterior {
+            self.collecting_posterior = true;
+            self.convergence_iteration = 0;
+        }
+        retained
     }
 
     /// Observe a retained h2 sample. Returns true when the monitoring summary
@@ -662,26 +753,56 @@ impl BayesSamplingController {
     pub(crate) fn observe(&mut self, values: &[f64]) -> bool {
         if self.collecting_posterior {
             self.posterior_samples += 1;
-            let _ = self.rhat_state.observe(values);
+            if self.adaptive {
+                let _ = self.posterior_rhat_state.observe(values);
+                if self.posterior_samples >= BAYES_POSTERIOR_SAMPLES
+                    && self.convergence_iteration > 0
+                {
+                    let posterior_rhat = self.posterior_rhat_state.rhat_max();
+                    if !posterior_rhat.is_finite() || posterior_rhat >= BAYES_RHAT_THRESHOLD {
+                        if self.posterior_validation_restarts < BAYES_MAX_POSTERIOR_RESTARTS {
+                            self.posterior_validation_restarts += 1;
+                            self.collecting_posterior = false;
+                            self.convergence_iteration = 0;
+                            self.posterior_samples = 0;
+                            self.monitor_rhat_state.reset();
+                            self.posterior_rhat_state.reset();
+                            let retained_updates = BAYES_RHAT_WINDOW
+                                .saturating_add(
+                                    BAYES_RHAT_CHECK_EVERY.saturating_mul(BAYES_RHAT_STABLE_CHECKS),
+                                )
+                                .saturating_mul(self.thin);
+                            self.monitor_end = self
+                                .monitor_end
+                                .max(self.actual_iterations.saturating_add(retained_updates));
+                            return true;
+                        }
+                        // Do not report an adaptive convergence that failed
+                        // its final posterior-window validation. The samples
+                        // remain available as a fallback result.
+                        self.convergence_iteration = 0;
+                    }
+                }
+            }
             return false;
         }
 
-        if self.rhat_state.observe(values) {
+        if self.monitor_rhat_state.observe(values) {
             self.collecting_posterior = true;
             self.convergence_iteration = self.actual_iterations;
             self.posterior_samples = 0;
-            self.rhat_state.reset();
+            self.posterior_rhat_state.reset();
             return true;
         }
 
         // No convergence by the monitoring upper bound: use the following
         // 1000 iterations as the fallback posterior window. There is no
         // convergence iteration to report in this branch.
-        if self.actual_iterations >= self.n_iter {
+        if self.actual_iterations >= self.monitor_end {
             self.collecting_posterior = true;
             self.convergence_iteration = 0;
             self.posterior_samples = 0;
-            self.rhat_state.reset();
+            self.posterior_rhat_state.reset();
             return true;
         }
 
@@ -695,18 +816,30 @@ impl BayesSamplingController {
 
     #[inline]
     pub(crate) fn rhat_value(&self) -> f64 {
-        self.rhat_state.value()
+        if self.collecting_posterior {
+            self.posterior_rhat_state.value()
+        } else {
+            self.monitor_rhat_state.value()
+        }
     }
 
     #[inline]
     pub(crate) fn rhat_values(&self) -> Vec<f64> {
-        self.rhat_state.values()
+        if self.collecting_posterior {
+            self.posterior_rhat_state.values()
+        } else {
+            self.monitor_rhat_state.values()
+        }
     }
 
     #[cfg(test)]
     #[inline]
     pub(crate) fn rhat_max(&self) -> f64 {
-        self.rhat_state.rhat_max()
+        if self.collecting_posterior {
+            self.posterior_rhat_state.rhat_max()
+        } else {
+            self.monitor_rhat_state.rhat_max()
+        }
     }
 
     #[inline]
@@ -721,14 +854,22 @@ impl BayesSamplingController {
 }
 
 /// Synchronized controller used by the native multi-chain kernels. Every
-/// chain contributes a vector of scalar monitors at the same iteration, so
-/// convergence can be decided from the maximum between-chain Gelman--Rubin
-/// statistic before posterior accumulators are enabled. Marker blocks and all
-/// model state remain in the caller's chain states.
+/// chain contributes report metrics and a predictive monitor vector at the
+/// same retained iteration. Adaptive convergence is decided from the maximum
+/// between-chain Gelman--Rubin statistic of the predictive vector; report
+/// metrics are retained separately for diagnostics. `None` for `burnin`
+/// enables this adaptive decision; `Some(n)` skips it and starts the fixed
+/// 1000-sample posterior window immediately after the warm-up. Marker blocks
+/// and all model state remain in the caller's chain states. A triggered
+/// posterior window is validated once and retried at most once before it is
+/// reported as fallback.
 #[derive(Debug)]
 pub(crate) struct BayesMultiChainController {
     rhat_names: &'static [&'static str],
-    n_iter: usize,
+    monitor_names: &'static [&'static str],
+    monitor_end: usize,
+    burnin: usize,
+    adaptive: bool,
     thin: usize,
     chains: usize,
     actual_iterations: usize,
@@ -737,27 +878,49 @@ pub(crate) struct BayesMultiChainController {
     collecting_posterior: bool,
     stable_checks: usize,
     monitor_n: usize,
+    monitor_history: Vec<Vec<VecDeque<f64>>>,
     monitor_valid: Vec<bool>,
+    monitor_invalid_count: Vec<Vec<usize>>,
     monitor_sum: Vec<Vec<f64>>,
     monitor_sq_sum: Vec<Vec<f64>>,
     posterior_valid: Vec<bool>,
     posterior_sum: Vec<Vec<f64>>,
     posterior_sq_sum: Vec<Vec<f64>>,
+    posterior_monitor_valid: Vec<bool>,
+    posterior_monitor_sum: Vec<Vec<f64>>,
+    posterior_monitor_sq_sum: Vec<Vec<f64>>,
+    posterior_validation_restarts: usize,
 }
 
 impl BayesMultiChainController {
     pub(crate) fn new(
         chains: usize,
         n_iter: usize,
+        burnin: Option<usize>,
         thin: usize,
         rhat_names: &'static [&'static str],
+    ) -> Result<Self, String> {
+        Self::new_with_monitor(chains, n_iter, burnin, thin, rhat_names, rhat_names)
+    }
+
+    pub(crate) fn new_with_monitor(
+        chains: usize,
+        n_iter: usize,
+        burnin: Option<usize>,
+        thin: usize,
+        rhat_names: &'static [&'static str],
+        monitor_names: &'static [&'static str],
     ) -> Result<Self, String> {
         if chains == 0 {
             return Err("native multi-chain controller requires at least one chain".to_string());
         }
+        let (burnin, adaptive) = resolve_burnin(burnin);
         Ok(Self {
             rhat_names,
-            n_iter,
+            monitor_names,
+            monitor_end: monitor_end_iteration(n_iter, burnin, thin.max(1), adaptive),
+            burnin,
+            adaptive,
             thin: thin.max(1),
             chains,
             actual_iterations: 0,
@@ -766,12 +929,25 @@ impl BayesMultiChainController {
             collecting_posterior: false,
             stable_checks: 0,
             monitor_n: 0,
-            monitor_valid: vec![true; rhat_names.len()],
-            monitor_sum: vec![vec![0.0; chains]; rhat_names.len()],
-            monitor_sq_sum: vec![vec![0.0; chains]; rhat_names.len()],
+            monitor_history: monitor_names
+                .iter()
+                .map(|_| {
+                    (0..chains)
+                        .map(|_| VecDeque::with_capacity(BAYES_RHAT_WINDOW))
+                        .collect()
+                })
+                .collect(),
+            monitor_valid: vec![true; monitor_names.len()],
+            monitor_invalid_count: vec![vec![0; chains]; monitor_names.len()],
+            monitor_sum: vec![vec![0.0; chains]; monitor_names.len()],
+            monitor_sq_sum: vec![vec![0.0; chains]; monitor_names.len()],
             posterior_valid: vec![true; rhat_names.len()],
             posterior_sum: vec![vec![0.0; chains]; rhat_names.len()],
             posterior_sq_sum: vec![vec![0.0; chains]; rhat_names.len()],
+            posterior_monitor_valid: vec![true; monitor_names.len()],
+            posterior_monitor_sum: vec![vec![0.0; chains]; monitor_names.len()],
+            posterior_monitor_sq_sum: vec![vec![0.0; chains]; monitor_names.len()],
+            posterior_validation_restarts: 0,
         })
     }
 
@@ -780,16 +956,19 @@ impl BayesMultiChainController {
         if self.collecting_posterior {
             self.posterior_samples < BAYES_POSTERIOR_SAMPLES
         } else {
-            let remainder = self.n_iter.saturating_sub(1) % self.thin;
-            let monitor_end = self.n_iter + (self.thin - remainder) % self.thin;
-            self.actual_iterations < monitor_end
+            self.actual_iterations < self.monitor_end
         }
     }
 
     #[inline]
     pub(crate) fn begin_iteration(&mut self) -> bool {
         self.actual_iterations += 1;
-        (self.actual_iterations - 1) % self.thin == 0
+        let it = self.actual_iterations - 1;
+        let retained = it >= self.burnin && ((it - self.burnin) % self.thin == 0);
+        if retained && !self.adaptive && !self.collecting_posterior {
+            self.start_posterior(false);
+        }
+        retained
     }
 
     #[inline]
@@ -805,7 +984,34 @@ impl BayesMultiChainController {
             values.fill(0.0);
         }
         self.posterior_valid.fill(true);
+        self.posterior_monitor_valid.fill(true);
+        for values in &mut self.posterior_monitor_sum {
+            values.fill(0.0);
+        }
+        for values in &mut self.posterior_monitor_sq_sum {
+            values.fill(0.0);
+        }
         self.posterior_samples = 0;
+    }
+
+    fn reset_monitor_state(&mut self) {
+        for values in &mut self.monitor_history {
+            for history in values {
+                history.clear();
+            }
+        }
+        self.monitor_valid.fill(true);
+        for values in &mut self.monitor_invalid_count {
+            values.fill(0);
+        }
+        for values in &mut self.monitor_sum {
+            values.fill(0.0);
+        }
+        for values in &mut self.monitor_sq_sum {
+            values.fill(0.0);
+        }
+        self.monitor_n = 0;
+        self.stable_checks = 0;
     }
 
     fn start_posterior(&mut self, converged: bool) {
@@ -814,8 +1020,47 @@ impl BayesMultiChainController {
         self.reset_accumulators();
     }
 
+    fn posterior_monitor_rhat(&self) -> f64 {
+        if self.posterior_samples < 2 {
+            return f64::NAN;
+        }
+        let values = self
+            .posterior_monitor_sum
+            .iter()
+            .zip(self.posterior_monitor_sq_sum.iter())
+            .zip(self.posterior_monitor_valid.iter())
+            .map(|((sum, sq_sum), valid)| {
+                if *valid {
+                    multi_chain_rhat_from_moments(sum, sq_sum, self.posterior_samples)
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect::<Vec<_>>();
+        finite_rhat_max(&values)
+    }
+
+    fn restart_adaptive_monitoring(&mut self) {
+        self.collecting_posterior = false;
+        self.convergence_iteration = 0;
+        self.reset_accumulators();
+        self.reset_monitor_state();
+        let retained_updates = BAYES_RHAT_WINDOW
+            .saturating_add(BAYES_RHAT_CHECK_EVERY.saturating_mul(BAYES_RHAT_STABLE_CHECKS))
+            .saturating_mul(self.thin);
+        self.monitor_end = self
+            .monitor_end
+            .max(self.actual_iterations.saturating_add(retained_updates));
+    }
+
     fn monitor_rhat(&self) -> f64 {
-        if self.monitor_n < BAYES_RHAT_MIN_KEEP {
+        let window_n = self
+            .monitor_history
+            .first()
+            .and_then(|chains| chains.first())
+            .map(VecDeque::len)
+            .unwrap_or(0);
+        if window_n < BAYES_RHAT_MIN_KEEP {
             return f64::NAN;
         }
         let values = self
@@ -823,9 +1068,10 @@ impl BayesMultiChainController {
             .iter()
             .zip(self.monitor_sq_sum.iter())
             .zip(self.monitor_valid.iter())
-            .map(|((sum, sq_sum), valid)| {
-                if *valid {
-                    multi_chain_rhat_from_moments(sum, sq_sum, self.monitor_n)
+            .zip(self.monitor_invalid_count.iter())
+            .map(|(((sum, sq_sum), valid), invalid_count)| {
+                if *valid && invalid_count.iter().all(|count| *count == 0) {
+                    multi_chain_rhat_from_moments(sum, sq_sum, window_n)
                 } else {
                     f64::NAN
                 }
@@ -837,6 +1083,15 @@ impl BayesMultiChainController {
     /// Observe one synchronized retained sample. Returns true when model
     /// accumulators must be cleared before the next iteration.
     pub(crate) fn observe(&mut self, values: &[Vec<f64>], retained: bool) -> Result<bool, String> {
+        self.observe_with_monitor(values, values, retained)
+    }
+
+    pub(crate) fn observe_with_monitor(
+        &mut self,
+        values: &[Vec<f64>],
+        monitor_values: &[Vec<f64>],
+        retained: bool,
+    ) -> Result<bool, String> {
         if !retained {
             return Ok(false);
         }
@@ -846,6 +1101,13 @@ impl BayesMultiChainController {
                 .any(|value| value.len() != self.rhat_names.len())
         {
             return Err("native multi-chain R-hat metric dimensions mismatch".to_string());
+        }
+        if monitor_values.len() != self.chains
+            || monitor_values
+                .iter()
+                .any(|value| value.len() != self.monitor_names.len())
+        {
+            return Err("native multi-chain predictive monitor dimensions mismatch".to_string());
         }
         if self.collecting_posterior {
             for (chain, chain_values) in values.iter().enumerate() {
@@ -858,17 +1120,58 @@ impl BayesMultiChainController {
                     }
                 }
             }
+            for (chain, chain_values) in monitor_values.iter().enumerate() {
+                for (metric, value) in chain_values.iter().copied().enumerate() {
+                    if value.is_finite() {
+                        self.posterior_monitor_sum[metric][chain] += value;
+                        self.posterior_monitor_sq_sum[metric][chain] += value * value;
+                    } else {
+                        self.posterior_monitor_valid[metric] = false;
+                    }
+                }
+            }
             self.posterior_samples += 1;
+            if self.adaptive
+                && self.posterior_samples >= BAYES_POSTERIOR_SAMPLES
+                && self.convergence_iteration > 0
+            {
+                let predictive_rhat = self.posterior_monitor_rhat();
+                if !predictive_rhat.is_finite() || predictive_rhat >= BAYES_RHAT_THRESHOLD {
+                    if self.posterior_validation_restarts < BAYES_MAX_POSTERIOR_RESTARTS {
+                        self.posterior_validation_restarts += 1;
+                        self.restart_adaptive_monitoring();
+                        return Ok(true);
+                    }
+                    // A second failed validation is still a failed adaptive
+                    // convergence attempt. Keep the posterior window for a
+                    // usable fallback result, but never report that it
+                    // converged.
+                    self.convergence_iteration = 0;
+                }
+            }
             return Ok(false);
         }
-        for (chain, chain_values) in values.iter().enumerate() {
+        for (chain, chain_values) in monitor_values.iter().enumerate() {
             for (metric, value) in chain_values.iter().copied().enumerate() {
+                let history = &mut self.monitor_history[metric][chain];
+                if history.len() >= BAYES_RHAT_WINDOW {
+                    if let Some(old) = history.pop_front() {
+                        if old.is_finite() {
+                            self.monitor_sum[metric][chain] -= old;
+                            self.monitor_sq_sum[metric][chain] -= old * old;
+                        } else {
+                            self.monitor_invalid_count[metric][chain] =
+                                self.monitor_invalid_count[metric][chain].saturating_sub(1);
+                        }
+                    }
+                }
                 if value.is_finite() {
                     self.monitor_sum[metric][chain] += value;
                     self.monitor_sq_sum[metric][chain] += value * value;
                 } else {
-                    self.monitor_valid[metric] = false;
+                    self.monitor_invalid_count[metric][chain] += 1;
                 }
+                history.push_back(value);
             }
         }
         self.monitor_n += 1;
@@ -883,7 +1186,7 @@ impl BayesMultiChainController {
                 return Ok(true);
             }
         }
-        if self.actual_iterations >= self.n_iter {
+        if self.actual_iterations >= self.monitor_end {
             self.start_posterior(false);
             return Ok(true);
         }
@@ -921,6 +1224,9 @@ impl BayesMultiChainController {
     }
 
     pub(crate) fn posterior_rhat_values(&self) -> Vec<f64> {
+        if !self.adaptive {
+            return vec![f64::NAN; self.rhat_names.len()];
+        }
         self.posterior_sum
             .iter()
             .zip(self.posterior_sq_sum.iter())
@@ -983,11 +1289,8 @@ fn multi_chain_rhat_from_moments(sum: &[f64], sq_sum: &[f64], n: usize) -> f64 {
     }
 }
 
-fn split_rhat_from_prefix(sum: &[f64], sq_sum: &[f64]) -> f64 {
-    let n = sum.len().saturating_sub(1);
-    if sq_sum.len() != sum.len() {
-        return f64::NAN;
-    }
+fn split_rhat_from_window(history: &VecDeque<f64>, total_sum: f64, total_sq_sum: f64) -> f64 {
+    let n = history.len();
     if n < 4 {
         return f64::NAN;
     }
@@ -996,13 +1299,29 @@ fn split_rhat_from_prefix(sum: &[f64], sq_sum: &[f64]) -> f64 {
     if chain_n < 2 {
         return f64::NAN;
     }
-    let left_sum = sum[chain_n];
-    let left_sq_sum = sq_sum[chain_n];
+    let left_sum = history.iter().take(chain_n).sum::<f64>();
+    let left_sq_sum = history
+        .iter()
+        .take(chain_n)
+        .map(|value| value * value)
+        .sum::<f64>();
     let split_end = chain_n * 2;
-    let total_sum = sum[split_end];
-    let total_sq_sum = sq_sum[split_end];
-    let right_sum = total_sum - left_sum;
-    let right_sq_sum = total_sq_sum - left_sq_sum;
+    let split_sum = if split_end == n {
+        total_sum
+    } else {
+        history.iter().take(split_end).sum::<f64>()
+    };
+    let split_sq_sum = if split_end == n {
+        total_sq_sum
+    } else {
+        history
+            .iter()
+            .take(split_end)
+            .map(|value| value * value)
+            .sum::<f64>()
+    };
+    let right_sum = split_sum - left_sum;
+    let right_sq_sum = split_sq_sum - left_sq_sum;
     let mean_left = left_sum / chain_n as f64;
     let mean_right = right_sum / chain_n as f64;
     let var_left =
@@ -2751,6 +3070,74 @@ fn maybe_predecode_source_dense_f32(
     Ok(Some(dense_f32))
 }
 
+#[inline]
+fn genetic_value_from_residual(
+    y: &[f64],
+    r: &[f64],
+    x: &[f64],
+    alpha: &[f64],
+    i: usize,
+    q: usize,
+) -> f64 {
+    let mut xa = 0.0;
+    for k in 0..q {
+        xa += x[i * q + k] * alpha[k];
+    }
+    y[i] - r[i] - xa
+}
+
+/// Build the low-dimensional predictive state used by adaptive multi-chain
+/// stopping.  The fixed sign sketches are cheap linear projections of the
+/// current GEBV vector; unlike mixture hyperparameters, they directly detect
+/// chains that still disagree on marker allocation and predictions.
+pub(crate) fn bayes_predictive_monitor_values(
+    y: &[f64],
+    r: &[f64],
+    x: &[f64],
+    alpha: &[f64],
+    n: usize,
+    q: usize,
+    h2: f64,
+    var_g: f64,
+    var_e: f64,
+) -> Vec<f64> {
+    if n <= 1 || y.len() < n || r.len() < n || x.len() < n.saturating_mul(q) || alpha.len() < q {
+        return vec![f64::NAN; BAYES_PREDICTIVE_MONITOR_NAMES.len()];
+    }
+    let mut mean_g = 0.0;
+    let mut mean_y = 0.0;
+    for i in 0..n {
+        let g = genetic_value_from_residual(y, r, x, alpha, i, q);
+        let count = (i + 1) as f64;
+        mean_g += (g - mean_g) / count;
+        mean_y += (y[i] - mean_y) / count;
+    }
+    let mut centered_ss_g = 0.0;
+    let mut centered_cross_gy = 0.0;
+    let mut sketches = [0.0_f64; 8];
+    for i in 0..n {
+        let g = genetic_value_from_residual(y, r, x, alpha, i, q);
+        let centered_g = g - mean_g;
+        let centered_y = y[i] - mean_y;
+        centered_ss_g += centered_g * centered_g;
+        centered_cross_gy += centered_g * centered_y;
+        for (sketch, value) in sketches.iter_mut().enumerate() {
+            let key =
+                (i as u64).wrapping_add((sketch as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let sign = if splitmix64(key) & 1 == 0 { 1.0 } else { -1.0 };
+            *value += sign * centered_g;
+        }
+    }
+    let denominator = (n - 1) as f64;
+    let mut values = Vec::with_capacity(BAYES_PREDICTIVE_MONITOR_NAMES.len());
+    values.extend([h2, var_g, var_e]);
+    values.push(mean_g);
+    values.push(centered_ss_g / denominator);
+    values.push(centered_cross_gy / denominator);
+    values.extend(sketches.into_iter().map(|value| value / n as f64));
+    values
+}
+
 pub(crate) fn genetic_variance_from_residual(
     y: &[f64],
     r: &[f64],
@@ -2765,11 +3152,7 @@ pub(crate) fn genetic_variance_from_residual(
     let mut mean_g = 0.0;
     let mut m2 = 0.0;
     for i in 0..n {
-        let mut xa = 0.0;
-        for k in 0..q {
-            xa += x[i * q + k] * alpha[k];
-        }
-        let g = y[i] - r[i] - xa;
+        let g = genetic_value_from_residual(y, r, x, alpha, i, q);
         let delta = g - mean_g;
         mean_g += delta / (i as f64 + 1.0);
         let delta2 = g - mean_g;
@@ -2831,7 +3214,7 @@ fn bayesb_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -3127,7 +3510,7 @@ fn bayesc_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -3407,7 +3790,7 @@ fn bayesa_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -3930,6 +4313,7 @@ impl BayesAChainState {
         s0_b: f64,
         df0_b: f64,
         var_e: f64,
+        start_scale: f64,
         seed: Option<u64>,
     ) -> Self {
         let rng = match seed {
@@ -3942,11 +4326,12 @@ impl BayesAChainState {
                 StdRng::from_seed(seed_bytes)
             }
         };
+        let initial_s = s0_b * start_scale;
         Self {
             rng,
             beta: vec![0.0; p],
-            var_b: vec![s0_b / (df0_b + 2.0); p],
-            s: s0_b,
+            var_b: vec![initial_s / (df0_b + 2.0); p],
+            s: initial_s,
             var_e,
             alpha: fixed_init.alpha.clone(),
             residual: fixed_init.residual.clone(),
@@ -3976,7 +4361,7 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
     x: &[f64],
     q: usize,
     n_iter: usize,
-    _burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -4011,14 +4396,33 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
     let prior_ss_e = prior_calibration.prior_ss_e;
     let x2_x = fixed_effects.x2_x();
     let xtx = fixed_effects.xtx();
+    let adaptive = burnin.is_none();
     let seeds = bayes_chain_seeds(seed, chains);
     let mut states = seeds
         .into_iter()
-        .map(|chain_seed| {
-            BayesAChainState::new(&fixed_init, p, q, s0_b, df0_b, initial_var_e, chain_seed)
+        .enumerate()
+        .map(|(chain_index, chain_seed)| {
+            let start_scale = bayes_chain_start_scale(chain_index, chains, adaptive);
+            BayesAChainState::new(
+                &fixed_init,
+                p,
+                q,
+                s0_b,
+                df0_b,
+                initial_var_e,
+                start_scale,
+                chain_seed,
+            )
         })
         .collect::<Vec<_>>();
-    let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_A_NAMES)?;
+    let mut controller = BayesMultiChainController::new_with_monitor(
+        chains,
+        n_iter,
+        burnin,
+        thin,
+        BAYES_RHAT_A_NAMES,
+        BAYES_PREDICTIVE_MONITOR_NAMES,
+    )?;
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|error| error.to_string())?;
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
     let var_b_fixed = 1.0e10_f64;
@@ -4067,7 +4471,7 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
             Ok(())
         })?;
 
-        let metrics = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
+        let chain_summaries = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
             copy_f32_to_f64(&state.marker_residual, &mut state.residual);
             for j in 0..p {
                 state.var_b[j] = bayes_positive_floor(
@@ -4095,9 +4499,23 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
                 }
                 state.var_e_sum += state.var_e;
             }
-            Ok(vec![h2_value, var_g, state.var_e])
+            Ok((
+                vec![h2_value, var_g, state.var_e],
+                bayes_predictive_monitor_values(
+                    y,
+                    &state.residual,
+                    x,
+                    &state.alpha,
+                    n,
+                    q,
+                    h2_value,
+                    var_g,
+                    state.var_e,
+                ),
+            ))
         })?;
-        if controller.observe(&metrics, retained)? {
+        let (metrics, monitor_metrics): (Vec<_>, Vec<_>) = chain_summaries.into_iter().unzip();
+        if controller.observe_with_monitor(&metrics, &monitor_metrics, retained)? {
             bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
                 state.clear_posterior();
             });
@@ -4169,6 +4587,7 @@ impl BayesBChainState {
         var_e: f64,
         prob_in: f64,
         df0_b: f64,
+        start_scale: f64,
         seed: Option<u64>,
     ) -> Self {
         let rng = match seed {
@@ -4181,12 +4600,13 @@ impl BayesBChainState {
                 StdRng::from_seed(seed_bytes)
             }
         };
+        let initial_s = s0_b * start_scale;
         Self {
             rng,
             beta: vec![0.0; p],
             d: vec![0; p],
-            var_b: vec![s0_b / (df0_b + 2.0); p],
-            s: s0_b,
+            var_b: vec![initial_s / (df0_b + 2.0); p],
+            s: initial_s,
             prob_in,
             var_e,
             alpha: fixed_init.alpha.clone(),
@@ -4223,7 +4643,7 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
     x: &[f64],
     q: usize,
     n_iter: usize,
-    _burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -4269,23 +4689,39 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
     let x2_x = fixed_effects.x2_x();
     let xtx = fixed_effects.xtx();
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
+    let adaptive = burnin.is_none();
     let seeds = bayes_chain_seeds(seed, chains);
     let mut states = seeds
         .into_iter()
-        .map(|chain_seed| {
+        .enumerate()
+        .map(|(chain_index, chain_seed)| {
+            let start_scale = bayes_chain_start_scale(chain_index, chains, adaptive);
+            let start_prob = if fixed_prob_in_opt.is_some() {
+                prob_in_base
+            } else {
+                bayes_chain_start_probability(prob_in_base, start_scale)
+            };
             BayesBChainState::new(
                 &fixed_init,
                 p,
                 q,
                 s0_b,
                 initial_var_e,
-                prob_in_base,
+                start_prob,
                 df0_b,
+                start_scale,
                 chain_seed,
             )
         })
         .collect::<Vec<_>>();
-    let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_B_NAMES)?;
+    let mut controller = BayesMultiChainController::new_with_monitor(
+        chains,
+        n_iter,
+        burnin,
+        thin,
+        BAYES_RHAT_B_NAMES,
+        BAYES_PREDICTIVE_MONITOR_NAMES,
+    )?;
     let chi_b_active = ChiSquared::new(df0_b + 1.0).map_err(|error| error.to_string())?;
     let chi_b_inactive = ChiSquared::new(df0_b).map_err(|error| error.to_string())?;
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
@@ -4361,7 +4797,7 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
             })
         })?;
 
-        let metrics = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
+        let chain_summaries = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
             copy_f32_to_f64(&state.marker_residual, &mut state.residual);
             let mut n_active = 0usize;
             for j in 0..p {
@@ -4411,9 +4847,23 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
                 state.prob_in_sum += state.prob_in;
                 state.n_active_sum += mrk_in;
             }
-            Ok(vec![h2_value, var_g, state.var_e, state.prob_in, mrk_in])
+            Ok((
+                vec![h2_value, var_g, state.var_e, state.prob_in, mrk_in],
+                bayes_predictive_monitor_values(
+                    y,
+                    &state.residual,
+                    x,
+                    &state.alpha,
+                    n,
+                    q,
+                    h2_value,
+                    var_g,
+                    state.var_e,
+                ),
+            ))
         })?;
-        if controller.observe(&metrics, retained)? {
+        let (metrics, monitor_metrics): (Vec<_>, Vec<_>) = chain_summaries.into_iter().unzip();
+        if controller.observe_with_monitor(&metrics, &monitor_metrics, retained)? {
             bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
                 state.clear_posterior();
             });
@@ -4488,6 +4938,7 @@ impl BayesCChainState {
         s0_b: f64,
         var_e: f64,
         prob_in: f64,
+        start_scale: f64,
         seed: Option<u64>,
     ) -> Self {
         let rng = match seed {
@@ -4500,11 +4951,12 @@ impl BayesCChainState {
                 StdRng::from_seed(seed_bytes)
             }
         };
+        let initial_var_b = s0_b * start_scale;
         Self {
             rng,
             beta: vec![0.0; p],
             d: vec![0; p],
-            var_b: s0_b,
+            var_b: initial_var_b,
             prob_in,
             var_e,
             alpha: fixed_init.alpha.clone(),
@@ -4541,7 +4993,7 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
     x: &[f64],
     q: usize,
     n_iter: usize,
-    _burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -4578,22 +5030,38 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
     let x2_x = fixed_effects.x2_x();
     let xtx = fixed_effects.xtx();
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
+    let adaptive = burnin.is_none();
     let seeds = bayes_chain_seeds(seed, chains);
     let mut states = seeds
         .into_iter()
-        .map(|chain_seed| {
+        .enumerate()
+        .map(|(chain_index, chain_seed)| {
+            let start_scale = bayes_chain_start_scale(chain_index, chains, adaptive);
+            let start_prob = if fixed_prob_in_opt.is_some() {
+                prob_in_base
+            } else {
+                bayes_chain_start_probability(prob_in_base, start_scale)
+            };
             BayesCChainState::new(
                 &fixed_init,
                 p,
                 q,
                 s0_b,
                 initial_var_e,
-                prob_in_base,
+                start_prob,
+                start_scale,
                 chain_seed,
             )
         })
         .collect::<Vec<_>>();
-    let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_C_NAMES)?;
+    let mut controller = BayesMultiChainController::new_with_monitor(
+        chains,
+        n_iter,
+        burnin,
+        thin,
+        BAYES_RHAT_C_NAMES,
+        BAYES_PREDICTIVE_MONITOR_NAMES,
+    )?;
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
     let var_b_fixed = 1.0e10_f64;
 
@@ -4666,7 +5134,7 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
                 Ok(())
             })
         })?;
-        let metrics = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
+        let chain_summaries = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
             copy_f32_to_f64(&state.marker_residual, &mut state.residual);
             let mut active = 0usize;
             let mut ss_b = 0.0;
@@ -4708,16 +5176,30 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
                 state.prob_in_sum += state.prob_in;
                 state.n_active_sum += active as f64;
             }
-            Ok(vec![
-                h2_value,
-                var_g,
-                state.var_e,
-                state.var_b,
-                state.prob_in,
-                active as f64,
-            ])
+            Ok((
+                vec![
+                    h2_value,
+                    var_g,
+                    state.var_e,
+                    state.var_b,
+                    state.prob_in,
+                    active as f64,
+                ],
+                bayes_predictive_monitor_values(
+                    y,
+                    &state.residual,
+                    x,
+                    &state.alpha,
+                    n,
+                    q,
+                    h2_value,
+                    var_g,
+                    state.var_e,
+                ),
+            ))
         })?;
-        if controller.observe(&metrics, retained)? {
+        let (metrics, monitor_metrics): (Vec<_>, Vec<_>) = chain_summaries.into_iter().unzip();
+        if controller.observe_with_monitor(&metrics, &monitor_metrics, retained)? {
             bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
                 state.clear_posterior();
             });
@@ -4768,7 +5250,7 @@ fn bayesa_multi_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -4842,7 +5324,7 @@ fn bayesb_multi_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -4923,7 +5405,7 @@ fn bayesc_multi_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -5004,7 +5486,7 @@ fn bayesa_packed_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -5299,7 +5781,7 @@ fn bayesb_packed_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -5661,7 +6143,7 @@ fn bayesc_packed_core_impl(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -6017,7 +6499,7 @@ fn bayesa_packed_multi_core_impl<'a>(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -6142,7 +6624,7 @@ fn bayesb_packed_multi_core_impl<'a>(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -6277,7 +6759,7 @@ fn bayesc_packed_multi_core_impl<'a>(
     p: usize,
     q: usize,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -6394,7 +6876,7 @@ fn bayesc_packed_multi_core_impl<'a>(
     m,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -6414,7 +6896,7 @@ pub fn bayesa(
     m: Bound<'_, PyAny>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -6544,7 +7026,7 @@ pub fn bayesa(
     m,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -6566,7 +7048,7 @@ pub fn bayesb(
     m: Bound<'_, PyAny>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -6711,7 +7193,7 @@ pub fn bayesb(
     m,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -6731,7 +7213,7 @@ pub fn bayesc(
     m: Bound<'_, PyAny>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -6880,7 +7362,7 @@ pub fn bayesc(
     sample_indices,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -6907,7 +7389,7 @@ pub fn bayesa_packed(
     sample_indices: PyReadonlyArray1<i64>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -7110,7 +7592,7 @@ pub fn bayesa_packed(
     sample_indices,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -7139,7 +7621,7 @@ pub fn bayesb_packed(
     sample_indices: PyReadonlyArray1<i64>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -7355,7 +7837,7 @@ pub fn bayesb_packed(
     sample_indices,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -7382,7 +7864,7 @@ pub fn bayesc_packed(
     sample_indices: PyReadonlyArray1<i64>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -7599,7 +8081,7 @@ pub fn bayesc_packed(
     sample_indices,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -7628,7 +8110,7 @@ pub fn bayesa_stream_bed(
     sample_indices: PyReadonlyArray1<i64>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -7823,7 +8305,7 @@ pub fn bayesa_stream_bed(
     sample_indices,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -7854,7 +8336,7 @@ pub fn bayesb_stream_bed(
     sample_indices: PyReadonlyArray1<i64>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -8062,7 +8544,7 @@ pub fn bayesb_stream_bed(
     sample_indices,
     x = None,
     n_iter = 10000,
-    burnin = 1000,
+    burnin = None,
     thin = 1,
     r2 = 0.5,
     df0_b = 5.0,
@@ -8091,7 +8573,7 @@ pub fn bayesc_stream_bed(
     sample_indices: PyReadonlyArray1<i64>,
     x: Option<PyReadonlyArray2<f64>>,
     n_iter: usize,
-    burnin: usize,
+    burnin: Option<usize>,
     thin: usize,
     r2: f64,
     df0_b: f64,
@@ -9895,6 +10377,81 @@ mod backend_tests {
     }
 
     #[test]
+    fn adaptive_chain_start_scales_are_overdispersed_but_fixed_mode_is_neutral() {
+        let scales = (0..4)
+            .map(|index| bayes_chain_start_scale(index, 4, true))
+            .collect::<Vec<_>>();
+        assert_eq!(scales, vec![0.7, 1.0, 1.4, 2.0]);
+        assert_eq!(bayes_chain_start_scale(0, 4, false), 1.0);
+        assert_eq!(bayes_chain_start_scale(0, 1, true), 1.0);
+        assert_eq!(bayes_chain_start_scale(1, 2, true), 2.0);
+        assert_eq!(bayes_chain_start_scale(1, 3, true), 1.0);
+    }
+
+    #[test]
+    fn adaptive_chain_probability_scales_inclusion_odds() {
+        let base = 0.2;
+        let lower = bayes_chain_start_probability(base, 0.7);
+        let upper = bayes_chain_start_probability(base, 2.0);
+        assert_eq!(bayes_chain_start_probability(base, 1.0), base);
+        assert!(lower < base && base < upper);
+        assert!((lower / (1.0 - lower) - 0.7 * base / (1.0 - base)).abs() < 1e-12);
+        assert!((upper / (1.0 - upper) - 2.0 * base / (1.0 - base)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn adaptive_chain_start_scale_separates_a_b_and_c_states() {
+        let fixed_init = BayesFixedEffectInit {
+            alpha: vec![0.0],
+            residual: vec![1.0, -1.0],
+        };
+        let a_low = BayesAChainState::new(&fixed_init, 2, 1, 4.0, 5.0, 2.0, 0.7, Some(1));
+        let a_high = BayesAChainState::new(&fixed_init, 2, 1, 4.0, 5.0, 2.0, 2.0, Some(2));
+        assert!(a_low.s < a_high.s);
+        assert!(a_low.var_b[0] < a_high.var_b[0]);
+
+        let b_low = BayesBChainState::new(&fixed_init, 2, 1, 4.0, 2.0, 0.1, 5.0, 0.7, Some(1));
+        let b_high = BayesBChainState::new(&fixed_init, 2, 1, 4.0, 2.0, 0.1, 5.0, 2.0, Some(2));
+        assert!(b_low.s < b_high.s);
+        assert!(b_low.var_b[0] < b_high.var_b[0]);
+
+        let c_low = BayesCChainState::new(&fixed_init, 2, 1, 4.0, 2.0, 0.1, 0.7, Some(1));
+        let c_high = BayesCChainState::new(&fixed_init, 2, 1, 4.0, 2.0, 0.1, 2.0, Some(2));
+        assert!(c_low.var_b < c_high.var_b);
+    }
+
+    #[test]
+    fn predictive_monitor_tracks_gebv_state_without_changing_report_metrics() {
+        let y = [1.0, 2.0, 3.0, 4.0];
+        let residual = [0.5, 1.0, 1.5, 2.0];
+        let x = [1.0, 1.0, 1.0, 1.0];
+        let alpha = [0.5];
+        let values =
+            bayes_predictive_monitor_values(&y, &residual, &x, &alpha, 4, 1, 0.25, 0.75, 0.5);
+        assert_eq!(values.len(), BAYES_PREDICTIVE_MONITOR_NAMES.len());
+        assert_eq!(&values[..3], &[0.25, 0.75, 0.5]);
+        assert!((values[3] - 0.75).abs() < 1e-12);
+        assert!(values.iter().all(|value| value.is_finite()));
+
+        let changed_residual = [0.25, 1.0, 1.75, 2.5];
+        let changed = bayes_predictive_monitor_values(
+            &y,
+            &changed_residual,
+            &x,
+            &alpha,
+            4,
+            1,
+            0.25,
+            0.75,
+            0.5,
+        );
+        assert!(values[3..]
+            .iter()
+            .zip(changed[3..].iter())
+            .any(|(a, b)| { (a - b).abs() > 1e-12 }));
+    }
+
+    #[test]
     fn pooled_chain_rhat_detects_between_chain_shift() {
         let equal = aggregate_bayes_h2(&[0.5, 0.5], &[0.01, 0.01], &[1.01, 1.02], 1000);
         assert!(equal.0 > 0.49 && equal.0 < 0.51);
@@ -9906,7 +10463,7 @@ mod backend_tests {
     #[test]
     fn native_chain_controller_does_not_converge_on_shifted_constant_chains() {
         let mut controller =
-            BayesMultiChainController::new(2, 2000, 1, BAYES_RHAT_A_NAMES).unwrap();
+            BayesMultiChainController::new(2, 2000, None, 1, BAYES_RHAT_A_NAMES).unwrap();
         let mut started = false;
         for _ in 0..650 {
             assert!(controller.should_run());
@@ -9924,8 +10481,223 @@ mod backend_tests {
     }
 
     #[test]
+    fn multi_chain_adaptive_stop_ignores_architecture_report_metrics() {
+        let mut controller = BayesMultiChainController::new_with_monitor(
+            2,
+            2000,
+            None,
+            1,
+            BAYES_RHAT_R_NAMES,
+            BAYES_PREDICTIVE_MONITOR_NAMES,
+        )
+        .unwrap();
+        let stable_monitor = vec![0.5; BAYES_PREDICTIVE_MONITOR_NAMES.len()];
+        let shifted_report = [
+            vec![0.1, 0.2, 0.3, 2.0, 0.1, 0.1, 0.1, 0.1, 1.0],
+            vec![0.9, 0.8, 0.7, 8.0, 0.9, 0.9, 0.9, 0.9, 9.0],
+        ];
+        let mut started = false;
+        while controller.should_run() {
+            let retained = controller.begin_iteration();
+            if controller
+                .observe_with_monitor(
+                    &shifted_report,
+                    &[stable_monitor.clone(), stable_monitor.clone()],
+                    retained,
+                )
+                .unwrap()
+            {
+                started = true;
+                break;
+            }
+        }
+        assert!(started);
+        assert!(controller.collecting_posterior());
+    }
+
+    #[test]
+    fn multi_chain_adaptive_stop_detects_predictive_monitor_shift() {
+        let mut controller = BayesMultiChainController::new_with_monitor(
+            2,
+            2000,
+            None,
+            1,
+            BAYES_RHAT_R_NAMES,
+            BAYES_PREDICTIVE_MONITOR_NAMES,
+        )
+        .unwrap();
+        let mut shifted_monitor = [
+            vec![0.5; BAYES_PREDICTIVE_MONITOR_NAMES.len()],
+            vec![0.5; BAYES_PREDICTIVE_MONITOR_NAMES.len()],
+        ];
+        for value in &mut shifted_monitor[1] {
+            *value = 1.5;
+        }
+        let report = vec![0.5; BAYES_RHAT_R_NAMES.len()];
+        let reports = [report.clone(), report];
+        for _ in 0..650 {
+            assert!(controller.should_run());
+            let retained = controller.begin_iteration();
+            assert!(!controller
+                .observe_with_monitor(&reports, &shifted_monitor, retained)
+                .unwrap());
+        }
+        assert!(!controller.collecting_posterior());
+    }
+
+    #[test]
+    fn posterior_predictive_validation_restarts_after_post_trigger_drift() {
+        let mut controller = BayesMultiChainController::new_with_monitor(
+            2,
+            5000,
+            None,
+            1,
+            BAYES_RHAT_R_NAMES,
+            BAYES_PREDICTIVE_MONITOR_NAMES,
+        )
+        .unwrap();
+        let report = vec![
+            vec![0.5; BAYES_RHAT_R_NAMES.len()],
+            vec![0.5; BAYES_RHAT_R_NAMES.len()],
+        ];
+        let stable_monitor = [
+            vec![0.5; BAYES_PREDICTIVE_MONITOR_NAMES.len()],
+            vec![0.5; BAYES_PREDICTIVE_MONITOR_NAMES.len()],
+        ];
+        for _ in 0..BAYES_AUTO_BURNIN {
+            let retained = controller.begin_iteration();
+            assert!(!retained);
+            assert!(!controller
+                .observe_with_monitor(&report, &stable_monitor, retained)
+                .unwrap());
+        }
+        let mut triggered = false;
+        while !triggered {
+            assert!(controller.should_run());
+            let retained = controller.begin_iteration();
+            triggered = controller
+                .observe_with_monitor(&report, &stable_monitor, retained)
+                .unwrap();
+        }
+        assert!(controller.collecting_posterior());
+        assert!(controller.convergence_iteration() > 0);
+
+        let divergent_monitor = [
+            vec![0.5; BAYES_PREDICTIVE_MONITOR_NAMES.len()],
+            vec![1.5; BAYES_PREDICTIVE_MONITOR_NAMES.len()],
+        ];
+        for index in 0..BAYES_POSTERIOR_SAMPLES {
+            let retained = controller.begin_iteration();
+            assert!(retained);
+            let restarted = controller
+                .observe_with_monitor(&report, &divergent_monitor, retained)
+                .unwrap();
+            if index + 1 < BAYES_POSTERIOR_SAMPLES {
+                assert!(!restarted);
+            } else {
+                assert!(restarted);
+            }
+        }
+        assert!(!controller.collecting_posterior());
+        assert_eq!(controller.posterior_samples(), 0);
+        assert_eq!(controller.convergence_iteration(), 0);
+        assert!(controller.should_run());
+
+        // The retry must also be validated. Exhausting the bounded retry
+        // budget may retain a fallback posterior, but it cannot restore a
+        // false positive convergence flag.
+        let mut retriggered = false;
+        while !retriggered {
+            assert!(controller.should_run());
+            let retained = controller.begin_iteration();
+            retriggered = controller
+                .observe_with_monitor(&report, &stable_monitor, retained)
+                .unwrap();
+        }
+        assert!(controller.collecting_posterior());
+        assert!(controller.convergence_iteration() > 0);
+        for index in 0..BAYES_POSTERIOR_SAMPLES {
+            let retained = controller.begin_iteration();
+            assert!(retained);
+            let completed = controller
+                .observe_with_monitor(&report, &divergent_monitor, retained)
+                .unwrap();
+            if index + 1 < BAYES_POSTERIOR_SAMPLES {
+                assert!(!completed);
+            } else {
+                assert!(!completed);
+            }
+        }
+        assert_eq!(controller.convergence_iteration(), 0);
+        assert!(!controller.should_run());
+    }
+
+    #[test]
+    fn single_chain_posterior_validation_clears_false_convergence() {
+        let mut controller = BayesSamplingController::new(5000, None, 1, BAYES_RHAT_A_NAMES);
+        let stable = [0.5, 0.5, 0.5];
+        while !controller.collecting_posterior {
+            assert!(controller.should_run());
+            let retained = controller.begin_iteration();
+            if retained {
+                let started = controller.observe(&stable);
+                assert_eq!(started, controller.collecting_posterior);
+            }
+        }
+        assert!(controller.convergence_iteration() > 0);
+
+        for index in 0..BAYES_POSTERIOR_SAMPLES {
+            let retained = controller.begin_iteration();
+            assert!(retained);
+            let values = if index < BAYES_POSTERIOR_SAMPLES / 2 {
+                stable
+            } else {
+                [1.5, 1.5, 1.5]
+            };
+            let restarted = controller.observe(&values);
+            if index + 1 < BAYES_POSTERIOR_SAMPLES {
+                assert!(!restarted);
+            } else {
+                assert!(restarted);
+            }
+        }
+        assert!(!controller.collecting_posterior);
+        assert_eq!(controller.posterior_samples(), 0);
+        assert_eq!(controller.convergence_iteration(), 0);
+        assert!(controller.should_run());
+    }
+
+    #[test]
+    fn chain_controllers_respect_burnin_before_rhat_and_posterior() {
+        let stable = [vec![0.5, 0.2, 0.3], vec![0.5, 0.2, 0.3]];
+        let mut multi =
+            BayesMultiChainController::new(2, 2000, Some(1000), 1, BAYES_RHAT_A_NAMES).unwrap();
+        for _ in 0..1000 {
+            assert!(multi.should_run());
+            let retained = multi.begin_iteration();
+            assert!(!retained);
+            assert!(!multi.observe(&stable, retained).unwrap());
+        }
+        assert_eq!(multi.actual_iterations(), 1000);
+        assert_eq!(multi.posterior_samples(), 0);
+        assert!(!multi.collecting_posterior());
+
+        let mut single = BayesSamplingController::new(2000, Some(1000), 1, BAYES_RHAT_A_NAMES);
+        for _ in 0..1000 {
+            assert!(single.should_run());
+            let retained = single.begin_iteration();
+            assert!(!retained);
+            if retained {
+                assert!(!single.observe(&stable[0]));
+            }
+        }
+        assert_eq!(single.actual_iterations(), 1000);
+        assert_eq!(single.posterior_samples(), 0);
+    }
+
+    #[test]
     fn rhat_controller_reports_each_metric_and_uses_their_maximum() {
-        let mut controller = BayesSamplingController::new(2000, 1, 1, BAYES_RHAT_A_NAMES);
+        let mut controller = BayesSamplingController::new(2000, None, 1, BAYES_RHAT_A_NAMES);
         for iteration in 0..1500 {
             assert!(controller.should_run());
             let retained = controller.begin_iteration();
@@ -9946,6 +10718,123 @@ mod backend_tests {
         }
         assert_eq!(finite_rhat_max(&[1.01, f64::INFINITY]), f64::INFINITY);
         assert!(finite_rhat_max(&[1.01, f64::NAN]).is_nan());
+    }
+
+    #[test]
+    fn single_chain_rhat_uses_recent_window_not_prefix_history() {
+        let mut state = BayesRhatState::with_window(BAYES_RHAT_A_NAMES, BAYES_RHAT_WINDOW);
+        for index in 0..BAYES_RHAT_WINDOW {
+            let phase = (index % 2) as f64;
+            assert!(!state.observe(&[10.0 + phase, 10.0 + phase, 10.0 + phase]));
+        }
+        for index in 0..BAYES_RHAT_WINDOW {
+            let phase = (index % 2) as f64;
+            assert!(!state.observe(&[1.0 + phase, 1.0 + phase, 1.0 + phase]));
+        }
+        assert!(state
+            .values()
+            .iter()
+            .all(|value| *value < BAYES_RHAT_THRESHOLD));
+    }
+
+    #[test]
+    fn multi_chain_rhat_uses_recent_window_not_prefix_history() {
+        let mut controller =
+            BayesMultiChainController::new(2, 5000, None, 1, BAYES_RHAT_A_NAMES).unwrap();
+        for _ in 0..BAYES_AUTO_BURNIN {
+            assert!(controller.should_run());
+            let retained = controller.begin_iteration();
+            assert!(!retained);
+            assert!(!controller
+                .observe(&[vec![0.0, 0.0, 0.0], vec![0.0, 0.0, 0.0],], retained,)
+                .unwrap());
+        }
+        for index in 0..(BAYES_RHAT_WINDOW * 2) {
+            let phase = (index % 2) as f64;
+            let (chain0, chain1) = if index < BAYES_RHAT_WINDOW {
+                (
+                    vec![10.0 + phase, 10.0 + phase, 10.0 + phase],
+                    vec![1.0 + phase, 1.0 + phase, 1.0 + phase],
+                )
+            } else {
+                (
+                    vec![1.0 + phase, 1.0 + phase, 1.0 + phase],
+                    vec![1.0 + phase, 1.0 + phase, 1.0 + phase],
+                )
+            };
+            assert!(controller.should_run());
+            let retained = controller.begin_iteration();
+            assert!(retained);
+            assert!(!controller.observe(&[chain0, chain1], retained).unwrap());
+        }
+        assert!(!controller.collecting_posterior());
+        assert!(controller.monitor_rhat() < BAYES_RHAT_THRESHOLD);
+    }
+
+    #[test]
+    fn fixed_burnin_skips_rhat_and_auto_burnin_starts_at_minimum() {
+        let stable = [vec![0.5, 0.2, 0.3], vec![0.5, 0.2, 0.3]];
+        let mut fixed =
+            BayesMultiChainController::new(2, 2000, Some(3), 1, BAYES_RHAT_A_NAMES).unwrap();
+        for _ in 0..3 {
+            assert!(fixed.should_run());
+            let retained = fixed.begin_iteration();
+            assert!(!retained);
+            assert!(!fixed.observe(&stable, retained).unwrap());
+        }
+        assert!(!fixed.collecting_posterior());
+        assert!(fixed.should_run());
+        assert!(fixed.begin_iteration());
+        assert!(fixed.collecting_posterior());
+        assert!(!fixed.observe(&stable, true).unwrap());
+        assert_eq!(fixed.posterior_samples(), 1);
+        assert_eq!(fixed.convergence_iteration(), 0);
+        assert!(fixed
+            .posterior_rhat_values()
+            .iter()
+            .all(|value| value.is_nan()));
+
+        let mut auto =
+            BayesMultiChainController::new(2, 2000, None, 1, BAYES_RHAT_A_NAMES).unwrap();
+        for _ in 0..500 {
+            assert!(auto.should_run());
+            let retained = auto.begin_iteration();
+            assert!(!retained);
+            assert!(!auto.observe(&stable, retained).unwrap());
+        }
+        assert!(!auto.collecting_posterior());
+        assert_eq!(auto.actual_iterations(), 500);
+    }
+
+    #[test]
+    fn fixed_burnin_collects_exactly_one_thousand_samples_without_rhat() {
+        let stable = [vec![0.5, 0.2, 0.3], vec![0.5, 0.2, 0.3]];
+
+        let mut single = BayesSamplingController::new(1, Some(7), 1, BAYES_RHAT_A_NAMES);
+        while single.should_run() {
+            let retained = single.begin_iteration();
+            if retained {
+                assert!(!single.observe(&stable[0]));
+            }
+        }
+        assert_eq!(single.actual_iterations(), 1007);
+        assert_eq!(single.posterior_samples(), BAYES_POSTERIOR_SAMPLES);
+        assert_eq!(single.convergence_iteration(), 0);
+        assert!(single.rhat_value().is_nan());
+
+        let mut multi =
+            BayesMultiChainController::new(2, 1, Some(7), 1, BAYES_RHAT_A_NAMES).unwrap();
+        while multi.should_run() {
+            let retained = multi.begin_iteration();
+            assert!(!multi.observe(&stable, retained).unwrap());
+        }
+        assert_eq!(multi.actual_iterations(), 1007);
+        assert_eq!(multi.posterior_samples(), BAYES_POSTERIOR_SAMPLES);
+        assert_eq!(multi.convergence_iteration(), 0);
+        assert!(multi
+            .posterior_rhat_values()
+            .iter()
+            .all(|value| value.is_nan()));
     }
 
     #[test]
