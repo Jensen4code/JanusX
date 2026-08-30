@@ -71,6 +71,98 @@ def _parse_expression_sites(expr: str) -> set[tuple[str, int]]:
     return out
 
 
+def _parse_window_unit_name(unit_name: str) -> Optional[tuple[str, int, int]]:
+    """Parse a GARFIELD window label (``chrom:start-end``).
+
+    GARFIELD writes chromosome labels with and without a ``chr`` prefix.  The
+    benchmark keeps the normalized chromosome representation used by the LD
+    helpers, so a label such as ``chr2:10-20`` becomes ``("2", 10, 20)``.
+    ``None`` is returned for the legacy/global unit labels that do not encode a
+    genomic interval.
+    """
+    m = re.match(r"^\s*([^:]+):(\d+)-(\d+)\s*$", str(unit_name))
+    if m is None:
+        return None
+    chrom = _normalize_chrom(m.group(1))
+    start = int(m.group(2))
+    end = int(m.group(3))
+    if start > end:
+        start, end = end, start
+    return chrom, start, end
+
+
+def _rule_sites(row: dict[str, Any]) -> set[tuple[str, int]]:
+    """Extract sites from both historical and current rules TSV schemas."""
+    expr = row.get("expression", None)
+    if expr in (None, ""):
+        expr = row.get("snp_name", None)
+    if expr in (None, ""):
+        expr = row.get("rule", "")
+    return _parse_expression_sites(str(expr))
+
+
+def _build_window_credit_sets(
+    rows: list[dict[str, Any]],
+    causal_set: set[tuple[str, int]],
+    site_genotypes: dict[tuple[str, int], np.ndarray],
+    ld_r2_threshold: float,
+) -> dict[str, dict[str, Any]]:
+    """Build LD credit sets independently for every scanned GARFIELD window.
+
+    Only SNPs retained in a rule for the same window are representatives.  A
+    causal SNP receives a representative when the two sites are on the same
+    chromosome and their dosage ``r^2`` reaches ``ld_r2_threshold``.  Keeping
+    this mapping per window prevents a proxy from a different window from
+    turning an untested causal combination into a hit.
+
+    The returned mapping is intentionally explicit so callers can report both
+    the representative set and the causal-to-proxy map in a sidecar file.
+    """
+    grouped: dict[str, set[tuple[str, int]]] = {}
+    for row in rows:
+        unit = str(row.get("unit_name", "__all__") or "__all__")
+        grouped.setdefault(unit, set()).update(_rule_sites(row))
+
+    out: dict[str, dict[str, Any]] = {}
+    threshold = float(ld_r2_threshold)
+    for unit, representatives in grouped.items():
+        parsed = _parse_window_unit_name(unit)
+
+        def _in_unit(site: tuple[str, int]) -> bool:
+            if parsed is None:
+                return True
+            return (
+                _normalize_chrom(site[0]) == parsed[0]
+                and parsed[1] <= int(site[1]) <= parsed[2]
+            )
+
+        causal_in_unit = {c for c in causal_set if _in_unit(c)}
+        if len(causal_in_unit) == 0:
+            continue
+        proxy_map: dict[tuple[str, int], set[tuple[str, int]]] = {}
+        for causal in sorted(causal_in_unit):
+            gx = site_genotypes.get(causal)
+            proxies: set[tuple[str, int]] = set()
+            for rep in representatives:
+                if _normalize_chrom(rep[0]) != _normalize_chrom(causal[0]):
+                    continue
+                if rep == causal:
+                    proxies.add(rep)
+                    continue
+                gy = site_genotypes.get(rep)
+                if gx is None or gy is None:
+                    continue
+                if _site_vec_r2(gx, gy) >= threshold:
+                    proxies.add(rep)
+            proxy_map[causal] = proxies
+        out[unit] = {
+            "representatives": set(representatives),
+            "causal_sites": causal_in_unit,
+            "causal_proxy_map": proxy_map,
+        }
+    return out
+
+
 def _site_vec_r2(x: np.ndarray, y: np.ndarray) -> float:
     a = np.asarray(x, dtype=np.float64).reshape(-1)
     b = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -142,36 +234,6 @@ def _covers_all_causal_with_ld(
         return False
 
     return _dfs(0)
-
-
-def _build_ld_proxy_map(
-    causal_set: set[tuple[str, int]],
-    candidate_sites: set[tuple[str, int]],
-    site_genotypes: dict[tuple[str, int], np.ndarray],
-    ld_r2_threshold: float,
-) -> dict[tuple[str, int], set[tuple[str, int]]]:
-    out: dict[tuple[str, int], set[tuple[str, int]]] = {}
-    ld_thr = float(ld_r2_threshold)
-    for c in causal_set:
-        cc = set([c])
-        gx = site_genotypes.get(c, None)
-        if gx is None:
-            out[c] = cc
-            continue
-        c_chrom = _normalize_chrom(c[0])
-        for s in candidate_sites:
-            if _normalize_chrom(s[0]) != c_chrom:
-                continue
-            if s == c:
-                cc.add(s)
-                continue
-            gy = site_genotypes.get(s, None)
-            if gy is None:
-                continue
-            if _site_vec_r2(gx, gy) >= ld_thr:
-                cc.add(s)
-        out[c] = cc
-    return out
 
 
 def _causal_site_set(causal_sites: list[tuple[str, int, int]]) -> set[tuple[str, int]]:
@@ -271,6 +333,8 @@ def _run_garfield_subprocess(
     out_dir: str,
     out_prefix: str,
     feature_source: str,
+    input_maf: float,
+    input_geno: float,
     extension: int,
     step: Optional[int],
     nsnp: int,
@@ -291,29 +355,36 @@ def _run_garfield_subprocess(
         str(pheno_path),
         "-n",
         "0",
-        "--scan-mode",
-        "window",
-        "--feature-source",
-        str(feature_source),
-        "-ext",
+        "-maf",
+        str(float(input_maf)),
+        "-geno",
+        str(float(input_geno)),
+        "-w",
         str(int(extension)),
-        "-nsnp",
-        str(int(nsnp)),
-        "-m",
-        str(int(max_pick)),
-        "--top-k-validate",
-        str(int(top_k_validate)),
-        "--val-frac",
-        str(float(val_frac)),
-        "--seed",
-        str(int(seed)),
-        "-t",
-        str(int(thread)),
-        "-o",
-        str(Path(out_dir) / str(out_prefix)),
     ]
+    # The current GARFIELD interface takes window extension and step as the
+    # optional values following ``-w``.  ``nsnp`` is the historical benchmark
+    # name for the unified ``-width`` parameter; validation options are kept
+    # in garfieldbench's result schema for compatibility but are no longer
+    # passed to the main CLI because that stage is now fixed in GARFIELD.
     if step is not None:
-        cmd.extend(["-step", str(int(step))])
+        cmd.append(str(int(step)))
+    else:
+        cmd.append(str(max(1, int(extension) // 2)))
+    cmd.extend(
+        [
+            "-width",
+            str(int(nsnp)),
+            "-m",
+            str(int(max_pick)),
+            "--seed",
+            str(int(seed)),
+            "-t",
+            str(int(thread)),
+            "-o",
+            str(Path(out_dir) / str(out_prefix)),
+        ]
+    )
     with open(log_path, "w", encoding="utf-8") as fw:
         rc = subprocess.run(cmd, stdout=fw, stderr=subprocess.STDOUT, check=False).returncode
     if rc != 0:
@@ -329,94 +400,236 @@ def _evaluate_rules(
     ld_r2_threshold: float = 0.8,
     ld_geno_source: Optional[str] = None,
     ld_chunk_size: int = 100_000,
+    credit_sets_path: Optional[str] = None,
 ) -> dict[str, Any]:
+    """Evaluate exact and per-window LD-credit recovery separately.
+
+    ``top*_hit_*`` remains the metric selected by ``hit_mode`` for backwards
+    compatibility.  The explicit ``exact_*`` and ``credit_*`` fields are
+    always returned so a benchmark cannot confuse a global LD proxy match
+    with an exact causal recovery.
+    """
+    empty = {
+        "top1_hit_any": False,
+        "top1_hit_all": False,
+        "topk_hit_any": False,
+        "topk_hit_all": False,
+        "first_hit_any_rank": np.nan,
+        "first_hit_all_rank": np.nan,
+        "exact_top1_hit_any": False,
+        "exact_top1_hit_all": False,
+        "exact_topk_hit_any": False,
+        "exact_topk_hit_all": False,
+        "exact_first_hit_any_rank": np.nan,
+        "exact_first_hit_all_rank": np.nan,
+        "credit_top1_hit_any": False,
+        "credit_top1_hit_all": False,
+        "credit_topk_hit_any": False,
+        "credit_topk_hit_all": False,
+        "credit_first_hit_any_rank": np.nan,
+        "credit_first_hit_all_rank": np.nan,
+        "credit_status": "not_tested",
+        "credit_window_count": 0,
+        "credit_representative_count": 0,
+        "credit_complete_window": False,
+        "best_val_score": np.nan,
+        "best_rule": "",
+    }
     if len(causal_set) == 0:
-        return {
-            "top1_hit_any": False,
-            "top1_hit_all": False,
-            "topk_hit_any": False,
-            "topk_hit_all": False,
-            "first_hit_any_rank": np.nan,
-            "first_hit_all_rank": np.nan,
-            "best_val_score": np.nan,
-            "best_rule": "",
-        }
+        return empty
     with open(rules_path, "r", encoding="utf-8") as fr:
         rd = csv.DictReader(fr, delimiter="\t")
         rows = list(rd)
     if len(rows) == 0:
-        return {
-            "top1_hit_any": False,
-            "top1_hit_all": False,
-            "topk_hit_any": False,
-            "topk_hit_all": False,
-            "first_hit_any_rank": np.nan,
-            "first_hit_all_rank": np.nan,
-            "best_val_score": np.nan,
-            "best_rule": "",
-        }
+        return empty
 
-    all_seen_sites: set[tuple[str, int]] = set()
-    for r in rows:
-        all_seen_sites.update(_parse_expression_sites(str(r.get("expression", ""))))
+    if str(hit_mode) not in {"all", "all-ld"}:
+        raise ValueError(f"Unsupported hit mode: {hit_mode}")
+    if str(hit_mode) == "all-ld" and ld_geno_source is None:
+        raise ValueError("ld_geno_source is required when --hit-mode=all-ld")
 
-    ld_proxy_map: dict[tuple[str, int], set[tuple[str, int]]] = {}
-    if str(hit_mode) == "all-ld":
-        if ld_geno_source is None:
-            raise ValueError("ld_geno_source is required when --hit-mode=all-ld")
-        candidate_sites = set(all_seen_sites).union(set(causal_set))
+    # GARFIELD's current rules schema uses ``snp_name`` and ``MLrank`` while
+    # older benchmark outputs used ``expression`` and numeric ``rank``.  The
+    # file order is the authoritative output ranking for the current schema;
+    # use a numeric rank only when it is actually present.
+    normalized_rows: list[dict[str, Any]] = []
+    for i, row in enumerate(rows, start=1):
+        rank_text = str(row.get("rank", "") or "").strip()
+        try:
+            rank = int(rank_text) if rank_text else i
+        except ValueError:
+            rank = i
+        sites = _rule_sites(row)
+        unit = str(row.get("unit_name", "__all__") or "__all__")
+        expression = str(row.get("expression", "") or row.get("snp_name", ""))
+        normalized_rows.append({"row": row, "rank": rank, "sites": sites, "unit": unit, "expression": expression})
+
+    site_genotypes: dict[tuple[str, int], np.ndarray] = {}
+    credit_sets: dict[str, dict[str, Any]] = {}
+    if ld_geno_source is not None:
         site_genotypes = _load_site_genotypes(str(ld_geno_source), int(ld_chunk_size))
-        ld_proxy_map = _build_ld_proxy_map(
+        credit_sets = _build_window_credit_sets(
+            rows=rows,
             causal_set=causal_set,
-            candidate_sites=candidate_sites,
             site_genotypes=site_genotypes,
             ld_r2_threshold=float(ld_r2_threshold),
         )
 
-    top1_hit_any = False
-    top1_hit_all = False
-    topk_hit_any = False
-    topk_hit_all = False
-    first_hit_any_rank: float = np.nan
-    first_hit_all_rank: float = np.nan
+    if credit_sets_path is not None:
+        p = Path(credit_sets_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8", newline="") as fw:
+            wr = csv.writer(fw, delimiter="\t")
+            wr.writerow(
+                [
+                    "unit_name",
+                    "representative",
+                    "causal",
+                    "r2",
+                    "causal_is_representative",
+                ]
+            )
+            for unit in sorted(credit_sets):
+                data = credit_sets[unit]
+                mapped_representatives: set[tuple[str, int]] = set()
+                for causal in sorted(data["causal_proxy_map"]):
+                    for rep in sorted(data["causal_proxy_map"][causal]):
+                        mapped_representatives.add(rep)
+                        r2 = 1.0 if rep == causal else _site_vec_r2(
+                            site_genotypes.get(causal, np.array([], dtype=np.float32)),
+                            site_genotypes.get(rep, np.array([], dtype=np.float32)),
+                        )
+                        wr.writerow(
+                            [
+                                unit,
+                                f"{rep[0]}:{rep[1]}",
+                                f"{causal[0]}:{causal[1]}",
+                                f"{float(r2):.8g}",
+                                str(bool(rep == causal)),
+                            ]
+                        )
+                # Keep representatives with no causal proxy in the sidecar as
+                # well.  They are still part of the per-window credit set and
+                # make the set size auditable rather than silently dropping
+                # uninformative retained SNPs.
+                for rep in sorted(set(data["representatives"]).difference(mapped_representatives)):
+                    wr.writerow([unit, f"{rep[0]}:{rep[1]}", "", "", "False"])
 
-    for r in rows:
-        rank = int(r.get("rank", "0") or 0)
-        expr = str(r.get("expression", ""))
-        seen = _parse_expression_sites(expr)
-        if str(hit_mode) == "all-ld":
-            hit_any = any(len(seen.intersection(ld_proxy_map.get(c, set()))) > 0 for c in causal_set)
-            hit_all = _covers_all_causal_with_ld(seen, causal_set, ld_proxy_map)
-        elif str(hit_mode) == "all":
-            hit_any = len(seen.intersection(causal_set)) > 0
-            hit_all = causal_set.issubset(seen)
-        else:
-            raise ValueError(f"Unsupported hit mode: {hit_mode}")
+    exact_top1_any = False
+    exact_top1_all = False
+    exact_topk_any = False
+    exact_topk_all = False
+    exact_first_any: float = np.nan
+    exact_first_all: float = np.nan
+    credit_top1_any = False
+    credit_top1_all = False
+    credit_topk_any = False
+    credit_topk_all = False
+    credit_first_any: float = np.nan
+    credit_first_all: float = np.nan
 
-        if rank == 1:
-            top1_hit_any = hit_any
-            top1_hit_all = hit_all
-        if rank <= int(top_k_hit):
-            topk_hit_any = topk_hit_any or hit_any
-            topk_hit_all = topk_hit_all or hit_all
-        if hit_any and np.isnan(first_hit_any_rank):
-            first_hit_any_rank = float(rank)
-        if hit_all and np.isnan(first_hit_all_rank):
-            first_hit_all_rank = float(rank)
+    for i, item in enumerate(normalized_rows, start=1):
+        rank = int(item["rank"])
+        seen = set(item["sites"])
+        exact_any = len(seen.intersection(causal_set)) > 0
+        exact_all = causal_set.issubset(seen)
 
-    best_row = rows[0]
-    best_val = float(best_row.get("val_score", "nan"))
-    best_rule = str(best_row.get("expression", ""))
-    return {
-        "top1_hit_any": bool(top1_hit_any),
-        "top1_hit_all": bool(top1_hit_all),
-        "topk_hit_any": bool(topk_hit_any),
-        "topk_hit_all": bool(topk_hit_all),
-        "first_hit_any_rank": first_hit_any_rank,
-        "first_hit_all_rank": first_hit_all_rank,
-        "best_val_score": best_val,
-        "best_rule": best_rule,
-    }
+        data = credit_sets.get(str(item["unit"]))
+        credit_any = False
+        credit_all = False
+        if data is not None:
+            proxy_map = data["causal_proxy_map"]
+            credit_any = any(len(seen.intersection(proxy_map.get(c, set()))) > 0 for c in causal_set)
+            credit_all = _covers_all_causal_with_ld(seen, causal_set, proxy_map)
+
+        if i == 1:
+            exact_top1_any, exact_top1_all = exact_any, exact_all
+            credit_top1_any, credit_top1_all = credit_any, credit_all
+        if i <= int(top_k_hit):
+            exact_topk_any = exact_topk_any or exact_any
+            exact_topk_all = exact_topk_all or exact_all
+            credit_topk_any = credit_topk_any or credit_any
+            credit_topk_all = credit_topk_all or credit_all
+        if exact_any and np.isnan(exact_first_any):
+            exact_first_any = float(rank)
+        if exact_all and np.isnan(exact_first_all):
+            exact_first_all = float(rank)
+        if credit_any and np.isnan(credit_first_any):
+            credit_first_any = float(rank)
+        if credit_all and np.isnan(credit_first_all):
+            credit_first_all = float(rank)
+
+    complete_windows = [
+        unit
+        for unit, data in credit_sets.items()
+        if causal_set.issubset(set(data["causal_sites"]))
+    ]
+    if len(complete_windows) == 0:
+        credit_status = "not_tested"
+    elif exact_topk_all:
+        credit_status = "recovered_exact"
+    elif credit_topk_all:
+        credit_status = "recovered_credit"
+    else:
+        credit_status = "tested_but_not_recovered"
+
+    best_row = normalized_rows[0]
+    raw_best = best_row["row"]
+    score_text = str(raw_best.get("val_score", "") or raw_best.get("score", "nan"))
+    try:
+        best_val = float(score_text)
+    except ValueError:
+        best_val = float("nan")
+    result = dict(empty)
+    result.update(
+        {
+            "exact_top1_hit_any": bool(exact_top1_any),
+            "exact_top1_hit_all": bool(exact_top1_all),
+            "exact_topk_hit_any": bool(exact_topk_any),
+            "exact_topk_hit_all": bool(exact_topk_all),
+            "exact_first_hit_any_rank": exact_first_any,
+            "exact_first_hit_all_rank": exact_first_all,
+            "credit_top1_hit_any": bool(credit_top1_any),
+            "credit_top1_hit_all": bool(credit_top1_all),
+            "credit_topk_hit_any": bool(credit_topk_any),
+            "credit_topk_hit_all": bool(credit_topk_all),
+            "credit_first_hit_any_rank": credit_first_any,
+            "credit_first_hit_all_rank": credit_first_all,
+            "credit_status": credit_status,
+            "credit_window_count": int(len(credit_sets)),
+            "credit_representative_count": int(
+                len(set().union(*(set(x["representatives"]) for x in credit_sets.values())))
+                if credit_sets
+                else 0
+            ),
+            "credit_complete_window": bool(len(complete_windows) > 0),
+            "best_val_score": best_val,
+            "best_rule": str(best_row["expression"]),
+        }
+    )
+    if str(hit_mode) == "all-ld":
+        result.update(
+            {
+                "top1_hit_any": bool(credit_top1_any),
+                "top1_hit_all": bool(credit_top1_all),
+                "topk_hit_any": bool(credit_topk_any),
+                "topk_hit_all": bool(credit_topk_all),
+                "first_hit_any_rank": credit_first_any,
+                "first_hit_all_rank": credit_first_all,
+            }
+        )
+    else:
+        result.update(
+            {
+                "top1_hit_any": bool(exact_top1_any),
+                "top1_hit_all": bool(exact_top1_all),
+                "topk_hit_any": bool(exact_topk_any),
+                "topk_hit_all": bool(exact_topk_all),
+                "first_hit_any_rank": exact_first_any,
+                "first_hit_all_rank": exact_first_all,
+            }
+        )
+    return result
 
 
 def _format_site_set(sites: set[tuple[str, int]]) -> str:
@@ -505,7 +718,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--hit-mode",
         choices=["all", "all-ld"],
         default="all-ld",
-        help="all: require all causal sites; all-ld: allow high-LD proxy sites (default: all-ld).",
+        help=(
+            "all: exact causal sites; all-ld: use retained representatives from the same "
+            "window as high-LD proxies (default: all-ld)."
+        ),
     )
     optional_group.add_argument(
         "--hit-ld-r2",
@@ -608,6 +824,8 @@ def _run_one(
                 out_dir=str(gar_dir),
                 out_prefix=gf_prefix,
                 feature_source=str(args.feature_source),
+                input_maf=float(args.maf),
+                input_geno=float(args.geno),
                 extension=int(run_ext),
                 step=int(run_step),
                 nsnp=int(args.nsnp),
@@ -627,6 +845,7 @@ def _run_one(
     if len(rules_files) == 0:
         raise FileNotFoundError(f"[{run_name}] rules file not found under {gar_dir}")
     rules_path = str(rules_files[0])
+    credit_sets_path = str(gar_dir / f"{gf_prefix}.garfield.credit_sets.tsv")
 
     hit = _evaluate_rules(
         rules_path,
@@ -636,6 +855,7 @@ def _run_one(
         ld_r2_threshold=float(args.hit_ld_r2),
         ld_geno_source=region_prefix,
         ld_chunk_size=int(min(max(1_000, int(args.chunksize)), 250_000)),
+        credit_sets_path=credit_sets_path,
     )
     out = {
         "run_index": int(run_idx),
@@ -652,6 +872,7 @@ def _run_one(
         "n_causal_sites": int(len(causal_set)),
         "causal_sites": _format_site_set(causal_set),
         "rules_path": rules_path,
+        "credit_sets_path": credit_sets_path,
         "sim_prefix": sim_prefix,
         "garfield_log": gf_log,
         "hit_mode": str(args.hit_mode),
@@ -660,8 +881,10 @@ def _run_one(
     }
     logger.info(
         f"[{run_name}] span={int(causal_span_bp)}bp, ext={int(run_ext)}, step={int(run_step)}, "
-        f"top1_hit_all={bool(hit['top1_hit_all'])}, "
-        f"top{int(args.top_k_hit)}_hit_all={bool(hit['topk_hit_all'])}, "
+        f"exact_top1_hit_all={bool(hit['exact_top1_hit_all'])}, "
+        f"exact_top{int(args.top_k_hit)}_hit_all={bool(hit['exact_topk_hit_all'])}, "
+        f"credit_top{int(args.top_k_hit)}_hit_all={bool(hit['credit_topk_hit_all'])}, "
+        f"credit_status={hit['credit_status']}, "
         f"best_val={float(hit['best_val_score']):.6g}"
     )
     return out
@@ -797,9 +1020,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         topk_any = float(np.mean(ok_df["topk_hit_any"].astype(float))) if "topk_hit_any" in ok_df.columns else float("nan")
         logger.info(
             f"Hit rates (n_ok={len(ok_df)}): "
-            f"top1_any={top1_any:.3f}, top1_all={top1_all:.3f}, "
-            f"top{int(args.top_k_hit)}_any={topk_any:.3f}, top{int(args.top_k_hit)}_all={topk_all:.3f}"
+            f"credit_top1_any={top1_any:.3f}, credit_top1_all={top1_all:.3f}, "
+            f"credit_top{int(args.top_k_hit)}_any={topk_any:.3f}, "
+            f"credit_top{int(args.top_k_hit)}_all={topk_all:.3f}"
         )
+        if "exact_topk_hit_all" in ok_df.columns:
+            exact_topk_all = float(np.mean(ok_df["exact_topk_hit_all"].astype(float)))
+            logger.info(
+                f"Exact recovery (top{int(args.top_k_hit)}_all)={exact_topk_all:.3f}; "
+                "credit metrics are evaluated per window."
+            )
     else:
         logger.warning("No successful runs; hit-rate summary skipped.")
 

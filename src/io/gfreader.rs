@@ -4901,7 +4901,10 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
             kept_missing.push(missing_rate);
             kept_maf.push(alt_freq);
             kept_sites.push(site.clone());
-            row_flip.push(false);
+            // `alt_freq` is the BED A2 frequency.  Keep the retained-site
+            // orientation consistent with both full and windowed scans so
+            // interval/grouped callers also label the minor state correctly.
+            row_flip.push(alt_freq > 0.5_f32);
         } else {
             match reason {
                 PURE_LINE_FILTER_FAIL_MISSING => fail_missing += 1,
@@ -5817,7 +5820,11 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line_sparse_wi
             let keep = reason == PURE_LINE_FILTER_KEEP;
             site_keep.push(keep);
             if keep {
-                row_flip_keep.push(false);
+                // `alt_freq` is retained in `maf_batch` as the frequency of
+                // the BED A2 state.  Keep the orientation metadata in sync
+                // with the non-windowed path so external-GRM callers do not
+                // silently label a common A2 state as the positive BIN.
+                row_flip_keep.push(maf_batch[off] > 0.5_f32);
                 row_source_indices.push(base + off);
                 missing_rate_keep.push(missing_batch[off]);
                 maf_keep.push(maf_batch[off]);
@@ -6196,7 +6203,10 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap
     let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
     for (i, (status, missing_rate, alt_freq)) in keep_flip_stats.iter().copied().enumerate() {
         if pure_line_filter_status_reason(status) == PURE_LINE_FILTER_KEEP {
-            row_flip_keep.push(false);
+            // `alt_freq` is the BED A2 frequency; a frequency above 0.5
+            // means the A1/ref state is the minor homozygous state and must
+            // become the positive BIN after row flipping.
+            row_flip_keep.push(alt_freq > 0.5_f32);
             row_source_indices.push(i);
             missing_rate_keep.push(missing_rate);
             maf_keep.push(alt_freq);
@@ -8878,6 +8888,7 @@ mod tests {
         count_packed_row_pure_line_counts_selected_with_excluded_lut,
         evaluate_packed_row_keep_and_flip, format_zero_sites_pure_line_error,
         precompute_excluded_sample_indices,
+        prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window,
         pure_line_filter_status_from_counts, pure_line_filter_status_reason,
         PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
@@ -8977,7 +8988,7 @@ mod tests {
         )
         .expect("write BIM");
         let mut bed = vec![0x6c, 0x1b, 0x01];
-        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b11, 0b11]));
+        bed.extend(pack_plink_codes(&[0b11, 0b11, 0b11, 0b00]));
         bed.extend(pack_plink_codes(&[0b11, 0b00, 0b10, 0b01]));
         bed.extend(pack_plink_codes(&[0b00, 0b11, 0b00, 0b11]));
         fs::write(prefix.with_extension("bed"), bed).expect("write BED");
@@ -9009,12 +9020,27 @@ mod tests {
 
         assert_eq!(windowed.site_keep, full.site_keep);
         assert_eq!(windowed.row_flip, full.row_flip);
+        assert_eq!(full.row_flip, vec![true, false, false]);
         assert_eq!(windowed.row_source_indices, full.row_source_indices);
         assert_eq!(windowed.missing_rate, full.missing_rate);
         assert_eq!(windowed.maf, full.maf);
         assert_eq!(windowed.n_samples, full.n_samples);
         assert_eq!(windowed.n_snps_total, full.n_snps_total);
         assert_eq!(windowed.bytes_per_snp, full.bytes_per_snp);
+
+        let interval = prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals(
+            prefix.to_str().unwrap(),
+            0.0,
+            1.0,
+            1.0,
+            false,
+            &[vec![("1".to_string(), 0, 25)]],
+            None,
+        )
+        .expect("prepare interval metadata");
+        assert_eq!(interval.row_source_indices, vec![0, 1]);
+        assert_eq!(interval.row_flip, vec![true, false]);
+
         let full_sites = full
             .sites
             .iter()
