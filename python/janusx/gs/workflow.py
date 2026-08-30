@@ -8879,6 +8879,8 @@ def GSapi(
     bayes_runtime_state: dict[str, typing.Any] | None = None,
     bayes_auto_cfg: dict[str, typing.Any] | None = None,
     bayes_chains: int = 1,
+    bayes_burnin: int | None = None,
+    bayes_posterior: int = 1000,
     model_state: dict[str, typing.Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
@@ -8936,6 +8938,13 @@ def GSapi(
     bayes_chains : int, optional
         Number of independent Bayesian chains. The effective count is capped
         at ``max(1, n_jobs // 2)`` and scheduled inside one native call.
+    bayes_burnin : int, optional
+        Bayesian warm-up iterations. ``None`` selects the adaptive default
+        with a minimum 500-update warm-up; an integer keeps adaptive R-hat
+        monitoring enabled after that warm-up.
+    bayes_posterior : int, optional
+        Posterior samples retained per Bayesian chain after warm-up. Defaults
+        to 1000.
     model_state : dict, optional
         Mutable sink for exporting a lightweight fitted-model artifact.
 
@@ -8949,6 +8958,11 @@ def GSapi(
         Variance-component PVE/h2 for mixed models and Bayes models,
         or predictive PVE (inner-CV R2) for ML models.
     """
+    if bayes_burnin is not None and int(bayes_burnin) < 0:
+        raise ValueError("bayes_burnin must be >= 0")
+    bayes_posterior = int(bayes_posterior)
+    if bayes_posterior <= 0:
+        raise ValueError("bayes_posterior must be > 0")
     train_pred_idx = _normalize_train_pred_indices(
         train_pred_indices,
         int(Y.reshape(-1).shape[0]),
@@ -11022,7 +11036,8 @@ def GSapi(
                 packed_backend = (
                     "resident" if use_packed_resident_native else "stream"
                 )
-                bayes_n_iter, bayes_posterior_target = _bayes_mcmc_defaults(method)
+                bayes_n_iter, _ = _bayes_mcmc_defaults(method)
+                bayes_posterior_target = int(bayes_posterior)
                 packed_kwargs: dict[str, typing.Any] = {
                     "y": y_vec,
                     "n_samples": int(n_total_samples),
@@ -11042,10 +11057,11 @@ def GSapi(
                     "sample_indices": train_abs,
                     "x": None,
                     "n_iter": int(bayes_n_iter),
-                    # None selects the 500-update auto warm-up followed by
-                    # R-hat monitoring; explicit user burn-in is handled by
-                    # the Python Bayes API before reaching this route.
-                    "burnin": None,
+                    "burnin": (
+                        None if bayes_burnin is None else int(bayes_burnin)
+                    ),
+                    "adaptive_burnin": True,
+                    "posterior_samples": int(bayes_posterior_target),
                     "r2": float(r2_used),
                     "threads": int(max(0, int(n_jobs))),
                     "chains": int(max(1, int(bayes_chains))),
@@ -11169,6 +11185,13 @@ def GSapi(
                     bayes_posterior_samples = int(
                         bayes_diagnostics["posterior_samples"]
                     )
+                    if str(method) in {"BayesB", "BayesC"}:
+                        # These legacy native tuples omit the posterior count;
+                        # the controller guarantees the requested target.
+                        bayes_posterior_samples = int(bayes_posterior_target)
+                        bayes_diagnostics["posterior_samples"] = int(
+                            bayes_posterior_target
+                        )
 
                 if bayes_runtime_state is not None:
                     bayes_runtime_state["prob_in_prior"] = float(
@@ -11375,6 +11398,9 @@ def GSapi(
             seed=(int(seed) if int(bayes_chains) > 1 else None),
             chains=int(max(1, int(bayes_chains))),
             threads=int(max(1, int(n_jobs))),
+            burnin=(None if bayes_burnin is None else int(bayes_burnin)),
+            adaptive_burnin=True,
+            posterior_samples=int(bayes_posterior),
         )
         pve = model.pve
         if bayes_runtime_state is not None:
@@ -11626,6 +11652,8 @@ def _run_method_task(
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
     bayes_pi: float | None = None,
     bayes_chains: int = 1,
+    bayes_burnin: int | None = None,
+    bayes_posterior: int = 1000,
     save_model_artifact: bool = False,
     stage_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
 ) -> dict[str, typing.Any]:
@@ -12675,6 +12703,8 @@ def _run_method_task(
                     bayes_runtime_state=bayes_state_call,
                     bayes_auto_cfg=bayes_auto_r2_cfg,
                     bayes_chains=bayes_chains,
+                    bayes_burnin=bayes_burnin,
+                    bayes_posterior=bayes_posterior,
                 )
                 if _is_gblup_method(str(method)) and gblup_state_call is not None:
                     _append_gblup_vc_row(int(fold_id), dict(gblup_state_call))
@@ -13478,9 +13508,11 @@ def _run_method_task(
             gblup_runtime_state=gblup_state_final,
                 bayes_auto_r2=bayes_r2_final_call,
                 bayes_pi=bayes_pi,
-                bayes_runtime_state=bayes_state_final,
+            bayes_runtime_state=bayes_state_final,
             bayes_auto_cfg=bayes_auto_r2_cfg,
             bayes_chains=bayes_chains,
+            bayes_burnin=bayes_burnin,
+            bayes_posterior=bayes_posterior,
             model_state=model_state_call,
         )
         _emit_stage("fit_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_fit_stage)))
@@ -15166,6 +15198,8 @@ def _run_methods_parallel(
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
     bayes_pi_by_method: dict[str, float | None] | None = None,
     bayes_chains: int = 1,
+    bayes_burnin: int | None = None,
+    bayes_posterior: int = 1000,
     save_model_artifact: bool = False,
     emit_cv_progress_bar: bool = True,
     emit_method_summary: bool = True,
@@ -15766,6 +15800,8 @@ def _run_methods_parallel(
             bayes_auto_r2_cfg=bayes_auto_r2_cfg,
             bayes_pi=bayes_pi_task,
             bayes_chains=bayes_chains,
+            bayes_burnin=bayes_burnin,
+            bayes_posterior=bayes_posterior,
             save_model_artifact=save_model_artifact,
             stage_hook=None,
         )
@@ -16682,6 +16718,8 @@ def _run_methods_parallel(
                             else bayes_pi_by_method.get(str(m))
                         ),
                         bayes_chains=bayes_chains,
+                        bayes_burnin=bayes_burnin,
+                        bayes_posterior=bayes_posterior,
                         save_model_artifact=save_model_artifact,
                         stage_hook=_stage_hook,
                     )
@@ -17517,6 +17555,8 @@ def _run_methods_parallel(
                             else bayes_pi_by_method.get(str(m))
                         ),
                         bayes_chains=bayes_chains,
+                        bayes_burnin=bayes_burnin,
+                        bayes_posterior=bayes_posterior,
                         save_model_artifact=save_model_artifact,
                         stage_hook=_stage_hook,
                     )
@@ -20004,6 +20044,29 @@ def parse_args(argv: typing.Optional[list[str]] = None):
             if show_dev_help else argparse.SUPPRESS
         ),
     )
+    optional_group.add_argument(
+        "-Bayes-burnin", "--Bayes-burnin",
+        dest="bayes_burnin",
+        type=int,
+        default=None,
+        help=(
+            "Initial Bayes warm-up iterations before adaptive R-hat monitoring; "
+            "when set, R-hat stopping and posterior validation remain enabled "
+            "(default: auto, minimum 500)."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
+    optional_group.add_argument(
+        "-Bayes-posterior", "--Bayes-posterior",
+        dest="bayes_posterior",
+        type=int,
+        default=1000,
+        help=(
+            "Posterior samples retained per Bayesian chain after warm-up "
+            "(default: 1000)."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
     add_common_memory_arg(
         optional_group,
         default=None,
@@ -20166,6 +20229,10 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         parser.error(str(e))
     if int(args.chains) <= 0:
         parser.error("--chains must be > 0.")
+    if args.bayes_burnin is not None and int(args.bayes_burnin) < 0:
+        parser.error("--Bayes-burnin must be >= 0.")
+    if int(args.bayes_posterior) <= 0:
+        parser.error("--Bayes-posterior must be > 0.")
     if args.rrblup_snp_block_size is None:
         args.rrblup_snp_block_size = int(_GS_AUTO_MEM_PCG_BLOCK_ROWS)
     if int(args.rrblup_snp_block_size) <= 0:
@@ -24147,6 +24214,8 @@ def _run_gs_pipeline_impl(
                 bayes_auto_r2_cfg=bayes_auto_r2_cfg,
                 bayes_pi_by_method=bayes_pi_by_method,
                 bayes_chains=int(getattr(args, "chains", 1)),
+                bayes_burnin=getattr(args, "bayes_burnin", None),
+                bayes_posterior=int(getattr(args, "bayes_posterior", 1000)),
                 save_model_artifact=bool(args.save_model),
                 emit_cv_progress_bar=True,
                 emit_method_summary=False,

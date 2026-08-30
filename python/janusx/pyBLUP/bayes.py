@@ -69,6 +69,18 @@ def _normalize_burnin(value: int | str | None) -> int | None:
     return parsed
 
 
+def _normalize_posterior_samples(value: int) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError("posterior_samples must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("posterior_samples must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError("posterior_samples must be > 0")
+    return parsed
+
+
 def bayes_mcmc_defaults(method: str) -> tuple[int, int]:
     key = str(method).strip()
     try:
@@ -262,6 +274,8 @@ def _call_bayesa(
     seed: Optional[int],
     chains: int = 1,
     threads: int = 1,
+    adaptive_burnin: bool = False,
+    posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -277,6 +291,7 @@ def _call_bayesa(
 ]:
     n_iter = int(n_iter)
     burnin = _normalize_burnin(burnin)
+    posterior_samples = _normalize_posterior_samples(posterior_samples)
     thin = 1
     if n_iter <= 0:
         raise ValueError("n_iter must be > 0")
@@ -325,6 +340,8 @@ def _call_bayesa(
         seed=seed,
         chains=int(chains),
         threads=int(threads),
+        adaptive_burnin=bool(adaptive_burnin),
+        posterior_samples=posterior_samples,
     )
     return typing.cast(
         Tuple[
@@ -363,6 +380,8 @@ def _call_bayesb(
     seed: Optional[int],
     chains: int = 1,
     threads: int = 1,
+    adaptive_burnin: bool = False,
+    posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -381,6 +400,7 @@ def _call_bayesb(
 ]:
     n_iter = int(n_iter)
     burnin = _normalize_burnin(burnin)
+    posterior_samples = _normalize_posterior_samples(posterior_samples)
     thin = 1
     if n_iter <= 0:
         raise ValueError("n_iter must be > 0")
@@ -430,11 +450,12 @@ def _call_bayesb(
         seed=seed,
         chains=int(chains),
         threads=int(threads),
+        adaptive_burnin=bool(adaptive_burnin),
+        posterior_samples=posterior_samples,
     )
     native_result = typing.cast(tuple[object, ...], native_result)
-    # Keep the fixed posterior count at the Python API boundary.  The native
-    # tuple already carries the scalar R-hat mapping as its final item.
-    return (*native_result, BAYES_POSTERIOR_SAMPLE_TARGET)
+    # B/C native tuples keep the historical ABI; append the requested count.
+    return (*native_result, posterior_samples)
 
 
 def _call_bayesc(
@@ -454,6 +475,8 @@ def _call_bayesc(
     seed: Optional[int],
     chains: int = 1,
     threads: int = 1,
+    adaptive_burnin: bool = False,
+    posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -472,6 +495,7 @@ def _call_bayesc(
 ]:
     n_iter = int(n_iter)
     burnin = _normalize_burnin(burnin)
+    posterior_samples = _normalize_posterior_samples(posterior_samples)
     thin = 1
     if n_iter <= 0:
         raise ValueError("n_iter must be > 0")
@@ -511,9 +535,11 @@ def _call_bayesc(
         seed=seed,
         chains=int(chains),
         threads=int(threads),
+        adaptive_burnin=bool(adaptive_burnin),
+        posterior_samples=posterior_samples,
     )
     native_result = typing.cast(tuple[object, ...], native_result)
-    return (*native_result, BAYES_POSTERIOR_SAMPLE_TARGET)
+    return (*native_result, posterior_samples)
 
 
 def _call_bayesr(
@@ -532,9 +558,12 @@ def _call_bayesr(
     seed: Optional[int],
     chains: int = 1,
     threads: int = 1,
+    adaptive_burnin: bool = False,
+    posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
 ) -> dict[str, object]:
     n_iter = int(n_iter)
     burnin = _normalize_burnin(burnin)
+    posterior_samples = _normalize_posterior_samples(posterior_samples)
     if n_iter <= 0:
         raise ValueError("n_iter must be > 0")
     if not (0.0 < r2 < 1.0):
@@ -585,6 +614,8 @@ def _call_bayesr(
             seed=seed,
             chains=int(chains),
             threads=int(threads),
+            adaptive_burnin=bool(adaptive_burnin),
+            posterior_samples=posterior_samples,
         )
     )
     return typing.cast(dict[str, object], result)
@@ -609,6 +640,8 @@ def BayesA(
     seed: Optional[int] = None,
     chains: int = 1,
     threads: int = 1,
+    adaptive_burnin: bool = False,
+    posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -739,6 +772,8 @@ def BayesA(
         seed,
         chains,
         threads,
+        adaptive_burnin,
+        posterior_samples,
     )
 
 def BayesB(
@@ -760,6 +795,8 @@ def BayesB(
     seed: Optional[int] = None,
     chains: int = 1,
     threads: int = 1,
+    adaptive_burnin: bool = False,
+    posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -887,6 +924,8 @@ def BayesB(
         seed,
         chains,
         threads,
+        adaptive_burnin,
+        posterior_samples,
     )
 
 
@@ -907,6 +946,8 @@ def BayesC(
     seed: Optional[int] = None,
     chains: int = 1,
     threads: int = 1,
+    adaptive_burnin: bool = False,
+    posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -1028,6 +1069,8 @@ def BayesC(
         seed,
         chains,
         threads,
+        adaptive_burnin,
+        posterior_samples,
     )
 
 
@@ -1047,6 +1090,8 @@ def BayesR(
     seed: Optional[int] = None,
     chains: int = 1,
     threads: int = 1,
+    adaptive_burnin: bool = False,
+    posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -1112,6 +1157,8 @@ def BayesR(
         seed,
         chains,
         threads,
+        adaptive_burnin,
+        posterior_samples,
     )
     return (
         np.ascontiguousarray(result["beta"], dtype=np.float64).reshape(-1),
@@ -1149,7 +1196,9 @@ class BAYES:
         seed: Optional[int] = None,
         chains: int = 1,
         threads: int = 1,
-    ):
+        adaptive_burnin: bool = False,
+        posterior_samples: int = BAYES_POSTERIOR_SAMPLE_TARGET,
+):
         """
         Bayesian genomic prediction using BayesA/B/C/R with minimal hyperparameters.
 
@@ -1167,8 +1216,9 @@ class BAYES:
             Maximum iterations for auto burn-in R-hat monitoring.
         burnin : {"auto", int}, default="auto"
             ``"auto"`` reserves at least 500 warm-up updates and then uses
-            R-hat to start a 1000-sample posterior window. An integer uses a
-            fixed warm-up and skips R-hat stopping.
+            R-hat to start a posterior window. An integer uses a fixed
+            warm-up and skips R-hat stopping unless ``adaptive_burnin`` is
+            enabled.
         r2 : float, optional
             Proportion of variance explained by markers. If None, estimated
             via GBLUP (BLUP with kinship=1).
@@ -1189,6 +1239,10 @@ class BAYES:
             ``max(1, threads // 2)``.
         threads : int, default=1
         CPU budget used by the native multi-chain scheduler.
+        adaptive_burnin : bool, default=False
+            Keep R-hat monitoring enabled even when ``burnin`` is an integer.
+        posterior_samples : int, default=1000
+            Number of posterior samples retained after warm-up/monitoring.
 
         Attributes
         ----------
@@ -1230,6 +1284,8 @@ class BAYES:
         if n_iter is None:
             n_iter = int(default_n_iter)
         burnin = _normalize_burnin(burnin)
+        posterior_samples = _normalize_posterior_samples(posterior_samples)
+        adaptive_burnin = bool(adaptive_burnin)
 
         r2_blup_pheno_scale: float | None = None
         if r2 is None:
@@ -1259,11 +1315,21 @@ class BAYES:
         self.rhat_metrics: dict[str, float] = {}
         self.rhat_max: float = float("nan")
         self.rhat: float = float("nan")
-        self.burnin: str | int = "auto" if burnin is None else int(burnin)
-        self.rhat_max_iterations: int = (
-            max(int(n_iter), BAYES_AUTO_BURNIN_MIN + 1) if burnin is None else 0
+        self.adaptive_burnin = adaptive_burnin
+        self.burnin: str | int = (
+            "auto"
+            if burnin is None and not adaptive_burnin
+            else int(burnin if burnin is not None else BAYES_AUTO_BURNIN_MIN)
         )
-        self.posterior_sample_target: int = BAYES_POSTERIOR_SAMPLE_TARGET
+        self.rhat_max_iterations: int = (
+            max(
+                int(n_iter),
+                int(burnin if burnin is not None else BAYES_AUTO_BURNIN_MIN) + 1,
+            )
+            if burnin is None or adaptive_burnin
+            else 0
+        )
+        self.posterior_sample_target: int = posterior_samples
         self.actual_iterations: int = 0
         self.convergence_iteration: int = 0
         self.posterior_samples: int = 0
@@ -1285,6 +1351,8 @@ class BAYES:
             seed=seed,
             chains=requested_chains,
             threads=max(1, int(threads)),
+            adaptive_burnin=adaptive_burnin,
+            posterior_samples=posterior_samples,
         )
         if method != "BayesR":
             method_kwargs["prob_in"] = prob_in

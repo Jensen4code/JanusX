@@ -23,7 +23,7 @@ use crate::bayes::{
     genetic_variance_from_residual, marker_sufficient_stats, rhat_metrics_to_py,
     update_alpha_gauss_seidel_blas, BayesFixedEffectBackend, BayesFixedEffectInit,
     BayesMarkerBackend, BayesMultiChainController, BayesPackedSource, BayesPriorCalibration,
-    BayesSamplingController, DenseBayesBackend, PackedBayesBackend, BAYES_POSTERIOR_SAMPLES,
+    BayesSamplingController, BayesSamplingOptions, DenseBayesBackend, PackedBayesBackend,
     BAYES_PREDICTIVE_MONITOR_NAMES, BAYES_RHAT_R_NAMES,
 };
 use crate::blas::OpenBlasThreadGuard;
@@ -266,7 +266,7 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     x: &[f64],
     q: usize,
     n_iter: usize,
-    burnin: Option<usize>,
+    sampling: BayesSamplingOptions,
     thin: usize,
     r2: f64,
     df0_e: f64,
@@ -386,7 +386,14 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     let mut pi_sum = [0.0_f64; BAYESR_COMPONENTS];
     let mut h2_sum = 0.0_f64;
     let mut h2_sq_sum = 0.0_f64;
-    let mut schedule = BayesSamplingController::new(n_iter, burnin, thin, BAYES_RHAT_R_NAMES);
+    let mut schedule = BayesSamplingController::new_with_options(
+        n_iter,
+        sampling.burnin,
+        sampling.adaptive_burnin,
+        thin,
+        BAYES_RHAT_R_NAMES,
+        sampling.posterior_target,
+    );
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
 
     while schedule.should_run() {
@@ -544,9 +551,10 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     }
 
     let n_keep = schedule.posterior_samples();
-    if n_keep != BAYES_POSTERIOR_SAMPLES {
+    if n_keep != schedule.posterior_target() {
         return Err(format!(
-            "BayesR retained {n_keep} posterior samples; expected {BAYES_POSTERIOR_SAMPLES}"
+            "BayesR retained {n_keep} posterior samples; expected {}",
+            schedule.posterior_target()
         ));
     }
     let inv_keep = 1.0 / n_keep as f64;
@@ -679,7 +687,7 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
     x: &[f64],
     q: usize,
     n_iter: usize,
-    burnin: Option<usize>,
+    sampling: BayesSamplingOptions,
     thin: usize,
     r2: f64,
     df0_e: f64,
@@ -746,7 +754,7 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
     let xtx = fixed_effects.xtx();
 
     let gamma_array = [gamma[0], gamma[1], gamma[2], gamma[3]];
-    let adaptive = burnin.is_none();
+    let adaptive = sampling.adaptive_burnin || sampling.burnin.is_none();
     let seeds = bayes_chain_seeds(seed, chains);
     let mut states = seeds
         .into_iter()
@@ -765,13 +773,15 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
             )
         })
         .collect::<Vec<_>>();
-    let mut controller = BayesMultiChainController::new_with_monitor(
+    let mut controller = BayesMultiChainController::new_with_monitor_options(
         chains,
         n_iter,
-        burnin,
+        sampling.burnin,
+        adaptive,
         thin,
         BAYES_RHAT_R_NAMES,
         BAYES_PREDICTIVE_MONITOR_NAMES,
+        sampling.posterior_target,
     )?;
     let chi_e = ChiSquared::new(n as f64 + df0_e).map_err(|error| error.to_string())?;
 
@@ -951,9 +961,10 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
     }
 
     let n_keep = controller.posterior_samples();
-    if n_keep != BAYES_POSTERIOR_SAMPLES {
+    if n_keep != controller.posterior_target() {
         return Err(format!(
-            "BayesR retained {n_keep} posterior samples; expected {BAYES_POSTERIOR_SAMPLES}"
+            "BayesR retained {n_keep} posterior samples; expected {}",
+            controller.posterior_target()
         ));
     }
     let scale = 1.0 / (n_keep * chains) as f64;
@@ -1136,7 +1147,7 @@ fn bayesr_dense_multi_core_impl(
     x: &[f64],
     q: usize,
     n_iter: usize,
-    burnin: Option<usize>,
+    sampling: BayesSamplingOptions,
     thin: usize,
     r2: f64,
     df0_e: f64,
@@ -1164,7 +1175,7 @@ fn bayesr_dense_multi_core_impl(
             x,
             q,
             n_iter,
-            burnin,
+            sampling,
             thin,
             r2,
             df0_e,
@@ -1193,7 +1204,7 @@ fn bayesr_dense_multi_core_impl(
             x,
             q,
             n_iter,
-            burnin,
+            sampling,
             thin,
             r2,
             df0_e,
@@ -1221,7 +1232,7 @@ fn bayesr_packed_multi_core_impl<'a>(
     x: &[f64],
     q: usize,
     n_iter: usize,
-    burnin: Option<usize>,
+    sampling: BayesSamplingOptions,
     thin: usize,
     r2: f64,
     df0_e: f64,
@@ -1259,7 +1270,7 @@ fn bayesr_packed_multi_core_impl<'a>(
                 x,
                 q,
                 n_iter,
-                burnin,
+                sampling,
                 thin,
                 r2,
                 df0_e,
@@ -1279,7 +1290,7 @@ fn bayesr_packed_multi_core_impl<'a>(
             x,
             q,
             n_iter,
-            burnin,
+            sampling,
             thin,
             r2,
             df0_e,
@@ -1309,7 +1320,7 @@ fn bayesr_packed_multi_core_impl<'a>(
             x,
             q,
             n_iter,
-            burnin,
+            sampling,
             thin,
             r2,
             df0_e,
@@ -1446,7 +1457,9 @@ fn bayesr_result_to_pydict<'py>(
     s0_lambda2 = None,
     seed = None,
     chains = 1,
-    threads = 1
+    threads = 1,
+    adaptive_burnin = false,
+    posterior_samples = 1000
 ))]
 pub fn bayesr<'py>(
     py: Python<'py>,
@@ -1466,7 +1479,15 @@ pub fn bayesr<'py>(
     seed: Option<u64>,
     chains: usize,
     threads: usize,
+    adaptive_burnin: bool,
+    posterior_samples: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
+    }
+    if posterior_samples == 0 {
+        return Err(PyValueError::new_err("posterior_samples must be > 0"));
+    }
     let y_vec = if let Ok(slice) = y.as_slice() {
         slice.to_vec()
     } else {
@@ -1480,9 +1501,10 @@ pub fn bayesr<'py>(
     let (x_vec, q) = parse_covariates(x.as_ref(), y_vec.len())?;
     let pi_vec = parse_bayesr_prior(pi.as_ref(), &BAYESR_DEFAULT_PI, "pi")?;
     let gamma_vec = parse_bayesr_prior(gamma.as_ref(), &BAYESR_DEFAULT_GAMMA, "gamma")?;
+    let sampling = BayesSamplingOptions::new(burnin, adaptive_burnin, posterior_samples);
     let result = py.detach(|| {
         bayesr_dense_multi_core_impl(
-            m_slice, &y_vec, &x_vec, q, n_iter, burnin, thin, r2, df0_e, prior_ss_e, &pi_vec,
+            m_slice, &y_vec, &x_vec, q, n_iter, sampling, thin, r2, df0_e, prior_ss_e, &pi_vec,
             &gamma_vec, df0_lambda, s0_lambda2, seed, chains, threads,
         )
     });
@@ -1505,7 +1527,7 @@ fn bayesr_packed_core_impl<'a>(
     x: &[f64],
     q: usize,
     n_iter: usize,
-    burnin: Option<usize>,
+    sampling: BayesSamplingOptions,
     thin: usize,
     r2: f64,
     df0_e: f64,
@@ -1543,7 +1565,7 @@ fn bayesr_packed_core_impl<'a>(
             x,
             q,
             n_iter,
-            burnin,
+            sampling,
             thin,
             r2,
             df0_e,
@@ -1561,7 +1583,7 @@ fn bayesr_packed_core_impl<'a>(
         x,
         q,
         n_iter,
-        burnin,
+        sampling,
         thin,
         r2,
         df0_e,
@@ -1598,7 +1620,9 @@ fn bayesr_packed_core_impl<'a>(
     threads = 0,
     chains = 1,
     seed = None,
-    block_rows = None
+    block_rows = None,
+    adaptive_burnin = false,
+    posterior_samples = 1000
 ))]
 pub fn bayesr_packed<'py>(
     py: Python<'py>,
@@ -1625,9 +1649,17 @@ pub fn bayesr_packed<'py>(
     chains: usize,
     seed: Option<u64>,
     block_rows: Option<usize>,
+    adaptive_burnin: bool,
+    posterior_samples: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     if n_samples == 0 {
         return Err(PyValueError::new_err("BayesR n_samples must be > 0"));
+    }
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
+    }
+    if posterior_samples == 0 {
+        return Err(PyValueError::new_err("posterior_samples must be > 0"));
     }
     let packed_arr = packed.as_array();
     let shape = packed_arr.shape();
@@ -1670,6 +1702,7 @@ pub fn bayesr_packed<'py>(
     let (x_vec, q) = parse_covariates(x.as_ref(), y_vec.len())?;
     let pi_vec = parse_bayesr_prior(pi.as_ref(), &BAYESR_DEFAULT_PI, "pi")?;
     let gamma_vec = parse_bayesr_prior(gamma.as_ref(), &BAYESR_DEFAULT_GAMMA, "gamma")?;
+    let sampling = BayesSamplingOptions::new(burnin, adaptive_burnin, posterior_samples);
     let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
         Ok(slice) => Cow::Borrowed(slice),
         Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
@@ -1694,7 +1727,7 @@ pub fn bayesr_packed<'py>(
             &x_vec,
             q,
             n_iter,
-            burnin,
+            sampling,
             thin,
             r2,
             df0_e,
@@ -1742,7 +1775,9 @@ pub fn bayesr_packed<'py>(
     chains = 1,
     seed = None,
     block_rows = None,
-    mmap_window_mb = None
+    mmap_window_mb = None,
+    adaptive_burnin = false,
+    posterior_samples = 1000
 ))]
 pub fn bayesr_stream_bed<'py>(
     py: Python<'py>,
@@ -1771,9 +1806,17 @@ pub fn bayesr_stream_bed<'py>(
     seed: Option<u64>,
     block_rows: Option<usize>,
     mmap_window_mb: Option<usize>,
+    adaptive_burnin: bool,
+    posterior_samples: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     if n_samples == 0 {
         return Err(PyValueError::new_err("BayesR n_samples must be > 0"));
+    }
+    if n_iter == 0 {
+        return Err(PyValueError::new_err("n_iter must be > 0"));
+    }
+    if posterior_samples == 0 {
+        return Err(PyValueError::new_err("posterior_samples must be > 0"));
     }
     let row_indices_raw = row_indices.as_slice()?.to_vec();
     let p = row_indices_raw.len();
@@ -1810,6 +1853,7 @@ pub fn bayesr_stream_bed<'py>(
     let (x_vec, q) = parse_covariates(x.as_ref(), y_vec.len())?;
     let pi_vec = parse_bayesr_prior(pi.as_ref(), &BAYESR_DEFAULT_PI, "pi")?;
     let gamma_vec = parse_bayesr_prior(gamma.as_ref(), &BAYESR_DEFAULT_GAMMA, "gamma")?;
+    let sampling = BayesSamplingOptions::new(burnin, adaptive_burnin, posterior_samples);
     let pool_owned = get_cached_pool(threads)?;
     let pool = pool_owned.as_ref();
     let result = py.detach(|| {
@@ -1838,7 +1882,7 @@ pub fn bayesr_stream_bed<'py>(
             &x_vec,
             q,
             n_iter,
-            burnin,
+            sampling,
             thin,
             r2,
             df0_e,
@@ -2022,7 +2066,7 @@ mod tests {
             &x,
             1,
             1,
-            Some(0),
+            super::BayesSamplingOptions::new(Some(0), false, 1000),
             1,
             0.5,
             5.0,
