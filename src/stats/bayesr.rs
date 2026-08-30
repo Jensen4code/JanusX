@@ -21,8 +21,9 @@ use crate::bayes::{
     copy_f64_to_f32, ddot_f64, duplicate_bayes_source, effective_bayes_chains, finite_rhat_max,
     genetic_variance_from_residual, marker_sufficient_stats, rhat_metrics_to_py,
     update_alpha_gauss_seidel_blas, BayesFixedEffectBackend, BayesFixedEffectInit,
-    BayesMarkerBackend, BayesMultiChainController, BayesPackedSource, BayesSamplingController,
-    DenseBayesBackend, PackedBayesBackend, BAYES_POSTERIOR_SAMPLES, BAYES_RHAT_R_NAMES,
+    BayesMarkerBackend, BayesMultiChainController, BayesPackedSource, BayesPriorCalibration,
+    BayesSamplingController, DenseBayesBackend, PackedBayesBackend, BAYES_POSTERIOR_SAMPLES,
+    BAYES_RHAT_R_NAMES,
 };
 use crate::blas::OpenBlasThreadGuard;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
@@ -203,6 +204,8 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
     if n_iter == 0 || thin == 0 {
         return Err("BayesR n_iter must be > 0 and thin must be >= 1".to_string());
     }
@@ -255,19 +258,6 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
         return Err("BayesR marker mean square must be positive".to_string());
     }
 
-    let y_mean = y.iter().sum::<f64>() / n as f64;
-    let var_y = y
-        .iter()
-        .map(|value| {
-            let delta = *value - y_mean;
-            delta * delta
-        })
-        .sum::<f64>()
-        / (n - 1) as f64;
-    if !(var_y.is_finite() && var_y > 0.0) {
-        return Err("BayesR phenotype variance must be positive".to_string());
-    }
-
     let mut pi = [0.0_f64; BAYESR_COMPONENTS];
     let pi_total = pi_init.iter().sum::<f64>();
     for (dst, value) in pi.iter_mut().zip(pi_init.iter()) {
@@ -275,14 +265,8 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     }
     let gamma_array: [f64; BAYESR_COMPONENTS] = [gamma[0], gamma[1], gamma[2], gamma[3]];
     let mut sigma_lambda2 = s0_lambda2;
-    let mut var_e = var_y * (1.0 - r2);
-    if !(var_e.is_finite() && var_e > 0.0) {
-        return Err("BayesR initial residual variance must be positive".to_string());
-    }
-    let prior_ss_e = prior_ss_e_opt.unwrap_or(var_e * (df0_e + 2.0));
-    if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
-        return Err("BayesR prior_ss_e must be finite and > 0 (nu_0 * S_0^2)".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut alpha = fixed_init.alpha;
     let x2_x = fixed_effects.x2_x();
@@ -624,6 +608,8 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
     if n_iter == 0 || thin == 0 {
         return Err("BayesR n_iter must be > 0 and thin must be >= 1".to_string());
     }
@@ -645,19 +631,6 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
     if !(msx.is_finite() && msx > 0.0) {
         return Err("BayesR marker mean square must be positive".to_string());
     }
-    let y_mean = y.iter().sum::<f64>() / n as f64;
-    let var_y = y
-        .iter()
-        .map(|value| {
-            let delta = *value - y_mean;
-            delta * delta
-        })
-        .sum::<f64>()
-        / (n - 1) as f64;
-    if !(var_y.is_finite() && var_y > 0.0) {
-        return Err("BayesR phenotype variance must be positive".to_string());
-    }
-
     let pi_total = pi_init.iter().sum::<f64>();
     let pi_base = [
         pi_init[0] / pi_total,
@@ -665,14 +638,8 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
         pi_init[2] / pi_total,
         pi_init[3] / pi_total,
     ];
-    let initial_var_e = var_y * (1.0 - r2);
-    if !(initial_var_e.is_finite() && initial_var_e > 0.0) {
-        return Err("BayesR initial residual variance must be positive".to_string());
-    }
-    let prior_ss_e = prior_ss_e_opt.unwrap_or(initial_var_e * (df0_e + 2.0));
-    if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
-        return Err("BayesR prior_ss_e must be finite and > 0 (nu_0 * S_0^2)".to_string());
-    }
+    let initial_var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let x2_x = fixed_effects.x2_x();
     let xtx = fixed_effects.xtx();

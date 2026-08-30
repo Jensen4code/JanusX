@@ -1234,6 +1234,87 @@ pub(crate) struct BayesFixedEffectInit {
     pub(crate) residual: Vec<f64>,
 }
 
+/// Data-scaled variance-prior calibration shared by every Bayes backend.
+///
+/// `residualized_var` is computed from the fixed-effect residual
+/// `y - X alpha`, so automatic prior scales do not use variation already
+/// explained by covariates. The calibration is immutable after construction;
+/// MCMC updates only the sampled variance states.
+#[derive(Clone, Copy)]
+pub(crate) struct BayesPriorCalibration {
+    pub(crate) residualized_var: f64,
+    pub(crate) initial_var_e: f64,
+    pub(crate) prior_ss_e: f64,
+}
+
+impl BayesPriorCalibration {
+    pub(crate) fn from_fixed_init(
+        fixed_init: &BayesFixedEffectInit,
+        r2: f64,
+        df0_e: f64,
+        prior_ss_e_opt: Option<f64>,
+    ) -> Result<Self, String> {
+        if !(r2.is_finite() && r2 > 0.0 && r2 < 1.0) {
+            return Err("r2 must be finite and in (0, 1)".to_string());
+        }
+        if !(df0_e.is_finite() && df0_e > 0.0) {
+            return Err("df0_e must be finite and > 0".to_string());
+        }
+        let residualized_var = phenotype_variance(&fixed_init.residual)?;
+        let initial_var_e = residualized_var * (1.0 - r2);
+        if !(initial_var_e.is_finite() && initial_var_e > 0.0) {
+            return Err(
+                "varE must be positive; check r2 and residualized phenotype variance".to_string(),
+            );
+        }
+        let prior_ss_e = prior_ss_e_opt.unwrap_or(initial_var_e * (df0_e + 2.0));
+        if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
+            return Err("prior_ss_e must be finite and > 0".to_string());
+        }
+        Ok(Self {
+            residualized_var,
+            initial_var_e,
+            prior_ss_e,
+        })
+    }
+
+    pub(crate) fn marker_scale(
+        &self,
+        msx: f64,
+        r2: f64,
+        df0_b: f64,
+        inclusion_probability: Option<f64>,
+        explicit_s0_b: Option<f64>,
+    ) -> Result<f64, String> {
+        if let Some(value) = explicit_s0_b {
+            if value.is_finite() && value > 0.0 {
+                return Ok(value);
+            }
+            return Err("S0_b must be finite and > 0".to_string());
+        }
+        if !(msx.is_finite() && msx > 0.0) {
+            return Err("MSx must be positive to compute S0_b".to_string());
+        }
+        if !(r2.is_finite() && r2 > 0.0 && r2 < 1.0) {
+            return Err("r2 must be finite and in (0, 1)".to_string());
+        }
+        if !(df0_b.is_finite() && df0_b > 0.0) {
+            return Err("df0_b must be finite and > 0".to_string());
+        }
+        let mut scale = self.residualized_var * r2 / msx * (df0_b + 2.0);
+        if let Some(probability) = inclusion_probability {
+            if !(probability.is_finite() && probability > 0.0 && probability < 1.0) {
+                return Err("prob_in must be finite and in (0, 1)".to_string());
+            }
+            scale /= probability;
+        }
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err("S0_b must be finite and > 0".to_string());
+        }
+        Ok(scale)
+    }
+}
+
 impl<'a> BayesFixedEffectBackend<'a> {
     pub(crate) fn new(x: &'a [f64], n: usize, q: usize) -> Result<Self, String> {
         if n == 0 || q == 0 {
@@ -1291,7 +1372,7 @@ fn solve_fixed_effects_qr_svd(x: &[f64], n: usize, q: usize, y: &[f64]) -> Optio
 
     let xmat = DMatrix::<f64>::from_row_slice(n, q, x);
     let yvec = DVector::<f64>::from_column_slice(y);
-    let qr = xmat.qr();
+    let qr = xmat.clone().qr();
     let r = qr.r();
     let mut qty = yvec;
     qr.q_tr_mul(&mut qty);
@@ -1318,11 +1399,13 @@ fn solve_fixed_effects_qr_svd(x: &[f64], n: usize, q: usize, y: &[f64]) -> Optio
         }
     }
 
-    // The QR factor already contains all information needed for the least-
-    // squares problem. Decomposing R instead of X keeps the SVD at q x q
-    // (or min(n, q) x q when q > n), independent of the sample count.
-    let r_rows = r.nrows();
-    let svd = r.svd(true, true);
+    // Use the original design for the fallback. `nalgebra::QR::r()` stores a
+    // sign-normalized triangular factor, while `q_tr_mul` follows the
+    // reflector convention of the original factorization; pairing those
+    // values in a second SVD can change the projection for rank-deficient
+    // designs. The direct SVD remains n x q, never n x n, and is only used
+    // after the cheap full-rank QR path is rejected.
+    let svd = xmat.svd(true, true);
     let u = svd.u?;
     let vt = svd.v_t?;
     let smax = svd
@@ -1341,8 +1424,8 @@ fn solve_fixed_effects_qr_svd(x: &[f64], n: usize, q: usize, y: &[f64]) -> Optio
             continue;
         }
         let mut uy = 0.0_f64;
-        for row in 0..r_rows {
-            uy += u[(row, i)] * qty[row];
+        for row in 0..n {
+            uy += u[(row, i)] * y[row];
         }
         let coefficient = uy / singular;
         for column in 0..q {
@@ -2782,6 +2865,8 @@ fn bayesb_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -2816,45 +2901,12 @@ fn bayesb_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
-
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, Some(prob_in_base), s0_b_opt)?;
 
     let rate0 = bayesb_rate0(shape0, rate0_opt, s0_b)?;
 
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
@@ -3107,6 +3159,8 @@ fn bayesc_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -3141,43 +3195,10 @@ fn bayesc_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, Some(prob_in_base), s0_b_opt)?;
 
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
-
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
@@ -3411,6 +3432,8 @@ fn bayesa_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -3445,30 +3468,7 @@ fn bayesa_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
-
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0)
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, None, s0_b_opt)?;
 
     let rate0 = match rate0_opt {
         Some(v) => v,
@@ -3483,18 +3483,8 @@ fn bayesa_core_impl(
         return Err("rate0 must be positive".to_string());
     }
 
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
@@ -4009,27 +3999,16 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
     let (x2, _mean_x, msx) = marker_sufficient_stats(backend, n, p)?;
-    let var_y = phenotype_variance(y)?;
-    if s0_b_opt.is_none() && !(msx.is_finite() && msx > 0.0) {
-        return Err("MSx must be positive to compute S0_b".to_string());
-    }
-    let s0_b = s0_b_opt.unwrap_or_else(|| var_y * r2 / msx * (df0_b + 2.0));
-    if !(s0_b.is_finite() && s0_b > 0.0) {
-        return Err("S0_b must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, None, s0_b_opt)?;
     let rate0 = rate0_opt.unwrap_or_else(|| (shape0 - 1.0) / s0_b);
     if !(rate0.is_finite() && rate0 > 0.0) {
         return Err("rate0 must be positive; shape0 must be > 1".to_string());
     }
-    let initial_var_e = var_y * (1.0 - r2);
-    if !(initial_var_e.is_finite() && initial_var_e > 0.0) {
-        return Err("varE must be positive; check R2".to_string());
-    }
-    let prior_ss_e = prior_ss_e_opt.unwrap_or(initial_var_e * (df0_e + 2.0));
-    if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let initial_var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
     let x2_x = fixed_effects.x2_x();
     let xtx = fixed_effects.xtx();
     let seeds = bayes_chain_seeds(seed, chains);
@@ -4270,34 +4249,23 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
     if !(prob_in_init > 0.0 && prob_in_init < 1.0) || counts < 0.0 {
         return Err("prob_in must be in (0, 1) and counts must be >= 0".to_string());
     }
     let (x2, _mean_x, msx) = marker_sufficient_stats(backend, n, p)?;
-    let var_y = phenotype_variance(y)?;
-    if !(msx.is_finite() && msx > 0.0) {
-        return Err("MSx must be positive to compute S0_b".to_string());
-    }
     let prob_in_base = fixed_prob_in_opt.unwrap_or(prob_in_init);
     if !(prob_in_base > 0.0 && prob_in_base < 1.0) {
         return Err("fixed pi must be in (0, 1)".to_string());
     }
-    let s0_b = s0_b_opt.unwrap_or(var_y * r2 / msx * (df0_b + 2.0) / prob_in_base);
-    if !(s0_b.is_finite() && s0_b > 0.0) {
-        return Err("S0_b must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, Some(prob_in_base), s0_b_opt)?;
     let rate0 = rate0_opt.unwrap_or_else(|| (shape0 - 1.0) / s0_b);
     if !(rate0.is_finite() && rate0 > 0.0) {
         return Err("rate0 must be positive; shape0 must be > 1".to_string());
     }
-    let initial_var_e = var_y * (1.0 - r2);
-    if !(initial_var_e.is_finite() && initial_var_e > 0.0) {
-        return Err("varE must be positive; check R2".to_string());
-    }
-    let prior_ss_e = prior_ss_e_opt.unwrap_or(initial_var_e * (df0_e + 2.0));
-    if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let initial_var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
     let x2_x = fixed_effects.x2_x();
     let xtx = fixed_effects.xtx();
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
@@ -4597,27 +4565,16 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
     if !(prob_in_init > 0.0 && prob_in_init < 1.0) || counts < 0.0 {
         return Err("prob_in must be in (0, 1) and counts must be >= 0".to_string());
     }
     let (x2, _mean_x, msx) = marker_sufficient_stats(backend, n, p)?;
-    let var_y = phenotype_variance(y)?;
-    if !(msx.is_finite() && msx > 0.0) {
-        return Err("MSx must be positive to compute S0_b".to_string());
-    }
     let prob_in_base = fixed_prob_in_opt.unwrap_or(prob_in_init);
-    let s0_b = s0_b_opt.unwrap_or(var_y * r2 / msx * (df0_b + 2.0) / prob_in_base);
-    if !(s0_b.is_finite() && s0_b > 0.0) {
-        return Err("S0_b must be positive".to_string());
-    }
-    let initial_var_e = var_y * (1.0 - r2);
-    if !(initial_var_e.is_finite() && initial_var_e > 0.0) {
-        return Err("varE must be positive; check R2".to_string());
-    }
-    let prior_ss_e = prior_ss_e_opt.unwrap_or(initial_var_e * (df0_e + 2.0));
-    if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, Some(prob_in_base), s0_b_opt)?;
+    let initial_var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
     let x2_x = fixed_effects.x2_x();
     let xtx = fixed_effects.xtx();
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
@@ -5111,6 +5068,8 @@ fn bayesa_packed_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
     let mut rng = match seed {
@@ -5150,30 +5109,7 @@ fn bayesa_packed_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
-
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0)
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, None, s0_b_opt)?;
 
     let rate0 = match rate0_opt {
         Some(v) => v,
@@ -5188,18 +5124,8 @@ fn bayesa_packed_core_impl(
         return Err("rate0 must be positive".to_string());
     }
 
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
@@ -5448,6 +5374,8 @@ fn bayesb_packed_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
     let mut rng = match seed {
@@ -5487,45 +5415,12 @@ fn bayesb_packed_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
-
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, Some(prob_in_base), s0_b_opt)?;
 
     let rate0 = bayesb_rate0(shape0, rate0_opt, s0_b)?;
 
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
@@ -5837,6 +5732,8 @@ fn bayesc_packed_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
     let mut rng = match seed {
@@ -5876,43 +5773,10 @@ fn bayesc_packed_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, Some(prob_in_base), s0_b_opt)?;
 
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
-
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
@@ -8467,6 +8331,8 @@ fn bayesa_packed_trace_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
 
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
@@ -8524,30 +8390,7 @@ fn bayesa_packed_trace_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
-
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0)
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, None, s0_b_opt)?;
 
     let rate0 = match rate0_opt {
         Some(v) => v,
@@ -8562,18 +8405,8 @@ fn bayesa_packed_trace_core_impl(
         return Err("rate0 must be positive".to_string());
     }
 
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
@@ -8806,6 +8639,8 @@ fn bayesb_packed_trace_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
 
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
@@ -8863,45 +8698,12 @@ fn bayesb_packed_trace_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
-
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, Some(prob_in_base), s0_b_opt)?;
 
     let rate0 = bayesb_rate0(shape0, rate0_opt, s0_b)?;
 
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
@@ -9191,6 +8993,8 @@ fn bayesc_packed_trace_core_impl(
     }
     let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
     let fixed_init = fixed_effects.initial_state(y)?;
+    let prior_calibration =
+        BayesPriorCalibration::from_fixed_init(&fixed_init, r2, df0_e, prior_ss_e_opt)?;
 
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
@@ -9248,43 +9052,10 @@ fn bayesc_packed_trace_core_impl(
     }
     let msx = sum_x2 / n_f - sum_mean_x2;
 
-    let mut y_mean = 0.0;
-    for v in y {
-        y_mean += *v;
-    }
-    y_mean /= n_f;
-    let mut var_y = 0.0;
-    for v in y {
-        let d = *v - y_mean;
-        var_y += d * d;
-    }
-    var_y /= n_f - 1.0;
+    let s0_b = prior_calibration.marker_scale(msx, r2, df0_b, Some(prob_in_base), s0_b_opt)?;
 
-    let s0_b = match s0_b_opt {
-        Some(v) => v,
-        None => {
-            if msx <= 0.0 {
-                return Err("MSx must be positive to compute S0_b".to_string());
-            }
-            var_y * r2 / msx * (df0_b + 2.0) / prob_in_base
-        }
-    };
-    if s0_b <= 0.0 {
-        return Err("S0_b must be positive".to_string());
-    }
-
-    let mut var_e = var_y * (1.0 - r2);
-    if var_e <= 0.0 {
-        return Err("varE must be positive; check R2".to_string());
-    }
-
-    let prior_ss_e = match prior_ss_e_opt {
-        Some(v) => v,
-        None => var_e * (df0_e + 2.0),
-    };
-    if prior_ss_e <= 0.0 {
-        return Err("prior_ss_e must be positive".to_string());
-    }
+    let mut var_e = prior_calibration.initial_var_e;
+    let prior_ss_e = prior_calibration.prior_ss_e;
 
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
