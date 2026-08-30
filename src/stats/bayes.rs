@@ -34,6 +34,7 @@
 //! 1000 iterations form the fallback posterior window. Trace-only kernels
 //! retain explicit thinning for diagnostic plots.
 
+use nalgebra::{DMatrix, DVector};
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
@@ -1212,6 +1213,143 @@ fn row_major_xtx_f64(x: &[f64], n: usize, q: usize, xtx_out: &mut [f64]) {
             }
         }
     }
+}
+
+/// Shared fixed-effect setup for all Bayesian marker samplers.
+///
+/// The marker sampler only needs the small `q x q` cross-product for its
+/// conditional updates.  Initialization is deliberately solved from the
+/// original `n x q` design with QR, and falls back to an SVD pseudo-inverse
+/// when the QR factor is rank deficient.  No `n x n` matrix is constructed.
+pub(crate) struct BayesFixedEffectBackend<'a> {
+    x: &'a [f64],
+    n: usize,
+    q: usize,
+    x2_x: Vec<f64>,
+    xtx: Vec<f64>,
+}
+
+pub(crate) struct BayesFixedEffectInit {
+    pub(crate) alpha: Vec<f64>,
+    pub(crate) residual: Vec<f64>,
+}
+
+impl<'a> BayesFixedEffectBackend<'a> {
+    pub(crate) fn new(x: &'a [f64], n: usize, q: usize) -> Result<Self, String> {
+        if n == 0 || q == 0 {
+            return Err("Bayesian fixed-effect design must be non-empty".to_string());
+        }
+        if x.len() != n.saturating_mul(q) {
+            return Err("Bayesian fixed-effect design dimensions are incompatible".to_string());
+        }
+        let mut xtx = vec![0.0_f64; q.saturating_mul(q)];
+        row_major_xtx_f64(x, n, q, &mut xtx);
+        let x2_x = (0..q).map(|k| xtx[k * q + k]).collect();
+        Ok(Self { x, n, q, x2_x, xtx })
+    }
+
+    #[inline]
+    pub(crate) fn x2_x(&self) -> &[f64] {
+        &self.x2_x
+    }
+
+    #[inline]
+    pub(crate) fn xtx(&self) -> &[f64] {
+        &self.xtx
+    }
+
+    pub(crate) fn initial_state(&self, y: &[f64]) -> Result<BayesFixedEffectInit, String> {
+        if y.len() != self.n {
+            return Err("Bayesian fixed-effect phenotype length does not match design".to_string());
+        }
+        let alpha = solve_fixed_effects_qr_svd(self.x, self.n, self.q, y)
+            .unwrap_or_else(|| vec![0.0_f64; self.q]);
+        let mut residual = vec![0.0_f64; self.n];
+        for i in 0..self.n {
+            let row = &self.x[i * self.q..(i + 1) * self.q];
+            let fitted = row
+                .iter()
+                .zip(alpha.iter())
+                .map(|(value, coefficient)| value * coefficient)
+                .sum::<f64>();
+            residual[i] = y[i] - fitted;
+        }
+        Ok(BayesFixedEffectInit { alpha, residual })
+    }
+}
+
+/// Solve `min_alpha ||y - X alpha||` without forming a sample-by-sample
+/// covariance matrix. QR is preferred for full-rank designs; SVD supplies a
+/// stable minimum-norm solution for rank-deficient or ill-conditioned designs.
+fn solve_fixed_effects_qr_svd(x: &[f64], n: usize, q: usize, y: &[f64]) -> Option<Vec<f64>> {
+    if n == 0 || q == 0 || x.len() != n.saturating_mul(q) || y.len() != n {
+        return None;
+    }
+    if !x.iter().all(|value| value.is_finite()) || !y.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+
+    let xmat = DMatrix::<f64>::from_row_slice(n, q, x);
+    let yvec = DVector::<f64>::from_column_slice(y);
+    let qr = xmat.qr();
+    let r = qr.r();
+    let mut qty = yvec;
+    qr.q_tr_mul(&mut qty);
+    let diag_scale = (0..r.nrows().min(r.ncols()))
+        .map(|i| r[(i, i)].abs())
+        .fold(0.0_f64, f64::max);
+    let qr_cutoff = 1.0e-12_f64 * diag_scale;
+    let qr_full_rank = n >= q
+        && diag_scale.is_finite()
+        && diag_scale > 0.0
+        && (0..q).all(|i| r[(i, i)].abs() > qr_cutoff);
+    if qr_full_rank {
+        let mut solution = vec![0.0_f64; q];
+        for ii in 0..q {
+            let i = q - 1 - ii;
+            let mut rhs = qty[i];
+            for j in (i + 1)..q {
+                rhs -= r[(i, j)] * solution[j];
+            }
+            solution[i] = rhs / r[(i, i)];
+        }
+        if solution.iter().all(|value| value.is_finite()) {
+            return Some(solution);
+        }
+    }
+
+    // The QR factor already contains all information needed for the least-
+    // squares problem. Decomposing R instead of X keeps the SVD at q x q
+    // (or min(n, q) x q when q > n), independent of the sample count.
+    let r_rows = r.nrows();
+    let svd = r.svd(true, true);
+    let u = svd.u?;
+    let vt = svd.v_t?;
+    let smax = svd
+        .singular_values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, f64::max);
+    if !(smax.is_finite() && smax > 0.0) {
+        return None;
+    }
+    let cutoff = 1.0e-12_f64 * smax;
+    let mut alpha = vec![0.0_f64; q];
+    for (i, singular) in svd.singular_values.iter().copied().enumerate() {
+        if !(singular.is_finite() && singular > cutoff) {
+            continue;
+        }
+        let mut uy = 0.0_f64;
+        for row in 0..r_rows {
+            uy += u[(row, i)] * qty[row];
+        }
+        let coefficient = uy / singular;
+        for column in 0..q {
+            alpha[column] += vt[(i, column)] * coefficient;
+        }
+    }
+    alpha.iter().all(|value| value.is_finite()).then_some(alpha)
 }
 
 #[inline]
@@ -2642,6 +2780,8 @@ fn bayesb_core_impl(
     if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -2723,18 +2863,10 @@ fn bayesb_core_impl(
     let mut prob_in = prob_in_base;
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
 
-    let mut alpha = vec![0.0; q];
-    let mut x2_x = vec![0.0; q];
-    for k in 0..q {
-        let mut s2 = 0.0;
-        for i in 0..n {
-            let v = x[i * q + k];
-            s2 += v * v;
-        }
-        x2_x[k] = s2;
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut pip_sum = vec![0.0; p];
@@ -2973,6 +3105,8 @@ fn bayesc_core_impl(
     if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -3053,18 +3187,10 @@ fn bayesc_core_impl(
     let counts_in = counts * prob_in_base;
     let counts_out = counts - counts_in;
 
-    let mut alpha = vec![0.0; q];
-    let mut x2_x = vec![0.0; q];
-    for k in 0..q {
-        let mut s2 = 0.0;
-        for i in 0..n {
-            let v = x[i * q + k];
-            s2 += v * v;
-        }
-        x2_x[k] = s2;
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut pip_sum = vec![0.0; p];
@@ -3283,6 +3409,8 @@ fn bayesa_core_impl(
     if q == 0 || x.len() != n * q {
         return Err("X has incompatible dimensions".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
 
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -3372,18 +3500,10 @@ fn bayesa_core_impl(
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
     let mut s = s0_b;
 
-    let mut alpha = vec![0.0; q];
-    let mut x2_x = vec![0.0; q];
-    for k in 0..q {
-        let mut s2 = 0.0;
-        for i in 0..n {
-            let v = x[i * q + k];
-            s2 += v * v;
-        }
-        x2_x[k] = s2;
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut varb_sum = vec![0.0; p];
@@ -3814,7 +3934,7 @@ struct BayesAChainState {
 
 impl BayesAChainState {
     fn new(
-        y: &[f64],
+        fixed_init: &BayesFixedEffectInit,
         p: usize,
         q: usize,
         s0_b: f64,
@@ -3838,12 +3958,12 @@ impl BayesAChainState {
             var_b: vec![s0_b / (df0_b + 2.0); p],
             s: s0_b,
             var_e,
-            alpha: vec![0.0; q],
-            residual: y.to_vec(),
-            marker_residual: vec![0.0; y.len()],
+            alpha: fixed_init.alpha.clone(),
+            residual: fixed_init.residual.clone(),
+            marker_residual: vec![0.0; fixed_init.residual.len()],
             alpha_xtr: vec![0.0; q],
             alpha_delta: vec![0.0; q],
-            alpha_tmp_n: vec![0.0; y.len()],
+            alpha_tmp_n: vec![0.0; fixed_init.residual.len()],
             beta_sum: vec![0.0; p],
             varb_sum: vec![0.0; p],
             alpha_sum: vec![0.0; q],
@@ -3887,6 +4007,8 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
     if q == 0 || x.len() != n.saturating_mul(q) {
         return Err("BayesA covariate dimensions are incompatible".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
     let (x2, _mean_x, msx) = marker_sufficient_stats(backend, n, p)?;
     let var_y = phenotype_variance(y)?;
     if s0_b_opt.is_none() && !(msx.is_finite() && msx > 0.0) {
@@ -3908,13 +4030,14 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
     if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
         return Err("prior_ss_e must be positive".to_string());
     }
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let x2_x = (0..q).map(|k| xtx[k * q + k]).collect::<Vec<_>>();
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let seeds = bayes_chain_seeds(seed, chains);
     let mut states = seeds
         .into_iter()
-        .map(|chain_seed| BayesAChainState::new(y, p, q, s0_b, df0_b, initial_var_e, chain_seed))
+        .map(|chain_seed| {
+            BayesAChainState::new(&fixed_init, p, q, s0_b, df0_b, initial_var_e, chain_seed)
+        })
         .collect::<Vec<_>>();
     let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_A_NAMES)?;
     let chi_b = ChiSquared::new(df0_b + 1.0).map_err(|error| error.to_string())?;
@@ -4060,7 +4183,7 @@ struct BayesBChainState {
 
 impl BayesBChainState {
     fn new(
-        y: &[f64],
+        fixed_init: &BayesFixedEffectInit,
         p: usize,
         q: usize,
         s0_b: f64,
@@ -4087,12 +4210,12 @@ impl BayesBChainState {
             s: s0_b,
             prob_in,
             var_e,
-            alpha: vec![0.0; q],
-            residual: y.to_vec(),
-            marker_residual: vec![0.0; y.len()],
+            alpha: fixed_init.alpha.clone(),
+            residual: fixed_init.residual.clone(),
+            marker_residual: vec![0.0; fixed_init.residual.len()],
             alpha_xtr: vec![0.0; q],
             alpha_delta: vec![0.0; q],
-            alpha_tmp_n: vec![0.0; y.len()],
+            alpha_tmp_n: vec![0.0; fixed_init.residual.len()],
             beta_sum: vec![0.0; p],
             pip_sum: vec![0.0; p],
             varb_sum: vec![0.0; p],
@@ -4145,6 +4268,8 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
     if q == 0 || x.len() != n.saturating_mul(q) {
         return Err("BayesB covariate dimensions are incompatible".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
     if !(prob_in_init > 0.0 && prob_in_init < 1.0) || counts < 0.0 {
         return Err("prob_in must be in (0, 1) and counts must be >= 0".to_string());
     }
@@ -4173,16 +4298,15 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
     if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
         return Err("prior_ss_e must be positive".to_string());
     }
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let x2_x = (0..q).map(|k| xtx[k * q + k]).collect::<Vec<_>>();
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
     let seeds = bayes_chain_seeds(seed, chains);
     let mut states = seeds
         .into_iter()
         .map(|chain_seed| {
             BayesBChainState::new(
-                y,
+                &fixed_init,
                 p,
                 q,
                 s0_b,
@@ -4390,7 +4514,7 @@ struct BayesCChainState {
 
 impl BayesCChainState {
     fn new(
-        y: &[f64],
+        fixed_init: &BayesFixedEffectInit,
         p: usize,
         q: usize,
         s0_b: f64,
@@ -4415,12 +4539,12 @@ impl BayesCChainState {
             var_b: s0_b,
             prob_in,
             var_e,
-            alpha: vec![0.0; q],
-            residual: y.to_vec(),
-            marker_residual: vec![0.0; y.len()],
+            alpha: fixed_init.alpha.clone(),
+            residual: fixed_init.residual.clone(),
+            marker_residual: vec![0.0; fixed_init.residual.len()],
             alpha_xtr: vec![0.0; q],
             alpha_delta: vec![0.0; q],
-            alpha_tmp_n: vec![0.0; y.len()],
+            alpha_tmp_n: vec![0.0; fixed_init.residual.len()],
             beta_sum: vec![0.0; p],
             pip_sum: vec![0.0; p],
             alpha_sum: vec![0.0; q],
@@ -4471,6 +4595,8 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
     if q == 0 || x.len() != n.saturating_mul(q) {
         return Err("BayesC covariate dimensions are incompatible".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
     if !(prob_in_init > 0.0 && prob_in_init < 1.0) || counts < 0.0 {
         return Err("prob_in must be in (0, 1) and counts must be >= 0".to_string());
     }
@@ -4492,15 +4618,22 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
     if !(prior_ss_e.is_finite() && prior_ss_e > 0.0) {
         return Err("prior_ss_e must be positive".to_string());
     }
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let x2_x = (0..q).map(|k| xtx[k * q + k]).collect::<Vec<_>>();
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
     let seeds = bayes_chain_seeds(seed, chains);
     let mut states = seeds
         .into_iter()
         .map(|chain_seed| {
-            BayesCChainState::new(y, p, q, s0_b, initial_var_e, prob_in_base, chain_seed)
+            BayesCChainState::new(
+                &fixed_init,
+                p,
+                q,
+                s0_b,
+                initial_var_e,
+                prob_in_base,
+                chain_seed,
+            )
         })
         .collect::<Vec<_>>();
     let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_C_NAMES)?;
@@ -4976,6 +5109,8 @@ fn bayesa_packed_core_impl(
             seed,
         );
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
     let mut rng = match seed {
@@ -5070,18 +5205,14 @@ fn bayesa_packed_core_impl(
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
     let mut s = s0_b;
 
-    let mut alpha = vec![0.0; q];
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let mut x2_x = vec![0.0_f64; q];
-    for k in 0..q {
-        x2_x[k] = xtx[k * q + k];
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let mut alpha_xtr = vec![0.0_f64; q];
     let mut alpha_delta = vec![0.0_f64; q];
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut varb_sum = vec![0.0; p];
@@ -5315,6 +5446,8 @@ fn bayesb_packed_core_impl(
             seed,
         );
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
     let mut rng = match seed {
@@ -5401,18 +5534,14 @@ fn bayesb_packed_core_impl(
     let mut s = s0_b;
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
 
-    let mut alpha = vec![0.0; q];
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let mut x2_x = vec![0.0_f64; q];
-    for k in 0..q {
-        x2_x[k] = xtx[k * q + k];
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let mut alpha_xtr = vec![0.0_f64; q];
     let mut alpha_delta = vec![0.0_f64; q];
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut pip_sum = vec![0.0; p];
@@ -5706,6 +5835,8 @@ fn bayesc_packed_core_impl(
             seed,
         );
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
     let mut rng = match seed {
@@ -5790,18 +5921,14 @@ fn bayesc_packed_core_impl(
     let counts_in = counts * prob_in_base;
     let counts_out = counts - counts_in;
 
-    let mut alpha = vec![0.0; q];
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let mut x2_x = vec![0.0_f64; q];
-    for k in 0..q {
-        x2_x[k] = xtx[k * q + k];
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let mut alpha_xtr = vec![0.0_f64; q];
     let mut alpha_delta = vec![0.0_f64; q];
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut pip_sum = vec![0.0; p];
@@ -8338,6 +8465,8 @@ fn bayesa_packed_trace_core_impl(
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
         return Err("row metadata length mismatch with packed rows".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
 
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
@@ -8450,18 +8579,14 @@ fn bayesa_packed_trace_core_impl(
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
     let mut s = s0_b;
 
-    let mut alpha = vec![0.0; q];
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let mut x2_x = vec![0.0_f64; q];
-    for k in 0..q {
-        x2_x[k] = xtx[k * q + k];
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let mut alpha_xtr = vec![0.0_f64; q];
     let mut alpha_delta = vec![0.0_f64; q];
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
@@ -8679,6 +8804,8 @@ fn bayesb_packed_trace_core_impl(
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
         return Err("row metadata length mismatch with packed rows".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
 
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
@@ -8783,18 +8910,14 @@ fn bayesb_packed_trace_core_impl(
     let mut s = s0_b;
     let (counts_in, counts_out) = bayes_inclusion_prior_shapes(prob_in_base, counts);
 
-    let mut alpha = vec![0.0; q];
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let mut x2_x = vec![0.0_f64; q];
-    for k in 0..q {
-        x2_x[k] = xtx[k * q + k];
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let mut alpha_xtr = vec![0.0_f64; q];
     let mut alpha_delta = vec![0.0_f64; q];
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
@@ -9066,6 +9189,8 @@ fn bayesc_packed_trace_core_impl(
     if row_flip.len() != p || row_maf.len() != p || row_mean.len() != p || row_inv_sd.len() != p {
         return Err("row metadata length mismatch with packed rows".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
 
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
 
@@ -9168,18 +9293,14 @@ fn bayesc_packed_trace_core_impl(
     let counts_in = counts * prob_in_base;
     let counts_out = counts - counts_in;
 
-    let mut alpha = vec![0.0; q];
-    let mut xtx = vec![0.0_f64; q * q];
-    row_major_xtx_f64(x, n, q, &mut xtx);
-    let mut x2_x = vec![0.0_f64; q];
-    for k in 0..q {
-        x2_x[k] = xtx[k * q + k];
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let mut alpha_xtr = vec![0.0_f64; q];
     let mut alpha_delta = vec![0.0_f64; q];
     let mut alpha_tmp_n = vec![0.0_f64; n];
 
-    let mut r = y.to_vec();
+    let mut r = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];

@@ -20,9 +20,9 @@ use crate::bayes::{
     bayes_packed_blas_threads, bayes_packed_block_rows, build_bayes_chain_pool, copy_f32_to_f64,
     copy_f64_to_f32, ddot_f64, duplicate_bayes_source, effective_bayes_chains, finite_rhat_max,
     genetic_variance_from_residual, marker_sufficient_stats, rhat_metrics_to_py,
-    update_alpha_gauss_seidel_blas, BayesMarkerBackend, BayesMultiChainController,
-    BayesPackedSource, BayesSamplingController, DenseBayesBackend, PackedBayesBackend,
-    BAYES_POSTERIOR_SAMPLES, BAYES_RHAT_R_NAMES,
+    update_alpha_gauss_seidel_blas, BayesFixedEffectBackend, BayesFixedEffectInit,
+    BayesMarkerBackend, BayesMultiChainController, BayesPackedSource, BayesSamplingController,
+    DenseBayesBackend, PackedBayesBackend, BAYES_POSTERIOR_SAMPLES, BAYES_RHAT_R_NAMES,
 };
 use crate::blas::OpenBlasThreadGuard;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64_value_error};
@@ -201,6 +201,8 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     if x.len() != n.saturating_mul(q) || q == 0 {
         return Err("BayesR covariate dimensions are incompatible".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
     if n_iter == 0 || thin == 0 {
         return Err("BayesR n_iter must be > 0 and thin must be >= 1".to_string());
     }
@@ -282,25 +284,9 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
         return Err("BayesR prior_ss_e must be finite and > 0 (nu_0 * S_0^2)".to_string());
     }
 
-    let mut alpha = vec![0.0_f64; q];
-    let mut x2_x = vec![0.0_f64; q];
-    for k in 0..q {
-        let mut sum = 0.0;
-        for i in 0..n {
-            let value = x[i * q + k];
-            sum += value * value;
-        }
-        x2_x[k] = sum;
-    }
-    let mut xtx = vec![0.0_f64; q * q];
-    for i in 0..n {
-        for a in 0..q {
-            let xa = x[i * q + a];
-            for b in 0..q {
-                xtx[a * q + b] += xa * x[i * q + b];
-            }
-        }
-    }
+    let mut alpha = fixed_init.alpha;
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
     let mut alpha_xtr = vec![0.0_f64; q];
     let mut alpha_delta = vec![0.0_f64; q];
     let mut alpha_tmp_n = vec![0.0_f64; n];
@@ -311,7 +297,7 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
     // separate f32 marker residual is used only during the O(n * p) Gibbs
     // sweep, cutting the repeatedly streamed residual bandwidth in half while
     // retaining f64 dot-product accumulation.
-    let mut residual = y.to_vec();
+    let mut residual = fixed_init.residual;
     let mut marker_residual = vec![0.0_f32; n];
     let mut beta_sum = vec![0.0_f64; p];
     let mut beta_second_sum = vec![0.0_f64; p];
@@ -554,7 +540,7 @@ struct BayesRChainState {
 
 impl BayesRChainState {
     fn new(
-        y: &[f64],
+        fixed_init: &BayesFixedEffectInit,
         p: usize,
         q: usize,
         pi: [f64; BAYESR_COMPONENTS],
@@ -576,12 +562,12 @@ impl BayesRChainState {
             rng,
             beta: vec![0.0; p],
             component: vec![0; p],
-            alpha: vec![0.0; q],
-            residual: y.to_vec(),
-            marker_residual: vec![0.0; y.len()],
+            alpha: fixed_init.alpha.clone(),
+            residual: fixed_init.residual.clone(),
+            marker_residual: vec![0.0; fixed_init.residual.len()],
             alpha_xtr: vec![0.0; q],
             alpha_delta: vec![0.0; q],
-            alpha_tmp_n: vec![0.0; y.len()],
+            alpha_tmp_n: vec![0.0; fixed_init.residual.len()],
             pi,
             sigma_lambda2,
             var_e,
@@ -636,6 +622,8 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
     if q == 0 || x.len() != n.saturating_mul(q) {
         return Err("BayesR covariate dimensions are incompatible".to_string());
     }
+    let fixed_effects = BayesFixedEffectBackend::new(x, n, q)?;
+    let fixed_init = fixed_effects.initial_state(y)?;
     if n_iter == 0 || thin == 0 {
         return Err("BayesR n_iter must be > 0 and thin must be >= 1".to_string());
     }
@@ -686,24 +674,23 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
         return Err("BayesR prior_ss_e must be finite and > 0 (nu_0 * S_0^2)".to_string());
     }
 
-    let mut x2_x = vec![0.0_f64; q];
-    let mut xtx = vec![0.0_f64; q * q];
-    for i in 0..n {
-        for a in 0..q {
-            let xa = x[i * q + a];
-            x2_x[a] += xa * xa;
-            for b in 0..q {
-                xtx[a * q + b] += xa * x[i * q + b];
-            }
-        }
-    }
+    let x2_x = fixed_effects.x2_x();
+    let xtx = fixed_effects.xtx();
 
     let gamma_array = [gamma[0], gamma[1], gamma[2], gamma[3]];
     let seeds = bayes_chain_seeds(seed, chains);
     let mut states = seeds
         .into_iter()
         .map(|chain_seed| {
-            BayesRChainState::new(y, p, q, pi_base, s0_lambda2, initial_var_e, chain_seed)
+            BayesRChainState::new(
+                &fixed_init,
+                p,
+                q,
+                pi_base,
+                s0_lambda2,
+                initial_var_e,
+                chain_seed,
+            )
         })
         .collect::<Vec<_>>();
     let mut controller = BayesMultiChainController::new(chains, n_iter, thin, BAYES_RHAT_R_NAMES)?;
