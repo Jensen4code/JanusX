@@ -15,7 +15,9 @@ mod score_backend;
 //   targeted debugging, but are not accepted as active search modes.
 // - Active beam expansion is AND/XOR-only; negation remains supported.
 
-use self::all_pair::scan_all_pairs_continuous_packed_with_parallel;
+use self::all_pair::{
+    scan_all_pairs_continuous_packed_with_parallel_and_xor, AllPairCandidate, AllPairGate,
+};
 use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use self::bs::{
     beam_search_train_test_continuous_fuzzy,
@@ -113,7 +115,7 @@ use std::time::Instant;
 
 use self::bs::cmp_candidate;
 use self::bs::{take_garfield_frontier_trace, BeamFrontierTraceRecord};
-pub use all_pair::garfield_all_pair_scan_bin_py;
+pub use all_pair::{garfield_all_pair_scan_bin_py, garfield_all_pair_scan_bin_xor_py};
 #[allow(unused_imports)]
 pub use bs::{
     beam_search_train_test_continuous, evaluate_rule_continuous, materialize_rule_bits,
@@ -3052,6 +3054,16 @@ fn pair_triple_rule_from_indices(
     polarity: u8,
     group_ids: &[usize],
 ) -> Result<BeamRule, String> {
+    pair_triple_rule_from_indices_with_op(indices, polarity, group_ids, BeamBinaryOp::And)
+}
+
+#[inline]
+fn pair_triple_rule_from_indices_with_op(
+    indices: &[usize],
+    polarity: u8,
+    group_ids: &[usize],
+    op: BeamBinaryOp,
+) -> Result<BeamRule, String> {
     if indices.is_empty() {
         return Err("pair-triple backend cannot build an empty rule".to_string());
     }
@@ -3080,7 +3092,7 @@ fn pair_triple_rule_from_indices(
             )
         })?;
         rest.push((
-            BeamBinaryOp::And,
+            op,
             BeamLiteral {
                 row_index,
                 group_id,
@@ -3089,6 +3101,28 @@ fn pair_triple_rule_from_indices(
         ));
     }
     Ok(BeamRule { first, rest })
+}
+
+#[inline]
+fn pair_triple_rule_from_candidate(
+    candidate: &AllPairCandidate,
+    group_ids: &[usize],
+) -> Result<BeamRule, String> {
+    let op = match candidate.gate {
+        AllPairGate::And => BeamBinaryOp::And,
+        AllPairGate::Xor => {
+            if candidate.polarity != 0 {
+                return Err("pair-triple backend received a non-canonical XOR polarity".to_string());
+            }
+            BeamBinaryOp::Xor
+        }
+    };
+    pair_triple_rule_from_indices_with_op(
+        &[candidate.first, candidate.second],
+        candidate.polarity,
+        group_ids,
+        op,
+    )
 }
 
 #[inline]
@@ -3168,6 +3202,13 @@ fn pair_triple_search_train_test_continuous(
         ));
     }
     let max_order = params.max_pick.min(3);
+    if params.xor_search_enabled && max_order >= 3 {
+        return Err(
+            "GARFIELD pair-triple backend supports --xor-search only for order-2 AllPair; "
+                .to_string()
+                + "disable --xor-search or use the legacy backend for order-3 search",
+        );
+    }
     let mut candidates = Vec::<BeamRuleCandidate>::new();
     let singleton_negations = [false, true];
     for row_index in 0..n_rows {
@@ -3214,7 +3255,7 @@ fn pair_triple_search_train_test_continuous(
         return Ok(candidates);
     }
 
-    let pair_scan = scan_all_pairs_continuous_packed_with_parallel(
+    let pair_scan = scan_all_pairs_continuous_packed_with_parallel_and_xor(
         prepared_bits.train_bits(),
         prepared_bits.row_words_train,
         n_rows,
@@ -3222,11 +3263,11 @@ fn pair_triple_search_train_test_continuous(
         y_train.len(),
         GARFIELD_PAIR_TRIPLE_K2,
         params.allow_parallel,
+        params.xor_search_enabled,
     )?;
     let mut pair_seeds = Vec::<PairTripleSeed>::with_capacity(pair_scan.candidates.len());
     for (rank, pair) in pair_scan.candidates.iter().enumerate() {
-        let rule =
-            pair_triple_rule_from_indices(&[pair.first, pair.second], pair.polarity, group_ids)?;
+        let rule = pair_triple_rule_from_candidate(pair, group_ids)?;
         if let Some(candidate) = pair_triple_candidate_from_rule(
             rule,
             y_train,
@@ -17852,6 +17893,110 @@ mod tests {
         assert!(conditional_split_support_passes(100, 40, 100, 20));
         assert!(!conditional_split_support_passes(100, 2, 100, 20));
         assert!(!conditional_split_support_passes(100, 98, 100, 20));
+    }
+
+    #[test]
+    fn pair_triple_maps_canonical_xor_candidate_to_xor_rule() {
+        let candidate = AllPairCandidate {
+            first: 2,
+            second: 5,
+            gate: AllPairGate::Xor,
+            polarity: 0,
+            raw_score: 1.0,
+            support: 10,
+        };
+        let rule = pair_triple_rule_from_candidate(&candidate, &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(rule.len(), 2);
+        assert_eq!(rule.first.row_index, 2);
+        assert!(!rule.first.negated);
+        assert_eq!(rule.rest[0].0, BeamBinaryOp::Xor);
+        assert_eq!(rule.rest[0].1.row_index, 5);
+        assert!(!rule.rest[0].1.negated);
+    }
+
+    #[test]
+    fn pair_triple_rejects_noncanonical_xor_polarity() {
+        let candidate = AllPairCandidate {
+            first: 0,
+            second: 1,
+            gate: AllPairGate::Xor,
+            polarity: 1,
+            raw_score: 1.0,
+            support: 10,
+        };
+        let error = pair_triple_rule_from_candidate(&candidate, &[0, 1]).unwrap_err();
+        assert!(error.contains("non-canonical XOR polarity"));
+    }
+
+    #[test]
+    fn pair_triple_search_emits_xor_pair_when_enabled() {
+        let n_samples = 8usize;
+        let row_words = words_for_samples(n_samples);
+        let mut bits = vec![0u64; 2 * row_words];
+        bits[0] = 0b0000_1111;
+        bits[row_words] = 0b0011_0011;
+        let y = vec![0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0];
+        let prepared = GarfieldUnitBitMatrices {
+            train_bits: Cow::Owned(bits),
+            train_bits_hi: None,
+            row_words_train: row_words,
+            test_bits: None,
+            test_bits_hi: None,
+            row_words_test: row_words,
+            selected_bits_full: None,
+            selected_bits_full_hi: None,
+            selected_bits_full_alias_train: false,
+            selected_bits_full_hi_alias_train: false,
+        };
+        let mut params = BeamSearchParams::default();
+        params.search_backend = GarfieldSearchBackend::PairTriple;
+        params.max_pick = 2;
+        params.beam_width = 8;
+        params.allow_parallel = false;
+        params.maf_threshold = 0.0;
+        params.xor_search_enabled = true;
+        let candidates =
+            pair_triple_search_train_test_continuous(&y, &prepared, 2, &y, &[0, 1], params, None)
+                .unwrap();
+        assert!(candidates.iter().any(|candidate| {
+            candidate
+                .rule
+                .rest
+                .first()
+                .map(|(op, _)| *op == BeamBinaryOp::Xor)
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn pair_triple_rejects_xor_order_three_until_gate_is_supported() {
+        let prepared = GarfieldUnitBitMatrices {
+            train_bits: Cow::Owned(vec![0b0000_1111, 0b0011_0011, 0b0101_0101]),
+            train_bits_hi: None,
+            row_words_train: 1,
+            test_bits: None,
+            test_bits_hi: None,
+            row_words_test: 1,
+            selected_bits_full: None,
+            selected_bits_full_hi: None,
+            selected_bits_full_alias_train: false,
+            selected_bits_full_hi_alias_train: false,
+        };
+        let mut params = BeamSearchParams::default();
+        params.search_backend = GarfieldSearchBackend::PairTriple;
+        params.max_pick = 3;
+        params.xor_search_enabled = true;
+        let error = pair_triple_search_train_test_continuous(
+            &[0.0; 8],
+            &prepared,
+            3,
+            &[0.0; 8],
+            &[0, 1, 2],
+            params,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("only for order-2 AllPair"));
     }
 
     #[test]

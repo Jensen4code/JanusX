@@ -3,8 +3,9 @@
 //! This module is deliberately separate from the Beam implementation.  An
 //! all-pair scan must evaluate every `i < j` pair and all four signed AND
 //! variants without using parent-gain, min-gain, singleton-prefix, or Beam
-//! retention rules.  It is a proposal/raw-design primitive; formal inference
-//! remains owned by the existing GARFIELD pipeline.
+//! retention rules.  An optional fifth, canonical XOR mask can be enabled for
+//! order-2 exploratory searches.  It is a proposal/raw-design primitive;
+//! formal inference remains owned by the existing GARFIELD pipeline.
 
 use crate::breader::load_bin01_as_u64_words;
 use crate::bstats::{tail_mask, words_for_samples};
@@ -20,16 +21,28 @@ use super::score::{
     score_cont_centered_gain_from_sum_and_n_hit, validate_continuous_y, PackedYSumLookup,
 };
 
-/// The best signed AND interpretation for one unordered marker pair.
+/// The gate used for an all-pair candidate.
 ///
-/// `polarity` is a two-bit mask: bit 0 negates `first`, bit 1 negates
-/// `second`.  The scanner keeps one record per *site pair*, not four duplicate
-/// records, so pair Top-K remains comparable with unsigned pair methods such as
-/// PLINK epistasis.
+/// `Xor` is represented canonically without a polarity bit: XNOR is the
+/// complement of XOR and has the same centered-Gain score, so evaluating both
+/// would only duplicate work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AllPairGate {
+    And,
+    Xor,
+}
+
+/// The best signed interpretation for one unordered marker pair.
+///
+/// For `And`, `polarity` is a two-bit mask: bit 0 negates `first`, bit 1
+/// negates `second`.  For `Xor`, polarity is always zero because XOR/XNOR are
+/// centered-Gain complements.  The scanner keeps one record per *site pair*,
+/// not one record per gate variant, so pair Top-K remains bounded.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AllPairCandidate {
     pub(crate) first: usize,
     pub(crate) second: usize,
+    pub(crate) gate: AllPairGate,
     pub(crate) polarity: u8,
     pub(crate) raw_score: f64,
     pub(crate) support: usize,
@@ -46,11 +59,18 @@ pub(crate) struct AllPairScanResult {
 
 #[inline]
 fn candidate_cmp(a: &AllPairCandidate, b: &AllPairCandidate) -> Ordering {
+    let gate_rank = |gate: AllPairGate| match gate {
+        // Preserve the historical AND winner for exact ties.  XOR remains
+        // deterministic, but does not replace an equally scoring AND rule.
+        AllPairGate::Xor => 0u8,
+        AllPairGate::And => 1u8,
+    };
     a.raw_score
         .total_cmp(&b.raw_score)
         // Lower pair indices are the deterministic winner for exact ties.
         .then_with(|| b.first.cmp(&a.first))
         .then_with(|| b.second.cmp(&a.second))
+        .then_with(|| gate_rank(a.gate).cmp(&gate_rank(b.gate)))
         .then_with(|| b.polarity.cmp(&a.polarity))
 }
 
@@ -61,6 +81,7 @@ impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
         self.0.first == other.0.first
             && self.0.second == other.0.second
+            && self.0.gate == other.0.gate
             && self.0.polarity == other.0.polarity
             && self.0.support == other.0.support
             && self.0.raw_score.to_bits() == other.0.raw_score.to_bits()
@@ -123,13 +144,15 @@ fn best_pair_candidate_fused(
     n_samples: usize,
     lookup: &PackedYSumLookup,
     total_sum: f64,
+    xor_search: bool,
 ) -> AllPairCandidate {
     let first_pos = row_slice(bits_flat, row_words, first, needed_words);
     let second_pos = row_slice(bits_flat, row_words, second, needed_words);
     let first_neg = row_slice(negated, needed_words, first, needed_words);
     let second_neg = row_slice(negated, needed_words, second, needed_words);
-    let mut counts = [0usize; 4];
-    let mut sums = [0.0f64; 4];
+    let n_variants = if xor_search { 5 } else { 4 };
+    let mut counts = [0usize; 5];
+    let mut sums = [0.0f64; 5];
     for word_idx in 0..needed_words {
         let mut lhs = first_pos[word_idx];
         let mut rhs = second_pos[word_idx];
@@ -139,31 +162,43 @@ fn best_pair_candidate_fused(
                 rhs &= mask;
             }
         }
-        let words = [
+        let and_words = [
             lhs & rhs,
             first_neg[word_idx] & rhs,
             lhs & second_neg[word_idx],
             first_neg[word_idx] & second_neg[word_idx],
         ];
-        for (variant, word) in words.into_iter().enumerate() {
+        for (variant, word) in and_words.into_iter().enumerate() {
             counts[variant] = counts[variant].saturating_add(word.count_ones() as usize);
             sums[variant] += lookup.sum_word(word_idx, word);
         }
+        if xor_search {
+            let xor_word = lhs ^ rhs;
+            counts[4] = counts[4].saturating_add(xor_word.count_ones() as usize);
+            sums[4] += lookup.sum_word(word_idx, xor_word);
+        }
     }
     let mut best: Option<AllPairCandidate> = None;
-    for polarity in 0u8..4 {
+    for variant in 0..n_variants {
+        let is_xor = variant == 4;
+        let polarity = if is_xor { 0 } else { variant as u8 };
         let score = score_cont_centered_gain_from_sum_and_n_hit(
             total_sum,
-            sums[polarity as usize],
+            sums[variant],
             n_samples,
-            counts[polarity as usize],
+            counts[variant],
         );
         let candidate = AllPairCandidate {
             first,
             second,
+            gate: if is_xor {
+                AllPairGate::Xor
+            } else {
+                AllPairGate::And
+            },
             polarity,
             raw_score: score.raw_score,
-            support: counts[polarity as usize],
+            support: counts[variant],
         };
         if best
             .as_ref()
@@ -173,7 +208,7 @@ fn best_pair_candidate_fused(
             best = Some(candidate);
         }
     }
-    best.expect("pair has four polarity variants")
+    best.expect("pair has at least four polarity variants")
 }
 
 fn validate_scan_inputs(
@@ -219,6 +254,9 @@ fn validate_scan_inputs(
 /// This function intentionally has no search pruning.  It only keeps the
 /// requested number of best *site pairs* in a bounded heap; all four polarity
 /// variants are evaluated before selecting the best variant for that pair.
+/// The historical API keeps XOR disabled; callers that need the optional
+/// canonical XOR gate should use
+/// [`scan_all_pairs_continuous_packed_with_parallel_and_xor`].
 pub(crate) fn scan_all_pairs_continuous_packed(
     bits_flat: &[u64],
     row_words: usize,
@@ -244,6 +282,34 @@ pub(crate) fn scan_all_pairs_continuous_packed_with_parallel(
     n_samples: usize,
     top_k: usize,
     allow_parallel: bool,
+) -> Result<AllPairScanResult, String> {
+    scan_all_pairs_continuous_packed_with_parallel_and_xor(
+        bits_flat,
+        row_words,
+        n_rows,
+        y,
+        n_samples,
+        top_k,
+        allow_parallel,
+        false,
+    )
+}
+
+/// Internal all-pair scanner with an optional canonical XOR gate.
+///
+/// `xor_search=false` is the historical four-AND path and keeps its candidate
+/// ordering and counters unchanged.  When enabled, each pair evaluates one
+/// additional `lhs ^ rhs` mask; its complement (XNOR) is intentionally omitted
+/// because centered Gain is invariant to group complementation.
+pub(crate) fn scan_all_pairs_continuous_packed_with_parallel_and_xor(
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    y: &[f64],
+    n_samples: usize,
+    top_k: usize,
+    allow_parallel: bool,
+    xor_search: bool,
 ) -> Result<AllPairScanResult, String> {
     let needed_words = validate_scan_inputs(bits_flat, row_words, n_rows, y, n_samples)?;
     let tail = tail_mask(n_samples);
@@ -294,6 +360,7 @@ pub(crate) fn scan_all_pairs_continuous_packed_with_parallel(
                             n_samples,
                             &lookup,
                             total_sum,
+                            xor_search,
                         );
                         push_top_k(&mut local_heap, candidate, top_k);
                     }
@@ -324,6 +391,7 @@ pub(crate) fn scan_all_pairs_continuous_packed_with_parallel(
                     n_samples,
                     &lookup,
                     total_sum,
+                    xor_search,
                 );
                 push_top_k(&mut serial_heap, candidate, top_k);
             }
@@ -335,7 +403,7 @@ pub(crate) fn scan_all_pairs_continuous_packed_with_parallel(
         .and_then(|value| value.checked_div(2))
         .ok_or_else(|| "garfield_all_pair_scan: pair counter overflow".to_string())?;
     let polarity_evaluated = pairs_evaluated
-        .checked_mul(4)
+        .checked_mul(if xor_search { 5 } else { 4 })
         .ok_or_else(|| "garfield_all_pair_scan: polarity counter overflow".to_string())?;
 
     let mut candidates = heap
@@ -359,6 +427,24 @@ pub(crate) fn scan_all_pairs_continuous_packed_with_parallel(
 /// raw_score, support)` tuples.  The API is intentionally standalone so the
 /// production Beam/search path remains unchanged while all-pair benchmarks
 /// establish the raw-score oracle ceiling.
+fn scan_all_pair_bin_py_impl<'py>(
+    bin_path: &str,
+    y: PyReadonlyArray1<'py, f64>,
+    top_k: usize,
+    xor_search: bool,
+) -> PyResult<AllPairScanResult> {
+    let (bits, row_words, n_rows, n_samples) =
+        load_bin01_as_u64_words(bin_path, "garfield_all_pair_scan_bin")
+            .map_err(PyRuntimeError::new_err)?;
+    let y_vec = y
+        .as_slice()
+        .map_err(|e| PyValueError::new_err(format!("garfield_all_pair_scan_bin: {e}")))?;
+    scan_all_pairs_continuous_packed_with_parallel_and_xor(
+        &bits, row_words, n_rows, y_vec, n_samples, top_k, true, xor_search,
+    )
+    .map_err(PyValueError::new_err)
+}
+
 #[pyfunction(name = "garfield_all_pair_scan_bin")]
 #[pyo3(signature = (bin_path, y, top_k=100))]
 pub fn garfield_all_pair_scan_bin_py(
@@ -372,15 +458,7 @@ pub fn garfield_all_pair_scan_bin_py(
     usize,
     usize,
 )> {
-    let (bits, row_words, n_rows, n_samples) =
-        load_bin01_as_u64_words(&bin_path, "garfield_all_pair_scan_bin")
-            .map_err(PyRuntimeError::new_err)?;
-    let y_vec = y
-        .as_slice()
-        .map_err(|e| PyValueError::new_err(format!("garfield_all_pair_scan_bin: {e}")))?;
-    let result =
-        scan_all_pairs_continuous_packed(&bits, row_words, n_rows, y_vec, n_samples, top_k)
-            .map_err(PyValueError::new_err)?;
+    let result = scan_all_pair_bin_py_impl(&bin_path, y, top_k, false)?;
     let candidates = result
         .candidates
         .into_iter()
@@ -388,6 +466,52 @@ pub fn garfield_all_pair_scan_bin_py(
             (
                 candidate.first,
                 candidate.second,
+                candidate.polarity,
+                candidate.raw_score,
+                candidate.support,
+            )
+        })
+        .collect();
+    Ok((
+        candidates,
+        result.pairs_evaluated,
+        result.polarity_evaluated,
+        result.n_rows,
+        result.n_samples,
+    ))
+}
+
+/// Python benchmark wrapper for the five-gate order-2 scanner.
+///
+/// This preserves the historical `garfield_all_pair_scan_bin` tuple and adds
+/// an explicit gate label for the optional canonical XOR candidate.  The
+/// wrapper is intentionally diagnostic/benchmark-facing; the normal GARFIELD
+/// CLI enables the same gate through `--xor-search`.
+#[pyfunction(name = "garfield_all_pair_scan_bin_xor")]
+#[pyo3(signature = (bin_path, y, top_k=100))]
+pub fn garfield_all_pair_scan_bin_xor_py(
+    bin_path: String,
+    y: PyReadonlyArray1<'_, f64>,
+    top_k: usize,
+) -> PyResult<(
+    Vec<(usize, usize, String, u8, f64, usize)>,
+    usize,
+    usize,
+    usize,
+    usize,
+)> {
+    let result = scan_all_pair_bin_py_impl(&bin_path, y, top_k, true)?;
+    let candidates = result
+        .candidates
+        .into_iter()
+        .map(|candidate| {
+            (
+                candidate.first,
+                candidate.second,
+                match candidate.gate {
+                    AllPairGate::And => "AND".to_string(),
+                    AllPairGate::Xor => "XOR".to_string(),
+                },
                 candidate.polarity,
                 candidate.raw_score,
                 candidate.support,
@@ -539,6 +663,75 @@ mod tests {
         assert_eq!(serial, parallel);
     }
 
+    #[test]
+    fn xor_search_adds_one_canonical_gate_to_the_four_and_masks() {
+        // A xor B is the high-residual group; its complement (XNOR) has the
+        // same centered-Gain score and therefore does not need a second scan.
+        let n_samples = 8;
+        let bits = [row(n_samples, &[0, 1, 2, 3]), row(n_samples, &[0, 1, 4, 5])].concat();
+        let y = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0];
+
+        let without_xor = scan_all_pairs_continuous_packed_with_parallel_and_xor(
+            &bits, 1, 2, &y, n_samples, 2, false, false,
+        )
+        .unwrap();
+        assert_eq!(without_xor.polarity_evaluated, 4);
+        assert_eq!(without_xor.candidates[0].gate, AllPairGate::And);
+
+        let with_xor = scan_all_pairs_continuous_packed_with_parallel_and_xor(
+            &bits, 1, 2, &y, n_samples, 2, false, true,
+        )
+        .unwrap();
+        assert_eq!(with_xor.polarity_evaluated, 5);
+        assert_eq!(with_xor.candidates[0].gate, AllPairGate::Xor);
+        assert_eq!(with_xor.candidates[0].polarity, 0);
+        assert_eq!(with_xor.candidates[0].support, 4);
+    }
+
+    #[test]
+    fn xor_and_its_complement_have_identical_centered_gain() {
+        let n_samples = 9;
+        let lhs = row(n_samples, &[0, 1, 4, 7]);
+        let rhs = row(n_samples, &[1, 2, 4, 8]);
+        let xor = lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(&a, &b)| a ^ b)
+            .collect::<Vec<_>>();
+        let xnor = xor.iter().map(|word| !word).collect::<Vec<_>>();
+        let mut xnor = xnor;
+        if let Some(mask) = tail_mask(n_samples) {
+            *xnor.last_mut().expect("at least one packed word") &= mask;
+        }
+        let y = [0.2, -0.4, 1.1, 0.7, -0.2, 0.9, -0.8, 0.3, 1.4];
+        let lookup = PackedYSumLookup::build(&y, n_samples).unwrap();
+        let total_sum = y.iter().sum::<f64>();
+        let (xor_n, xor_sum) =
+            xor.iter()
+                .enumerate()
+                .fold((0usize, 0.0), |(count, sum), (word_idx, &word)| {
+                    (
+                        count + word.count_ones() as usize,
+                        sum + lookup.sum_word(word_idx, word),
+                    )
+                });
+        let (xnor_n, xnor_sum) =
+            xnor.iter()
+                .enumerate()
+                .fold((0usize, 0.0), |(count, sum), (word_idx, &word)| {
+                    (
+                        count + word.count_ones() as usize,
+                        sum + lookup.sum_word(word_idx, word),
+                    )
+                });
+        let xor_score =
+            score_cont_centered_gain_from_sum_and_n_hit(total_sum, xor_sum, n_samples, xor_n);
+        let xnor_score =
+            score_cont_centered_gain_from_sum_and_n_hit(total_sum, xnor_sum, n_samples, xnor_n);
+        assert_eq!(xor_n + xnor_n, n_samples);
+        assert!((xor_score.raw_score - xnor_score.raw_score).abs() < 1e-12);
+    }
+
     fn reference_all_pairs(
         bits_flat: &[u64],
         row_words: usize,
@@ -580,6 +773,7 @@ mod tests {
                     let candidate = AllPairCandidate {
                         first,
                         second,
+                        gate: AllPairGate::And,
                         polarity,
                         raw_score: score.raw_score,
                         support,

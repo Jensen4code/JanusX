@@ -1820,7 +1820,10 @@ def main() -> None:
         action="store_true",
         dest="xor_search",
         default=False,
-        help="Enable XOR logic-gate expansion during GARFIELD beam search (default: off).",
+        help=(
+            "Enable XOR logic-gate expansion during GARFIELD search (legacy Beam, "
+            "or the order-2 AllPair stage of pair-triple; default: off)."
+        ),
     )
     optional_group.add_argument(
         "-global",
@@ -2029,6 +2032,15 @@ def main() -> None:
     )
     if int(args.layer) <= 0:
         parser.error("-layer must be > 0")
+    if (
+        bool(args.xor_search)
+        and str(args.search_backend).lower() == "pair-triple"
+        and int(args.layer) >= 3
+    ):
+        parser.error(
+            "--xor-search with --search-backend pair-triple is currently supported "
+            "only for order-2 AllPair; use the legacy backend for order-3 search"
+        )
     if int(args.gain_layer) < 1:
         parser.error("-gain/--gain-layer must be >= 1")
     if int(args.rule_topk) <= 0:
