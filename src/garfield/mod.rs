@@ -1,5 +1,6 @@
 mod all_pair;
 pub(crate) mod bs;
+mod dosage;
 mod pair_triple;
 mod permutation;
 mod proposal;
@@ -123,6 +124,7 @@ pub use bs::{
     BeamGroupConstraintMode, BeamLiteral, BeamRankMode, BeamRule, BeamRuleCandidate,
     BeamSearchParams, GarfieldSearchBackend,
 };
+pub use dosage::{garfield_dosage_pair_fit_py, garfield_dosage_pair_scan_py};
 pub use pair_triple::garfield_pair_triple_refine_bin_py;
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
 use residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult};

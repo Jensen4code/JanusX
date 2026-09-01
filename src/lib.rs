@@ -224,10 +224,10 @@ use fvlmm::{
 };
 use fvlmm2::fvlmm2_assoc_chunk_f32;
 use garfield::{
-    garfield_all_pair_scan_bin_py, garfield_all_pair_scan_bin_xor_py, garfield_eval_rule_bin_py,
-    garfield_logic_search_bed_py, garfield_pair_triple_refine_bin_py,
-    garfield_prepare_input_bin_py, garfield_residualize_bed_py, garfield_residualize_grm_py,
-    garfield_scan_groups_bin_py, garfield_scan_windows_bin_py,
+    garfield_all_pair_scan_bin_py, garfield_all_pair_scan_bin_xor_py, garfield_dosage_pair_fit_py,
+    garfield_dosage_pair_scan_py, garfield_eval_rule_bin_py, garfield_logic_search_bed_py,
+    garfield_pair_triple_refine_bin_py, garfield_prepare_input_bin_py, garfield_residualize_bed_py,
+    garfield_residualize_grm_py, garfield_scan_groups_bin_py, garfield_scan_windows_bin_py,
     garfield_score_cont_centered_gain_batch_packed_cpu_py, garfield_subset_bin_samples_py,
     load_bin01_packed_py, load_mbin_packed_py, score_binary_ba_mcc_batch_py, score_binary_ba_py,
     score_binary_mcc_py, score_cont_corr_py, score_cont_mean_diff_corr_batch_py,
@@ -1013,6 +1013,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(garfield_scan_windows_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_all_pair_scan_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_all_pair_scan_bin_xor_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_dosage_pair_fit_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_dosage_pair_scan_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_pair_triple_refine_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_eval_rule_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_logic_search_bed_py, m)?)?;
