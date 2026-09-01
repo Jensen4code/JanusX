@@ -10,7 +10,7 @@
 //! once per marker and solves only the interaction column for each pair. No
 //! explicit inverse of `V` is formed.
 
-use nalgebra::{Cholesky, DMatrix, DVector, Dyn};
+use nalgebra::{Cholesky, DMatrix, Dyn};
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -60,6 +60,7 @@ pub(crate) struct GrmPairCandidate {
 
 #[derive(Clone, Debug)]
 struct GrmHeapEntry {
+    pair_index: usize,
     first: usize,
     second: usize,
     statistic: GrmPairStatistic,
@@ -104,11 +105,19 @@ struct GrmPairAccumulator {
 }
 
 impl GrmPairAccumulator {
-    fn push(&mut self, first: usize, second: usize, statistic: GrmPairStatistic, top_k: usize) {
+    fn push(
+        &mut self,
+        pair_index: usize,
+        first: usize,
+        second: usize,
+        statistic: GrmPairStatistic,
+        top_k: usize,
+    ) {
         if top_k == 0 {
             return;
         }
         let entry = Reverse(GrmHeapEntry {
+            pair_index,
             first,
             second,
             statistic,
@@ -130,7 +139,13 @@ impl GrmPairAccumulator {
         self.pairs_evaluated = self.pairs_evaluated.saturating_add(other.pairs_evaluated);
         self.pairs_skipped = self.pairs_skipped.saturating_add(other.pairs_skipped);
         for Reverse(entry) in other.heap {
-            self.push(entry.first, entry.second, entry.statistic, top_k);
+            self.push(
+                entry.pair_index,
+                entry.first,
+                entry.second,
+                entry.statistic,
+                top_k,
+            );
         }
     }
 }
@@ -165,6 +180,25 @@ impl PairWorkspace {
         self.solved_interaction[..lower_dim].fill(0.0);
         self.solved_y[..lower_dim].fill(0.0);
     }
+}
+
+/// Genotype-only geometry for one pair under a fixed covariance matrix.
+///
+/// The interaction column is formed and solved once while preparing a scan.
+/// Later phenotypes only update the response cross-products, so repeated
+/// scans sharing the same genotype window and variance components do not
+/// redo the expensive (V^{-1}(g_i g_j)) solve.
+struct PairGeometry {
+    lower_chol: Vec<f64>,
+    rhs_interaction: Vec<f64>,
+    solved_interaction: Vec<f64>,
+    projected_variance: f64,
+}
+
+struct PreparedPair {
+    first: usize,
+    second: usize,
+    geometry: PairGeometry,
 }
 
 struct FixedVContext {
@@ -305,6 +339,21 @@ impl FixedVContext {
         solve_cholesky_into(&self.chol_v, rhs, out)
     }
 
+    fn set_response(&mut self, y: &[f64]) -> Result<(), String> {
+        if y.len() != self.n {
+            return Err(format!("y length={} but expected {}", y.len(), self.n));
+        }
+        if y.iter().any(|value| !value.is_finite()) {
+            return Err("y contains non-finite values".to_string());
+        }
+        solve_cholesky_into(&self.chol_v, y, &mut self.vinv_y)?;
+        self.y_vinv_y = dot(y, &self.vinv_y);
+        for row in 0..self.fixed_rank {
+            self.fixed_y_cross[row] = dot(&self.fixed_columns[row], &self.vinv_y);
+        }
+        Ok(())
+    }
+
     fn precompute_marker_vinv(
         &self,
         genotypes: &[f64],
@@ -326,15 +375,14 @@ impl FixedVContext {
         Ok(result)
     }
 
-    fn score_pair_with_workspace(
+    fn build_pair_geometry(
         &self,
         g1: &[f64],
         g2: &[f64],
         vinv_g1: &[f64],
         vinv_g2: &[f64],
         workspace: &mut PairWorkspace,
-        beta_out: Option<&mut Vec<f64>>,
-    ) -> Result<GrmPairStatistic, String> {
+    ) -> Result<PairGeometry, String> {
         if g1.len() != self.n || g2.len() != self.n {
             return Err("genotype vector length does not match GRM".to_string());
         }
@@ -357,7 +405,6 @@ impl FixedVContext {
                 dot(&self.fixed_columns[row], vinv_g1);
             workspace.lower_gram[row * lower_dim + self.fixed_rank + 1] =
                 dot(&self.fixed_columns[row], vinv_g2);
-            workspace.rhs_y[row] = self.fixed_y_cross[row];
             workspace.rhs_interaction[row] =
                 dot(&self.fixed_columns[row], &workspace.vinv_interaction);
         }
@@ -373,31 +420,21 @@ impl FixedVContext {
             workspace.lower_gram[self.fixed_rank * lower_dim + self.fixed_rank + 1];
         workspace.lower_gram[(self.fixed_rank + 1) * lower_dim + self.fixed_rank + 1] =
             dot(g2, vinv_g2);
-        workspace.rhs_y[self.fixed_rank] = dot(g1, &self.vinv_y);
-        workspace.rhs_y[self.fixed_rank + 1] = dot(g2, &self.vinv_y);
         workspace.rhs_interaction[self.fixed_rank] = dot(g1, &workspace.vinv_interaction);
         workspace.rhs_interaction[self.fixed_rank + 1] = dot(g2, &workspace.vinv_interaction);
-        let lower = DMatrix::from_row_slice(
+
+        let mut lower_chol = workspace.lower_gram[..lower_dim * lower_dim].to_vec();
+        cholesky_factor_lower_in_place(&mut lower_chol, lower_dim)?;
+        let mut solved_interaction = vec![0.0; lower_dim];
+        solve_small_cholesky(
+            &lower_chol,
             lower_dim,
-            lower_dim,
-            &workspace.lower_gram[..lower_dim * lower_dim],
-        );
-        let lower_chol = Cholesky::new(lower).ok_or_else(|| {
-            "interaction unidentifiable: lower GLS design is rank-deficient".to_string()
-        })?;
-        let rhs_interaction = DVector::from_column_slice(&workspace.rhs_interaction[..lower_dim]);
-        let rhs_y = DVector::from_column_slice(&workspace.rhs_y[..lower_dim]);
-        let solved_interaction = lower_chol.solve(&rhs_interaction);
-        let solved_y = lower_chol.solve(&rhs_y);
-        workspace.solved_interaction[..lower_dim].copy_from_slice(solved_interaction.as_slice());
-        workspace.solved_y[..lower_dim].copy_from_slice(solved_y.as_slice());
+            &workspace.rhs_interaction[..lower_dim],
+            &mut solved_interaction,
+        )?;
         let interaction_raw_q = dot(&workspace.interaction, &workspace.vinv_interaction);
-        let interaction_cross_y = dot(&workspace.interaction, &self.vinv_y);
-        let projected_variance = interaction_raw_q
-            - dot(
-                &workspace.rhs_interaction[..lower_dim],
-                &workspace.solved_interaction[..lower_dim],
-            );
+        let projected_variance =
+            interaction_raw_q - dot(&workspace.rhs_interaction[..lower_dim], &solved_interaction);
         if !projected_variance.is_finite()
             || projected_variance <= VARIANCE_TOL * interaction_raw_q.abs().max(1.0)
         {
@@ -406,13 +443,44 @@ impl FixedVContext {
                     .to_string(),
             );
         }
-        let projected_covariance = interaction_cross_y
-            - dot(
-                &workspace.rhs_interaction[..lower_dim],
-                &workspace.solved_y[..lower_dim],
-            );
-        let interaction_beta = projected_covariance / projected_variance;
-        let delta_q = projected_covariance * interaction_beta;
+        Ok(PairGeometry {
+            lower_chol,
+            rhs_interaction: workspace.rhs_interaction[..lower_dim].to_vec(),
+            solved_interaction,
+            projected_variance,
+        })
+    }
+
+    fn score_pair_with_geometry(
+        &self,
+        g1: &[f64],
+        g2: &[f64],
+        geometry: &PairGeometry,
+        workspace: &mut PairWorkspace,
+        beta_out: Option<&mut Vec<f64>>,
+    ) -> Result<GrmPairStatistic, String> {
+        if g1.len() != self.n || g2.len() != self.n {
+            return Err("genotype vector length does not match GRM".to_string());
+        }
+        let lower_dim = self.fixed_rank + 2;
+        workspace.rhs_y[..lower_dim].fill(0.0);
+        workspace.rhs_y[..self.fixed_rank].copy_from_slice(&self.fixed_y_cross);
+        workspace.rhs_y[self.fixed_rank] = dot(g1, &self.vinv_y);
+        workspace.rhs_y[self.fixed_rank + 1] = dot(g2, &self.vinv_y);
+        solve_small_cholesky(
+            &geometry.lower_chol,
+            lower_dim,
+            &workspace.rhs_y[..lower_dim],
+            &mut workspace.solved_y[..lower_dim],
+        )?;
+        for row in 0..self.n {
+            workspace.interaction[row] = g1[row] * g2[row];
+        }
+        let interaction_cross_y = dot(&workspace.interaction, &self.vinv_y);
+        let projected_covariance =
+            interaction_cross_y - dot(&geometry.rhs_interaction, &workspace.solved_y[..lower_dim]);
+        let interaction_beta = projected_covariance / geometry.projected_variance;
+        let delta_q = (projected_covariance * interaction_beta).max(0.0);
         let null_q = (self.y_vinv_y
             - dot(
                 &workspace.rhs_y[..lower_dim],
@@ -431,20 +499,59 @@ impl FixedVContext {
             beta_out.extend(
                 workspace.solved_y[..lower_dim]
                     .iter()
-                    .zip(workspace.solved_interaction[..lower_dim].iter())
+                    .zip(geometry.solved_interaction.iter())
                     .map(|(null_beta, correction)| null_beta - correction * interaction_beta),
             );
             beta_out.push(interaction_beta);
         }
         Ok(GrmPairStatistic {
             interaction_beta,
-            interaction_variance: projected_variance,
+            interaction_variance: geometry.projected_variance,
             interaction_score: delta_q,
             delta_q,
             null_q,
             full_q,
             residual_df: self.n - self.fixed_rank - 3,
         })
+    }
+
+    fn fit_pair_with_geometry(
+        &self,
+        g1: &[f64],
+        g2: &[f64],
+        geometry: &PairGeometry,
+    ) -> Result<GrmPairFit, String> {
+        let mut workspace = PairWorkspace::new(self.n, self.fixed_rank + 2);
+        let mut beta = Vec::new();
+        let statistic =
+            self.score_pair_with_geometry(g1, g2, geometry, &mut workspace, Some(&mut beta))?;
+        Ok(GrmPairFit {
+            beta,
+            interaction_beta: statistic.interaction_beta,
+            interaction_variance: statistic.interaction_variance,
+            interaction_score: statistic.interaction_score,
+            delta_q: statistic.delta_q,
+            null_q: statistic.null_q,
+            full_q: statistic.full_q,
+            residual_df: statistic.residual_df,
+            fixed_rank: self.fixed_rank,
+            n_valid: self.n,
+            sigma_g2: self.sigma_g2,
+            sigma_e2: self.sigma_e2,
+        })
+    }
+
+    fn score_pair_with_workspace(
+        &self,
+        g1: &[f64],
+        g2: &[f64],
+        vinv_g1: &[f64],
+        vinv_g2: &[f64],
+        workspace: &mut PairWorkspace,
+        beta_out: Option<&mut Vec<f64>>,
+    ) -> Result<GrmPairStatistic, String> {
+        let geometry = self.build_pair_geometry(g1, g2, vinv_g1, vinv_g2, workspace)?;
+        self.score_pair_with_geometry(g1, g2, &geometry, workspace, beta_out)
     }
 
     fn fit_pair(&self, g1: &[f64], g2: &[f64]) -> Result<GrmPairFit, String> {
@@ -508,10 +615,88 @@ fn check_full_rank(matrix: &DMatrix<f64>, name: &str) -> Result<(), String> {
     }
 }
 
+fn cholesky_factor_lower_in_place(matrix: &mut [f64], dim: usize) -> Result<(), String> {
+    if matrix.len() != dim.saturating_mul(dim) {
+        return Err("small Cholesky factor dimension mismatch".to_string());
+    }
+    for row in 0..dim {
+        for column in 0..=row {
+            let mut value = matrix[row * dim + column];
+            for k in 0..column {
+                value -= matrix[row * dim + k] * matrix[column * dim + k];
+            }
+            if row == column {
+                if !value.is_finite() || value <= VARIANCE_TOL {
+                    return Err(
+                        "interaction unidentifiable: lower GLS design is rank-deficient"
+                            .to_string(),
+                    );
+                }
+                matrix[row * dim + column] = value.sqrt();
+            } else {
+                let diagonal = matrix[column * dim + column];
+                if !diagonal.is_finite() || diagonal <= 0.0 {
+                    return Err(
+                        "interaction unidentifiable: lower GLS design is rank-deficient"
+                            .to_string(),
+                    );
+                }
+                matrix[row * dim + column] = value / diagonal;
+            }
+        }
+        for column in (row + 1)..dim {
+            matrix[row * dim + column] = 0.0;
+        }
+    }
+    Ok(())
+}
+
+fn solve_small_cholesky(
+    lower: &[f64],
+    dim: usize,
+    rhs: &[f64],
+    out: &mut [f64],
+) -> Result<(), String> {
+    if lower.len() != dim.saturating_mul(dim) || rhs.len() != dim || out.len() != dim {
+        return Err("small Cholesky solve dimension mismatch".to_string());
+    }
+    out.copy_from_slice(rhs);
+    for row in 0..dim {
+        let mut value = out[row];
+        for column in 0..row {
+            value -= lower[row * dim + column] * out[column];
+        }
+        let diagonal = lower[row * dim + row];
+        if !diagonal.is_finite() || diagonal <= 0.0 {
+            return Err("non-positive small Cholesky diagonal".to_string());
+        }
+        out[row] = value / diagonal;
+    }
+    for row in (0..dim).rev() {
+        let mut value = out[row];
+        for column in (row + 1)..dim {
+            value -= lower[column * dim + row] * out[column];
+        }
+        let diagonal = lower[row * dim + row];
+        out[row] = value / diagonal;
+    }
+    if out.iter().any(|value| !value.is_finite()) {
+        Err("non-finite small Cholesky solution".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 #[inline]
 fn dot(left: &[f64], right: &[f64]) -> f64 {
     debug_assert_eq!(left.len(), right.len());
     left.iter().zip(right.iter()).map(|(a, b)| a * b).sum()
+}
+
+#[inline]
+fn pair_index(n_markers: usize, first: usize, second: usize) -> usize {
+    debug_assert!(first < second && second < n_markers);
+    first * (2 * n_markers - first - 1) / 2 + (second - first - 1)
 }
 
 fn solve_cholesky_into(
@@ -646,7 +831,13 @@ fn scan_grm_pairs(
                 ) {
                     Ok(statistic) => {
                         accumulator.pairs_evaluated = accumulator.pairs_evaluated.saturating_add(1);
-                        accumulator.push(first, second, statistic, top_k);
+                        accumulator.push(
+                            pair_index(n_markers, first, second),
+                            first,
+                            second,
+                            statistic,
+                            top_k,
+                        );
                     }
                     Err(error) if error.contains("unidentifiable") => {
                         accumulator.pairs_skipped = accumulator.pairs_skipped.saturating_add(1);
@@ -711,6 +902,215 @@ fn scan_grm_pairs(
     ))
 }
 
+/// Reusable fixed-\( V \) scan state.  The pair geometry is genotype-only,
+/// so one preparation can score many response vectors (for example, the
+/// phenotype replicates in a matched benchmark) without recomputing
+/// (V^{-1}(g_i g_j)).
+struct PreparedGrmScan {
+    context: FixedVContext,
+    genotypes: Vec<f64>,
+    n_samples: usize,
+    pairs: Vec<PreparedPair>,
+    pairs_skipped: usize,
+}
+
+impl PreparedGrmScan {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        genotypes: &[f64],
+        n_markers: usize,
+        n_samples: usize,
+        y: &[f64],
+        grm: &[f64],
+        sigma_g2: f64,
+        sigma_e2: f64,
+        _top_k: usize,
+        threads: usize,
+        covariates: &[f64],
+        n_covariates: usize,
+    ) -> Result<Self, String> {
+        validate_scan_inputs(genotypes, n_markers, n_samples, y, grm)?;
+        let context = FixedVContext::new(
+            y,
+            grm,
+            n_samples,
+            sigma_g2,
+            sigma_e2,
+            covariates,
+            n_covariates,
+        )?;
+        let vinv_markers = context.precompute_marker_vinv(genotypes, n_markers)?;
+        let first_count = n_markers.saturating_sub(1);
+        let build_range = |range: std::ops::Range<usize>| {
+            let mut prepared = Vec::new();
+            let mut skipped = 0usize;
+            let mut workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
+            for first in range {
+                let first_start = first * n_samples;
+                let first_values = &genotypes[first_start..first_start + n_samples];
+                for second in (first + 1)..n_markers {
+                    let second_start = second * n_samples;
+                    let second_values = &genotypes[second_start..second_start + n_samples];
+                    match context.build_pair_geometry(
+                        first_values,
+                        second_values,
+                        &vinv_markers[first],
+                        &vinv_markers[second],
+                        &mut workspace,
+                    ) {
+                        Ok(geometry) => prepared.push(PreparedPair {
+                            first,
+                            second,
+                            geometry,
+                        }),
+                        Err(error) if error.contains("unidentifiable") => {
+                            skipped = skipped.saturating_add(1)
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Ok::<_, String>((prepared, skipped))
+        };
+
+        let effective_threads = threads.max(1);
+        let (mut pairs, pairs_skipped) = if effective_threads <= 1 || first_count <= 1 {
+            build_range(0..first_count)?
+        } else {
+            let chunk_count = effective_threads.saturating_mul(4).max(1);
+            let chunk_len = (first_count + chunk_count - 1) / chunk_count;
+            let ranges = (0..first_count)
+                .step_by(chunk_len.max(1))
+                .map(|start| start..(start + chunk_len).min(first_count))
+                .collect::<Vec<_>>();
+            let partials = ThreadPoolBuilder::new()
+                .num_threads(effective_threads)
+                .build()
+                .map_err(|error| format!("failed to build GRM dosage Rayon pool: {error}"))?
+                .install(|| {
+                    ranges
+                        .par_iter()
+                        .map(|range| build_range(range.clone()))
+                        .collect::<Result<Vec<_>, String>>()
+                })?;
+            let mut skipped = 0usize;
+            let mut pairs = Vec::new();
+            for (partial, partial_skipped) in partials {
+                pairs.extend(partial);
+                skipped = skipped.saturating_add(partial_skipped);
+            }
+            (pairs, skipped)
+        };
+        pairs.sort_unstable_by_key(|pair| (pair.first, pair.second));
+        Ok(Self {
+            context,
+            genotypes: genotypes.to_vec(),
+            n_samples,
+            pairs,
+            pairs_skipped,
+        })
+    }
+
+    fn scan_many(
+        &mut self,
+        responses: &[&[f64]],
+        top_k: usize,
+        threads: usize,
+    ) -> Result<Vec<(Vec<GrmPairCandidate>, usize, usize)>, String> {
+        let mut results = Vec::with_capacity(responses.len());
+        for response in responses {
+            self.context.set_response(response)?;
+            results.push(self.scan_one(top_k, threads)?);
+        }
+        Ok(results)
+    }
+
+    fn scan_one(
+        &self,
+        top_k: usize,
+        threads: usize,
+    ) -> Result<(Vec<GrmPairCandidate>, usize, usize), String> {
+        let scan_range = |range: std::ops::Range<usize>| -> Result<GrmPairAccumulator, String> {
+            let mut accumulator = GrmPairAccumulator::default();
+            let mut workspace = PairWorkspace::new(self.n_samples, self.context.fixed_rank + 2);
+            for pair_index in range {
+                let pair = &self.pairs[pair_index];
+                let first_start = pair.first * self.n_samples;
+                let second_start = pair.second * self.n_samples;
+                let first_values = &self.genotypes[first_start..first_start + self.n_samples];
+                let second_values = &self.genotypes[second_start..second_start + self.n_samples];
+                match self.context.score_pair_with_geometry(
+                    first_values,
+                    second_values,
+                    &pair.geometry,
+                    &mut workspace,
+                    None,
+                ) {
+                    Ok(statistic) => {
+                        accumulator.pairs_evaluated = accumulator.pairs_evaluated.saturating_add(1);
+                        accumulator.push(pair_index, pair.first, pair.second, statistic, top_k);
+                    }
+                    Err(error) if error.contains("unidentifiable") => {
+                        accumulator.pairs_skipped = accumulator.pairs_skipped.saturating_add(1);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(accumulator)
+        };
+        let effective_threads = threads.max(1);
+        let accumulator = if effective_threads <= 1 || self.pairs.len() <= 1 {
+            scan_range(0..self.pairs.len())?
+        } else {
+            let chunk_count = effective_threads.saturating_mul(4).max(1);
+            let chunk_len = (self.pairs.len() + chunk_count - 1) / chunk_count;
+            let ranges = (0..self.pairs.len())
+                .step_by(chunk_len.max(1))
+                .map(|start| start..(start + chunk_len).min(self.pairs.len()))
+                .collect::<Vec<_>>();
+            let partials = ThreadPoolBuilder::new()
+                .num_threads(effective_threads)
+                .build()
+                .map_err(|error| format!("failed to build GRM dosage Rayon pool: {error}"))?
+                .install(|| {
+                    ranges
+                        .par_iter()
+                        .map(|range| scan_range(range.clone()))
+                        .collect::<Result<Vec<_>, String>>()
+                })?;
+            let mut merged = GrmPairAccumulator::default();
+            for partial in partials {
+                merged.merge(partial, top_k);
+            }
+            merged
+        };
+
+        let mut entries = accumulator
+            .heap
+            .into_iter()
+            .map(|Reverse(entry)| entry)
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| candidate_cmp(right, left));
+        let mut candidates = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let pair = &self.pairs[entry.pair_index];
+            let first_start = pair.first * self.n_samples;
+            let second_start = pair.second * self.n_samples;
+            let first_values = &self.genotypes[first_start..first_start + self.n_samples];
+            let second_values = &self.genotypes[second_start..second_start + self.n_samples];
+            let fit =
+                self.context
+                    .fit_pair_with_geometry(first_values, second_values, &pair.geometry)?;
+            candidates.push(GrmPairCandidate {
+                first: pair.first,
+                second: pair.second,
+                fit,
+            });
+        }
+        Ok((candidates, accumulator.pairs_evaluated, self.pairs_skipped))
+    }
+}
+
 fn array1_to_vec(array: &PyReadonlyArray1<'_, f64>) -> Vec<f64> {
     let view = array.as_array();
     if view.is_standard_layout() {
@@ -757,6 +1157,37 @@ fn set_fit_items<'py>(py: Python<'py>, out: &Bound<'py, PyDict>, fit: &GrmPairFi
     out.set_item("n_valid", fit.n_valid)?;
     out.set_item("sigma_g2", fit.sigma_g2)?;
     out.set_item("sigma_e2", fit.sigma_e2)?;
+    Ok(())
+}
+
+fn set_scan_items<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    candidates: &[GrmPairCandidate],
+    pairs_evaluated: usize,
+    pairs_skipped: usize,
+    n_markers: usize,
+    n_samples: usize,
+    threads: usize,
+    sigma_g2: f64,
+    sigma_e2: f64,
+) -> PyResult<()> {
+    let output_candidates = PyList::empty(py);
+    for candidate in candidates {
+        let item = PyDict::new(py);
+        item.set_item("first", candidate.first)?;
+        item.set_item("second", candidate.second)?;
+        set_fit_items(py, &item, &candidate.fit)?;
+        output_candidates.append(item)?;
+    }
+    out.set_item("candidates", output_candidates)?;
+    out.set_item("pairs_evaluated", pairs_evaluated)?;
+    out.set_item("pairs_skipped", pairs_skipped)?;
+    out.set_item("n_markers", n_markers)?;
+    out.set_item("n_samples", n_samples)?;
+    out.set_item("threads", threads)?;
+    out.set_item("sigma_g2", sigma_g2)?;
+    out.set_item("sigma_e2", sigma_e2)?;
     Ok(())
 }
 
@@ -897,9 +1328,115 @@ pub fn garfield_dosage_grm_pair_scan_py<'py>(
     Ok(out)
 }
 
+/// Batch variant for matched responses sharing one genotype window, GRM and
+/// pair-search geometry.  Each response still gets an independent fixed-V
+/// GLS/FWL score; only genotype-only quantities are reused.
+#[pyfunction(name = "garfield_dosage_grm_pair_scan_batch")]
+#[pyo3(signature = (genotypes, phenotypes, grm, sigma_g2, sigma_e2, top_k=100, threads=0, covariates=None))]
+pub fn garfield_dosage_grm_pair_scan_batch_py<'py>(
+    py: Python<'py>,
+    genotypes: PyReadonlyArray2<'py, f64>,
+    phenotypes: PyReadonlyArray2<'py, f64>,
+    grm: PyReadonlyArray2<'py, f64>,
+    sigma_g2: f64,
+    sigma_e2: f64,
+    top_k: usize,
+    threads: usize,
+    covariates: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let genotype_shape = genotypes.shape();
+    if genotype_shape.len() != 2 {
+        return Err(PyValueError::new_err(
+            "genotypes must be a 2D marker-major array",
+        ));
+    }
+    let n_markers = genotype_shape[0];
+    let n_samples = genotype_shape[1];
+    let phenotype_shape = phenotypes.shape();
+    if phenotype_shape.len() != 2 || phenotype_shape[0] == 0 || phenotype_shape[1] != n_samples {
+        return Err(PyValueError::new_err(format!(
+            "phenotypes must have shape (n_responses, {n_samples}); got {:?}",
+            phenotype_shape
+        )));
+    }
+    let grm_shape = grm.shape();
+    if grm_shape.len() != 2 || grm_shape[0] != grm_shape[1] || grm_shape[0] != n_samples {
+        return Err(PyValueError::new_err(format!(
+            "grm must have shape ({n_samples}, {n_samples}); got {:?}",
+            grm_shape
+        )));
+    }
+    let genotype_vec = array2_to_vec(&genotypes);
+    let phenotype_vec = array2_to_vec(&phenotypes);
+    let grm_vec = array2_to_vec(&grm);
+    let (covariate_vec, n_covariates) = if let Some(covariates) = covariates {
+        let shape = covariates.shape();
+        if shape.len() != 2 || shape[0] != n_samples {
+            return Err(PyValueError::new_err(format!(
+                "covariates must have shape (n_samples, n_covariates); got {:?}, expected first dimension {n_samples}",
+                shape
+            )));
+        }
+        (array2_to_vec(&covariates), shape[1])
+    } else {
+        (Vec::new(), 0)
+    };
+    let effective_threads = if threads == 0 {
+        rayon::current_num_threads().max(1)
+    } else {
+        threads
+    };
+    let first_response = &phenotype_vec[..n_samples];
+    let mut prepared = PreparedGrmScan::new(
+        &genotype_vec,
+        n_markers,
+        n_samples,
+        first_response,
+        &grm_vec,
+        sigma_g2,
+        sigma_e2,
+        top_k,
+        effective_threads,
+        &covariate_vec,
+        n_covariates,
+    )
+    .map_err(PyValueError::new_err)?;
+    let responses = phenotype_vec.chunks_exact(n_samples).collect::<Vec<_>>();
+    let scans = prepared
+        .scan_many(&responses, top_k, effective_threads)
+        .map_err(PyValueError::new_err)?;
+    let output_scans = PyList::empty(py);
+    for (candidates, pairs_evaluated, pairs_skipped) in scans {
+        let item = PyDict::new(py);
+        set_scan_items(
+            py,
+            &item,
+            &candidates,
+            pairs_evaluated,
+            pairs_skipped,
+            n_markers,
+            n_samples,
+            effective_threads,
+            sigma_g2,
+            sigma_e2,
+        )?;
+        output_scans.append(item)?;
+    }
+    let out = PyDict::new(py);
+    out.set_item("scans", output_scans)?;
+    out.set_item("n_responses", phenotype_shape[0])?;
+    out.set_item("n_markers", n_markers)?;
+    out.set_item("n_samples", n_samples)?;
+    out.set_item("threads", effective_threads)?;
+    out.set_item("sigma_g2", sigma_g2)?;
+    out.set_item("sigma_e2", sigma_e2)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nalgebra::DVector;
 
     #[test]
     fn fixed_v_pair_matches_direct_gls_reference() {
@@ -977,6 +1514,31 @@ mod tests {
                 .expect("identity V scan should succeed");
         assert_eq!(evaluated + skipped, 3);
         assert_eq!(candidates.len(), 3);
+    }
+
+    #[test]
+    fn prepared_scan_reuses_pair_geometry_for_multiple_responses() {
+        let genotypes = [
+            0.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+            2.0, 1.0, 1.0, 0.0, 1.0, 2.0, 0.0,
+        ];
+        let y1 = [1.2, 0.4, 2.1, 3.7, 1.5, 0.8, 2.4, 2.9];
+        let y2 = [-0.2, 1.4, 0.1, 2.7, 0.5, 1.8, 1.4, 3.9];
+        let grm = (0..64)
+            .map(|index| if index / 8 == index % 8 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let mut prepared =
+            PreparedGrmScan::new(&genotypes, 3, 8, &y1, &grm, 0.0, 1.0, 10, 1, &[], 0)
+                .expect("prepared scan should succeed");
+        let batch = prepared
+            .scan_many(&[&y1, &y2], 10, 1)
+            .expect("batch scan should succeed");
+        assert_eq!(batch.len(), 2);
+        let one = scan_grm_pairs(&genotypes, 3, 8, &y1, &grm, 0.0, 1.0, 10, 1, &[], 0)
+            .expect("single scan should succeed");
+        assert_eq!(batch[0].1, one.1);
+        assert_eq!(batch[0].2, one.2);
+        assert_eq!(batch[0].0, one.0);
     }
 
     #[test]
