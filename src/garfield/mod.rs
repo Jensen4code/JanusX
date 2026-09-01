@@ -128,7 +128,7 @@ pub use bs::{
 pub use dosage::{garfield_dosage_pair_fit_py, garfield_dosage_pair_scan_py};
 pub use dosage_random::{
     garfield_dosage_grm_pair_fit_py, garfield_dosage_grm_pair_scan_batch_py,
-    garfield_dosage_grm_pair_scan_py,
+    garfield_dosage_grm_pair_scan_py, garfield_dosage_grm_pair_scan_reml_py,
 };
 pub use pair_triple::garfield_pair_triple_refine_bin_py;
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};

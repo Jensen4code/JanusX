@@ -21,6 +21,8 @@ use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use super::residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult};
+
 const RANK_TOL: f64 = 1.0e-11;
 const VARIANCE_TOL: f64 = 1.0e-12;
 
@@ -902,6 +904,68 @@ fn scan_grm_pairs(
     ))
 }
 
+/// Fit the null GRM model once and scan all pairs with the resulting fixed
+/// covariance.  This is deliberately an internal helper first: callers can
+/// compare the automatic path with `scan_grm_pairs` supplied with the same
+/// variance components before any CLI defaults are changed.
+#[allow(clippy::too_many_arguments)]
+fn scan_grm_pairs_reml(
+    genotypes: &[f64],
+    n_markers: usize,
+    n_samples: usize,
+    y: &[f64],
+    grm: &[f64],
+    top_k: usize,
+    threads: usize,
+    covariates: &[f64],
+    n_covariates: usize,
+) -> Result<
+    (
+        (Vec<GrmPairCandidate>, usize, usize),
+        GarfieldResidualResult,
+    ),
+    String,
+> {
+    validate_scan_inputs(genotypes, n_markers, n_samples, y, grm)?;
+    let x_cov = if n_covariates == 0 {
+        None
+    } else {
+        Some(covariates.to_vec())
+    };
+    let reml = garfield_residualize_exact_from_grm_rust(
+        grm.to_vec(),
+        n_samples,
+        y.to_vec(),
+        x_cov,
+        n_covariates,
+        threads,
+        -5.0,
+        5.0,
+        50,
+        1.0e-3,
+        true,
+        15_000,
+        false,
+        None,
+        0,
+        0,
+    )?;
+    let scan = scan_grm_pairs(
+        genotypes,
+        n_markers,
+        n_samples,
+        y,
+        grm,
+        reml.sigma_g2,
+        reml.sigma_e2,
+        top_k,
+        threads,
+        covariates,
+        n_covariates,
+    )?;
+    Ok((scan, reml))
+}
+
 /// Reusable fixed-\( V \) scan state.  The pair geometry is genotype-only,
 /// so one preparation can score many response vectors (for example, the
 /// phenotype replicates in a matched benchmark) without recomputing
@@ -1433,6 +1497,91 @@ pub fn garfield_dosage_grm_pair_scan_batch_py<'py>(
     Ok(out)
 }
 
+/// Fit one null REML model and scan all marker pairs with its fixed
+/// covariance.  The null is fitted exactly once; variance components are not
+/// re-estimated inside the pair loop.  This API is intentionally separate
+/// from the existing fixed-V scan so callers can validate the two stages
+/// independently before wiring a production CLI path.
+#[pyfunction(name = "garfield_dosage_grm_pair_scan_reml")]
+#[pyo3(signature = (genotypes, y, grm, top_k=100, threads=0, covariates=None))]
+pub fn garfield_dosage_grm_pair_scan_reml_py<'py>(
+    py: Python<'py>,
+    genotypes: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray1<'py, f64>,
+    grm: PyReadonlyArray2<'py, f64>,
+    top_k: usize,
+    threads: usize,
+    covariates: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let genotype_shape = genotypes.shape();
+    if genotype_shape.len() != 2 {
+        return Err(PyValueError::new_err(
+            "genotypes must be a 2D marker-major array",
+        ));
+    }
+    let n_markers = genotype_shape[0];
+    let n_samples = genotype_shape[1];
+    let y_vec = array1_to_vec(&y);
+    let grm_shape = grm.shape();
+    if grm_shape.len() != 2 || grm_shape[0] != grm_shape[1] || grm_shape[0] != n_samples {
+        return Err(PyValueError::new_err(format!(
+            "grm must have shape ({n_samples}, {n_samples}); got {:?}",
+            grm_shape
+        )));
+    }
+    let genotype_vec = array2_to_vec(&genotypes);
+    let grm_vec = array2_to_vec(&grm);
+    let (covariate_vec, n_covariates) = if let Some(covariates) = covariates {
+        let shape = covariates.shape();
+        if shape.len() != 2 || shape[0] != n_samples {
+            return Err(PyValueError::new_err(format!(
+                "covariates must have shape (n_samples, n_covariates); got {:?}, expected first dimension {n_samples}",
+                shape
+            )));
+        }
+        (array2_to_vec(&covariates), shape[1])
+    } else {
+        (Vec::new(), 0)
+    };
+    let effective_threads = if threads == 0 {
+        rayon::current_num_threads().max(1)
+    } else {
+        threads
+    };
+    let ((candidates, pairs_evaluated, pairs_skipped), reml) = scan_grm_pairs_reml(
+        &genotype_vec,
+        n_markers,
+        n_samples,
+        &y_vec,
+        &grm_vec,
+        top_k,
+        effective_threads,
+        &covariate_vec,
+        n_covariates,
+    )
+    .map_err(PyValueError::new_err)?;
+    let out = PyDict::new(py);
+    set_scan_items(
+        py,
+        &out,
+        &candidates,
+        pairs_evaluated,
+        pairs_skipped,
+        n_markers,
+        n_samples,
+        effective_threads,
+        reml.sigma_g2,
+        reml.sigma_e2,
+    )?;
+    out.set_item("pve", reml.pve)?;
+    out.set_item("reml_lbd", reml.lbd)?;
+    out.set_item("reml_loglike", reml.reml)?;
+    out.set_item("reml_n_fixed_effects", reml.n_fixed_effects)?;
+    out.set_item("reml_eigh_backend", reml.eigh_backend)?;
+    out.set_item("reml_eigh_elapsed", reml.eigh_elapsed)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1539,6 +1688,38 @@ mod tests {
         assert_eq!(batch[0].1, one.1);
         assert_eq!(batch[0].2, one.2);
         assert_eq!(batch[0].0, one.0);
+    }
+
+    #[test]
+    fn reml_scan_matches_explicit_fixed_v_scan() {
+        let genotypes = [
+            0.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+            2.0, 1.0, 1.0, 0.0, 1.0, 2.0, 0.0,
+        ];
+        let y = [1.2, 0.4, 2.1, 3.7, 1.5, 0.8, 2.4, 2.9];
+        let grm = (0..64)
+            .map(|index| if index / 8 == index % 8 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let ((automatic_candidates, automatic_evaluated, automatic_skipped), reml) =
+            scan_grm_pairs_reml(&genotypes, 3, 8, &y, &grm, 10, 1, &[], 0)
+                .expect("automatic REML scan should succeed");
+        let explicit = scan_grm_pairs(
+            &genotypes,
+            3,
+            8,
+            &y,
+            &grm,
+            reml.sigma_g2,
+            reml.sigma_e2,
+            10,
+            1,
+            &[],
+            0,
+        )
+        .expect("explicit fixed-V scan should succeed");
+        assert_eq!(automatic_evaluated, explicit.1);
+        assert_eq!(automatic_skipped, explicit.2);
+        assert_eq!(automatic_candidates, explicit.0);
     }
 
     #[test]
