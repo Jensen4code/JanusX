@@ -13,6 +13,9 @@
 //! The public fit is currently an OLS/FWL backend.  An LMM/PCG adapter can
 //! later provide transformed moments without changing the pair scorer.
 
+#[path = "dosage_covariate.rs"]
+mod dosage_covariate;
+
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use crate::blas::{
     cblas_dgemm_dispatch, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
@@ -349,6 +352,276 @@ impl MaskYLookup {
     fn sum_y2(&self, mask: u64, word: usize) -> f64 {
         debug_assert!(word < self.n_words);
         Self::sum_table(&self.y2, mask, word)
+    }
+}
+
+/// Byte-indexed lookup table for projected fixed-effect coordinates.  It is
+/// built once per scan and lets discrete backends obtain
+/// `Q' * (g1*g2)` from category intersections without revisiting samples.
+struct MaskCoordinateLookup {
+    values: Vec<f64>,
+    n_words: usize,
+    rank: usize,
+}
+
+impl MaskCoordinateLookup {
+    const BYTE_TABLE_SIZE: usize = 256;
+    const BYTES_PER_WORD: usize = 8;
+
+    fn new(projector: &dosage_covariate::CovariateProjector) -> Result<Self, String> {
+        let rank = projector.rank();
+        let n_words = words_for_samples(projector.n_samples());
+        let table_len = n_words
+            .checked_mul(Self::BYTES_PER_WORD)
+            .and_then(|value| value.checked_mul(Self::BYTE_TABLE_SIZE))
+            .and_then(|value| value.checked_mul(rank))
+            .ok_or_else(|| "covariate mask lookup size overflow".to_string())?;
+        let mut values = vec![0.0_f64; table_len];
+        for word in 0..n_words {
+            for byte in 0..Self::BYTES_PER_WORD {
+                let sample_base = word * 64 + byte * 8;
+                let base = (word * Self::BYTES_PER_WORD + byte) * Self::BYTE_TABLE_SIZE * rank;
+                for mask in 1..Self::BYTE_TABLE_SIZE {
+                    let low_bit = mask.trailing_zeros() as usize;
+                    let previous = mask & (mask - 1);
+                    let sample = sample_base + low_bit;
+                    if let Some(q_row) = projector.q_row(sample) {
+                        for coordinate in 0..rank {
+                            values[base + mask * rank + coordinate] =
+                                values[base + previous * rank + coordinate] + q_row[coordinate];
+                        }
+                    } else {
+                        for coordinate in 0..rank {
+                            values[base + mask * rank + coordinate] =
+                                values[base + previous * rank + coordinate];
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            values,
+            n_words,
+            rank,
+        })
+    }
+
+    #[inline]
+    fn sum_channel(&self, mask: u64, word: usize, coordinate: usize) -> f64 {
+        debug_assert!(word < self.n_words);
+        debug_assert!(coordinate < self.rank);
+        let base = word * Self::BYTES_PER_WORD * Self::BYTE_TABLE_SIZE * self.rank;
+        let stride = Self::BYTE_TABLE_SIZE * self.rank;
+        self.values[base + (mask as usize & 0xff) * self.rank + coordinate]
+            + self.values[base + stride + ((mask >> 8) as usize & 0xff) * self.rank + coordinate]
+            + self.values
+                [base + 2 * stride + ((mask >> 16) as usize & 0xff) * self.rank + coordinate]
+            + self.values
+                [base + 3 * stride + ((mask >> 24) as usize & 0xff) * self.rank + coordinate]
+            + self.values
+                [base + 4 * stride + ((mask >> 32) as usize & 0xff) * self.rank + coordinate]
+            + self.values
+                [base + 5 * stride + ((mask >> 40) as usize & 0xff) * self.rank + coordinate]
+            + self.values
+                [base + 6 * stride + ((mask >> 48) as usize & 0xff) * self.rank + coordinate]
+            + self.values
+                [base + 7 * stride + ((mask >> 56) as usize & 0xff) * self.rank + coordinate]
+    }
+}
+
+struct CovariateScanContext {
+    projector: dosage_covariate::CovariateProjector,
+    q_y: Vec<f64>,
+    q_markers: Vec<Option<Vec<f64>>>,
+    q_lookup: MaskCoordinateLookup,
+    covariates: Vec<f64>,
+    n_covariates: usize,
+}
+
+impl CovariateScanContext {
+    fn new(
+        representations: &[Option<MarkerRepresentation>],
+        n_samples: usize,
+        y: &[f64],
+        covariates: &[f64],
+        n_covariates: usize,
+    ) -> Result<Self, String> {
+        let projector = dosage_covariate::CovariateProjector::from_covariates(
+            covariates,
+            n_samples,
+            n_covariates,
+        )?;
+        if y.len() != n_samples {
+            return Err(format!("y length={} but expected {n_samples}", y.len()));
+        }
+        let mut q_y = vec![0.0_f64; projector.rank()];
+        projector.q_coordinates(y, &mut q_y)?;
+        let q_markers = representations
+            .iter()
+            .map(|representation| {
+                let Some(representation) = representation.as_ref() else {
+                    return None;
+                };
+                if representation.n_samples() != n_samples || representation.has_missing() {
+                    return None;
+                }
+                let encoding = representation.encoding();
+                let encoded = (0..n_samples)
+                    .map(|row| (representation.value_at(row) - encoding.offset) / encoding.scale)
+                    .collect::<Vec<_>>();
+                let mut coordinates = vec![0.0_f64; projector.rank()];
+                projector.q_coordinates(&encoded, &mut coordinates).ok()?;
+                Some(coordinates)
+            })
+            .collect::<Vec<_>>();
+        let q_lookup = MaskCoordinateLookup::new(&projector)?;
+        Ok(Self {
+            projector,
+            q_y,
+            q_markers,
+            q_lookup,
+            covariates: covariates.to_vec(),
+            n_covariates,
+        })
+    }
+
+    #[inline]
+    fn dot_coordinates(left: &[f64], right: &[f64]) -> f64 {
+        left.iter()
+            .zip(right.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f64>()
+    }
+
+    fn interaction_coordinates(
+        &self,
+        representation_g1: &MarkerRepresentation,
+        representation_g2: &MarkerRepresentation,
+    ) -> Result<Vec<f64>, String> {
+        if representation_g1.has_missing() || representation_g2.has_missing() {
+            return Err("projected complete path requires missing-free markers".to_string());
+        }
+        if representation_g1.is_discrete() && representation_g2.is_discrete() {
+            let mut coordinates = vec![0.0_f64; self.projector.rank()];
+            let n_words = words_for_samples(self.projector.n_samples());
+            let encoding_g1 = representation_g1.encoding();
+            let encoding_g2 = representation_g2.encoding();
+            for category_g1 in 0..representation_g1.category_count() {
+                let raw_g1 = raw_category_value(representation_g1, category_g1);
+                let encoded_g1 = (raw_g1 - encoding_g1.offset) / encoding_g1.scale;
+                for category_g2 in 0..representation_g2.category_count() {
+                    let raw_g2 = raw_category_value(representation_g2, category_g2);
+                    let encoded_g2 = (raw_g2 - encoding_g2.offset) / encoding_g2.scale;
+                    let coefficient = encoded_g1 * encoded_g2;
+                    if coefficient == 0.0 {
+                        continue;
+                    }
+                    for word in 0..n_words {
+                        let mask = representation_g1.category_word(category_g1, word)
+                            & representation_g2.category_word(category_g2, word);
+                        if mask == 0 {
+                            continue;
+                        }
+                        for coordinate in 0..self.projector.rank() {
+                            coordinates[coordinate] +=
+                                coefficient * self.q_lookup.sum_channel(mask, word, coordinate);
+                        }
+                    }
+                }
+            }
+            return Ok(coordinates);
+        }
+
+        let mut coordinates = vec![0.0_f64; self.projector.rank()];
+        let encoding_g1 = representation_g1.encoding();
+        let encoding_g2 = representation_g2.encoding();
+        for row in 0..self.projector.n_samples() {
+            let g1 = (representation_g1.value_at(row) - encoding_g1.offset) / encoding_g1.scale;
+            let g2 = (representation_g2.value_at(row) - encoding_g2.offset) / encoding_g2.scale;
+            let q_row = self
+                .projector
+                .q_row(row)
+                .ok_or_else(|| "projector row out of range".to_string())?;
+            let product = g1 * g2;
+            for coordinate in 0..self.projector.rank() {
+                coordinates[coordinate] += q_row[coordinate] * product;
+            }
+        }
+        Ok(coordinates)
+    }
+
+    fn projected_pair_moments(
+        &self,
+        moments: &PairMoments,
+        representation_g1: &MarkerRepresentation,
+        representation_g2: &MarkerRepresentation,
+        first: usize,
+        second: usize,
+    ) -> Result<ProjectedPairMoments, String> {
+        let q_g1 = self
+            .q_markers
+            .get(first)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| "projected scan requires complete marker coordinates".to_string())?;
+        let q_g2 = self
+            .q_markers
+            .get(second)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| "projected scan requires complete marker coordinates".to_string())?;
+        let q_interaction = self.interaction_coordinates(representation_g1, representation_g2)?;
+        let q_columns = [q_g1.as_slice(), q_g2.as_slice(), q_interaction.as_slice()];
+        let mut gram = [[0.0_f64; 3]; 3];
+        for row in 0..3 {
+            for column in 0..3 {
+                gram[row][column] = moments.xtx[row + 1][column + 1]
+                    - Self::dot_coordinates(q_columns[row], q_columns[column]);
+            }
+        }
+        let mut rhs = [0.0_f64; 3];
+        for column in 0..3 {
+            rhs[column] =
+                moments.xty[column + 1] - Self::dot_coordinates(q_columns[column], &self.q_y);
+        }
+        let yty = moments.yty - Self::dot_coordinates(&self.q_y, &self.q_y);
+        Ok(ProjectedPairMoments {
+            gram,
+            rhs,
+            yty,
+            n_valid: moments.n_valid,
+            fixed_effect_rank: self.projector.rank(),
+        })
+    }
+
+    #[inline]
+    fn score(
+        &self,
+        moments: &PairMoments,
+        representation_g1: &MarkerRepresentation,
+        representation_g2: &MarkerRepresentation,
+        first: usize,
+        second: usize,
+    ) -> Result<FwlScore, String> {
+        let projected = self.projected_pair_moments(
+            moments,
+            representation_g1,
+            representation_g2,
+            first,
+            second,
+        )?;
+        let score = score_projected_pair_moments(&projected)?;
+        Ok(FwlScore {
+            beta_encoded: [
+                0.0,
+                score.beta_projected[0],
+                score.beta_projected[1],
+                score.beta_projected[2],
+            ],
+            interaction_se_encoded: score.interaction_se,
+            interaction_score: score.interaction_score,
+            interaction_delta_rss: score.interaction_delta_rss,
+            sigma_e2: score.sigma_e2,
+            residual_df: score.residual_df,
+        })
     }
 }
 
@@ -1784,6 +2057,159 @@ struct FwlScore {
     interaction_score: f64,
     interaction_delta_rss: f64,
     sigma_e2: f64,
+    residual_df: usize,
+}
+
+/// Sufficient statistics for the interaction model after the fixed-effect
+/// columns have already been projected out.  The three columns are ordered
+/// `[g1, g2, g1*g2]`; unlike `PairMoments`, this representation deliberately
+/// has no intercept column because the intercept is part of the projector.
+#[derive(Clone, Copy, Debug)]
+struct ProjectedPairMoments {
+    gram: [[f64; 3]; 3],
+    rhs: [f64; 3],
+    yty: f64,
+    n_valid: usize,
+    fixed_effect_rank: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProjectedFwlScore {
+    beta_projected: [f64; 3],
+    interaction_se: f64,
+    interaction_score: f64,
+    interaction_delta_rss: f64,
+    sigma_e2: f64,
+    full_rss: f64,
+    residual_df: usize,
+}
+
+/// Build projected moments from already-projected vectors.  Backend scan
+/// paths use this fixed-width representation after accumulating the raw
+/// moments and Q-coordinates; the vector loop is kept as a small reference
+/// helper for pair fitting and tests.
+fn projected_pair_moments(
+    projected_g1: &[f64],
+    projected_g2: &[f64],
+    projected_interaction: &[f64],
+    projected_y: &[f64],
+    fixed_effect_rank: usize,
+) -> ProjectedPairMoments {
+    debug_assert_eq!(projected_g1.len(), projected_g2.len());
+    debug_assert_eq!(projected_g1.len(), projected_interaction.len());
+    debug_assert_eq!(projected_g1.len(), projected_y.len());
+    let mut moments = ProjectedPairMoments {
+        gram: [[0.0; 3]; 3],
+        rhs: [0.0; 3],
+        yty: 0.0,
+        n_valid: projected_y.len(),
+        fixed_effect_rank,
+    };
+    for row in 0..projected_y.len() {
+        let columns = [
+            projected_g1[row],
+            projected_g2[row],
+            projected_interaction[row],
+        ];
+        let y = projected_y[row];
+        moments.yty += y * y;
+        for column in 0..3 {
+            moments.rhs[column] += columns[column] * y;
+            for other in 0..3 {
+                moments.gram[column][other] += columns[column] * columns[other];
+            }
+        }
+    }
+    moments
+}
+
+/// Scalar FWL scorer for a model whose fixed-effect subspace has already
+/// been removed.  No intercept is added here.  The residual degrees of
+/// freedom use the projector rank plus the three interaction-model columns.
+fn score_projected_pair_moments(
+    moments: &ProjectedPairMoments,
+) -> Result<ProjectedFwlScore, String> {
+    let n = moments.n_valid;
+    let fixed_rank = moments.fixed_effect_rank;
+    if n <= fixed_rank + 3 {
+        return Err(
+            "interaction unidentifiable: insufficient residual degrees of freedom".to_string(),
+        );
+    }
+
+    let cxx = moments.gram[0][0];
+    let cxz = moments.gram[0][1];
+    let cxw = moments.gram[0][2];
+    let czz = moments.gram[1][1];
+    let czw = moments.gram[1][2];
+    let cww = moments.gram[2][2];
+    let cxy = moments.rhs[0];
+    let czy = moments.rhs[1];
+    let cyw = moments.rhs[2];
+    let cyy = moments.yty;
+    let values = [cxx, cxz, cxw, czz, czw, cww, cxy, czy, cyw, cyy];
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err("interaction unidentifiable: non-finite projected moments".to_string());
+    }
+
+    let determinant = cxx * czz - cxz * cxz;
+    let determinant_scale = (cxx * czz).abs().max(cxz * cxz).max(1.0);
+    let determinant_tol = SOLVE_EPS * determinant_scale;
+    if !(determinant > determinant_tol) || !determinant.is_finite() {
+        return Err(
+            "interaction unidentifiable: rank-deficient projected main effects".to_string(),
+        );
+    }
+    let null_beta_x = (czz * cxy - cxz * czy) / determinant;
+    let null_beta_z = (cxx * czy - cxz * cxy) / determinant;
+    let w_projection_x = (czz * cxw - cxz * czw) / determinant;
+    let w_projection_z = (cxx * czw - cxz * cxw) / determinant;
+    let interaction_variance = cww - w_projection_x * cxw - w_projection_z * czw;
+    let interaction_variance_tol = SOLVE_EPS * cww.abs().max(1.0);
+    if !(interaction_variance > interaction_variance_tol) || !interaction_variance.is_finite() {
+        return Err("interaction unidentifiable: rank-deficient projected interaction".to_string());
+    }
+
+    let interaction_covariance = cyw - w_projection_x * cxy - w_projection_z * czy;
+    let interaction_beta = interaction_covariance / interaction_variance;
+    let beta_projected = [
+        null_beta_x - w_projection_x * interaction_beta,
+        null_beta_z - w_projection_z * interaction_beta,
+        interaction_beta,
+    ];
+    if beta_projected.iter().any(|value| !value.is_finite()) {
+        return Err("interaction unidentifiable: non-finite projected coefficient".to_string());
+    }
+
+    let null_explained = null_beta_x * cxy + null_beta_z * czy;
+    let null_rss = (cyy - null_explained).max(0.0);
+    let interaction_delta_rss = (interaction_covariance * interaction_beta).max(0.0);
+    let full_rss = (null_rss - interaction_delta_rss).max(0.0);
+    let residual_df = n - fixed_rank - 3;
+    let sigma_e2 = full_rss / residual_df as f64;
+    let interaction_se = if sigma_e2 > 0.0 {
+        (sigma_e2 / interaction_variance).sqrt()
+    } else {
+        0.0
+    };
+    let interaction_score = if interaction_delta_rss > SOLVE_EPS {
+        if sigma_e2 > SOLVE_EPS {
+            interaction_delta_rss / sigma_e2
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        0.0
+    };
+    Ok(ProjectedFwlScore {
+        beta_projected,
+        interaction_se,
+        interaction_score,
+        interaction_delta_rss,
+        sigma_e2,
+        full_rss,
+        residual_df,
+    })
 }
 
 #[cfg(test)]
@@ -1847,6 +2273,7 @@ fn score_pair_moments_generic_reference(moments: &PairMoments) -> Result<FwlScor
         interaction_score,
         interaction_delta_rss: delta_rss,
         sigma_e2,
+        residual_df: degrees_of_freedom,
     })
 }
 
@@ -1962,12 +2389,16 @@ fn score_pair_moments_scalar(moments: &PairMoments) -> Result<FwlScore, String> 
         interaction_score,
         interaction_delta_rss,
         sigma_e2,
+        residual_df: degrees_of_freedom,
     })
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DosagePairFit {
     pub(crate) beta: [f64; DESIGN_COLS],
+    pub(crate) covariate_beta: Vec<f64>,
+    pub(crate) covariate_rank: usize,
+    pub(crate) residual_df: usize,
     pub(crate) dosage_cell_means: [f64; DOSAGE_CELLS],
     pub(crate) observed_dosage_cell_means: [f64; DOSAGE_CELLS],
     pub(crate) dosage_cell_counts: [usize; DOSAGE_CELLS],
@@ -2032,6 +2463,7 @@ impl PairScanAccumulator {
         n_samples: usize,
         y: &[f64],
         lookup: &MaskYLookup,
+        covariates: Option<&CovariateScanContext>,
         top_k: usize,
     ) -> Result<Self, String> {
         let mut accumulator = Self::default();
@@ -2043,11 +2475,14 @@ impl PairScanAccumulator {
                 let Some(representation_g2) = representations[second].as_ref() else {
                     continue;
                 };
-                let score = match score_marker_pair_with_lookup(
+                let score = match score_marker_pair_with_context(
                     representation_g1,
                     representation_g2,
                     y,
                     Some(lookup),
+                    covariates,
+                    first,
+                    second,
                 ) {
                     Ok(score) => score,
                     Err(error) if error.contains("unidentifiable") => {
@@ -2293,28 +2728,19 @@ fn back_transform_beta(
     [intercept, beta1, beta2, interaction]
 }
 
-fn fit_marker_pair(
+fn materialize_dosage_pair_fit(
     representation_g1: &MarkerRepresentation,
     representation_g2: &MarkerRepresentation,
-    y: &[f64],
-) -> Result<DosagePairFit, String> {
-    if y.iter().any(|value| !value.is_finite()) {
-        return Err("y contains non-finite values".to_string());
-    }
-    fit_marker_pair_with_lookup(representation_g1, representation_g2, y, None)
-}
-
-fn fit_marker_pair_with_lookup(
-    representation_g1: &MarkerRepresentation,
-    representation_g2: &MarkerRepresentation,
-    y: &[f64],
-    lookup: Option<&MaskYLookup>,
-) -> Result<DosagePairFit, String> {
-    let moments = pair_moments_with_lookup(representation_g1, representation_g2, y, lookup)?;
-    let score = score_pair_moments_scalar(&moments)?;
+    moments: &PairMoments,
+    score: &FwlScore,
+    beta_encoded: [f64; DESIGN_COLS],
+    covariate_beta: Vec<f64>,
+    covariate_rank: usize,
+    residual_df: usize,
+) -> DosagePairFit {
     let encoding_g1 = representation_g1.encoding();
     let encoding_g2 = representation_g2.encoding();
-    let beta = back_transform_beta(&score.beta_encoded, encoding_g1, encoding_g2);
+    let beta = back_transform_beta(&beta_encoded, encoding_g1, encoding_g2);
     let interaction_scale = encoding_g1.scale * encoding_g2.scale;
     let interaction_se = score.interaction_se_encoded / interaction_scale.abs();
     let dosage_cell_means = std::array::from_fn(|cell| {
@@ -2322,15 +2748,18 @@ fn fit_marker_pair_with_lookup(
         let g2 = (cell % DOSAGE_LEVELS) as f64;
         fitted_dosage_cell_mean(&beta, g1, g2)
     });
-    let observed_dosage_cell_means = observed_cell_means(&moments);
+    let observed_dosage_cell_means = observed_cell_means(moments);
     let (binary_cell_means, observed_binary_cell_means, binary_cell_counts) =
-        binary_summaries(&beta, &moments, representation_g1, representation_g2);
+        binary_summaries(&beta, moments, representation_g1, representation_g2);
     let logic_label = binary_cell_means
         .as_ref()
         .map(|means| classify_logic(means, beta[3]))
         .unwrap_or(DosageLogicLabel::Unresolved);
-    Ok(DosagePairFit {
+    DosagePairFit {
         beta,
+        covariate_beta,
+        covariate_rank,
+        residual_df,
         dosage_cell_means,
         observed_dosage_cell_means,
         dosage_cell_counts: moments.cell_counts,
@@ -2351,18 +2780,197 @@ fn fit_marker_pair_with_lookup(
         interaction_delta_rss: score.interaction_delta_rss,
         sigma_e2: score.sigma_e2,
         logic_label,
-    })
+    }
 }
 
-#[inline]
-fn score_marker_pair_with_lookup(
+fn fit_marker_pair(
+    representation_g1: &MarkerRepresentation,
+    representation_g2: &MarkerRepresentation,
+    y: &[f64],
+) -> Result<DosagePairFit, String> {
+    if y.iter().any(|value| !value.is_finite()) {
+        return Err("y contains non-finite values".to_string());
+    }
+    fit_marker_pair_with_lookup(representation_g1, representation_g2, y, None)
+}
+
+fn fit_marker_pair_with_lookup(
     representation_g1: &MarkerRepresentation,
     representation_g2: &MarkerRepresentation,
     y: &[f64],
     lookup: Option<&MaskYLookup>,
-) -> Result<FwlScore, String> {
+) -> Result<DosagePairFit, String> {
     let moments = pair_moments_with_lookup(representation_g1, representation_g2, y, lookup)?;
-    score_pair_moments_scalar(&moments)
+    let score = score_pair_moments_scalar(&moments)?;
+    Ok(materialize_dosage_pair_fit(
+        representation_g1,
+        representation_g2,
+        &moments,
+        &score,
+        score.beta_encoded,
+        Vec::new(),
+        1,
+        score.residual_df,
+    ))
+}
+
+fn score_marker_pair_with_context(
+    representation_g1: &MarkerRepresentation,
+    representation_g2: &MarkerRepresentation,
+    y: &[f64],
+    lookup: Option<&MaskYLookup>,
+    covariates: Option<&CovariateScanContext>,
+    first: usize,
+    second: usize,
+) -> Result<FwlScore, String> {
+    match covariates {
+        Some(context) if representation_g1.has_missing() || representation_g2.has_missing() => {
+            score_marker_pair_covariate_masked(representation_g1, representation_g2, y, context)
+        }
+        Some(context) => {
+            let moments =
+                pair_moments_with_lookup(representation_g1, representation_g2, y, lookup)?;
+            context.score(
+                &moments,
+                representation_g1,
+                representation_g2,
+                first,
+                second,
+            )
+        }
+        None => {
+            let moments =
+                pair_moments_with_lookup(representation_g1, representation_g2, y, lookup)?;
+            score_pair_moments_scalar(&moments)
+        }
+    }
+}
+
+fn gather_pair_covariate_inputs(
+    representation_g1: &MarkerRepresentation,
+    representation_g2: &MarkerRepresentation,
+    y: &[f64],
+    context: &CovariateScanContext,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
+    if context.covariates.len() != context.projector.n_samples() * context.n_covariates {
+        return Err("covariate design length does not match scan samples".to_string());
+    }
+    let mut g1 = Vec::new();
+    let mut g2 = Vec::new();
+    let mut y_valid = Vec::new();
+    let mut covariates = Vec::new();
+    for row in 0..y.len() {
+        if representation_g1.missing_at(row) || representation_g2.missing_at(row) {
+            continue;
+        }
+        g1.push(representation_g1.value_at(row));
+        g2.push(representation_g2.value_at(row));
+        y_valid.push(y[row]);
+        let cov_start = row * context.n_covariates;
+        covariates
+            .extend_from_slice(&context.covariates[cov_start..cov_start + context.n_covariates]);
+    }
+    if y_valid.len() <= context.n_covariates + 4 {
+        return Err("interaction unidentifiable: insufficient valid samples".to_string());
+    }
+    Ok((g1, g2, y_valid, covariates))
+}
+
+fn score_marker_pair_covariate_masked(
+    representation_g1: &MarkerRepresentation,
+    representation_g2: &MarkerRepresentation,
+    y: &[f64],
+    context: &CovariateScanContext,
+) -> Result<FwlScore, String> {
+    let (g1, g2, y_valid, covariates) =
+        gather_pair_covariate_inputs(representation_g1, representation_g2, y, context)?;
+    let representation_g1 = build_marker_representation(&g1, "masked g1")?;
+    let representation_g2 = build_marker_representation(&g2, "masked g2")?;
+    let representations = vec![Some(representation_g1), Some(representation_g2)];
+    let context = CovariateScanContext::new(
+        &representations,
+        y_valid.len(),
+        &y_valid,
+        &covariates,
+        context.n_covariates,
+    )?;
+    let lookup = MaskYLookup::new(&y_valid);
+    score_marker_pair_with_context(
+        representations[0].as_ref().expect("masked marker exists"),
+        representations[1].as_ref().expect("masked marker exists"),
+        &y_valid,
+        Some(&lookup),
+        Some(&context),
+        0,
+        1,
+    )
+}
+
+fn fit_marker_pair_with_covariate_context(
+    representation_g1: &MarkerRepresentation,
+    representation_g2: &MarkerRepresentation,
+    y: &[f64],
+    lookup: Option<&MaskYLookup>,
+    context: &CovariateScanContext,
+    first: usize,
+    second: usize,
+) -> Result<DosagePairFit, String> {
+    if representation_g1.has_missing() || representation_g2.has_missing() {
+        let (g1, g2, y_valid, covariates) =
+            gather_pair_covariate_inputs(representation_g1, representation_g2, y, context)?;
+        return fit_dosage_pair_with_covariates(
+            &g1,
+            &g2,
+            &y_valid,
+            &covariates,
+            context.n_covariates,
+        );
+    }
+    let moments = pair_moments_with_lookup(representation_g1, representation_g2, y, lookup)?;
+    let score = context.score(
+        &moments,
+        representation_g1,
+        representation_g2,
+        first,
+        second,
+    )?;
+    let n = y.len();
+    let encoding_g1 = representation_g1.encoding();
+    let encoding_g2 = representation_g2.encoding();
+    let encoded_g1 = (0..n)
+        .map(|row| (representation_g1.value_at(row) - encoding_g1.offset) / encoding_g1.scale)
+        .collect::<Vec<_>>();
+    let encoded_g2 = (0..n)
+        .map(|row| (representation_g2.value_at(row) - encoding_g2.offset) / encoding_g2.scale)
+        .collect::<Vec<_>>();
+    let mut fixed_target = vec![0.0_f64; n];
+    for row in 0..n {
+        let interaction = encoded_g1[row] * encoded_g2[row];
+        fixed_target[row] = y[row]
+            - score.beta_encoded[1] * encoded_g1[row]
+            - score.beta_encoded[2] * encoded_g2[row]
+            - score.beta_encoded[3] * interaction;
+    }
+    let mut fixed_beta = vec![0.0_f64; context.projector.rank()];
+    context
+        .projector
+        .solve_fixed_effects(&fixed_target, &mut fixed_beta)?;
+    let beta_encoded = [
+        fixed_beta[0],
+        score.beta_encoded[1],
+        score.beta_encoded[2],
+        score.beta_encoded[3],
+    ];
+    Ok(materialize_dosage_pair_fit(
+        representation_g1,
+        representation_g2,
+        &moments,
+        &score,
+        beta_encoded,
+        fixed_beta.into_iter().skip(1).collect(),
+        context.projector.rank(),
+        score.residual_df,
+    ))
 }
 
 /// Compute the interaction p-value after selection.
@@ -2373,7 +2981,7 @@ fn score_marker_pair_with_lookup(
 pub(crate) fn interaction_p_value(fit: &DosagePairFit) -> Option<f64> {
     #[cfg(test)]
     PVALUE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
-    let residual_df = fit.n_valid.saturating_sub(DESIGN_COLS);
+    let residual_df = fit.residual_df;
     if residual_df == 0 || fit.interaction_score.is_nan() {
         return None;
     }
@@ -2403,6 +3011,146 @@ pub(crate) fn fit_dosage_pair(g1: &[f64], g2: &[f64], y: &[f64]) -> Result<Dosag
     let representation_g1 = build_marker_representation(g1, "g1")?;
     let representation_g2 = build_marker_representation(g2, "g2")?;
     fit_marker_pair(&representation_g1, &representation_g2, y)
+}
+
+/// Fit the saturated two-locus dosage model after removing an implicit
+/// intercept and the supplied fixed-effect covariates.  This is the
+/// correctness-first pair-fit path; scan backends reuse the same projected
+/// scorer but precompute marker Q-coordinates before entering their hot loop.
+pub(crate) fn fit_dosage_pair_with_covariates(
+    g1: &[f64],
+    g2: &[f64],
+    y: &[f64],
+    covariates: &[f64],
+    n_covariates: usize,
+) -> Result<DosagePairFit, String> {
+    if g1.len() != g2.len() || g1.len() != y.len() {
+        return Err(format!(
+            "g1, g2, and y lengths must match; got {}, {}, {}",
+            g1.len(),
+            g2.len(),
+            y.len()
+        ));
+    }
+    if y.len() <= n_covariates.saturating_add(4) {
+        return Err("not enough samples for covariate-adjusted interaction".to_string());
+    }
+    if y.iter().any(|value| !value.is_finite()) {
+        return Err("y contains non-finite values".to_string());
+    }
+    let representation_g1 = build_marker_representation(g1, "g1")?;
+    let representation_g2 = build_marker_representation(g2, "g2")?;
+    if representation_g1.has_missing() || representation_g2.has_missing() {
+        let representations = vec![
+            Some(representation_g1.clone()),
+            Some(representation_g2.clone()),
+        ];
+        let full_context =
+            CovariateScanContext::new(&representations, y.len(), y, covariates, n_covariates)?;
+        let (g1_valid, g2_valid, y_valid, covariates_valid) =
+            gather_pair_covariate_inputs(&representation_g1, &representation_g2, y, &full_context)?;
+        return fit_dosage_pair_with_covariates(
+            &g1_valid,
+            &g2_valid,
+            &y_valid,
+            &covariates_valid,
+            n_covariates,
+        );
+    }
+    let n = y.len();
+    let projector =
+        dosage_covariate::CovariateProjector::from_covariates(covariates, n, n_covariates)?;
+    let encoding_g1 = representation_g1.encoding();
+    let encoding_g2 = representation_g2.encoding();
+    let encoded_g1 = (0..n)
+        .map(|row| (representation_g1.value_at(row) - encoding_g1.offset) / encoding_g1.scale)
+        .collect::<Vec<_>>();
+    let encoded_g2 = (0..n)
+        .map(|row| (representation_g2.value_at(row) - encoding_g2.offset) / encoding_g2.scale)
+        .collect::<Vec<_>>();
+    let interaction = encoded_g1
+        .iter()
+        .zip(encoded_g2.iter())
+        .map(|(left, right)| left * right)
+        .collect::<Vec<_>>();
+    let mut projected_g1 = vec![0.0; n];
+    let mut projected_g2 = vec![0.0; n];
+    let mut projected_interaction = vec![0.0; n];
+    let mut projected_y = vec![0.0; n];
+    projector.project_vector(&encoded_g1, &mut projected_g1)?;
+    projector.project_vector(&encoded_g2, &mut projected_g2)?;
+    projector.project_vector(&interaction, &mut projected_interaction)?;
+    projector.project_vector(y, &mut projected_y)?;
+    let projected = projected_pair_moments(
+        &projected_g1,
+        &projected_g2,
+        &projected_interaction,
+        &projected_y,
+        projector.rank(),
+    );
+    let score = score_projected_pair_moments(&projected)?;
+
+    // Recover the fixed effects from the QR factorization after fitting the
+    // three genotype columns.  The coefficient vector is in encoded dosage
+    // coordinates; back_transform_beta restores the caller's raw dosage
+    // scale while the covariates remain in their supplied units.
+    let mut fixed_target = vec![0.0; n];
+    for row in 0..n {
+        fixed_target[row] = y[row]
+            - score.beta_projected[0] * encoded_g1[row]
+            - score.beta_projected[1] * encoded_g2[row]
+            - score.beta_projected[2] * interaction[row];
+    }
+    let mut fixed_beta = vec![0.0; projector.rank()];
+    projector.solve_fixed_effects(&fixed_target, &mut fixed_beta)?;
+    let beta_encoded = [
+        fixed_beta[0],
+        score.beta_projected[0],
+        score.beta_projected[1],
+        score.beta_projected[2],
+    ];
+    let beta = back_transform_beta(&beta_encoded, encoding_g1, encoding_g2);
+    let interaction_scale = encoding_g1.scale * encoding_g2.scale;
+    let interaction_se = score.interaction_se / interaction_scale.abs();
+    let moments = pair_moments_with_lookup(&representation_g1, &representation_g2, y, None)?;
+    let dosage_cell_means = std::array::from_fn(|cell| {
+        let g1 = (cell / DOSAGE_LEVELS) as f64;
+        let g2 = (cell % DOSAGE_LEVELS) as f64;
+        fitted_dosage_cell_mean(&beta, g1, g2)
+    });
+    let observed_dosage_cell_means = observed_cell_means(&moments);
+    let (binary_cell_means, observed_binary_cell_means, binary_cell_counts) =
+        binary_summaries(&beta, &moments, &representation_g1, &representation_g2);
+    let logic_label = binary_cell_means
+        .as_ref()
+        .map(|means| classify_logic(means, beta[3]))
+        .unwrap_or(DosageLogicLabel::Unresolved);
+    Ok(DosagePairFit {
+        beta,
+        covariate_beta: fixed_beta.into_iter().skip(1).collect(),
+        covariate_rank: projector.rank(),
+        residual_df: score.residual_df,
+        dosage_cell_means,
+        observed_dosage_cell_means,
+        dosage_cell_counts: moments.cell_counts,
+        binary_cell_means,
+        observed_binary_cell_means,
+        binary_cell_counts,
+        n_levels_g1: representation_g1.n_levels(),
+        n_levels_g2: representation_g2.n_levels(),
+        n_valid: moments.n_valid,
+        encoding_offset_g1: encoding_g1.offset,
+        encoding_offset_g2: encoding_g2.offset,
+        encoding_scale_g1: encoding_g1.scale,
+        encoding_scale_g2: encoding_g2.scale,
+        interaction_identifiable: true,
+        interaction_beta: beta[3],
+        interaction_se,
+        interaction_score: score.interaction_score,
+        interaction_delta_rss: score.interaction_delta_rss,
+        sigma_e2: score.sigma_e2,
+        logic_label,
+    })
 }
 
 fn validate_scan_inputs(
@@ -2445,6 +3193,30 @@ fn build_marker_representations(
         .collect()
 }
 
+fn scan_dosage_pairs_with_covariates(
+    genotypes: &[f64],
+    n_markers: usize,
+    n_samples: usize,
+    y: &[f64],
+    top_k: usize,
+    covariates: &[f64],
+    n_covariates: usize,
+) -> Result<DosagePairScanResult, String> {
+    validate_scan_inputs(genotypes.len(), n_markers, n_samples, y.len())?;
+    let representations = build_marker_representations(genotypes, n_markers, n_samples);
+    let context =
+        CovariateScanContext::new(&representations, n_samples, y, covariates, n_covariates)?;
+    scan_dosage_pairs_from_representations_with_context(
+        representations,
+        n_markers,
+        n_samples,
+        y,
+        top_k,
+        1,
+        Some(&context),
+    )
+}
+
 fn scan_dosage_pairs_from_representations(
     representations: Vec<Option<MarkerRepresentation>>,
     n_markers: usize,
@@ -2470,6 +3242,26 @@ fn scan_dosage_pairs_from_representations_with_threads(
     top_k: usize,
     threads: usize,
 ) -> Result<DosagePairScanResult, String> {
+    scan_dosage_pairs_from_representations_with_context(
+        representations,
+        n_markers,
+        n_samples,
+        y,
+        top_k,
+        threads,
+        None,
+    )
+}
+
+fn scan_dosage_pairs_from_representations_with_context(
+    representations: Vec<Option<MarkerRepresentation>>,
+    n_markers: usize,
+    n_samples: usize,
+    y: &[f64],
+    top_k: usize,
+    threads: usize,
+    covariates: Option<&CovariateScanContext>,
+) -> Result<DosagePairScanResult, String> {
     if representations.len() != n_markers {
         return Err("marker representation count does not match n_markers".to_string());
     }
@@ -2487,7 +3279,7 @@ fn scan_dosage_pairs_from_representations_with_threads(
             Some(MarkerRepresentation::Float(marker)) if !marker.has_missing
         )
     });
-    let mut accumulator = if all_complete_float {
+    let mut accumulator = if all_complete_float && covariates.is_none() {
         let float_markers = representations
             .iter()
             .map(|representation| match representation.as_ref() {
@@ -2504,6 +3296,7 @@ fn scan_dosage_pairs_from_representations_with_threads(
             n_samples,
             y,
             &lookup,
+            covariates,
             top_k,
         )?
     } else {
@@ -2524,6 +3317,7 @@ fn scan_dosage_pairs_from_representations_with_threads(
                         n_samples,
                         y,
                         &lookup,
+                        covariates,
                         top_k,
                     )
                 })
@@ -2565,9 +3359,21 @@ fn scan_dosage_pairs_from_representations_with_threads(
         let Some(representation_g2) = representations[scored.second].as_ref() else {
             continue;
         };
-        let fit =
-            fit_marker_pair_with_lookup(representation_g1, representation_g2, y, Some(&lookup))
-                .map_err(|error| format!("failed to materialize retained pair: {error}"))?;
+        let fit = match covariates {
+            Some(context) => fit_marker_pair_with_covariate_context(
+                representation_g1,
+                representation_g2,
+                y,
+                Some(&lookup),
+                context,
+                scored.first,
+                scored.second,
+            ),
+            None => {
+                fit_marker_pair_with_lookup(representation_g1, representation_g2, y, Some(&lookup))
+            }
+        }
+        .map_err(|error| format!("failed to materialize retained pair: {error}"))?;
         candidates.push(DosagePairCandidate {
             first: scored.first,
             second: scored.second,
@@ -2628,6 +3434,42 @@ fn scan_dosage_pairs_owned_with_threads(
         y,
         top_k,
         threads,
+    )
+}
+
+fn scan_dosage_pairs_owned_with_covariates_with_threads(
+    genotypes: Vec<f64>,
+    n_markers: usize,
+    n_samples: usize,
+    y: &[f64],
+    top_k: usize,
+    threads: usize,
+    covariates: Option<&[f64]>,
+    n_covariates: usize,
+) -> Result<DosagePairScanResult, String> {
+    validate_scan_inputs(genotypes.len(), n_markers, n_samples, y.len())?;
+    let representations = build_marker_representations(&genotypes, n_markers, n_samples);
+    drop(genotypes);
+    let Some(covariates) = covariates else {
+        return scan_dosage_pairs_from_representations_with_threads(
+            representations,
+            n_markers,
+            n_samples,
+            y,
+            top_k,
+            threads,
+        );
+    };
+    let context =
+        CovariateScanContext::new(&representations, n_samples, y, covariates, n_covariates)?;
+    scan_dosage_pairs_from_representations_with_context(
+        representations,
+        n_markers,
+        n_samples,
+        y,
+        top_k,
+        threads,
+        Some(&context),
     )
 }
 
@@ -2702,6 +3544,12 @@ fn set_fit_items<'py>(
     out.set_item("n_levels_g1", fit.n_levels_g1)?;
     out.set_item("n_levels_g2", fit.n_levels_g2)?;
     out.set_item("n_valid", fit.n_valid)?;
+    out.set_item(
+        "covariate_beta",
+        PyArray1::from_vec(py, fit.covariate_beta.clone()),
+    )?;
+    out.set_item("covariate_rank", fit.covariate_rank)?;
+    out.set_item("residual_df", fit.residual_df)?;
     out.set_item("encoding_offset_g1", fit.encoding_offset_g1)?;
     out.set_item("encoding_offset_g2", fit.encoding_offset_g2)?;
     out.set_item("encoding_scale_g1", fit.encoding_scale_g1)?;
@@ -2718,17 +3566,33 @@ fn set_fit_items<'py>(
 }
 
 #[pyfunction(name = "garfield_dosage_pair_fit")]
-#[pyo3(signature = (g1, g2, y))]
+#[pyo3(signature = (g1, g2, y, covariates=None))]
 pub fn garfield_dosage_pair_fit_py<'py>(
     py: Python<'py>,
     g1: PyReadonlyArray1<'py, f64>,
     g2: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray1<'py, f64>,
+    covariates: Option<PyReadonlyArray2<'py, f64>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let g1_vec = array1_to_vec(&g1);
     let g2_vec = array1_to_vec(&g2);
     let y_vec = array1_to_vec(&y);
-    let fit = fit_dosage_pair(&g1_vec, &g2_vec, &y_vec).map_err(PyValueError::new_err)?;
+    let fit = if let Some(covariates) = covariates {
+        let shape = covariates.shape();
+        if shape.len() != 2 || shape[0] != y_vec.len() {
+            return Err(PyValueError::new_err(format!(
+                "covariates must have shape (n_samples, n_covariates); got {:?}, expected first dimension {}",
+                shape,
+                y_vec.len()
+            )));
+        }
+        let n_covariates = shape[1];
+        let covariate_vec = array2_to_vec(&covariates);
+        fit_dosage_pair_with_covariates(&g1_vec, &g2_vec, &y_vec, &covariate_vec, n_covariates)
+            .map_err(PyValueError::new_err)?
+    } else {
+        fit_dosage_pair(&g1_vec, &g2_vec, &y_vec).map_err(PyValueError::new_err)?
+    };
     let out = PyDict::new(py);
     set_fit_items(py, &out, &fit)?;
     out.set_item("n_samples", y_vec.len())?;
@@ -2736,13 +3600,14 @@ pub fn garfield_dosage_pair_fit_py<'py>(
 }
 
 #[pyfunction(name = "garfield_dosage_pair_scan")]
-#[pyo3(signature = (genotypes, y, top_k=100, threads=0))]
+#[pyo3(signature = (genotypes, y, top_k=100, threads=0, covariates=None))]
 pub fn garfield_dosage_pair_scan_py<'py>(
     py: Python<'py>,
     genotypes: PyReadonlyArray2<'py, f64>,
     y: PyReadonlyArray1<'py, f64>,
     top_k: usize,
     threads: usize,
+    covariates: Option<PyReadonlyArray2<'py, f64>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let shape = genotypes.shape();
     if shape.len() != 2 {
@@ -2754,18 +3619,33 @@ pub fn garfield_dosage_pair_scan_py<'py>(
     let n_samples = shape[1];
     let genotype_vec = array2_to_vec(&genotypes);
     let y_vec = array1_to_vec(&y);
+    let (covariate_vec, n_covariates) = if let Some(covariates) = covariates {
+        let cov_shape = covariates.shape();
+        if cov_shape.len() != 2 || cov_shape[0] != n_samples {
+            return Err(PyValueError::new_err(format!(
+                "covariates must have shape (n_samples, n_covariates); got {:?}, expected first dimension {}",
+                cov_shape,
+                n_samples
+            )));
+        }
+        (Some(array2_to_vec(&covariates)), cov_shape[1])
+    } else {
+        (None, 0)
+    };
     let effective_threads = if threads == 0 {
         rayon::current_num_threads().max(1)
     } else {
         threads
     };
-    let scan = scan_dosage_pairs_owned_with_threads(
+    let scan = scan_dosage_pairs_owned_with_covariates_with_threads(
         genotype_vec,
         n_markers,
         n_samples,
         &y_vec,
         top_k,
         effective_threads,
+        covariate_vec.as_deref(),
+        n_covariates,
     )
     .map_err(PyValueError::new_err)?;
     let candidates = PyList::empty(py);
@@ -3427,6 +4307,397 @@ mod tests {
                 got.score.interaction_delta_rss,
                 expected.score.interaction_delta_rss,
             );
+        }
+    }
+
+    #[test]
+    fn covariate_projector_uses_qr_for_projected_inner_products() {
+        let n = 7usize;
+        let covariates = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let a = [2.0, -1.0, 4.0, 3.0, 8.0, -2.0, 5.0];
+        let b = [1.0, 3.0, -2.0, 6.0, 0.5, 4.0, -3.0];
+        let projector =
+            super::dosage_covariate::CovariateProjector::from_covariates(&covariates, n, 1)
+                .unwrap();
+
+        assert_eq!(projector.rank(), 2);
+        let mut a_projected = vec![0.0; n];
+        let mut b_projected = vec![0.0; n];
+        projector.project_vector(&a, &mut a_projected).unwrap();
+        projector.project_vector(&b, &mut b_projected).unwrap();
+
+        let a_inner = a_projected
+            .iter()
+            .zip(b_projected.iter())
+            .map(|(x, z)| x * z)
+            .sum::<f64>();
+        let projected_inner = projector
+            .projected_inner_product(&a, &b)
+            .expect("projected inner product");
+        assert!((a_inner - projected_inner).abs() < 1.0e-10);
+        assert!(a_projected.iter().sum::<f64>().abs() < 1.0e-10);
+        assert!(
+            a_projected
+                .iter()
+                .zip(covariates.iter())
+                .map(|(value, cov)| value * cov)
+                .sum::<f64>()
+                .abs()
+                < 1.0e-10
+        );
+    }
+
+    #[test]
+    fn covariate_projector_rejects_rank_deficient_fixed_effects() {
+        let duplicate = [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0];
+        let error = super::dosage_covariate::CovariateProjector::from_covariates(&duplicate, 4, 2)
+            .expect_err("duplicate covariates must be rejected");
+        assert!(
+            error.contains("rank-deficient"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn projected_fwl_matches_full_model_with_fixed_covariate() {
+        use nalgebra::{DMatrix, DVector};
+
+        let n = 16usize;
+        let covariates = (0..n)
+            .map(|index| (index as f64 - 7.5) / 3.0)
+            .collect::<Vec<_>>();
+        let g1 = (0..n)
+            .map(|index| [0.0, 1.0, 2.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        let g2 = (0..n)
+            .map(|index| [0.0, 0.0, 1.0, 2.0][index % 4])
+            .collect::<Vec<_>>();
+        let y = g1
+            .iter()
+            .zip(g2.iter())
+            .zip(covariates.iter())
+            .map(|((x, z), c)| 2.5 + 1.75 * c + 0.8 * x - 0.4 * z + 1.2 * x * z)
+            .collect::<Vec<_>>();
+        let projector =
+            super::dosage_covariate::CovariateProjector::from_covariates(&covariates, n, 1)
+                .unwrap();
+        let mut projected_g1 = vec![0.0; n];
+        let mut projected_g2 = vec![0.0; n];
+        let interaction = g1
+            .iter()
+            .zip(g2.iter())
+            .map(|(x, z)| x * z)
+            .collect::<Vec<_>>();
+        let mut projected_interaction = vec![0.0; n];
+        let mut projected_y = vec![0.0; n];
+        projector.project_vector(&g1, &mut projected_g1).unwrap();
+        projector.project_vector(&g2, &mut projected_g2).unwrap();
+        projector
+            .project_vector(&interaction, &mut projected_interaction)
+            .unwrap();
+        projector.project_vector(&y, &mut projected_y).unwrap();
+        let projected = projected_pair_moments(
+            &projected_g1,
+            &projected_g2,
+            &projected_interaction,
+            &projected_y,
+            projector.rank(),
+        );
+        let score = score_projected_pair_moments(&projected).unwrap();
+
+        let full_design = DMatrix::from_fn(n, 5, |row, column| match column {
+            0 => 1.0,
+            1 => covariates[row],
+            2 => g1[row],
+            3 => g2[row],
+            _ => g1[row] * g2[row],
+        });
+        let full_beta = full_design
+            .clone()
+            .svd(true, true)
+            .solve(&DVector::from_vec(y.clone()), 1.0e-12)
+            .expect("full model must be identifiable");
+        let residual = DVector::from_vec(y) - full_design * &full_beta;
+        let full_rss = residual.dot(&residual);
+        assert!((score.beta_projected[0] - full_beta[2]).abs() < 1.0e-10);
+        assert!((score.beta_projected[1] - full_beta[3]).abs() < 1.0e-10);
+        assert!((score.beta_projected[2] - full_beta[4]).abs() < 1.0e-10);
+        assert!((score.full_rss - full_rss).abs() < 1.0e-10);
+        assert_eq!(score.residual_df, n - 5);
+    }
+
+    #[test]
+    fn projected_fwl_rejects_interaction_rank_deficiency() {
+        let n = 12usize;
+        let covariates = (0..n)
+            .map(|index| if index % 2 == 0 { 0.0 } else { 1.0 })
+            .collect::<Vec<_>>();
+        let g1 = covariates.clone();
+        let g2 = (0..n)
+            .map(|index| if index % 3 == 0 { 0.0 } else { 1.0 })
+            .collect::<Vec<_>>();
+        let y = (0..n).map(|index| index as f64 * 0.25).collect::<Vec<_>>();
+        let projector =
+            super::dosage_covariate::CovariateProjector::from_covariates(&covariates, n, 1)
+                .unwrap();
+        let mut projected_g1 = vec![0.0; n];
+        let mut projected_g2 = vec![0.0; n];
+        let interaction = g1
+            .iter()
+            .zip(g2.iter())
+            .map(|(x, z)| x * z)
+            .collect::<Vec<_>>();
+        let mut projected_interaction = vec![0.0; n];
+        let mut projected_y = vec![0.0; n];
+        projector.project_vector(&g1, &mut projected_g1).unwrap();
+        projector.project_vector(&g2, &mut projected_g2).unwrap();
+        projector
+            .project_vector(&interaction, &mut projected_interaction)
+            .unwrap();
+        projector.project_vector(&y, &mut projected_y).unwrap();
+        let projected = projected_pair_moments(
+            &projected_g1,
+            &projected_g2,
+            &projected_interaction,
+            &projected_y,
+            projector.rank(),
+        );
+        let error = score_projected_pair_moments(&projected)
+            .expect_err("a genotype collinear with the covariate must be unidentifiable");
+        assert!(
+            error.contains("unidentifiable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn covariate_adjusted_pair_fit_recovers_interaction_and_df() {
+        let n = 16usize;
+        let covariates = (0..n)
+            .map(|index| (index as f64 - 7.5) / 3.0)
+            .collect::<Vec<_>>();
+        let g1 = (0..n)
+            .map(|index| [0.0, 1.0, 2.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        let g2 = (0..n)
+            .map(|index| [0.0, 0.0, 1.0, 2.0][index % 4])
+            .collect::<Vec<_>>();
+        let y = g1
+            .iter()
+            .zip(g2.iter())
+            .zip(covariates.iter())
+            .map(|((x, z), c)| 2.5 + 1.75 * c + 0.8 * x - 0.4 * z + 1.2 * x * z)
+            .collect::<Vec<_>>();
+        let fit = fit_dosage_pair_with_covariates(&g1, &g2, &y, &covariates, 1).unwrap();
+        assert_close(fit.beta[0], 2.5);
+        assert_close(fit.beta[1], 0.8);
+        assert_close(fit.beta[2], -0.4);
+        assert_close(fit.beta[3], 1.2);
+        assert_eq!(fit.covariate_beta.len(), 1);
+        assert_close(fit.covariate_beta[0], 1.75);
+        assert_eq!(fit.covariate_rank, 2);
+        assert_eq!(fit.residual_df, n - 5);
+        assert!(fit.interaction_score > 1.0e8);
+    }
+
+    #[test]
+    fn covariate_adjusted_zero_two_encoding_back_transforms_interaction() {
+        let n = 20usize;
+        let g1 = (0..n)
+            .map(|index| if index % 4 >= 2 { 2.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let g2 = (0..n)
+            .map(|index| if index % 2 == 1 { 2.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let covariates = (0..n)
+            .map(|index| (index as f64 - 9.5) / 4.0)
+            .collect::<Vec<_>>();
+        let y = g1
+            .iter()
+            .zip(g2.iter())
+            .zip(covariates.iter())
+            .map(|((x, z), c)| 2.0 + 1.3 * c + 0.4 * x - 0.2 * z + 0.75 * x * z)
+            .collect::<Vec<_>>();
+        let fit = fit_dosage_pair_with_covariates(&g1, &g2, &y, &covariates, 1).unwrap();
+        assert_close(fit.beta[0], 2.0);
+        assert_close(fit.beta[1], 0.4);
+        assert_close(fit.beta[2], -0.2);
+        assert_close(fit.beta[3], 0.75);
+        assert_close(fit.interaction_beta, 0.75);
+        assert_close(fit.interaction_se, 0.0);
+    }
+
+    #[test]
+    fn covariate_adjusted_scan_materializes_fixed_effects() {
+        let n_samples = 16usize;
+        let mut genotypes = Vec::with_capacity(2 * n_samples);
+        let g1 = (0..n_samples)
+            .map(|index| [0.0, 1.0, 0.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        let g2 = (0..n_samples)
+            .map(|index| [0.0, 0.0, 1.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        genotypes.extend_from_slice(&g1);
+        genotypes.extend_from_slice(&g2);
+        let covariates = (0..n_samples)
+            .map(|index| (index as f64 - 7.5) / 3.0)
+            .collect::<Vec<_>>();
+        let y = g1
+            .iter()
+            .zip(g2.iter())
+            .zip(covariates.iter())
+            .map(|((x, z), c)| 1.5 + 2.25 * c + 0.6 * x - 0.25 * z + 1.8 * x * z)
+            .collect::<Vec<_>>();
+        let scan =
+            scan_dosage_pairs_with_covariates(&genotypes, 2, n_samples, &y, 1, &covariates, 1)
+                .unwrap();
+        assert_eq!(scan.candidates.len(), 1);
+        let fit = &scan.candidates[0].fit;
+        assert_close(fit.beta[0], 1.5);
+        assert_close(fit.beta[1], 0.6);
+        assert_close(fit.beta[2], -0.25);
+        assert_close(fit.beta[3], 1.8);
+        assert_eq!(fit.covariate_beta.len(), 1);
+        assert_close(fit.covariate_beta[0], 2.25);
+        assert_eq!(fit.covariate_rank, 2);
+        assert_eq!(fit.residual_df, n_samples - 5);
+    }
+
+    #[test]
+    fn covariate_adjusted_scan_uses_pairwise_missing_qr_fallback() {
+        let n_samples = 20usize;
+        let mut genotypes = Vec::with_capacity(2 * n_samples);
+        let mut g1 = (0..n_samples)
+            .map(|index| [0.0, 1.0, 0.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        let mut g2 = (0..n_samples)
+            .map(|index| [0.0, 0.0, 1.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        g1[3] = f64::NAN;
+        g2[7] = f64::NAN;
+        genotypes.extend_from_slice(&g1);
+        genotypes.extend_from_slice(&g2);
+        let covariates = (0..n_samples)
+            .map(|index| (index as f64 - 9.5) / 4.0)
+            .collect::<Vec<_>>();
+        let y = (0..n_samples)
+            .map(|index| {
+                let x = if g1[index].is_nan() { 0.0 } else { g1[index] };
+                let z = if g2[index].is_nan() { 0.0 } else { g2[index] };
+                1.0 + 1.5 * covariates[index] + 0.4 * x - 0.2 * z + 2.0 * x * z
+            })
+            .collect::<Vec<_>>();
+        let scan =
+            scan_dosage_pairs_with_covariates(&genotypes, 2, n_samples, &y, 1, &covariates, 1)
+                .unwrap();
+        assert_eq!(scan.candidates.len(), 1);
+        let fit = &scan.candidates[0].fit;
+        assert_eq!(fit.n_valid, n_samples - 2);
+        assert_eq!(fit.residual_df, n_samples - 2 - 5);
+        assert_close(fit.beta[3], 2.0);
+        assert_close(fit.covariate_beta[0], 1.5);
+    }
+
+    #[test]
+    fn covariate_adjusted_pair_fit_uses_pairwise_missing_qr_fallback() {
+        let n = 20usize;
+        let mut g1 = (0..n)
+            .map(|index| [0.0, 1.0, 0.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        let mut g2 = (0..n)
+            .map(|index| [0.0, 0.0, 1.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        g1[2] = f64::NAN;
+        g2[11] = f64::NAN;
+        let covariates = (0..n)
+            .map(|index| (index as f64 - 9.5) / 4.0)
+            .collect::<Vec<_>>();
+        let y = (0..n)
+            .map(|index| {
+                let x = if g1[index].is_nan() { 0.0 } else { g1[index] };
+                let z = if g2[index].is_nan() { 0.0 } else { g2[index] };
+                1.0 + 1.5 * covariates[index] + 0.4 * x - 0.2 * z + 2.0 * x * z
+            })
+            .collect::<Vec<_>>();
+        let fit = fit_dosage_pair_with_covariates(&g1, &g2, &y, &covariates, 1).unwrap();
+        assert_eq!(fit.n_valid, n - 2);
+        assert_eq!(fit.residual_df, n - 2 - 5);
+        assert_close(fit.beta[3], 2.0);
+        assert_close(fit.covariate_beta[0], 1.5);
+    }
+
+    #[test]
+    fn covariate_adjusted_scan_supports_binary_ternary_and_float_backends() {
+        let n_samples = 24usize;
+        let mut genotypes = Vec::with_capacity(3 * n_samples);
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let g_binary = (0..n_samples)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if state % 2 == 0 {
+                    2.0
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let g_ternary = (0..n_samples)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state % 3) as f64
+            })
+            .collect::<Vec<_>>();
+        let g_float = (0..n_samples)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((state % 1900) as f64 + 0.25) / 1000.0
+            })
+            .collect::<Vec<_>>();
+        genotypes.extend_from_slice(&g_binary);
+        genotypes.extend_from_slice(&g_ternary);
+        genotypes.extend_from_slice(&g_float);
+        let covariates = (0..n_samples)
+            .map(|index| (index as f64 - 11.5) / 5.0)
+            .collect::<Vec<_>>();
+        let y = g_binary
+            .iter()
+            .zip(g_float.iter())
+            .zip(covariates.iter())
+            .map(|((x, z), c)| 0.5 + 1.25 * c + 0.3 * x - 0.6 * z + 1.1 * x * z)
+            .collect::<Vec<_>>();
+        let scan =
+            scan_dosage_pairs_with_covariates(&genotypes, 3, n_samples, &y, 3, &covariates, 1)
+                .unwrap();
+        assert_eq!(scan.pairs_evaluated, 3);
+        assert_eq!(scan.candidates.len(), 3);
+        for candidate in scan.candidates {
+            assert_eq!(candidate.fit.covariate_rank, 2);
+            assert_eq!(candidate.fit.residual_df, n_samples - 5);
+        }
+    }
+
+    #[test]
+    fn zero_covariate_columns_preserve_unadjusted_scan_results() {
+        let n_samples = 18usize;
+        let genotypes = (0..(3 * n_samples))
+            .map(|index| ((index * 7 + 3) % 3) as f64)
+            .collect::<Vec<_>>();
+        let y = (0..n_samples)
+            .map(|index| (index as f64 * 0.31).sin())
+            .collect::<Vec<_>>();
+        let unadjusted = scan_dosage_pairs(&genotypes, 3, n_samples, &y, 3).unwrap();
+        let adjusted =
+            scan_dosage_pairs_with_covariates(&genotypes, 3, n_samples, &y, 3, &[], 0).unwrap();
+        assert_eq!(adjusted.pairs_evaluated, unadjusted.pairs_evaluated);
+        assert_eq!(adjusted.pairs_skipped, unadjusted.pairs_skipped);
+        for (got, expected) in adjusted.candidates.iter().zip(unadjusted.candidates.iter()) {
+            assert_eq!((got.first, got.second), (expected.first, expected.second));
+            assert_close(got.fit.interaction_score, expected.fit.interaction_score);
+            assert_close(
+                got.fit.interaction_delta_rss,
+                expected.fit.interaction_delta_rss,
+            );
+            assert_eq!(got.fit.residual_df, expected.fit.residual_df);
         }
     }
 
