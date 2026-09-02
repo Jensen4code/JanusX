@@ -5,11 +5,14 @@
 //! already-fitted variance components, then a single Cholesky factor of
 //! `V = sigma_g2 * K + sigma_e2 * I` is reused for pairwise GLS/FWL scores.
 //!
-//! The scan currently favors correctness and a bounded memory footprint over
-//! the eventual low-rank/blocked implementation. It precomputes `V^-1 g_j`
-//! once per marker and solves only the interaction column for each pair. No
-//! explicit inverse of `V` is formed.
+//! The scan keeps the covariance factorized: it precomputes `V^-1 g_j` once
+//! per marker and solves interaction columns in cache-sized blocks with a
+//! BLAS triangular-solve kernel. No explicit inverse of `V` is formed.
 
+use crate::blas::{
+    cblas_dtrsm_dispatch, rust_sgemm_backend_tag, BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR,
+    CBLAS_DIAG_NON_UNIT, CBLAS_LEFT, CBLAS_LOWER, CBLAS_NO_TRANS, CBLAS_TRANS,
+};
 use nalgebra::{Cholesky, DMatrix, Dyn};
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
@@ -25,6 +28,7 @@ use super::residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidual
 
 const RANK_TOL: f64 = 1.0e-11;
 const VARIANCE_TOL: f64 = 1.0e-12;
+const GRM_INTERACTION_BLOCK_SIZE: usize = 64;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GrmPairFit {
@@ -173,14 +177,6 @@ impl PairWorkspace {
             solved_interaction: vec![0.0; lower_dim],
             solved_y: vec![0.0; lower_dim],
         }
-    }
-
-    fn clear_lower(&mut self, lower_dim: usize) {
-        self.lower_gram[..lower_dim * lower_dim].fill(0.0);
-        self.rhs_interaction[..lower_dim].fill(0.0);
-        self.rhs_y[..lower_dim].fill(0.0);
-        self.solved_interaction[..lower_dim].fill(0.0);
-        self.solved_y[..lower_dim].fill(0.0);
     }
 }
 
@@ -356,13 +352,23 @@ impl FixedVContext {
         Ok(())
     }
 
-    fn precompute_marker_vinv(
+    fn precompute_marker_vinv_with_threads(
         &self,
         genotypes: &[f64],
         n_markers: usize,
-    ) -> Result<Vec<Vec<f64>>, String> {
-        let mut result = Vec::with_capacity(n_markers);
-        for marker in 0..n_markers {
+        threads: usize,
+    ) -> Result<Vec<f64>, String> {
+        let expected_len = n_markers
+            .checked_mul(self.n)
+            .ok_or_else(|| "genotype matrix size overflow".to_string())?;
+        if genotypes.len() != expected_len {
+            return Err(format!(
+                "genotype length={} but expected {expected_len}",
+                genotypes.len()
+            ));
+        }
+
+        let validate_marker = |marker: usize| -> Result<(), String> {
             let start = marker * self.n;
             let values = &genotypes[start..start + self.n];
             if values.iter().any(|value| !value.is_finite()) {
@@ -370,13 +376,50 @@ impl FixedVContext {
                     "genotype marker {marker} contains non-finite values"
                 ));
             }
-            let mut solved = vec![0.0; self.n];
-            self.solve_v_into(values, &mut solved)?;
-            result.push(solved);
+            Ok(())
+        };
+
+        // The CBLAS path treats marker-major genotype storage as an
+        // `n x n_markers` column-major RHS matrix, so all marker solves share
+        // one batched triangular solve.  Keep the existing Rayon scalar path
+        // for builds whose BLAS dispatch is the portable Rust fallback.
+        if rust_sgemm_backend_tag() != "rust" {
+            let _blas_guard = BlasThreadGuard::enter(threads.max(1));
+            let mut solved = genotypes.to_vec();
+            solve_cholesky_block_blas_into(&self.chol_v, genotypes, &mut solved, n_markers)?;
+            Ok(solved)
+        } else if threads <= 1 || n_markers <= 1 {
+            let mut solved = vec![0.0; expected_len];
+            for marker in 0..n_markers {
+                validate_marker(marker)?;
+                let start = marker * self.n;
+                self.solve_v_into(
+                    &genotypes[start..start + self.n],
+                    &mut solved[start..start + self.n],
+                )?;
+            }
+            Ok(solved)
+        } else {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|error| format!("failed to build GRM dosage Rayon pool: {error}"))?;
+            let mut solved = vec![0.0; expected_len];
+            pool.install(|| {
+                solved
+                    .par_chunks_mut(self.n)
+                    .enumerate()
+                    .try_for_each(|(marker, output)| {
+                        validate_marker(marker)?;
+                        let start = marker * self.n;
+                        self.solve_v_into(&genotypes[start..start + self.n], output)
+                    })
+            })?;
+            Ok(solved)
         }
-        Ok(result)
     }
 
+    #[cfg(test)]
     fn build_pair_geometry(
         &self,
         g1: &[f64],
@@ -385,6 +428,31 @@ impl FixedVContext {
         vinv_g2: &[f64],
         workspace: &mut PairWorkspace,
     ) -> Result<PairGeometry, String> {
+        let projected_variance =
+            self.build_pair_geometry_in_place(g1, g2, vinv_g1, vinv_g2, workspace)?;
+        let lower_dim = self.fixed_rank + 2;
+        Ok(PairGeometry {
+            lower_chol: workspace.lower_gram[..lower_dim * lower_dim].to_vec(),
+            rhs_interaction: workspace.rhs_interaction[..lower_dim].to_vec(),
+            solved_interaction: workspace.solved_interaction[..lower_dim].to_vec(),
+            projected_variance,
+        })
+    }
+
+    /// Build one pair's geometry directly in the caller-provided workspace.
+    ///
+    /// The scan path consumes the geometry immediately, so allocating three
+    /// small vectors for every pair is unnecessary.  The lower Gram matrix is
+    /// factorized in place and the projected interaction variance is returned;
+    /// the owning wrapper is retained for the reference unit tests.
+    fn build_pair_geometry_in_place(
+        &self,
+        g1: &[f64],
+        g2: &[f64],
+        vinv_g1: &[f64],
+        vinv_g2: &[f64],
+        workspace: &mut PairWorkspace,
+    ) -> Result<f64, String> {
         if g1.len() != self.n || g2.len() != self.n {
             return Err("genotype vector length does not match GRM".to_string());
         }
@@ -395,48 +463,106 @@ impl FixedVContext {
             workspace.interaction[row] = g1[row] * g2[row];
         }
         self.solve_v_into(&workspace.interaction, &mut workspace.vinv_interaction)?;
+        self.build_pair_geometry_from_solved_in_place(
+            g1,
+            g2,
+            vinv_g1,
+            vinv_g2,
+            &workspace.interaction,
+            &workspace.vinv_interaction,
+            0,
+            1,
+            &mut workspace.lower_gram,
+            &mut workspace.rhs_interaction,
+            &mut workspace.solved_interaction,
+        )
+    }
+
+    fn build_pair_geometry_from_solved_in_place(
+        &self,
+        g1: &[f64],
+        g2: &[f64],
+        vinv_g1: &[f64],
+        vinv_g2: &[f64],
+        interaction: &[f64],
+        vinv_interaction: &[f64],
+        offset: usize,
+        stride: usize,
+        lower_gram: &mut [f64],
+        rhs_interaction: &mut [f64],
+        solved_interaction: &mut [f64],
+    ) -> Result<f64, String> {
+        if g1.len() != self.n || g2.len() != self.n {
+            return Err("genotype vector length does not match GRM".to_string());
+        }
+        if stride == 0
+            || interaction
+                .len()
+                .checked_sub(offset)
+                .and_then(|length| length.checked_add(stride - 1))
+                .map(|length| length / stride)
+                .unwrap_or(0)
+                < self.n
+            || vinv_interaction
+                .len()
+                .checked_sub(offset)
+                .and_then(|length| length.checked_add(stride - 1))
+                .map(|length| length / stride)
+                .unwrap_or(0)
+                < self.n
+        {
+            return Err("V^-1 interaction length does not match GRM".to_string());
+        }
         let lower_dim = self.fixed_rank + 2;
-        workspace.clear_lower(lower_dim);
+        if lower_gram.len() < lower_dim * lower_dim
+            || rhs_interaction.len() < lower_dim
+            || solved_interaction.len() < lower_dim
+        {
+            return Err("pair workspace dimension mismatch".to_string());
+        }
+        lower_gram[..lower_dim * lower_dim].fill(0.0);
+        rhs_interaction[..lower_dim].fill(0.0);
+        solved_interaction[..lower_dim].fill(0.0);
 
         for row in 0..self.fixed_rank {
             for column in 0..self.fixed_rank {
-                workspace.lower_gram[row * lower_dim + column] =
+                lower_gram[row * lower_dim + column] =
                     self.fixed_gram[row * self.fixed_rank + column];
             }
-            workspace.lower_gram[row * lower_dim + self.fixed_rank] =
-                dot(&self.fixed_columns[row], vinv_g1);
-            workspace.lower_gram[row * lower_dim + self.fixed_rank + 1] =
+            lower_gram[row * lower_dim + self.fixed_rank] = dot(&self.fixed_columns[row], vinv_g1);
+            lower_gram[row * lower_dim + self.fixed_rank + 1] =
                 dot(&self.fixed_columns[row], vinv_g2);
-            workspace.rhs_interaction[row] =
-                dot(&self.fixed_columns[row], &workspace.vinv_interaction);
+            rhs_interaction[row] =
+                dot_strided(&self.fixed_columns[row], vinv_interaction, offset, stride);
         }
         for row in 0..self.fixed_rank {
-            workspace.lower_gram[self.fixed_rank * lower_dim + row] =
-                workspace.lower_gram[row * lower_dim + self.fixed_rank];
-            workspace.lower_gram[(self.fixed_rank + 1) * lower_dim + row] =
-                workspace.lower_gram[row * lower_dim + self.fixed_rank + 1];
+            lower_gram[self.fixed_rank * lower_dim + row] =
+                lower_gram[row * lower_dim + self.fixed_rank];
+            lower_gram[(self.fixed_rank + 1) * lower_dim + row] =
+                lower_gram[row * lower_dim + self.fixed_rank + 1];
         }
-        workspace.lower_gram[self.fixed_rank * lower_dim + self.fixed_rank] = dot(g1, vinv_g1);
-        workspace.lower_gram[self.fixed_rank * lower_dim + self.fixed_rank + 1] = dot(g1, vinv_g2);
-        workspace.lower_gram[(self.fixed_rank + 1) * lower_dim + self.fixed_rank] =
-            workspace.lower_gram[self.fixed_rank * lower_dim + self.fixed_rank + 1];
-        workspace.lower_gram[(self.fixed_rank + 1) * lower_dim + self.fixed_rank + 1] =
-            dot(g2, vinv_g2);
-        workspace.rhs_interaction[self.fixed_rank] = dot(g1, &workspace.vinv_interaction);
-        workspace.rhs_interaction[self.fixed_rank + 1] = dot(g2, &workspace.vinv_interaction);
+        lower_gram[self.fixed_rank * lower_dim + self.fixed_rank] = dot(g1, vinv_g1);
+        lower_gram[self.fixed_rank * lower_dim + self.fixed_rank + 1] = dot(g1, vinv_g2);
+        lower_gram[(self.fixed_rank + 1) * lower_dim + self.fixed_rank] =
+            lower_gram[self.fixed_rank * lower_dim + self.fixed_rank + 1];
+        lower_gram[(self.fixed_rank + 1) * lower_dim + self.fixed_rank + 1] = dot(g2, vinv_g2);
+        rhs_interaction[self.fixed_rank] = dot_strided(g1, vinv_interaction, offset, stride);
+        rhs_interaction[self.fixed_rank + 1] = dot_strided(g2, vinv_interaction, offset, stride);
 
-        let mut lower_chol = workspace.lower_gram[..lower_dim * lower_dim].to_vec();
-        cholesky_factor_lower_in_place(&mut lower_chol, lower_dim)?;
-        let mut solved_interaction = vec![0.0; lower_dim];
+        cholesky_factor_lower_in_place(&mut lower_gram[..lower_dim * lower_dim], lower_dim)?;
         solve_small_cholesky(
-            &lower_chol,
+            &lower_gram[..lower_dim * lower_dim],
             lower_dim,
-            &workspace.rhs_interaction[..lower_dim],
-            &mut solved_interaction,
+            &rhs_interaction[..lower_dim],
+            &mut solved_interaction[..lower_dim],
         )?;
-        let interaction_raw_q = dot(&workspace.interaction, &workspace.vinv_interaction);
-        let projected_variance =
-            interaction_raw_q - dot(&workspace.rhs_interaction[..lower_dim], &solved_interaction);
+        let interaction_raw_q =
+            dot_strided_both(interaction, vinv_interaction, offset, stride, self.n);
+        let projected_variance = interaction_raw_q
+            - dot(
+                &rhs_interaction[..lower_dim],
+                &solved_interaction[..lower_dim],
+            );
         if !projected_variance.is_finite()
             || projected_variance <= VARIANCE_TOL * interaction_raw_q.abs().max(1.0)
         {
@@ -445,12 +571,7 @@ impl FixedVContext {
                     .to_string(),
             );
         }
-        Ok(PairGeometry {
-            lower_chol,
-            rhs_interaction: workspace.rhs_interaction[..lower_dim].to_vec(),
-            solved_interaction,
-            projected_variance,
-        })
+        Ok(projected_variance)
     }
 
     fn score_pair_with_geometry(
@@ -461,34 +582,65 @@ impl FixedVContext {
         workspace: &mut PairWorkspace,
         beta_out: Option<&mut Vec<f64>>,
     ) -> Result<GrmPairStatistic, String> {
-        if g1.len() != self.n || g2.len() != self.n {
-            return Err("genotype vector length does not match GRM".to_string());
-        }
-        let lower_dim = self.fixed_rank + 2;
-        workspace.rhs_y[..lower_dim].fill(0.0);
-        workspace.rhs_y[..self.fixed_rank].copy_from_slice(&self.fixed_y_cross);
-        workspace.rhs_y[self.fixed_rank] = dot(g1, &self.vinv_y);
-        workspace.rhs_y[self.fixed_rank + 1] = dot(g2, &self.vinv_y);
-        solve_small_cholesky(
-            &geometry.lower_chol,
-            lower_dim,
-            &workspace.rhs_y[..lower_dim],
-            &mut workspace.solved_y[..lower_dim],
-        )?;
         for row in 0..self.n {
             workspace.interaction[row] = g1[row] * g2[row];
         }
         let interaction_cross_y = dot(&workspace.interaction, &self.vinv_y);
+        self.score_pair_with_scratch(
+            g1,
+            g2,
+            &geometry.lower_chol,
+            &geometry.rhs_interaction,
+            &geometry.solved_interaction,
+            geometry.projected_variance,
+            interaction_cross_y,
+            &mut workspace.rhs_y,
+            &mut workspace.solved_y,
+            beta_out,
+        )
+    }
+
+    fn score_pair_with_scratch(
+        &self,
+        g1: &[f64],
+        g2: &[f64],
+        lower_chol: &[f64],
+        rhs_interaction: &[f64],
+        solved_interaction: &[f64],
+        projected_variance: f64,
+        interaction_cross_y: f64,
+        rhs_y: &mut [f64],
+        solved_y: &mut [f64],
+        beta_out: Option<&mut Vec<f64>>,
+    ) -> Result<GrmPairStatistic, String> {
+        if g1.len() != self.n || g2.len() != self.n {
+            return Err("genotype vector length does not match GRM".to_string());
+        }
+        let lower_dim = self.fixed_rank + 2;
+        if lower_chol.len() != lower_dim * lower_dim
+            || rhs_interaction.len() != lower_dim
+            || solved_interaction.len() != lower_dim
+        {
+            return Err("pair geometry dimension mismatch".to_string());
+        }
+        if rhs_y.len() < lower_dim || solved_y.len() < lower_dim {
+            return Err("pair workspace dimension mismatch".to_string());
+        }
+        rhs_y[..lower_dim].fill(0.0);
+        rhs_y[..self.fixed_rank].copy_from_slice(&self.fixed_y_cross);
+        rhs_y[self.fixed_rank] = dot(g1, &self.vinv_y);
+        rhs_y[self.fixed_rank + 1] = dot(g2, &self.vinv_y);
+        solve_small_cholesky(
+            lower_chol,
+            lower_dim,
+            &rhs_y[..lower_dim],
+            &mut solved_y[..lower_dim],
+        )?;
         let projected_covariance =
-            interaction_cross_y - dot(&geometry.rhs_interaction, &workspace.solved_y[..lower_dim]);
-        let interaction_beta = projected_covariance / geometry.projected_variance;
+            interaction_cross_y - dot(rhs_interaction, &solved_y[..lower_dim]);
+        let interaction_beta = projected_covariance / projected_variance;
         let delta_q = (projected_covariance * interaction_beta).max(0.0);
-        let null_q = (self.y_vinv_y
-            - dot(
-                &workspace.rhs_y[..lower_dim],
-                &workspace.solved_y[..lower_dim],
-            ))
-        .max(0.0);
+        let null_q = (self.y_vinv_y - dot(&rhs_y[..lower_dim], &solved_y[..lower_dim])).max(0.0);
         let full_q = (null_q - delta_q).max(0.0);
         if ![interaction_beta, delta_q, null_q, full_q]
             .iter()
@@ -499,16 +651,16 @@ impl FixedVContext {
         if let Some(beta_out) = beta_out {
             beta_out.clear();
             beta_out.extend(
-                workspace.solved_y[..lower_dim]
+                solved_y[..lower_dim]
                     .iter()
-                    .zip(geometry.solved_interaction.iter())
+                    .zip(solved_interaction.iter())
                     .map(|(null_beta, correction)| null_beta - correction * interaction_beta),
             );
             beta_out.push(interaction_beta);
         }
         Ok(GrmPairStatistic {
             interaction_beta,
-            interaction_variance: geometry.projected_variance,
+            interaction_variance: projected_variance,
             interaction_score: delta_q,
             delta_q,
             null_q,
@@ -552,8 +704,22 @@ impl FixedVContext {
         workspace: &mut PairWorkspace,
         beta_out: Option<&mut Vec<f64>>,
     ) -> Result<GrmPairStatistic, String> {
-        let geometry = self.build_pair_geometry(g1, g2, vinv_g1, vinv_g2, workspace)?;
-        self.score_pair_with_geometry(g1, g2, &geometry, workspace, beta_out)
+        let projected_variance =
+            self.build_pair_geometry_in_place(g1, g2, vinv_g1, vinv_g2, workspace)?;
+        let lower_dim = self.fixed_rank + 2;
+        let interaction_cross_y = dot(&workspace.interaction, &self.vinv_y);
+        self.score_pair_with_scratch(
+            g1,
+            g2,
+            &workspace.lower_gram[..lower_dim * lower_dim],
+            &workspace.rhs_interaction[..lower_dim],
+            &workspace.solved_interaction[..lower_dim],
+            projected_variance,
+            interaction_cross_y,
+            &mut workspace.rhs_y,
+            &mut workspace.solved_y,
+            beta_out,
+        )
     }
 
     fn fit_pair(&self, g1: &[f64], g2: &[f64]) -> Result<GrmPairFit, String> {
@@ -696,6 +862,56 @@ fn dot(left: &[f64], right: &[f64]) -> f64 {
 }
 
 #[inline]
+fn dot_strided(left: &[f64], right: &[f64], offset: usize, stride: usize) -> f64 {
+    debug_assert!(stride > 0);
+    debug_assert!(
+        offset.saturating_add(left.len().saturating_sub(1).saturating_mul(stride)) < right.len()
+    );
+    let mut result = 0.0;
+    for (index, value) in left.iter().enumerate() {
+        result += *value * right[offset + index * stride];
+    }
+    result
+}
+
+#[inline]
+fn dot_strided_left(left: &[f64], right: &[f64], offset: usize, stride: usize) -> f64 {
+    debug_assert!(stride > 0);
+    debug_assert!(right.len() <= left.len());
+    debug_assert!(
+        offset.saturating_add(right.len().saturating_sub(1).saturating_mul(stride)) < left.len()
+    );
+    let mut result = 0.0;
+    for (index, value) in right.iter().enumerate() {
+        result += left[offset + index * stride] * *value;
+    }
+    result
+}
+
+#[inline]
+fn dot_strided_both(
+    left: &[f64],
+    right: &[f64],
+    offset: usize,
+    stride: usize,
+    length: usize,
+) -> f64 {
+    debug_assert!(stride > 0);
+    debug_assert!(
+        offset.saturating_add(length.saturating_sub(1).saturating_mul(stride)) < left.len()
+    );
+    debug_assert!(
+        offset.saturating_add(length.saturating_sub(1).saturating_mul(stride)) < right.len()
+    );
+    let mut result = 0.0;
+    for index in 0..length {
+        let position = offset + index * stride;
+        result += left[position] * right[position];
+    }
+    result
+}
+
+#[inline]
 fn pair_index(n_markers: usize, first: usize, second: usize) -> usize {
     debug_assert!(first < second && second < n_markers);
     first * (2 * n_markers - first - 1) / 2 + (second - first - 1)
@@ -732,6 +948,126 @@ fn solve_cholesky_into(
     }
     if out.iter().any(|value| !value.is_finite()) {
         Err("non-finite Cholesky solution".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Solve multiple right-hand sides stored row-major as `n_rows x n_rhs`.
+///
+/// The scalar path above is intentionally kept as the reference operation.
+/// This blocked variant performs the same forward/back substitutions while
+/// keeping a small group of right-hand sides adjacent in memory, improving
+/// cache reuse when the pair scanner processes several interactions together.
+#[cfg(test)]
+#[inline]
+fn solve_cholesky_block_into(
+    chol: &Cholesky<f64, Dyn>,
+    rhs: &[f64],
+    out: &mut [f64],
+    n_rhs: usize,
+) -> Result<(), String> {
+    let n = chol.l_dirty().nrows();
+    if n_rhs == 0 || rhs.len() != n.saturating_mul(n_rhs) || out.len() != rhs.len() {
+        return Err("blocked Cholesky solve dimension mismatch".to_string());
+    }
+    out.copy_from_slice(rhs);
+    let lower = chol.l_dirty();
+    for pivot in 0..n {
+        let diagonal = lower[(pivot, pivot)];
+        if !diagonal.is_finite() || diagonal <= 0.0 {
+            return Err("non-positive Cholesky diagonal".to_string());
+        }
+        for column in 0..n_rhs {
+            out[pivot * n_rhs + column] /= diagonal;
+        }
+        for row in (pivot + 1)..n {
+            let coefficient = lower[(row, pivot)];
+            for column in 0..n_rhs {
+                out[row * n_rhs + column] -= coefficient * out[pivot * n_rhs + column];
+            }
+        }
+    }
+    for pivot in (0..n).rev() {
+        let diagonal = lower[(pivot, pivot)];
+        for column in 0..n_rhs {
+            out[pivot * n_rhs + column] /= diagonal;
+        }
+        for row in 0..pivot {
+            let coefficient = lower[(pivot, row)];
+            for column in 0..n_rhs {
+                out[row * n_rhs + column] -= coefficient * out[pivot * n_rhs + column];
+            }
+        }
+    }
+    if out.iter().any(|value| !value.is_finite()) {
+        Err("non-finite blocked Cholesky solution".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Solve a column-major block of right-hand sides with the selected CBLAS
+/// triangular-solve kernel.  `rhs` and `out` are `n x n_rhs` matrices with
+/// leading dimension `n`; keeping the RHS column-major lets the BLAS call use
+/// the Cholesky factor without a per-block matrix copy.
+#[inline]
+fn solve_cholesky_block_blas_into(
+    chol: &Cholesky<f64, Dyn>,
+    rhs: &[f64],
+    out: &mut [f64],
+    n_rhs: usize,
+) -> Result<(), String> {
+    let n = chol.l_dirty().nrows();
+    if n_rhs == 0 || rhs.len() != n.saturating_mul(n_rhs) || out.len() != rhs.len() {
+        return Err("blocked Cholesky solve dimension mismatch".to_string());
+    }
+    let n_blas = CblasInt::try_from(n)
+        .map_err(|_| "blocked Cholesky dimension exceeds CBLAS integer range".to_string())?;
+    let n_rhs_blas = CblasInt::try_from(n_rhs)
+        .map_err(|_| "blocked Cholesky RHS count exceeds CBLAS integer range".to_string())?;
+    let lower = chol.l_dirty();
+    for index in 0..n {
+        let diagonal = lower[(index, index)];
+        if !diagonal.is_finite() || diagonal <= 0.0 {
+            return Err("non-positive Cholesky diagonal".to_string());
+        }
+    }
+    out.copy_from_slice(rhs);
+    // BLAS is intentionally held at one thread by the caller while the outer
+    // scanner distributes independent first-marker ranges with Rayon.
+    unsafe {
+        cblas_dtrsm_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_LEFT,
+            CBLAS_LOWER,
+            CBLAS_NO_TRANS,
+            CBLAS_DIAG_NON_UNIT,
+            n_blas,
+            n_rhs_blas,
+            1.0,
+            lower.as_slice().as_ptr(),
+            n_blas,
+            out.as_mut_ptr(),
+            n_blas,
+        );
+        cblas_dtrsm_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_LEFT,
+            CBLAS_LOWER,
+            CBLAS_TRANS,
+            CBLAS_DIAG_NON_UNIT,
+            n_blas,
+            n_rhs_blas,
+            1.0,
+            lower.as_slice().as_ptr(),
+            n_blas,
+            out.as_mut_ptr(),
+            n_blas,
+        );
+    }
+    if out.iter().any(|value| !value.is_finite()) {
+        Err("non-finite blocked Cholesky solution".to_string())
     } else {
         Ok(())
     }
@@ -810,42 +1146,109 @@ fn scan_grm_pairs(
         covariates,
         n_covariates,
     )?;
-    let vinv_markers = context.precompute_marker_vinv(genotypes, n_markers)?;
+    let vinv_markers =
+        context.precompute_marker_vinv_with_threads(genotypes, n_markers, threads)?;
+    // The outer Rayon scanner owns the parallelism; keep each BLAS triangular
+    // solve single-threaded to avoid Rayon × BLAS oversubscription.
+    let _blas_guard = BlasThreadGuard::enter(1);
     let first_count = n_markers.saturating_sub(1);
     let scan_range = |range: std::ops::Range<usize>| -> Result<GrmPairAccumulator, String> {
         let mut accumulator = GrmPairAccumulator::default();
         let mut workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
+        let block_capacity = GRM_INTERACTION_BLOCK_SIZE;
+        let mut block_interaction = vec![0.0; n_samples * block_capacity];
+        let mut block_vinv_interaction = vec![0.0; n_samples * block_capacity];
         for first in range {
             let first_start = first * n_samples;
             let first_values = &genotypes[first_start..first_start + n_samples];
-            let first_vinv = &vinv_markers[first];
-            for second in (first + 1)..n_markers {
-                let second_start = second * n_samples;
-                let second_values = &genotypes[second_start..second_start + n_samples];
-                let second_vinv = &vinv_markers[second];
-                match context.score_pair_with_workspace(
-                    first_values,
-                    second_values,
-                    first_vinv,
-                    second_vinv,
-                    &mut workspace,
-                    None,
-                ) {
-                    Ok(statistic) => {
-                        accumulator.pairs_evaluated = accumulator.pairs_evaluated.saturating_add(1);
-                        accumulator.push(
-                            pair_index(n_markers, first, second),
-                            first,
-                            second,
-                            statistic,
-                            top_k,
-                        );
+            let first_vinv_start = first * n_samples;
+            let first_vinv = &vinv_markers[first_vinv_start..first_vinv_start + n_samples];
+            let mut second_start = first + 1;
+            while second_start < n_markers {
+                let block_width = (n_markers - second_start).min(block_capacity);
+                for local in 0..block_width {
+                    let second = second_start + local;
+                    let block_column = local * n_samples;
+                    let second_values = &genotypes[second * n_samples..(second + 1) * n_samples];
+                    for row in 0..n_samples {
+                        block_interaction[block_column + row] =
+                            first_values[row] * second_values[row];
                     }
-                    Err(error) if error.contains("unidentifiable") => {
-                        accumulator.pairs_skipped = accumulator.pairs_skipped.saturating_add(1);
-                    }
-                    Err(error) => return Err(error),
                 }
+                solve_cholesky_block_blas_into(
+                    &context.chol_v,
+                    &block_interaction[..n_samples * block_width],
+                    &mut block_vinv_interaction[..n_samples * block_width],
+                    block_width,
+                )?;
+                for local in 0..block_width {
+                    let second = second_start + local;
+                    let second_start_offset = second * n_samples;
+                    let second_values =
+                        &genotypes[second_start_offset..second_start_offset + n_samples];
+                    let second_vinv_start = second * n_samples;
+                    let second_vinv =
+                        &vinv_markers[second_vinv_start..second_vinv_start + n_samples];
+                    let projected_variance = context.build_pair_geometry_from_solved_in_place(
+                        first_values,
+                        second_values,
+                        first_vinv,
+                        second_vinv,
+                        &block_interaction[..n_samples * block_width],
+                        &block_vinv_interaction[..n_samples * block_width],
+                        local * n_samples,
+                        1,
+                        &mut workspace.lower_gram,
+                        &mut workspace.rhs_interaction,
+                        &mut workspace.solved_interaction,
+                    );
+                    match projected_variance {
+                        Ok(projected_variance) => {
+                            let lower_dim = context.fixed_rank + 2;
+                            let interaction_cross_y = dot_strided_left(
+                                &block_interaction[..n_samples * block_width],
+                                &context.vinv_y,
+                                local * n_samples,
+                                1,
+                            );
+                            let statistic = context.score_pair_with_scratch(
+                                first_values,
+                                second_values,
+                                &workspace.lower_gram[..lower_dim * lower_dim],
+                                &workspace.rhs_interaction[..lower_dim],
+                                &workspace.solved_interaction[..lower_dim],
+                                projected_variance,
+                                interaction_cross_y,
+                                &mut workspace.rhs_y,
+                                &mut workspace.solved_y,
+                                None,
+                            );
+                            match statistic {
+                                Ok(statistic) => {
+                                    accumulator.pairs_evaluated =
+                                        accumulator.pairs_evaluated.saturating_add(1);
+                                    accumulator.push(
+                                        pair_index(n_markers, first, second),
+                                        first,
+                                        second,
+                                        statistic,
+                                        top_k,
+                                    );
+                                }
+                                Err(error) if error.contains("unidentifiable") => {
+                                    accumulator.pairs_skipped =
+                                        accumulator.pairs_skipped.saturating_add(1);
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(error) if error.contains("unidentifiable") => {
+                            accumulator.pairs_skipped = accumulator.pairs_skipped.saturating_add(1);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                second_start += block_width;
             }
         }
         Ok(accumulator)
@@ -1003,35 +1406,82 @@ impl PreparedGrmScan {
             covariates,
             n_covariates,
         )?;
-        let vinv_markers = context.precompute_marker_vinv(genotypes, n_markers)?;
+        let vinv_markers =
+            context.precompute_marker_vinv_with_threads(genotypes, n_markers, threads)?;
+        let _blas_guard = BlasThreadGuard::enter(1);
         let first_count = n_markers.saturating_sub(1);
         let build_range = |range: std::ops::Range<usize>| {
             let mut prepared = Vec::new();
             let mut skipped = 0usize;
             let mut workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
+            let block_capacity = GRM_INTERACTION_BLOCK_SIZE;
+            let mut block_interaction = vec![0.0; n_samples * block_capacity];
+            let mut block_vinv_interaction = vec![0.0; n_samples * block_capacity];
             for first in range {
                 let first_start = first * n_samples;
                 let first_values = &genotypes[first_start..first_start + n_samples];
-                for second in (first + 1)..n_markers {
-                    let second_start = second * n_samples;
-                    let second_values = &genotypes[second_start..second_start + n_samples];
-                    match context.build_pair_geometry(
-                        first_values,
-                        second_values,
-                        &vinv_markers[first],
-                        &vinv_markers[second],
-                        &mut workspace,
-                    ) {
-                        Ok(geometry) => prepared.push(PreparedPair {
-                            first,
-                            second,
-                            geometry,
-                        }),
-                        Err(error) if error.contains("unidentifiable") => {
-                            skipped = skipped.saturating_add(1)
+                let first_vinv_start = first * n_samples;
+                let first_vinv = &vinv_markers[first_vinv_start..first_vinv_start + n_samples];
+                let mut second_start = first + 1;
+                while second_start < n_markers {
+                    let block_width = (n_markers - second_start).min(block_capacity);
+                    for local in 0..block_width {
+                        let second = second_start + local;
+                        let block_column = local * n_samples;
+                        let second_values =
+                            &genotypes[second * n_samples..(second + 1) * n_samples];
+                        for row in 0..n_samples {
+                            block_interaction[block_column + row] =
+                                first_values[row] * second_values[row];
                         }
-                        Err(error) => return Err(error),
                     }
+                    solve_cholesky_block_blas_into(
+                        &context.chol_v,
+                        &block_interaction[..n_samples * block_width],
+                        &mut block_vinv_interaction[..n_samples * block_width],
+                        block_width,
+                    )?;
+                    for local in 0..block_width {
+                        let second = second_start + local;
+                        let second_offset = second * n_samples;
+                        let second_values = &genotypes[second_offset..second_offset + n_samples];
+                        let geometry = context.build_pair_geometry_from_solved_in_place(
+                            first_values,
+                            second_values,
+                            first_vinv,
+                            &vinv_markers[second * n_samples..(second + 1) * n_samples],
+                            &block_interaction[..n_samples * block_width],
+                            &block_vinv_interaction[..n_samples * block_width],
+                            local * n_samples,
+                            1,
+                            &mut workspace.lower_gram,
+                            &mut workspace.rhs_interaction,
+                            &mut workspace.solved_interaction,
+                        );
+                        match geometry {
+                            Ok(projected_variance) => prepared.push(PreparedPair {
+                                first,
+                                second,
+                                geometry: PairGeometry {
+                                    lower_chol: workspace.lower_gram
+                                        [..(context.fixed_rank + 2) * (context.fixed_rank + 2)]
+                                        .to_vec(),
+                                    rhs_interaction: workspace.rhs_interaction
+                                        [..context.fixed_rank + 2]
+                                        .to_vec(),
+                                    solved_interaction: workspace.solved_interaction
+                                        [..context.fixed_rank + 2]
+                                        .to_vec(),
+                                    projected_variance,
+                                },
+                            }),
+                            Err(error) if error.contains("unidentifiable") => {
+                                skipped = skipped.saturating_add(1)
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    second_start += block_width;
                 }
             }
             Ok::<_, String>((prepared, skipped))
@@ -1734,5 +2184,128 @@ mod tests {
         let error = fit_grm_pair(&g1, &g2, &y, &grm, 8, 0.0, 1.0, &covariates, 1)
             .expect_err("duplicate intercept must be rejected");
         assert!(error.contains("rank-deficient"));
+    }
+
+    #[test]
+    fn marker_vinv_parallel_matches_serial() {
+        let n_samples = 8;
+        let n_markers = 3;
+        let genotypes = [
+            0.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+            2.0, 1.0, 1.0, 0.0, 1.0, 2.0, 0.0,
+        ];
+        let y = [1.2, 0.4, 2.1, 3.7, 1.5, 0.8, 2.4, 2.9];
+        let grm = (0..n_samples * n_samples)
+            .map(|index| {
+                if index / n_samples == index % n_samples {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let context = FixedVContext::new(&y, &grm, n_samples, 0.4, 0.6, &[], 0)
+            .expect("identity covariance should be valid");
+        let serial = context
+            .precompute_marker_vinv_with_threads(&genotypes, n_markers, 1)
+            .expect("serial marker solve should succeed");
+        let parallel = context
+            .precompute_marker_vinv_with_threads(&genotypes, n_markers, 2)
+            .expect("parallel marker solve should succeed");
+        assert_eq!(serial.len(), n_markers * n_samples);
+        assert_eq!(serial.len(), parallel.len());
+        for (left, right) in serial.iter().zip(parallel.iter()) {
+            assert!((left - right).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn in_place_pair_geometry_matches_owned_geometry() {
+        let n_samples = 8;
+        let g1 = [0.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0];
+        let g2 = [1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0];
+        let y = [1.2, 0.4, 2.1, 3.7, 1.5, 0.8, 2.4, 2.9];
+        let grm = (0..n_samples * n_samples)
+            .map(|index| {
+                if index / n_samples == index % n_samples {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let context = FixedVContext::new(&y, &grm, n_samples, 0.0, 1.0, &[], 0)
+            .expect("identity covariance should be valid");
+        let mut owned_workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
+        let owned = context
+            .build_pair_geometry(&g1, &g2, &g1, &g2, &mut owned_workspace)
+            .expect("owned geometry should succeed");
+        let mut in_place_workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
+        let variance = context
+            .build_pair_geometry_in_place(&g1, &g2, &g1, &g2, &mut in_place_workspace)
+            .expect("in-place geometry should succeed");
+        let lower_dim = context.fixed_rank + 2;
+        assert!((variance - owned.projected_variance).abs() < 1.0e-14);
+        assert!(in_place_workspace.lower_gram[..lower_dim * lower_dim]
+            .iter()
+            .zip(owned.lower_chol.iter())
+            .all(|(left, right)| (left - right).abs() < 1.0e-14));
+        assert!(in_place_workspace.rhs_interaction[..lower_dim]
+            .iter()
+            .zip(owned.rhs_interaction.iter())
+            .all(|(left, right)| (left - right).abs() < 1.0e-14));
+        assert!(in_place_workspace.solved_interaction[..lower_dim]
+            .iter()
+            .zip(owned.solved_interaction.iter())
+            .all(|(left, right)| (left - right).abs() < 1.0e-14));
+    }
+
+    #[test]
+    fn blocked_cholesky_solve_matches_columnwise_solves() {
+        let matrix =
+            DMatrix::from_row_slice(3, 3, &[4.0, 1.0, 0.5, 1.0, 3.0, 0.25, 0.5, 0.25, 2.0]);
+        let chol = Cholesky::new(matrix).expect("test matrix should be positive definite");
+        let rhs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut expected = rhs;
+        for column in 0..2 {
+            let mut column_rhs = [rhs[column], rhs[2 + column], rhs[4 + column]];
+            let original_rhs = column_rhs;
+            solve_cholesky_into(&chol, &original_rhs, &mut column_rhs)
+                .expect("column solve should succeed");
+            expected[column] = column_rhs[0];
+            expected[2 + column] = column_rhs[1];
+            expected[4 + column] = column_rhs[2];
+        }
+        let mut blocked = vec![0.0; rhs.len()];
+        solve_cholesky_block_into(&chol, &rhs, &mut blocked, 2)
+            .expect("blocked solve should succeed");
+        assert!(blocked
+            .iter()
+            .zip(expected.iter())
+            .all(|(left, right)| (left - right).abs() < 1.0e-14));
+    }
+
+    #[test]
+    fn blas_blocked_cholesky_solve_matches_columnwise_solves() {
+        let matrix =
+            DMatrix::from_row_slice(3, 3, &[4.0, 1.0, 0.5, 1.0, 3.0, 0.25, 0.5, 0.25, 2.0]);
+        let chol = Cholesky::new(matrix).expect("test matrix should be positive definite");
+        // The BLAS path uses column-major `n x n_rhs` right-hand sides.
+        let rhs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut expected = rhs;
+        for column in 0..2 {
+            let original_rhs = [rhs[column * 3], rhs[column * 3 + 1], rhs[column * 3 + 2]];
+            let mut solved = [0.0; 3];
+            solve_cholesky_into(&chol, &original_rhs, &mut solved)
+                .expect("column solve should succeed");
+            expected[column * 3..column * 3 + 3].copy_from_slice(&solved);
+        }
+        let mut blocked = vec![0.0; rhs.len()];
+        solve_cholesky_block_blas_into(&chol, &rhs, &mut blocked, 2)
+            .expect("BLAS blocked solve should succeed");
+        assert!(blocked
+            .iter()
+            .zip(expected.iter())
+            .all(|(left, right)| (left - right).abs() < 1.0e-14));
     }
 }

@@ -21,6 +21,10 @@ pub(crate) const CBLAS_TRANS: CblasInt = 112;
 pub(crate) const CBLAS_UPPER: CblasInt = 121;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) const CBLAS_LOWER: CblasInt = 122;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) const CBLAS_LEFT: CblasInt = 141;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) const CBLAS_DIAG_NON_UNIT: CblasInt = 131;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -168,6 +172,21 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_dtrsm"]
+    fn cblas_dtrsm_accelerate(
+        order: CblasInt,
+        side: CblasInt,
+        uplo: CblasInt,
+        transa: CblasInt,
+        diag: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        alpha: f64,
+        a: *const f64,
+        lda: CblasInt,
+        b: *mut f64,
+        ldb: CblasInt,
+    );
     #[link_name = "cblas_ddot"]
     fn cblas_ddot_accelerate(
         n: CblasInt,
@@ -294,6 +313,21 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_dtrsm"]
+    fn cblas_dtrsm_blas(
+        order: CblasInt,
+        side: CblasInt,
+        uplo: CblasInt,
+        transa: CblasInt,
+        diag: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        alpha: f64,
+        a: *const f64,
+        lda: CblasInt,
+        b: *mut f64,
+        ldb: CblasInt,
+    );
     #[link_name = "cblas_ddot"]
     fn cblas_ddot_blas(
         n: CblasInt,
@@ -382,6 +416,21 @@ unsafe extern "C" {
         beta: f64,
         c: *mut f64,
         ldc: CblasInt,
+    );
+    #[link_name = "cblas_dtrsm"]
+    fn cblas_dtrsm_openblas(
+        order: CblasInt,
+        side: CblasInt,
+        uplo: CblasInt,
+        transa: CblasInt,
+        diag: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        alpha: f64,
+        a: *const f64,
+        lda: CblasInt,
+        b: *mut f64,
+        ldb: CblasInt,
     );
     #[link_name = "cblas_ddot"]
     fn cblas_ddot_openblas(
@@ -516,6 +565,21 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_dtrsm"]
+    fn cblas_dtrsm_openblas(
+        order: CblasInt,
+        side: CblasInt,
+        uplo: CblasInt,
+        transa: CblasInt,
+        diag: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        alpha: f64,
+        a: *const f64,
+        lda: CblasInt,
+        b: *mut f64,
+        ldb: CblasInt,
+    );
     #[link_name = "cblas_ddot"]
     fn cblas_ddot_openblas(
         n: CblasInt,
@@ -649,6 +713,21 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_dtrsm"]
+    fn cblas_dtrsm_openblas(
+        order: CblasInt,
+        side: CblasInt,
+        uplo: CblasInt,
+        transa: CblasInt,
+        diag: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        alpha: f64,
+        a: *const f64,
+        lda: CblasInt,
+        b: *mut f64,
+        ldb: CblasInt,
+    );
     #[link_name = "cblas_ddot"]
     fn cblas_ddot_openblas(
         n: CblasInt,
@@ -779,6 +858,21 @@ unsafe extern "C" {
         beta: f64,
         c: *mut f64,
         ldc: CblasInt,
+    );
+    #[link_name = "cblas_dtrsm"]
+    fn cblas_dtrsm_openblas(
+        order: CblasInt,
+        side: CblasInt,
+        uplo: CblasInt,
+        transa: CblasInt,
+        diag: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        alpha: f64,
+        a: *const f64,
+        lda: CblasInt,
+        b: *mut f64,
+        ldb: CblasInt,
     );
     #[link_name = "cblas_ddot"]
     fn cblas_ddot_openblas(
@@ -912,6 +1006,21 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_dtrsm"]
+    fn cblas_dtrsm_openblas(
+        order: CblasInt,
+        side: CblasInt,
+        uplo: CblasInt,
+        transa: CblasInt,
+        diag: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        alpha: f64,
+        a: *const f64,
+        lda: CblasInt,
+        b: *mut f64,
+        ldb: CblasInt,
+    );
     #[link_name = "cblas_ddot"]
     fn cblas_ddot_openblas(
         n: CblasInt,
@@ -1043,6 +1152,21 @@ unsafe extern "C" {
         beta: f64,
         c: *mut f64,
         ldc: CblasInt,
+    );
+    #[link_name = "cblas_dtrsm"]
+    fn cblas_dtrsm_openblas(
+        order: CblasInt,
+        side: CblasInt,
+        uplo: CblasInt,
+        transa: CblasInt,
+        diag: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        alpha: f64,
+        a: *const f64,
+        lda: CblasInt,
+        b: *mut f64,
+        ldb: CblasInt,
     );
     #[link_name = "cblas_ddot"]
     fn cblas_ddot_openblas(
@@ -1581,6 +1705,187 @@ pub(crate) unsafe fn cblas_dgemm_dispatch(
         cblas_dgemm_rust(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+unsafe fn cblas_dtrsm_rust(
+    order: CblasInt,
+    side: CblasInt,
+    uplo: CblasInt,
+    transa: CblasInt,
+    diag: CblasInt,
+    m: CblasInt,
+    n: CblasInt,
+    alpha: f64,
+    a: *const f64,
+    lda: CblasInt,
+    b: *mut f64,
+    ldb: CblasInt,
+) {
+    assert_eq!(
+        side, CBLAS_LEFT,
+        "Rust DTRSM fallback currently supports left-side solves only"
+    );
+    assert_eq!(
+        uplo, CBLAS_LOWER,
+        "Rust DTRSM fallback currently supports lower triangles only"
+    );
+    assert_eq!(
+        diag, CBLAS_DIAG_NON_UNIT,
+        "Rust DTRSM fallback expects non-unit diagonals"
+    );
+    assert!(order == CBLAS_ROW_MAJOR || order == CBLAS_COL_MAJOR);
+    assert!(m >= 0 && n >= 0 && lda >= m);
+    let rows = m as usize;
+    let columns = n as usize;
+    let lda = lda as usize;
+    let ldb = ldb as usize;
+    assert!(if order == CBLAS_ROW_MAJOR {
+        ldb >= columns
+    } else {
+        ldb >= rows
+    });
+    let a_slice = std::slice::from_raw_parts(a, rows.saturating_mul(lda));
+    let b_slice = std::slice::from_raw_parts_mut(b, rows.saturating_mul(ldb));
+    assert!(transa == CBLAS_NO_TRANS || transa == CBLAS_TRANS);
+    if order == CBLAS_ROW_MAJOR {
+        if transa == CBLAS_NO_TRANS {
+            for column in 0..columns {
+                for row in 0..rows {
+                    let mut value = alpha * b_slice[row * ldb + column];
+                    for pivot in 0..row {
+                        value -= a_slice[row * lda + pivot] * b_slice[pivot * ldb + column];
+                    }
+                    b_slice[row * ldb + column] = value / a_slice[row * lda + row];
+                }
+            }
+        } else {
+            for column in 0..columns {
+                for row in (0..rows).rev() {
+                    let mut value = alpha * b_slice[row * ldb + column];
+                    for pivot in (row + 1)..rows {
+                        value -= a_slice[pivot * lda + row] * b_slice[pivot * ldb + column];
+                    }
+                    b_slice[row * ldb + column] = value / a_slice[row * lda + row];
+                }
+            }
+        }
+    } else if transa == CBLAS_NO_TRANS {
+        for column in 0..columns {
+            for row in 0..rows {
+                let mut value = alpha * b_slice[row + column * ldb];
+                for pivot in 0..row {
+                    value -= a_slice[row + pivot * lda] * b_slice[pivot + column * ldb];
+                }
+                b_slice[row + column * ldb] = value / a_slice[row + row * lda];
+            }
+        }
+    } else {
+        for column in 0..columns {
+            for row in (0..rows).rev() {
+                let mut value = alpha * b_slice[row + column * ldb];
+                for pivot in (row + 1)..rows {
+                    value -= a_slice[pivot + row * lda] * b_slice[pivot + column * ldb];
+                }
+                b_slice[row + column * ldb] = value / a_slice[row + row * lda];
+            }
+        }
+    }
+}
+
+/// Dispatch a row/column-major double-precision triangular solve to the
+/// selected CBLAS backend.  The Rust fallback intentionally implements only
+/// the lower, left-side, non-unit case used by the GRM interaction scanner;
+/// unsupported combinations fail loudly instead of silently changing the
+/// solve semantics.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+#[allow(dead_code)]
+pub(crate) unsafe fn cblas_dtrsm_dispatch(
+    order: CblasInt,
+    side: CblasInt,
+    uplo: CblasInt,
+    transa: CblasInt,
+    diag: CblasInt,
+    m: CblasInt,
+    n: CblasInt,
+    alpha: f64,
+    a: *const f64,
+    lda: CblasInt,
+    b: *mut f64,
+    ldb: CblasInt,
+) {
+    match selected_sgemm_backend() {
+        SgemmBackend::Accelerate => {
+            #[cfg(all(
+                target_os = "macos",
+                not(all(feature = "blas-openblas", jx_openblas_available))
+            ))]
+            {
+                cblas_dtrsm_accelerate(
+                    order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb,
+                );
+                return;
+            }
+        }
+        SgemmBackend::OpenBlas => {
+            #[cfg(all(feature = "blas-openblas", jx_openblas_available))]
+            {
+                cblas_dtrsm_openblas(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb);
+                return;
+            }
+        }
+        SgemmBackend::Blas => {
+            #[cfg(all(
+                target_os = "linux",
+                jx_blas_available,
+                not(all(feature = "blas-openblas", jx_openblas_available))
+            ))]
+            {
+                cblas_dtrsm_blas(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb);
+                return;
+            }
+        }
+        SgemmBackend::Rust => {
+            cblas_dtrsm_rust(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb);
+            return;
+        }
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        cblas_dtrsm_accelerate(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb);
+        return;
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "blas-openblas",
+        jx_openblas_available
+    ))]
+    {
+        cblas_dtrsm_openblas(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb);
+        return;
+    }
+    #[cfg(all(
+        target_os = "linux",
+        jx_blas_available,
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        cblas_dtrsm_blas(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb);
+        return;
+    }
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "linux", not(jx_blas_available))
+    ))]
+    {
+        cblas_dtrsm_rust(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb);
     }
 }
 
