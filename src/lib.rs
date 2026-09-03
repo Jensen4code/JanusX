@@ -234,7 +234,7 @@ use garfield::{
     garfield_score_cont_centered_gain_batch_packed_cpu_py, garfield_subset_bin_samples_py,
     load_bin01_packed_py, load_mbin_packed_py, score_binary_ba_mcc_batch_py, score_binary_ba_py,
     score_binary_mcc_py, score_cont_corr_py, score_cont_mean_diff_corr_batch_py,
-    score_cont_mean_diff_py,
+    score_cont_mean_diff_py, GarfieldPackedBedDosageReader,
 };
 use gblup::{
     farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_grm_from_meta_to_npy,
@@ -738,6 +738,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyConvertStats>()?;
     m.add_class::<Bin01StreamWriter>()?;
     m.add_class::<KfileChunkReader>()?;
+    m.add_class::<GarfieldPackedBedDosageReader>()?;
     m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(and_popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(bitand_assign_py, m)?)?;

@@ -1530,7 +1530,7 @@ fn fit_grm_pair(
     context.fit_pair(g1, g2)
 }
 
-fn scan_grm_pairs(
+pub(crate) fn scan_grm_pairs(
     genotypes: &[f64],
     n_markers: usize,
     n_samples: usize,
@@ -2312,7 +2312,7 @@ fn set_fit_items<'py>(py: Python<'py>, out: &Bound<'py, PyDict>, fit: &GrmPairFi
     Ok(())
 }
 
-fn set_scan_items<'py>(
+pub(crate) fn set_scan_items<'py>(
     py: Python<'py>,
     out: &Bound<'py, PyDict>,
     candidates: &[GrmPairCandidate],

@@ -1,6 +1,7 @@
 mod all_pair;
 pub(crate) mod bs;
 mod dosage;
+mod dosage_bed;
 mod dosage_random;
 mod pair_triple;
 mod permutation;
@@ -126,6 +127,7 @@ pub use bs::{
     BeamSearchParams, GarfieldSearchBackend,
 };
 pub use dosage::{garfield_dosage_pair_fit_py, garfield_dosage_pair_scan_py};
+pub use dosage_bed::GarfieldPackedBedDosageReader;
 pub use dosage_random::{
     garfield_dosage_grm_pair_fit_py, garfield_dosage_grm_pair_scan_batch_py,
     garfield_dosage_grm_pair_scan_py, garfield_dosage_grm_pair_scan_reml_py,
