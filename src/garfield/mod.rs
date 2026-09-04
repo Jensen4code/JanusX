@@ -3,6 +3,7 @@ pub(crate) mod bs;
 mod dosage;
 mod dosage_bed;
 mod dosage_random;
+mod dosage_screen;
 mod pair_triple;
 mod permutation;
 mod proposal;
@@ -131,6 +132,13 @@ pub use dosage_bed::GarfieldPackedBedDosageReader;
 pub use dosage_random::{
     garfield_dosage_grm_pair_fit_py, garfield_dosage_grm_pair_scan_batch_py,
     garfield_dosage_grm_pair_scan_py, garfield_dosage_grm_pair_scan_reml_py,
+    GarfieldDosageGrmContext,
+};
+pub use dosage_screen::{
+    garfield_dosage_canonical_owner_plan_py, garfield_dosage_lm_screen_scan_canonical_owner_py,
+    garfield_dosage_lm_screen_scan_py, garfield_dosage_lm_screen_scan_selected_grouped_py,
+    garfield_dosage_lm_screen_scan_selected_py, garfield_dosage_lowrank_grm_screen_scan_py,
+    GarfieldDosageCanonicalTopK, GarfieldDosageLowrankScreenContext,
 };
 pub use pair_triple::garfield_pair_triple_refine_bin_py;
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
