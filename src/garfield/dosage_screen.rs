@@ -12,7 +12,7 @@ use nalgebra::DMatrix;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::cmp::{Ordering, Reverse};
@@ -501,6 +501,51 @@ struct ScreenMetric {
     correction_weights: Vec<f64>,
 }
 
+/// The eigendecomposition shared by all explicit and adaptive low-rank
+/// metrics.  Building this once is important for `--screen-rank auto`: a
+/// rank audit should compare several approximations of the same covariance,
+/// not repeatedly decompose the GRM.
+#[derive(Clone, Debug)]
+struct ScreenSpectrum {
+    n: usize,
+    inverse_eigenvalues: Vec<f64>,
+    eigenvectors_row_major: Vec<f64>,
+    diagnostic_baseline: f64,
+}
+
+const ADAPTIVE_SCREEN_RANKS: &[usize] = &[32, 64, 128, 256, 512];
+
+#[derive(Clone, Debug)]
+struct AdaptiveRankCandidate {
+    rank: usize,
+    baseline_weight: f64,
+    diagnostic_correction_energy_c0: f64,
+    geometry_valid_pairs: usize,
+    geometry_mean_relative_error: f64,
+    geometry_p95_relative_error: f64,
+    geometry_max_relative_error: f64,
+    geometry_pass: bool,
+    score_pairs_compared: usize,
+    score_spearman: f64,
+    score_top_k_overlap: f64,
+}
+
+#[derive(Clone, Debug)]
+struct AdaptiveRankReport {
+    selected_rank: usize,
+    full_rank: usize,
+    pilot_pair_count: usize,
+    full_geometry_valid_pairs: usize,
+    sigma_g2: f64,
+    sigma_e2: f64,
+    diagnostic_baseline: f64,
+    geometry_rtol: f64,
+    geometry_max_rtol: f64,
+    score_audit_top_k: usize,
+    used_largest_rank_fallback: bool,
+    candidates: Vec<AdaptiveRankCandidate>,
+}
+
 impl ScreenMetric {
     #[inline]
     fn rank(&self) -> usize {
@@ -674,6 +719,176 @@ fn check_full_rank(matrix: &DMatrix<f64>, name: &str) -> Result<(), String> {
     }
 }
 
+impl ScreenSpectrum {
+    fn from_grm(grm: &[f64], n: usize, sigma_g2: f64, sigma_e2: f64) -> Result<Self, String> {
+        if n == 0 {
+            return Err("GRM dimension must be > 0".to_string());
+        }
+        if grm.len() != n.saturating_mul(n) {
+            return Err(format!(
+                "GRM length={} but expected {}",
+                grm.len(),
+                n.saturating_mul(n)
+            ));
+        }
+        if !sigma_g2.is_finite() || sigma_g2 < 0.0 {
+            return Err(format!("sigma_g2 must be finite and >= 0; got {sigma_g2}"));
+        }
+        if !sigma_e2.is_finite() || sigma_e2 <= 0.0 {
+            return Err(format!("sigma_e2 must be finite and > 0; got {sigma_e2}"));
+        }
+        let mut covariance = vec![0.0; n * n];
+        for row in 0..n {
+            for column in 0..n {
+                let left = grm[row * n + column];
+                let right = grm[column * n + row];
+                if !left.is_finite() || !right.is_finite() {
+                    return Err("GRM contains non-finite values".to_string());
+                }
+                let scale = left.abs().max(right.abs()).max(1.0);
+                if (left - right).abs() > 1.0e-10 * scale {
+                    return Err(format!(
+                        "GRM is not symmetric at ({row}, {column}): {left} vs {right}"
+                    ));
+                }
+                covariance[row * n + column] =
+                    sigma_g2 * left + if row == column { sigma_e2 } else { 0.0 };
+            }
+        }
+        let (eigenvalues, eigenvectors_row_major, _) =
+            symmetric_eigh_f64_row_major(&covariance, n)?;
+        let inverse_eigenvalues = eigenvalues
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if !value.is_finite() || *value <= SCREEN_VARIANCE_TOL {
+                    Err(format!(
+                        "GRM covariance eigenvalue {index} is not positive: {value}"
+                    ))
+                } else {
+                    Ok(1.0 / value)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut sorted_inverse = inverse_eigenvalues.clone();
+        sorted_inverse.sort_by(f64::total_cmp);
+        let diagnostic_baseline = sorted_inverse[sorted_inverse.len() / 2];
+        Ok(Self {
+            n,
+            inverse_eigenvalues,
+            eigenvectors_row_major,
+            diagnostic_baseline,
+        })
+    }
+
+    /// Construct the same rank-specific omitted-space baseline used by the
+    /// existing explicit low-rank backend.  The adaptive selector only
+    /// chooses `requested_rank`; it never replaces this baseline with the
+    /// diagnostic fixed `c0`.
+    fn metric(&self, requested_rank: usize) -> Result<ScreenMetric, String> {
+        let take = requested_rank.min(self.n);
+        let mut selected = (0..self.n).collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            (self.inverse_eigenvalues[*right] - self.diagnostic_baseline)
+                .abs()
+                .total_cmp(&(self.inverse_eigenvalues[*left] - self.diagnostic_baseline).abs())
+                .then_with(|| left.cmp(right))
+        });
+        selected.truncate(take);
+        let mut selected_mask = vec![false; self.n];
+        for &index in &selected {
+            selected_mask[index] = true;
+        }
+        let mut omitted = (0..self.n)
+            .filter(|&index| !selected_mask[index])
+            .collect::<Vec<_>>();
+        let mut baseline = if omitted.is_empty() {
+            self.diagnostic_baseline
+        } else {
+            omitted
+                .iter()
+                .map(|&index| self.inverse_eigenvalues[index])
+                .sum::<f64>()
+                / omitted.len() as f64
+        };
+
+        // Re-rank once using the actual omitted-space baseline.  This keeps
+        // explicit-rank behavior unchanged while making `c_r` rank-specific.
+        selected = (0..self.n).collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            (self.inverse_eigenvalues[*right] - baseline)
+                .abs()
+                .total_cmp(&(self.inverse_eigenvalues[*left] - baseline).abs())
+                .then_with(|| left.cmp(right))
+        });
+        selected.truncate(take);
+        selected_mask.fill(false);
+        for &index in &selected {
+            selected_mask[index] = true;
+        }
+        omitted = (0..self.n)
+            .filter(|&index| !selected_mask[index])
+            .collect::<Vec<_>>();
+        baseline = if omitted.is_empty() {
+            self.diagnostic_baseline
+        } else {
+            omitted
+                .iter()
+                .map(|&index| self.inverse_eigenvalues[index])
+                .sum::<f64>()
+                / omitted.len() as f64
+        };
+        if !baseline.is_finite() || baseline <= 0.0 {
+            return Err(format!(
+                "invalid scalar baseline inverse weight: {baseline}"
+            ));
+        }
+
+        let rank = selected.len();
+        let mut eigenvectors = vec![0.0; self.n * rank];
+        let mut correction_weights = vec![0.0; rank];
+        for (out, index) in selected.iter().copied().enumerate() {
+            correction_weights[out] = self.inverse_eigenvalues[index] - baseline;
+            for row in 0..self.n {
+                eigenvectors[row + out * self.n] =
+                    self.eigenvectors_row_major[row * self.n + index];
+            }
+        }
+        Ok(ScreenMetric {
+            n: self.n,
+            baseline_weight: baseline,
+            eigenvectors,
+            correction_weights,
+        })
+    }
+
+    /// A diagnostic only: cumulative correction energy relative to a fixed
+    /// scalar `c0`.  The actual metric uses `metric()` and its rank-specific
+    /// omitted-space baseline instead.
+    fn diagnostic_correction_energy(&self, requested_rank: usize) -> f64 {
+        let total = self
+            .inverse_eigenvalues
+            .iter()
+            .map(|value| (value - self.diagnostic_baseline).powi(2))
+            .sum::<f64>();
+        if total <= SCREEN_VARIANCE_TOL {
+            return 1.0;
+        }
+        let mut indices = (0..self.n).collect::<Vec<_>>();
+        indices.sort_by(|left, right| {
+            (self.inverse_eigenvalues[*right] - self.diagnostic_baseline)
+                .abs()
+                .total_cmp(&(self.inverse_eigenvalues[*left] - self.diagnostic_baseline).abs())
+                .then_with(|| left.cmp(right))
+        });
+        let selected = indices.into_iter().take(requested_rank.min(self.n));
+        selected
+            .map(|index| (self.inverse_eigenvalues[index] - self.diagnostic_baseline).powi(2))
+            .sum::<f64>()
+            / total
+    }
+}
+
 fn build_lowrank_metric(
     grm: &[f64],
     n: usize,
@@ -681,109 +896,8 @@ fn build_lowrank_metric(
     sigma_e2: f64,
     requested_rank: usize,
 ) -> Result<ScreenMetric, String> {
-    if grm.len() != n.saturating_mul(n) {
-        return Err(format!(
-            "GRM length={} but expected {}",
-            grm.len(),
-            n.saturating_mul(n)
-        ));
-    }
-    if !sigma_g2.is_finite() || sigma_g2 < 0.0 {
-        return Err(format!("sigma_g2 must be finite and >= 0; got {sigma_g2}"));
-    }
-    if !sigma_e2.is_finite() || sigma_e2 <= 0.0 {
-        return Err(format!("sigma_e2 must be finite and > 0; got {sigma_e2}"));
-    }
-    let mut covariance = vec![0.0; n * n];
-    for row in 0..n {
-        for column in 0..n {
-            let left = grm[row * n + column];
-            let right = grm[column * n + row];
-            if !left.is_finite() || !right.is_finite() {
-                return Err("GRM contains non-finite values".to_string());
-            }
-            let scale = left.abs().max(right.abs()).max(1.0);
-            if (left - right).abs() > 1.0e-10 * scale {
-                return Err(format!(
-                    "GRM is not symmetric at ({row}, {column}): {left} vs {right}"
-                ));
-            }
-            covariance[row * n + column] =
-                sigma_g2 * left + if row == column { sigma_e2 } else { 0.0 };
-        }
-    }
-    let (eigenvalues, eigenvectors_row_major, _) = symmetric_eigh_f64_row_major(&covariance, n)?;
-    let inverse = eigenvalues
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            if !value.is_finite() || *value <= SCREEN_VARIANCE_TOL {
-                Err(format!(
-                    "GRM covariance eigenvalue {index} is not positive: {value}"
-                ))
-            } else {
-                Ok(1.0 / value)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut sorted_inverse = inverse.clone();
-    sorted_inverse.sort_by(f64::total_cmp);
-    let median = sorted_inverse[sorted_inverse.len() / 2];
-    let take = requested_rank.min(n);
-    let mut selected = (0..n).collect::<Vec<_>>();
-    selected.sort_by(|left, right| {
-        (inverse[*right] - median)
-            .abs()
-            .total_cmp(&(inverse[*left] - median).abs())
-            .then_with(|| left.cmp(right))
-    });
-    selected.truncate(take);
-    let mut omitted = (0..n)
-        .filter(|index| !selected.contains(index))
-        .collect::<Vec<_>>();
-    let mut baseline = if omitted.is_empty() {
-        median
-    } else {
-        omitted.iter().map(|index| inverse[*index]).sum::<f64>() / omitted.len() as f64
-    };
-    // Re-rank once using the actual omitted-space baseline.  This makes the
-    // retained directions the largest deviations from the scalar component.
-    selected = (0..n).collect::<Vec<_>>();
-    selected.sort_by(|left, right| {
-        (inverse[*right] - baseline)
-            .abs()
-            .total_cmp(&(inverse[*left] - baseline).abs())
-            .then_with(|| left.cmp(right))
-    });
-    selected.truncate(take);
-    omitted = (0..n)
-        .filter(|index| !selected.contains(index))
-        .collect::<Vec<_>>();
-    baseline = if omitted.is_empty() {
-        median
-    } else {
-        omitted.iter().map(|index| inverse[*index]).sum::<f64>() / omitted.len() as f64
-    };
-    if !baseline.is_finite() || baseline <= 0.0 {
-        return Err(format!(
-            "invalid scalar baseline inverse weight: {baseline}"
-        ));
-    }
-    let rank = selected.len();
-    let mut eigenvectors = vec![0.0; n * rank];
-    let mut correction_weights = vec![0.0; rank];
-    for (out, index) in selected.iter().copied().enumerate() {
-        correction_weights[out] = inverse[index] - baseline;
-        for row in 0..n {
-            eigenvectors[row + out * n] = eigenvectors_row_major[row * n + index];
-        }
-    }
-    Ok(ScreenMetric {
-        n,
-        baseline_weight: baseline,
-        eigenvectors,
-        correction_weights,
-    })
+    let spectrum = ScreenSpectrum::from_grm(grm, n, sigma_g2, sigma_e2)?;
+    spectrum.metric(requested_rank)
 }
 
 impl ScreenFixedContext {
@@ -1031,6 +1145,138 @@ impl ScreenFixedContext {
     }
 }
 
+/// Return the residualized interaction information
+/// `w' P_[fixed, x, z] w` for one marker pair.  This deliberately mirrors the
+/// lower-geometry part of `score_pair` but does not touch the phenotype.  It
+/// is used by the adaptive rank selector as the primary, outcome-independent
+/// criterion for deciding whether a low-rank metric is safe for a population.
+fn interaction_geometry_with_context(
+    context: &ScreenFixedContext,
+    first: usize,
+    second: usize,
+    first_values: &[f64],
+    second_values: &[f64],
+    marker_stats: &ScreenMarkerStats,
+    workspace: &mut ScreenWorkspace,
+) -> Result<f64, ScreenSkipReason> {
+    let lower_dim = context.fixed_rank + 2;
+    let rank = context.metric.rank();
+    let first_q = &marker_stats.q_markers[first * rank..(first + 1) * rank];
+    let second_q = &marker_stats.q_markers[second * rank..(second + 1) * rank];
+    let first_fixed_raw =
+        &marker_stats.raw_fixed_cross[first * context.fixed_rank..(first + 1) * context.fixed_rank];
+    let second_fixed_raw = &marker_stats.raw_fixed_cross
+        [second * context.fixed_rank..(second + 1) * context.fixed_rank];
+    let mut raw_xz = 0.0;
+    let mut raw_xw = 0.0;
+    let mut raw_zw = 0.0;
+    let mut raw_ww = 0.0;
+    let mut q_interaction = vec![0.0; rank];
+    workspace.raw_fixed_interaction.fill(0.0);
+    for row in 0..context.n {
+        let x = first_values[row];
+        let z = second_values[row];
+        let w = x * z;
+        raw_xz += w;
+        raw_xw += x * w;
+        raw_zw += z * w;
+        raw_ww += w * w;
+        for fixed in 0..context.fixed_rank {
+            workspace.raw_fixed_interaction[fixed] += context.fixed_columns[fixed][row] * w;
+        }
+    }
+    for component in 0..rank {
+        let eigenvector =
+            &context.metric.eigenvectors[component * context.n..(component + 1) * context.n];
+        q_interaction[component] = dot_product(eigenvector, first_values, second_values);
+    }
+    workspace.lower_gram[..lower_dim * lower_dim].fill(0.0);
+    workspace.rhs_interaction[..lower_dim].fill(0.0);
+    for row in 0..context.fixed_rank {
+        let row_q = &context.q_fixed[row * rank..(row + 1) * rank];
+        for column in 0..context.fixed_rank {
+            workspace.lower_gram[row * lower_dim + column] =
+                context.fixed_gram[row * context.fixed_rank + column];
+        }
+        workspace.lower_gram[row * lower_dim + context.fixed_rank] =
+            context
+                .metric
+                .weighted(first_fixed_raw[row], first_q, row_q);
+        workspace.lower_gram[row * lower_dim + context.fixed_rank + 1] =
+            context
+                .metric
+                .weighted(second_fixed_raw[row], second_q, row_q);
+        workspace.rhs_interaction[row] =
+            context
+                .metric
+                .weighted(workspace.raw_fixed_interaction[row], row_q, &q_interaction);
+    }
+    for row in 0..context.fixed_rank {
+        workspace.lower_gram[context.fixed_rank * lower_dim + row] =
+            workspace.lower_gram[row * lower_dim + context.fixed_rank];
+        workspace.lower_gram[(context.fixed_rank + 1) * lower_dim + row] =
+            workspace.lower_gram[row * lower_dim + context.fixed_rank + 1];
+    }
+    let first_self = context
+        .metric
+        .weighted(marker_stats.raw_sq_sum[first], first_q, first_q);
+    let cross = context.metric.weighted(raw_xz, first_q, second_q);
+    let second_self = context
+        .metric
+        .weighted(marker_stats.raw_sq_sum[second], second_q, second_q);
+    workspace.lower_gram[context.fixed_rank * lower_dim + context.fixed_rank] = first_self;
+    workspace.lower_gram[context.fixed_rank * lower_dim + context.fixed_rank + 1] = cross;
+    workspace.lower_gram[(context.fixed_rank + 1) * lower_dim + context.fixed_rank] = cross;
+    workspace.lower_gram[(context.fixed_rank + 1) * lower_dim + context.fixed_rank + 1] =
+        second_self;
+    workspace.rhs_interaction[context.fixed_rank] =
+        context.metric.weighted(raw_xw, first_q, &q_interaction);
+    workspace.rhs_interaction[context.fixed_rank + 1] =
+        context.metric.weighted(raw_zw, second_q, &q_interaction);
+    let interaction_raw = context
+        .metric
+        .weighted(raw_ww, &q_interaction, &q_interaction);
+    if !cholesky_lower_in_place(
+        &mut workspace.lower_gram[..lower_dim * lower_dim],
+        lower_dim,
+    ) {
+        return Err(ScreenSkipReason::LowerGeometry);
+    }
+    if !solve_cholesky(
+        &workspace.lower_gram[..lower_dim * lower_dim],
+        lower_dim,
+        &workspace.rhs_interaction[..lower_dim],
+        &mut workspace.solved_interaction[..lower_dim],
+    ) {
+        return Err(ScreenSkipReason::NonFinite);
+    }
+    let projected_variance = interaction_raw
+        - dot(
+            &workspace.rhs_interaction[..lower_dim],
+            &workspace.solved_interaction[..lower_dim],
+        );
+    if !projected_variance.is_finite()
+        || projected_variance <= SCREEN_VARIANCE_TOL * interaction_raw.abs().max(1.0)
+    {
+        return Err(ScreenSkipReason::InteractionVariance);
+    }
+    Ok(projected_variance)
+}
+
+/// Compute `sum eigenvector[row] * x[row] * z[row]` without materializing the
+/// interaction vector.  The helper keeps the geometry calculation in the
+/// same eigenvector convention as the production screen scorer.
+#[inline]
+fn dot_product(eigenvector: &[f64], first: &[f64], second: &[f64]) -> f64 {
+    debug_assert_eq!(eigenvector.len(), first.len());
+    debug_assert_eq!(first.len(), second.len());
+    eigenvector
+        .iter()
+        .zip(first.iter().zip(second))
+        .map(|(eigen, (left, right))| eigen * left * right)
+        .sum()
+}
+
 #[inline]
 fn dot(left: &[f64], right: &[f64]) -> f64 {
     debug_assert_eq!(left.len(), right.len());
@@ -1091,6 +1337,319 @@ fn solve_cholesky(lower: &[f64], dimension: usize, rhs: &[f64], out: &mut [f64])
         out[row] = value / diagonal;
     }
     out[..dimension].iter().all(|value| value.is_finite())
+}
+
+fn quantile95(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let index = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    sorted[index.min(sorted.len() - 1)]
+}
+
+fn ordinal_ranks(values: &[f64]) -> Vec<f64> {
+    let mut order = (0..values.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        values[*left]
+            .total_cmp(&values[*right])
+            .then_with(|| left.cmp(right))
+    });
+    let mut ranks = vec![0.0; values.len()];
+    for (rank, index) in order.into_iter().enumerate() {
+        ranks[index] = rank as f64;
+    }
+    ranks
+}
+
+fn pearson_correlation(left: &[f64], right: &[f64]) -> f64 {
+    if left.len() != right.len() || left.len() < 2 {
+        return f64::NAN;
+    }
+    let left_mean = left.iter().sum::<f64>() / left.len() as f64;
+    let right_mean = right.iter().sum::<f64>() / right.len() as f64;
+    let mut numerator = 0.0;
+    let mut left_ss = 0.0;
+    let mut right_ss = 0.0;
+    for (&left_value, &right_value) in left.iter().zip(right) {
+        let left_delta = left_value - left_mean;
+        let right_delta = right_value - right_mean;
+        numerator += left_delta * right_delta;
+        left_ss += left_delta * left_delta;
+        right_ss += right_delta * right_delta;
+    }
+    if left_ss <= SCREEN_VARIANCE_TOL || right_ss <= SCREEN_VARIANCE_TOL {
+        if left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| (a - b).abs() <= 1.0e-12)
+        {
+            1.0
+        } else {
+            f64::NAN
+        }
+    } else {
+        numerator / (left_ss * right_ss).sqrt()
+    }
+}
+
+fn score_pairs_for_audit(
+    context: &ScreenFixedContext,
+    genotypes: &[f64],
+    n_markers: usize,
+    y: &[f64],
+    pairs: &[(usize, usize)],
+) -> Result<HashMap<(usize, usize), f64>, String> {
+    if pairs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let result =
+        scan_selected_with_context(context, genotypes, n_markers, y, pairs, pairs.len(), 1)?;
+    Ok(result
+        .candidates
+        .into_iter()
+        .map(|candidate| ((candidate.first, candidate.second), candidate.score))
+        .collect())
+}
+
+fn geometry_for_pairs(
+    context: &ScreenFixedContext,
+    genotypes: &[f64],
+    n_markers: usize,
+    y: &[f64],
+    pairs: &[(usize, usize)],
+) -> Result<HashMap<(usize, usize), f64>, String> {
+    let marker_stats = context.prepare_markers(genotypes, n_markers, y)?;
+    let mut workspace = ScreenWorkspace::new(context.fixed_rank);
+    let mut output = HashMap::with_capacity(pairs.len());
+    for &(first, second) in pairs {
+        let first_values = &genotypes[first * context.n..(first + 1) * context.n];
+        let second_values = &genotypes[second * context.n..(second + 1) * context.n];
+        if let Ok(geometry) = interaction_geometry_with_context(
+            context,
+            first,
+            second,
+            first_values,
+            second_values,
+            &marker_stats,
+            &mut workspace,
+        ) {
+            output.insert((first, second), geometry);
+        }
+    }
+    Ok(output)
+}
+
+/// Select the smallest standard rank whose residualized interaction geometry
+/// is stable on a deterministic pilot set.  Score/rank agreement with the
+/// full-rank metric is recorded as an audit, but is intentionally not used as
+/// the selector: it depends on the observed phenotype and therefore must not
+/// silently alter a null-calibrated search space.
+fn choose_adaptive_rank(
+    genotypes: &[f64],
+    n_markers: usize,
+    n_samples: usize,
+    y: &[f64],
+    grm: &[f64],
+    sigma_g2: f64,
+    sigma_e2: f64,
+    pairs: &[(usize, usize)],
+    covariates: &[f64],
+    n_covariates: usize,
+    candidate_ranks: Vec<usize>,
+    geometry_rtol: f64,
+    geometry_max_rtol: f64,
+    score_audit_top_k: usize,
+) -> Result<AdaptiveRankReport, String> {
+    let spectrum = ScreenSpectrum::from_grm(grm, n_samples, sigma_g2, sigma_e2)?;
+    choose_adaptive_rank_with_spectrum(
+        genotypes,
+        n_markers,
+        n_samples,
+        y,
+        pairs,
+        covariates,
+        n_covariates,
+        candidate_ranks,
+        geometry_rtol,
+        geometry_max_rtol,
+        score_audit_top_k,
+        &spectrum,
+        sigma_g2,
+        sigma_e2,
+    )
+}
+
+fn choose_adaptive_rank_with_spectrum(
+    genotypes: &[f64],
+    n_markers: usize,
+    n_samples: usize,
+    y: &[f64],
+    pairs: &[(usize, usize)],
+    covariates: &[f64],
+    n_covariates: usize,
+    candidate_ranks: Vec<usize>,
+    geometry_rtol: f64,
+    geometry_max_rtol: f64,
+    score_audit_top_k: usize,
+    spectrum: &ScreenSpectrum,
+    sigma_g2: f64,
+    sigma_e2: f64,
+) -> Result<AdaptiveRankReport, String> {
+    validate_dense_inputs(genotypes, n_markers, n_samples, y)?;
+    if pairs.is_empty() {
+        return Err("adaptive rank pilot requires at least one marker pair".to_string());
+    }
+    if !geometry_rtol.is_finite() || geometry_rtol < 0.0 {
+        return Err(format!(
+            "geometry_rtol must be finite and >= 0; got {geometry_rtol}"
+        ));
+    }
+    if !geometry_max_rtol.is_finite() || geometry_max_rtol < geometry_rtol {
+        return Err(format!(
+            "geometry_max_rtol must be finite and >= geometry_rtol; got {geometry_max_rtol}"
+        ));
+    }
+    for (index, &(first, second)) in pairs.iter().enumerate() {
+        if first >= n_markers || second >= n_markers || first >= second {
+            return Err(format!(
+                "pilot_pairs[{index}] = ({first}, {second}) is not canonical or is out of range"
+            ));
+        }
+    }
+    let fixed_columns = build_fixed_columns(n_samples, covariates, n_covariates)?;
+    let full_context =
+        ScreenFixedContext::new(y, fixed_columns.clone(), spectrum.metric(n_samples)?)?;
+    let full_geometry = geometry_for_pairs(&full_context, genotypes, n_markers, y, pairs)?;
+    if full_geometry.is_empty() {
+        return Err("adaptive rank pilot has no full-rank geometry-valid pairs".to_string());
+    }
+    let full_scores = score_pairs_for_audit(&full_context, genotypes, n_markers, y, pairs)?;
+    let mut requested_ranks = if candidate_ranks.is_empty() {
+        ADAPTIVE_SCREEN_RANKS.to_vec()
+    } else {
+        candidate_ranks
+    };
+    requested_ranks.retain(|rank| *rank > 0);
+    if requested_ranks.is_empty() {
+        return Err("candidate_ranks must contain at least one positive rank".to_string());
+    }
+    requested_ranks.sort_unstable();
+    requested_ranks.dedup();
+    let mut effective_ranks = requested_ranks
+        .into_iter()
+        .map(|rank| rank.min(n_samples))
+        .filter(|rank| *rank > 0)
+        .collect::<Vec<_>>();
+    effective_ranks.sort_unstable();
+    effective_ranks.dedup();
+    let mut candidates = Vec::with_capacity(effective_ranks.len());
+    for rank in effective_ranks {
+        let metric = spectrum.metric(rank)?;
+        let context = ScreenFixedContext::new(y, fixed_columns.clone(), metric.clone())?;
+        let geometry = geometry_for_pairs(&context, genotypes, n_markers, y, pairs)?;
+        let errors = full_geometry
+            .iter()
+            .filter_map(|(pair, &full_value)| {
+                geometry.get(pair).map(|&value| {
+                    (value - full_value).abs() / full_value.abs().max(SCREEN_VARIANCE_TOL)
+                })
+            })
+            .filter(|error| error.is_finite())
+            .collect::<Vec<_>>();
+        let geometry_mean_relative_error = if errors.is_empty() {
+            f64::NAN
+        } else {
+            errors.iter().sum::<f64>() / errors.len() as f64
+        };
+        let geometry_p95_relative_error = quantile95(&errors);
+        let geometry_max_relative_error = errors.iter().copied().fold(0.0, f64::max);
+        let candidate_scores = score_pairs_for_audit(&context, genotypes, n_markers, y, pairs)?;
+        let mut common_pairs = Vec::new();
+        let mut full_values = Vec::new();
+        let mut candidate_values = Vec::new();
+        for pair in pairs {
+            if let (Some(&full_score), Some(&candidate_score)) =
+                (full_scores.get(pair), candidate_scores.get(pair))
+            {
+                common_pairs.push(*pair);
+                full_values.push(full_score);
+                candidate_values.push(candidate_score);
+            }
+        }
+        let score_spearman = pearson_correlation(
+            &ordinal_ranks(&full_values),
+            &ordinal_ranks(&candidate_values),
+        );
+        let score_top_k_overlap =
+            top_score_overlap(&full_scores, &candidate_scores, score_audit_top_k);
+        let geometry_pass = errors.len() == full_geometry.len()
+            && geometry_p95_relative_error.is_finite()
+            && geometry_p95_relative_error <= geometry_rtol
+            && geometry_max_relative_error <= geometry_max_rtol;
+        candidates.push(AdaptiveRankCandidate {
+            rank,
+            baseline_weight: metric.baseline_weight,
+            diagnostic_correction_energy_c0: spectrum.diagnostic_correction_energy(rank),
+            geometry_valid_pairs: errors.len(),
+            geometry_mean_relative_error,
+            geometry_p95_relative_error,
+            geometry_max_relative_error,
+            geometry_pass,
+            score_pairs_compared: common_pairs.len(),
+            score_spearman,
+            score_top_k_overlap,
+        });
+    }
+    let selected_index = candidates
+        .iter()
+        .position(|candidate| candidate.geometry_pass)
+        .unwrap_or_else(|| candidates.len().saturating_sub(1));
+    Ok(AdaptiveRankReport {
+        selected_rank: candidates[selected_index].rank,
+        full_rank: n_samples,
+        pilot_pair_count: pairs.len(),
+        full_geometry_valid_pairs: full_geometry.len(),
+        sigma_g2,
+        sigma_e2,
+        diagnostic_baseline: spectrum.diagnostic_baseline,
+        geometry_rtol,
+        geometry_max_rtol,
+        score_audit_top_k,
+        used_largest_rank_fallback: !candidates[selected_index].geometry_pass,
+        candidates,
+    })
+}
+
+fn top_score_overlap(
+    full_scores: &HashMap<(usize, usize), f64>,
+    candidate_scores: &HashMap<(usize, usize), f64>,
+    top_k: usize,
+) -> f64 {
+    if top_k == 0 || full_scores.is_empty() {
+        return f64::NAN;
+    }
+    let top = |scores: &HashMap<(usize, usize), f64>| {
+        let mut entries = scores.iter().collect::<Vec<_>>();
+        entries.sort_by(|(left_pair, left_score), (right_pair, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_pair.cmp(right_pair))
+        });
+        entries
+            .into_iter()
+            .take(top_k)
+            .map(|(pair, _)| *pair)
+            .collect::<HashSet<_>>()
+    };
+    let full_top = top(full_scores);
+    let candidate_top = top(candidate_scores);
+    if full_top.is_empty() {
+        f64::NAN
+    } else {
+        full_top.intersection(&candidate_top).count() as f64 / full_top.len() as f64
+    }
 }
 
 fn scan_with_context(
@@ -1928,6 +2487,63 @@ fn screen_result_to_py<'py>(
     Ok(out)
 }
 
+fn adaptive_rank_report_to_py<'py>(
+    py: Python<'py>,
+    report: &AdaptiveRankReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    let candidates = PyList::empty(py);
+    for candidate in &report.candidates {
+        let item = PyDict::new(py);
+        item.set_item("rank", candidate.rank)?;
+        item.set_item("baseline_weight", candidate.baseline_weight)?;
+        item.set_item(
+            "diagnostic_correction_energy_c0",
+            candidate.diagnostic_correction_energy_c0,
+        )?;
+        item.set_item("geometry_valid_pairs", candidate.geometry_valid_pairs)?;
+        item.set_item(
+            "geometry_mean_relative_error",
+            candidate.geometry_mean_relative_error,
+        )?;
+        item.set_item(
+            "geometry_p95_relative_error",
+            candidate.geometry_p95_relative_error,
+        )?;
+        item.set_item(
+            "geometry_max_relative_error",
+            candidate.geometry_max_relative_error,
+        )?;
+        item.set_item("geometry_pass", candidate.geometry_pass)?;
+        item.set_item("score_pairs_compared", candidate.score_pairs_compared)?;
+        item.set_item("score_spearman", candidate.score_spearman)?;
+        item.set_item("score_top_k_overlap", candidate.score_top_k_overlap)?;
+        candidates.append(item)?;
+    }
+    let out = PyDict::new(py);
+    out.set_item("mode", "adaptive")?;
+    out.set_item("selected_rank", report.selected_rank)?;
+    out.set_item("full_rank", report.full_rank)?;
+    out.set_item("pilot_pair_count", report.pilot_pair_count)?;
+    out.set_item(
+        "full_geometry_valid_pairs",
+        report.full_geometry_valid_pairs,
+    )?;
+    out.set_item("sigma_g2", report.sigma_g2)?;
+    out.set_item("sigma_e2", report.sigma_e2)?;
+    out.set_item("variance_ratio", report.sigma_g2 / report.sigma_e2)?;
+    out.set_item("diagnostic_baseline", report.diagnostic_baseline)?;
+    out.set_item("geometry_rtol", report.geometry_rtol)?;
+    out.set_item("geometry_max_rtol", report.geometry_max_rtol)?;
+    out.set_item("score_audit_top_k", report.score_audit_top_k)?;
+    out.set_item("selection_criterion", "geometry_p95_and_max_relative_error")?;
+    out.set_item(
+        "used_largest_rank_fallback",
+        report.used_largest_rank_fallback,
+    )?;
+    out.set_item("candidates", candidates)?;
+    Ok(out)
+}
+
 fn grouped_screen_result_to_py<'py>(
     py: Python<'py>,
     result: GroupedScreenScanResult,
@@ -2540,6 +3156,80 @@ pub fn garfield_dosage_lowrank_grm_screen_scan_py<'py>(
     screen_result_to_py(py, result, "lowrank-grm")
 }
 
+/// Choose a low-rank GRM screen rank from a genotype/pair pilot.
+///
+/// The selector compares residualized interaction geometry against the same
+/// covariance represented at full rank.  Score/rank agreement is returned as
+/// an audit only; it does not select a rank from the observed phenotype.  The
+/// chosen rank can therefore be fixed and recorded in a matched null
+/// calibration artifact before a genome-wide scan.
+#[pyfunction(name = "garfield_dosage_lowrank_choose_rank")]
+#[pyo3(signature = (pilot_genotypes, y, grm, sigma_g2, sigma_e2, pilot_pairs, covariates=None, candidate_ranks=None, geometry_rtol=0.02, geometry_max_rtol=0.10, score_top_k=100))]
+pub fn garfield_dosage_lowrank_choose_rank_py<'py>(
+    py: Python<'py>,
+    pilot_genotypes: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray1<'py, f64>,
+    grm: PyReadonlyArray2<'py, f64>,
+    sigma_g2: f64,
+    sigma_e2: f64,
+    pilot_pairs: PyReadonlyArray2<'py, i64>,
+    covariates: Option<PyReadonlyArray2<'py, f64>>,
+    candidate_ranks: Option<Vec<usize>>,
+    geometry_rtol: f64,
+    geometry_max_rtol: f64,
+    score_top_k: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let genotype_shape = pilot_genotypes.shape();
+    if genotype_shape.len() != 2 {
+        return Err(PyValueError::new_err(
+            "pilot_genotypes must be a 2D marker-major array",
+        ));
+    }
+    let y_vec = array1_to_vec(&y);
+    let n_markers = genotype_shape[0];
+    let n_samples = genotype_shape[1];
+    let grm_shape = grm.shape();
+    if grm_shape.len() != 2 || grm_shape[0] != n_samples || grm_shape[1] != n_samples {
+        return Err(PyValueError::new_err(format!(
+            "grm must have shape ({n_samples}, {n_samples}); got {:?}",
+            grm_shape
+        )));
+    }
+    let pilot_pairs_vec = array2_to_pairs(&pilot_pairs)?;
+    let genotype_vec = array2_to_vec(&pilot_genotypes);
+    let grm_vec = array2_to_vec(&grm);
+    let (covariate_vec, n_covariates) = if let Some(covariates) = covariates {
+        let cov_shape = covariates.shape();
+        if cov_shape.len() != 2 || cov_shape[0] != n_samples {
+            return Err(PyValueError::new_err(format!(
+                "covariates must have shape (n_samples, n_covariates); got {:?}",
+                cov_shape
+            )));
+        }
+        (array2_to_vec(&covariates), cov_shape[1])
+    } else {
+        (Vec::new(), 0)
+    };
+    let report = choose_adaptive_rank(
+        &genotype_vec,
+        n_markers,
+        n_samples,
+        &y_vec,
+        &grm_vec,
+        sigma_g2,
+        sigma_e2,
+        &pilot_pairs_vec,
+        &covariate_vec,
+        n_covariates,
+        candidate_ranks.unwrap_or_else(|| ADAPTIVE_SCREEN_RANKS.to_vec()),
+        geometry_rtol,
+        geometry_max_rtol,
+        score_top_k,
+    )
+    .map_err(PyValueError::new_err)?;
+    adaptive_rank_report_to_py(py, &report)
+}
+
 /// Reusable low-rank GRM screen context for window scans.
 ///
 /// The ordinary low-rank function intentionally has a simple, stateless API,
@@ -2550,6 +3240,7 @@ pub fn garfield_dosage_lowrank_grm_screen_scan_py<'py>(
 pub struct GarfieldDosageLowrankScreenContext {
     context: ScreenFixedContext,
     y: Vec<f64>,
+    adaptive_report: Option<AdaptiveRankReport>,
 }
 
 #[pymethods]
@@ -2595,7 +3286,109 @@ impl GarfieldDosageLowrankScreenContext {
             .map_err(PyValueError::new_err)?;
         let context = ScreenFixedContext::new(&y_vec, fixed_columns, metric)
             .map_err(PyValueError::new_err)?;
-        Ok(Self { context, y: y_vec })
+        Ok(Self {
+            context,
+            y: y_vec,
+            adaptive_report: None,
+        })
+    }
+
+    /// Construct a context using the adaptive geometry pilot.  The pilot is
+    /// deliberately explicit: callers must provide representative marker
+    /// pairs, and the resulting rank/report should be persisted with the
+    /// calibration metadata before scanning the rest of the genome.
+    #[staticmethod]
+    #[pyo3(signature = (pilot_genotypes, y, grm, sigma_g2, sigma_e2, pilot_pairs, covariates=None, candidate_ranks=None, geometry_rtol=0.02, geometry_max_rtol=0.10, score_top_k=100))]
+    fn auto<'py>(
+        pilot_genotypes: PyReadonlyArray2<'py, f64>,
+        y: PyReadonlyArray1<'py, f64>,
+        grm: PyReadonlyArray2<'py, f64>,
+        sigma_g2: f64,
+        sigma_e2: f64,
+        pilot_pairs: PyReadonlyArray2<'py, i64>,
+        covariates: Option<PyReadonlyArray2<'py, f64>>,
+        candidate_ranks: Option<Vec<usize>>,
+        geometry_rtol: f64,
+        geometry_max_rtol: f64,
+        score_top_k: usize,
+    ) -> PyResult<Self> {
+        let genotype_shape = pilot_genotypes.shape();
+        if genotype_shape.len() != 2 {
+            return Err(PyValueError::new_err(
+                "pilot_genotypes must be a 2D marker-major array",
+            ));
+        }
+        let y_vec = array1_to_vec(&y);
+        let n_markers = genotype_shape[0];
+        let n_samples = genotype_shape[1];
+        let grm_shape = grm.shape();
+        if grm_shape.len() != 2 || grm_shape[0] != n_samples || grm_shape[1] != n_samples {
+            return Err(PyValueError::new_err(format!(
+                "grm must have shape ({n_samples}, {n_samples}); got {:?}",
+                grm_shape
+            )));
+        }
+        let pilot_pairs_vec = array2_to_pairs(&pilot_pairs)?;
+        let genotype_vec = array2_to_vec(&pilot_genotypes);
+        let grm_vec = array2_to_vec(&grm);
+        let (covariate_vec, n_covariates) = if let Some(covariates) = covariates {
+            let cov_shape = covariates.shape();
+            if cov_shape.len() != 2 || cov_shape[0] != n_samples {
+                return Err(PyValueError::new_err(format!(
+                    "covariates must have shape (n_samples, n_covariates); got {:?}",
+                    cov_shape
+                )));
+            }
+            (array2_to_vec(&covariates), cov_shape[1])
+        } else {
+            (Vec::new(), 0)
+        };
+        let spectrum = ScreenSpectrum::from_grm(&grm_vec, n_samples, sigma_g2, sigma_e2)
+            .map_err(PyValueError::new_err)?;
+        let report = choose_adaptive_rank_with_spectrum(
+            &genotype_vec,
+            n_markers,
+            n_samples,
+            &y_vec,
+            &pilot_pairs_vec,
+            &covariate_vec,
+            n_covariates,
+            candidate_ranks.unwrap_or_else(|| ADAPTIVE_SCREEN_RANKS.to_vec()),
+            geometry_rtol,
+            geometry_max_rtol,
+            score_top_k,
+            &spectrum,
+            sigma_g2,
+            sigma_e2,
+        )
+        .map_err(PyValueError::new_err)?;
+        let fixed_columns = build_fixed_columns(n_samples, &covariate_vec, n_covariates)
+            .map_err(PyValueError::new_err)?;
+        let metric = spectrum
+            .metric(report.selected_rank)
+            .map_err(PyValueError::new_err)?;
+        let context = ScreenFixedContext::new(&y_vec, fixed_columns, metric)
+            .map_err(PyValueError::new_err)?;
+        Ok(Self {
+            context,
+            y: y_vec,
+            adaptive_report: Some(report),
+        })
+    }
+
+    /// Return the rank-selection audit.  Explicit-rank contexts return a
+    /// compact explicit-mode record so callers can serialize one stable shape.
+    fn rank_diagnostics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        if let Some(report) = &self.adaptive_report {
+            adaptive_rank_report_to_py(py, report)
+        } else {
+            let out = PyDict::new(py);
+            out.set_item("mode", "explicit")?;
+            out.set_item("selected_rank", self.context.metric.rank())?;
+            out.set_item("full_rank", self.context.n)?;
+            out.set_item("baseline_weight", self.context.metric.baseline_weight)?;
+            Ok(out)
+        }
     }
 
     #[pyo3(signature = (genotypes, top_k=100, threads=0))]
@@ -2972,6 +3765,106 @@ mod tests {
             .sum::<f64>();
         let approximated = metric.weighted(dot(&left, &right), &left_q, &right_q);
         assert!((approximated - direct).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn adaptive_rank_uses_geometry_and_allows_full_eigenspace_rank() {
+        let n = 8;
+        let grm = (0..n * n)
+            .map(|index| if index / n == index % n { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let genotypes = vec![
+            0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, // marker 0
+            0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, // marker 1
+            0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, // marker 2
+        ];
+        let y = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let report = choose_adaptive_rank(
+            &genotypes,
+            3,
+            n,
+            &y,
+            &grm,
+            0.4,
+            0.6,
+            &pairs,
+            &[],
+            0,
+            vec![n],
+            0.01,
+            0.10,
+            10,
+        )
+        .expect("adaptive rank should accept a full eigenspace candidate");
+        assert_eq!(report.selected_rank, n);
+        assert_eq!(report.candidates[0].rank, n);
+        assert!(report.candidates[0].geometry_valid_pairs > 0);
+        // The eigenspace rank is independent of the regression residual-df
+        // condition used when fitting a particular pair.
+        assert_eq!(
+            build_lowrank_metric(&grm, n, 0.4, 0.6, n).unwrap().rank(),
+            n
+        );
+    }
+
+    #[test]
+    fn adaptive_rank_reports_zero_geometry_error_for_scalar_covariance() {
+        let n = 8;
+        let grm = (0..n * n)
+            .map(|index| if index / n == index % n { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let genotypes = vec![
+            0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, // marker 0
+            0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, // marker 1
+            0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, // marker 2
+        ];
+        let y = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let report = choose_adaptive_rank(
+            &genotypes,
+            3,
+            n,
+            &y,
+            &grm,
+            0.4,
+            0.6,
+            &pairs,
+            &[],
+            0,
+            vec![1, 2, 4],
+            0.01,
+            0.10,
+            10,
+        )
+        .expect("scalar covariance should be geometry-stable");
+        assert_eq!(report.selected_rank, 1);
+        assert!(report.candidates[0].geometry_p95_relative_error < 1.0e-12);
+        assert!(report.candidates[0].score_pairs_compared > 0);
+        assert!(report.candidates[0].score_spearman.is_finite());
+    }
+
+    #[test]
+    fn adaptive_rank_uses_rank_specific_omitted_baselines() {
+        let n = 6;
+        let grm = (0..n * n)
+            .map(|index| {
+                let row = index / n;
+                let column = index % n;
+                if row == column {
+                    1.0 + row as f64 * 0.1
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let metric_1 = build_lowrank_metric(&grm, n, 0.8, 0.4, 1).unwrap();
+        let metric_2 = build_lowrank_metric(&grm, n, 0.8, 0.4, 2).unwrap();
+        assert_ne!(
+            metric_1.baseline_weight.to_bits(),
+            metric_2.baseline_weight.to_bits(),
+            "the actual approximation must retain the rank-specific omitted-space baseline"
+        );
     }
 
     #[test]

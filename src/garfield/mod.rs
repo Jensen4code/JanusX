@@ -137,8 +137,9 @@ pub use dosage_random::{
 pub use dosage_screen::{
     garfield_dosage_canonical_owner_plan_py, garfield_dosage_lm_screen_scan_canonical_owner_py,
     garfield_dosage_lm_screen_scan_py, garfield_dosage_lm_screen_scan_selected_grouped_py,
-    garfield_dosage_lm_screen_scan_selected_py, garfield_dosage_lowrank_grm_screen_scan_py,
-    GarfieldDosageCanonicalTopK, GarfieldDosageLowrankScreenContext,
+    garfield_dosage_lm_screen_scan_selected_py, garfield_dosage_lowrank_choose_rank_py,
+    garfield_dosage_lowrank_grm_screen_scan_py, GarfieldDosageCanonicalTopK,
+    GarfieldDosageLowrankScreenContext,
 };
 pub use pair_triple::garfield_pair_triple_refine_bin_py;
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
