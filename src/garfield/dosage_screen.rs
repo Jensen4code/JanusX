@@ -1515,10 +1515,16 @@ fn choose_adaptive_rank_with_spectrum(
             "geometry_max_rtol must be finite and >= geometry_rtol; got {geometry_max_rtol}"
         ));
     }
+    let mut unique_pairs = HashSet::with_capacity(pairs.len());
     for (index, &(first, second)) in pairs.iter().enumerate() {
         if first >= n_markers || second >= n_markers || first >= second {
             return Err(format!(
                 "pilot_pairs[{index}] = ({first}, {second}) is not canonical or is out of range"
+            ));
+        }
+        if !unique_pairs.insert((first, second)) {
+            return Err(format!(
+                "pilot_pairs[{index}] = ({first}, {second}) is a duplicate"
             ));
         }
     }
@@ -1612,10 +1618,49 @@ fn choose_adaptive_rank_with_spectrum(
             score_top_k_overlap,
         });
     }
-    let selected_index = candidates
+    let mut used_largest_rank_fallback = false;
+    let selected_index = if let Some(index) = candidates
         .iter()
         .position(|candidate| candidate.geometry_pass)
-        .unwrap_or_else(|| candidates.len().saturating_sub(1));
+    {
+        index
+    } else {
+        // A requested rank that misses the declared geometry tolerances must
+        // never be returned as if it were safe.  Add a full-rank exact
+        // candidate (the reference metric is already available) and make the
+        // fallback explicit in the report.  Callers that want a bounded
+        // approximation despite this condition can still use the explicit
+        // `Context::new(..., rank)` API.
+        used_largest_rank_fallback = true;
+        let full_rank = spectrum.n;
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.rank == full_rank)
+        {
+            let full_metric = spectrum.metric(full_rank)?;
+            let full_score_pairs = full_scores.len();
+            candidates.push(AdaptiveRankCandidate {
+                rank: full_rank,
+                baseline_weight: full_metric.baseline_weight,
+                diagnostic_correction_energy_c0: spectrum.diagnostic_correction_energy(full_rank),
+                diagnostic_spectral_tail_c0: 0.0,
+                geometry_valid_pairs: full_geometry.len(),
+                geometry_mean_relative_error: 0.0,
+                geometry_p95_relative_error: 0.0,
+                geometry_q99_relative_error: 0.0,
+                geometry_q999_relative_error: 0.0,
+                geometry_max_relative_error: 0.0,
+                geometry_pass: true,
+                score_pairs_compared: full_score_pairs,
+                score_spearman: if full_score_pairs >= 2 { 1.0 } else { f64::NAN },
+                score_top_k_overlap: if full_score_pairs > 0 { 1.0 } else { f64::NAN },
+            });
+        }
+        candidates
+            .iter()
+            .position(|candidate| candidate.rank == full_rank)
+            .expect("full-rank fallback candidate must be present")
+    };
     Ok(AdaptiveRankReport {
         selected_rank: candidates[selected_index].rank,
         full_rank: n_samples,
@@ -1627,7 +1672,7 @@ fn choose_adaptive_rank_with_spectrum(
         geometry_rtol,
         geometry_max_rtol,
         score_audit_top_k,
-        used_largest_rank_fallback: !candidates[selected_index].geometry_pass,
+        used_largest_rank_fallback,
         candidates,
     })
 }
@@ -2561,6 +2606,14 @@ fn adaptive_rank_report_to_py<'py>(
     out.set_item(
         "used_largest_rank_fallback",
         report.used_largest_rank_fallback,
+    )?;
+    out.set_item(
+        "fallback_mode",
+        if report.used_largest_rank_fallback {
+            "full_rank_exact"
+        } else {
+            "geometry_candidate"
+        },
     )?;
     out.set_item("candidates", candidates)?;
     Ok(out)
@@ -3890,6 +3943,88 @@ mod tests {
             metric_2.baseline_weight.to_bits(),
             "the actual approximation must retain the rank-specific omitted-space baseline"
         );
+    }
+
+    #[test]
+    fn adaptive_rank_falls_back_to_full_rank_when_candidates_fail() {
+        let n = 8;
+        let grm = (0..n * n)
+            .map(|index| {
+                let row = index / n;
+                let column = index % n;
+                if row == column {
+                    1.0 + row as f64 * 0.2
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let genotypes = vec![
+            0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, // marker 0
+            0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, // marker 1
+            0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, // marker 2
+        ];
+        let y = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+        let pairs = vec![(0, 1), (0, 2), (1, 2)];
+        let report = choose_adaptive_rank(
+            &genotypes,
+            3,
+            n,
+            &y,
+            &grm,
+            0.8,
+            0.4,
+            &pairs,
+            &[],
+            0,
+            vec![1, 2],
+            0.0,
+            0.0,
+            10,
+        )
+        .expect("adaptive rank should use a safe exact fallback");
+        assert_eq!(report.selected_rank, n);
+        assert!(report.used_largest_rank_fallback);
+        let full = report
+            .candidates
+            .last()
+            .expect("full-rank fallback should be reported");
+        assert_eq!(full.rank, n);
+        assert!(full.geometry_pass);
+        assert!(full.geometry_p95_relative_error.abs() < 1.0e-12);
+        assert!(full.geometry_q999_relative_error.abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn adaptive_rank_rejects_duplicate_pilot_pairs() {
+        let n = 4;
+        let grm = (0..n * n)
+            .map(|index| if index / n == index % n { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let genotypes = vec![
+            0.0, 0.0, 1.0, 1.0, // marker 0
+            0.0, 1.0, 0.0, 1.0, // marker 1
+        ];
+        let y = vec![0.0, 1.0, 0.0, 1.0];
+        let duplicate_pairs = vec![(0, 1), (0, 1)];
+        let error = choose_adaptive_rank(
+            &genotypes,
+            2,
+            n,
+            &y,
+            &grm,
+            0.4,
+            0.6,
+            &duplicate_pairs,
+            &[],
+            0,
+            vec![1, 2],
+            0.01,
+            0.10,
+            10,
+        )
+        .expect_err("duplicate pilot pairs must not silently reweight the audit");
+        assert!(error.contains("duplicate"));
     }
 
     #[test]
