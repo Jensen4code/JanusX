@@ -520,9 +520,12 @@ struct AdaptiveRankCandidate {
     rank: usize,
     baseline_weight: f64,
     diagnostic_correction_energy_c0: f64,
+    diagnostic_spectral_tail_c0: f64,
     geometry_valid_pairs: usize,
     geometry_mean_relative_error: f64,
     geometry_p95_relative_error: f64,
+    geometry_q99_relative_error: f64,
+    geometry_q999_relative_error: f64,
     geometry_max_relative_error: f64,
     geometry_pass: bool,
     score_pairs_compared: usize,
@@ -1339,13 +1342,14 @@ fn solve_cholesky(lower: &[f64], dimension: usize, rhs: &[f64], out: &mut [f64])
     out[..dimension].iter().all(|value| value.is_finite())
 }
 
-fn quantile95(values: &[f64]) -> f64 {
+fn quantile(values: &[f64], probability: f64) -> f64 {
     if values.is_empty() {
         return f64::NAN;
     }
+    debug_assert!((0.0..=1.0).contains(&probability));
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
-    let index = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    let index = ((sorted.len() as f64 * probability).ceil() as usize).saturating_sub(1);
     sorted[index.min(sorted.len() - 1)]
 }
 
@@ -1563,7 +1567,9 @@ fn choose_adaptive_rank_with_spectrum(
         } else {
             errors.iter().sum::<f64>() / errors.len() as f64
         };
-        let geometry_p95_relative_error = quantile95(&errors);
+        let geometry_p95_relative_error = quantile(&errors, 0.95);
+        let geometry_q99_relative_error = quantile(&errors, 0.99);
+        let geometry_q999_relative_error = quantile(&errors, 0.999);
         let geometry_max_relative_error = errors.iter().copied().fold(0.0, f64::max);
         let candidate_scores = score_pairs_for_audit(&context, genotypes, n_markers, y, pairs)?;
         let mut common_pairs = Vec::new();
@@ -1588,13 +1594,17 @@ fn choose_adaptive_rank_with_spectrum(
             && geometry_p95_relative_error.is_finite()
             && geometry_p95_relative_error <= geometry_rtol
             && geometry_max_relative_error <= geometry_max_rtol;
+        let diagnostic_correction_energy_c0 = spectrum.diagnostic_correction_energy(rank);
         candidates.push(AdaptiveRankCandidate {
             rank,
             baseline_weight: metric.baseline_weight,
-            diagnostic_correction_energy_c0: spectrum.diagnostic_correction_energy(rank),
+            diagnostic_correction_energy_c0,
+            diagnostic_spectral_tail_c0: (1.0 - diagnostic_correction_energy_c0).max(0.0),
             geometry_valid_pairs: errors.len(),
             geometry_mean_relative_error,
             geometry_p95_relative_error,
+            geometry_q99_relative_error,
+            geometry_q999_relative_error,
             geometry_max_relative_error,
             geometry_pass,
             score_pairs_compared: common_pairs.len(),
@@ -2500,6 +2510,10 @@ fn adaptive_rank_report_to_py<'py>(
             "diagnostic_correction_energy_c0",
             candidate.diagnostic_correction_energy_c0,
         )?;
+        item.set_item(
+            "diagnostic_spectral_tail_c0",
+            candidate.diagnostic_spectral_tail_c0,
+        )?;
         item.set_item("geometry_valid_pairs", candidate.geometry_valid_pairs)?;
         item.set_item(
             "geometry_mean_relative_error",
@@ -2508,6 +2522,14 @@ fn adaptive_rank_report_to_py<'py>(
         item.set_item(
             "geometry_p95_relative_error",
             candidate.geometry_p95_relative_error,
+        )?;
+        item.set_item(
+            "geometry_q99_relative_error",
+            candidate.geometry_q99_relative_error,
+        )?;
+        item.set_item(
+            "geometry_q999_relative_error",
+            candidate.geometry_q999_relative_error,
         )?;
         item.set_item(
             "geometry_max_relative_error",
@@ -3840,6 +3862,9 @@ mod tests {
         .expect("scalar covariance should be geometry-stable");
         assert_eq!(report.selected_rank, 1);
         assert!(report.candidates[0].geometry_p95_relative_error < 1.0e-12);
+        assert!(report.candidates[0].geometry_q99_relative_error < 1.0e-12);
+        assert!(report.candidates[0].geometry_q999_relative_error < 1.0e-12);
+        assert!(report.candidates[0].diagnostic_spectral_tail_c0 < 1.0e-12);
         assert!(report.candidates[0].score_pairs_compared > 0);
         assert!(report.candidates[0].score_spearman.is_finite());
     }
