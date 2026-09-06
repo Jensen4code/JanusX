@@ -10,9 +10,11 @@
 //! BLAS triangular-solve kernel. No explicit inverse of `V` is formed.
 
 use crate::blas::{
-    cblas_ddot_dispatch, cblas_dtrsm_dispatch, rust_sgemm_backend_tag, BlasThreadGuard, CblasInt,
-    CBLAS_COL_MAJOR, CBLAS_DIAG_NON_UNIT, CBLAS_LEFT, CBLAS_LOWER, CBLAS_NO_TRANS, CBLAS_TRANS,
+    cblas_ddot_dispatch, cblas_dgemm_dispatch, cblas_dtrsm_dispatch, rust_sgemm_backend_tag,
+    BlasThreadGuard, CblasInt, CBLAS_COL_MAJOR, CBLAS_DIAG_NON_UNIT, CBLAS_LEFT, CBLAS_LOWER,
+    CBLAS_NO_TRANS, CBLAS_TRANS,
 };
+use crate::eigh::symmetric_eigh_f64_row_major;
 use nalgebra::{Cholesky, DMatrix, Dyn};
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
@@ -152,6 +154,45 @@ struct GrmScanRangeResult {
 #[inline]
 fn grm_profile_enabled() -> bool {
     std::env::var("JX_GRM_PROFILE")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+fn parse_positive_usize(value: Option<&str>, fallback: usize) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|parsed| *parsed > 0)
+        .unwrap_or(fallback)
+}
+
+#[inline]
+fn grm_interaction_block_size() -> usize {
+    parse_positive_usize(
+        std::env::var("JX_GRM_INTERACTION_BLOCK_SIZE")
+            .ok()
+            .as_deref(),
+        GRM_INTERACTION_BLOCK_SIZE,
+    )
+}
+
+#[inline]
+fn grm_blas_threads(default: usize) -> usize {
+    parse_positive_usize(
+        std::env::var("JX_GRM_BLAS_THREADS").ok().as_deref(),
+        default.max(1),
+    )
+}
+
+#[inline]
+fn grm_eigen_geometry_enabled() -> bool {
+    std::env::var("JX_GRM_EIGEN_GEOMETRY")
         .ok()
         .map(|value| {
             matches!(
@@ -528,7 +569,7 @@ impl FixedVContext {
         // one batched triangular solve.  Keep the existing Rayon scalar path
         // for builds whose BLAS dispatch is the portable Rust fallback.
         if rust_sgemm_backend_tag() != "rust" {
-            let _blas_guard = BlasThreadGuard::enter(threads.max(1));
+            let _blas_guard = BlasThreadGuard::enter(grm_blas_threads(threads));
             let mut solved = genotypes.to_vec();
             solve_cholesky_block_blas_in_place(&self.chol_v, &mut solved, n_markers)?;
             Ok(solved)
@@ -1154,6 +1195,708 @@ impl FixedVContext {
     }
 }
 
+/// Fixed-ᵥ context backed by an eigendecomposition of the covariance.
+///
+/// This is an opt-in exact scanner used to profile the interaction bottleneck.
+/// Unlike the Cholesky path, it never materializes `V^-1 H` for an interaction
+/// block.  It transforms the raw block once, `H -> U^T H`, and all subsequent
+/// geometry is accumulated in the diagonal eigen-space representation of
+/// `V^-1`.
+struct EigenVContext {
+    n: usize,
+    fixed_rank: usize,
+    eigenvectors_col_major: Vec<f64>,
+    inverse_eigenvalues: Vec<f64>,
+    q_fixed: Vec<f64>,
+    q_y: Vec<f64>,
+    fixed_gram: Vec<f64>,
+    fixed_y_cross: Vec<f64>,
+    y_vinv_y: f64,
+    sigma_g2: f64,
+    sigma_e2: f64,
+}
+
+/// Results from the experimental selected-pair refinement path.  Scores are
+/// returned in the same order as the requested pair list; unidentifiable
+/// pairs are represented by NaN and counted in `pairs_skipped`.
+struct SelectedPairRefineResult {
+    interaction_score: Vec<f64>,
+    interaction_beta: Vec<f64>,
+    interaction_variance: Vec<f64>,
+    null_q: Vec<f64>,
+    full_q: Vec<f64>,
+    pairs_evaluated: usize,
+    pairs_skipped: usize,
+}
+
+impl EigenVContext {
+    fn new(
+        y: &[f64],
+        grm: &[f64],
+        n: usize,
+        sigma_g2: f64,
+        sigma_e2: f64,
+        covariates: &[f64],
+        n_covariates: usize,
+    ) -> Result<Self, String> {
+        if n == 0 {
+            return Err("GRM-aware interaction requires n > 0".to_string());
+        }
+        if y.len() != n {
+            return Err(format!("y length={} but expected {n}", y.len()));
+        }
+        if grm.len() != n.saturating_mul(n) {
+            return Err(format!(
+                "GRM length={} but expected {}",
+                grm.len(),
+                n.saturating_mul(n)
+            ));
+        }
+        if !sigma_g2.is_finite() || sigma_g2 < 0.0 {
+            return Err(format!("sigma_g2 must be finite and >= 0; got {sigma_g2}"));
+        }
+        if !sigma_e2.is_finite() || sigma_e2 <= 0.0 {
+            return Err(format!("sigma_e2 must be finite and > 0; got {sigma_e2}"));
+        }
+        if y.iter().any(|value| !value.is_finite()) {
+            return Err("y contains non-finite values".to_string());
+        }
+        let expected_covariates = n
+            .checked_mul(n_covariates)
+            .ok_or_else(|| "covariate design size overflow".to_string())?;
+        if covariates.len() != expected_covariates {
+            return Err(format!(
+                "covariate length={} but expected {expected_covariates}",
+                covariates.len()
+            ));
+        }
+        if covariates.iter().any(|value| !value.is_finite()) {
+            return Err("covariates contain non-finite values".to_string());
+        }
+        let fixed_rank = n_covariates
+            .checked_add(1)
+            .ok_or_else(|| "fixed-effect column count overflow".to_string())?;
+        if n <= fixed_rank + 3 {
+            return Err(format!(
+                "need more than fixed rank + 3 samples; got n={n}, fixed columns={fixed_rank}"
+            ));
+        }
+
+        let mut fixed_columns = Vec::with_capacity(fixed_rank);
+        fixed_columns.push(vec![1.0; n]);
+        for column in 0..n_covariates {
+            let mut values = Vec::with_capacity(n);
+            for row in 0..n {
+                values.push(covariates[row * n_covariates + column]);
+            }
+            fixed_columns.push(values);
+        }
+        let fixed_design =
+            DMatrix::from_fn(n, fixed_rank, |row, column| fixed_columns[column][row]);
+        check_full_rank(&fixed_design, "fixed-effect design")?;
+
+        let mut v = vec![0.0; n * n];
+        for row in 0..n {
+            for column in 0..n {
+                let left = grm[row * n + column];
+                let right = grm[column * n + row];
+                if !left.is_finite() || !right.is_finite() {
+                    return Err("GRM contains non-finite values".to_string());
+                }
+                let scale = left.abs().max(right.abs()).max(1.0);
+                if (left - right).abs() > 1.0e-10 * scale {
+                    return Err(format!(
+                        "GRM is not symmetric at ({row}, {column}): {left} vs {right}"
+                    ));
+                }
+                v[row * n + column] = sigma_g2 * left + if row == column { sigma_e2 } else { 0.0 };
+            }
+        }
+        let (eigenvalues, eigenvectors_row_major, _) = symmetric_eigh_f64_row_major(&v, n)?;
+        let mut inverse_eigenvalues = Vec::with_capacity(n);
+        for (index, value) in eigenvalues.iter().copied().enumerate() {
+            if !value.is_finite() || value <= VARIANCE_TOL {
+                return Err(format!(
+                    "GRM covariance eigenvalue {index} is not positive: {value}"
+                ));
+            }
+            inverse_eigenvalues.push(1.0 / value);
+        }
+        if eigenvectors_row_major.len() != n * n {
+            return Err("eigendecomposition returned an invalid eigenvector matrix".to_string());
+        }
+        let mut eigenvectors_col_major = vec![0.0; n * n];
+        for row in 0..n {
+            for column in 0..n {
+                eigenvectors_col_major[row + column * n] = eigenvectors_row_major[row * n + column];
+            }
+        }
+
+        let q_y = transform_columns_to_eigen_space(&eigenvectors_col_major, y, n, 1, 1)?;
+        let mut fixed_matrix = vec![0.0; n * fixed_rank];
+        for column in 0..fixed_rank {
+            fixed_matrix[column * n..(column + 1) * n].copy_from_slice(&fixed_columns[column]);
+        }
+        let q_fixed = transform_columns_to_eigen_space(
+            &eigenvectors_col_major,
+            &fixed_matrix,
+            n,
+            fixed_rank,
+            1,
+        )?;
+        let weighted =
+            |left: &[f64], right: &[f64]| weighted_eigen_dot(left, right, &inverse_eigenvalues);
+        let mut fixed_gram = vec![0.0; fixed_rank * fixed_rank];
+        let mut fixed_y_cross = vec![0.0; fixed_rank];
+        for row in 0..fixed_rank {
+            let left = &q_fixed[row * n..(row + 1) * n];
+            fixed_y_cross[row] = weighted(left, &q_y);
+            for column in 0..fixed_rank {
+                fixed_gram[row * fixed_rank + column] =
+                    weighted(left, &q_fixed[column * n..(column + 1) * n]);
+            }
+        }
+        let y_vinv_y = weighted(&q_y, &q_y);
+        Ok(Self {
+            n,
+            fixed_rank,
+            eigenvectors_col_major,
+            inverse_eigenvalues,
+            q_fixed,
+            q_y,
+            fixed_gram,
+            fixed_y_cross,
+            y_vinv_y,
+            sigma_g2,
+            sigma_e2,
+        })
+    }
+
+    fn precompute_marker_q(
+        &self,
+        genotypes: &[f64],
+        n_markers: usize,
+        threads: usize,
+    ) -> Result<Vec<f64>, String> {
+        let expected_len = n_markers
+            .checked_mul(self.n)
+            .ok_or_else(|| "genotype matrix size overflow".to_string())?;
+        if genotypes.len() != expected_len {
+            return Err(format!(
+                "genotype length={} but expected {expected_len}",
+                genotypes.len()
+            ));
+        }
+        for marker in 0..n_markers {
+            let start = marker * self.n;
+            if genotypes[start..start + self.n]
+                .iter()
+                .any(|value| !value.is_finite())
+            {
+                return Err(format!(
+                    "genotype marker {marker} contains non-finite values"
+                ));
+            }
+        }
+        transform_columns_to_eigen_space(
+            &self.eigenvectors_col_major,
+            genotypes,
+            self.n,
+            n_markers,
+            grm_blas_threads(threads),
+        )
+    }
+
+    fn marker_stats(&self, q_markers: &[f64], n_markers: usize) -> Result<MarkerVinvStats, String> {
+        let expected_len = n_markers
+            .checked_mul(self.n)
+            .ok_or_else(|| "transformed genotype matrix size overflow".to_string())?;
+        if q_markers.len() != expected_len {
+            return Err("transformed marker matrix dimension mismatch".to_string());
+        }
+        let mut fixed_cross = vec![0.0; n_markers * self.fixed_rank];
+        let mut y_cross = vec![0.0; n_markers];
+        let mut self_cross = vec![0.0; n_markers];
+        for marker in 0..n_markers {
+            let q_marker = &q_markers[marker * self.n..(marker + 1) * self.n];
+            y_cross[marker] = weighted_eigen_dot(q_marker, &self.q_y, &self.inverse_eigenvalues);
+            self_cross[marker] = weighted_eigen_dot(q_marker, q_marker, &self.inverse_eigenvalues);
+            for fixed in 0..self.fixed_rank {
+                fixed_cross[marker * self.fixed_rank + fixed] = weighted_eigen_dot(
+                    &self.q_fixed[fixed * self.n..(fixed + 1) * self.n],
+                    q_marker,
+                    &self.inverse_eigenvalues,
+                );
+            }
+        }
+        Ok(MarkerVinvStats {
+            fixed_cross,
+            y_cross,
+            self_cross,
+        })
+    }
+
+    fn build_pair_geometry_from_q_in_place(
+        &self,
+        q_first: &[f64],
+        q_second: &[f64],
+        marker_stats: MarkerPairVinvStats<'_>,
+        q_interaction: &[f64],
+        interaction_raw_q: f64,
+        lower_gram: &mut [f64],
+        rhs_interaction: &mut [f64],
+        solved_interaction: &mut [f64],
+    ) -> Result<f64, String> {
+        if q_first.len() != self.n || q_second.len() != self.n || q_interaction.len() != self.n {
+            return Err("eigen-space pair dimension mismatch".to_string());
+        }
+        let lower_dim = self.fixed_rank + 2;
+        if lower_gram.len() < lower_dim * lower_dim
+            || rhs_interaction.len() < lower_dim
+            || solved_interaction.len() < lower_dim
+        {
+            return Err("pair workspace dimension mismatch".to_string());
+        }
+        lower_gram[..lower_dim * lower_dim].fill(0.0);
+        rhs_interaction[..lower_dim].fill(0.0);
+        solved_interaction[..lower_dim].fill(0.0);
+        for row in 0..self.fixed_rank {
+            for column in 0..self.fixed_rank {
+                lower_gram[row * lower_dim + column] =
+                    self.fixed_gram[row * self.fixed_rank + column];
+            }
+            let q_fixed = &self.q_fixed[row * self.n..(row + 1) * self.n];
+            lower_gram[row * lower_dim + self.fixed_rank] = marker_stats.first_fixed_cross[row];
+            lower_gram[row * lower_dim + self.fixed_rank + 1] =
+                marker_stats.second_fixed_cross[row];
+            rhs_interaction[row] =
+                weighted_eigen_dot(q_fixed, q_interaction, &self.inverse_eigenvalues);
+        }
+        for row in 0..self.fixed_rank {
+            lower_gram[self.fixed_rank * lower_dim + row] =
+                lower_gram[row * lower_dim + self.fixed_rank];
+            lower_gram[(self.fixed_rank + 1) * lower_dim + row] =
+                lower_gram[row * lower_dim + self.fixed_rank + 1];
+        }
+        lower_gram[self.fixed_rank * lower_dim + self.fixed_rank] = marker_stats.first_self_cross;
+        lower_gram[self.fixed_rank * lower_dim + self.fixed_rank + 1] = marker_stats.cross;
+        lower_gram[(self.fixed_rank + 1) * lower_dim + self.fixed_rank] = marker_stats.cross;
+        lower_gram[(self.fixed_rank + 1) * lower_dim + self.fixed_rank + 1] =
+            marker_stats.second_self_cross;
+        rhs_interaction[self.fixed_rank] =
+            weighted_eigen_dot(q_first, q_interaction, &self.inverse_eigenvalues);
+        rhs_interaction[self.fixed_rank + 1] =
+            weighted_eigen_dot(q_second, q_interaction, &self.inverse_eigenvalues);
+        cholesky_factor_lower_in_place(&mut lower_gram[..lower_dim * lower_dim], lower_dim)?;
+        solve_small_cholesky(
+            &lower_gram[..lower_dim * lower_dim],
+            lower_dim,
+            &rhs_interaction[..lower_dim],
+            &mut solved_interaction[..lower_dim],
+        )?;
+        let projected_variance = interaction_raw_q
+            - dot(
+                &rhs_interaction[..lower_dim],
+                &solved_interaction[..lower_dim],
+            );
+        if !projected_variance.is_finite()
+            || projected_variance <= VARIANCE_TOL * interaction_raw_q.abs().max(1.0)
+        {
+            return Err(
+                "interaction unidentifiable: residualized interaction variance is non-positive"
+                    .to_string(),
+            );
+        }
+        Ok(projected_variance)
+    }
+
+    fn score_pair_from_geometry(
+        &self,
+        geometry: PairGeometryView<'_>,
+        interaction_cross_y: f64,
+        marker_y_cross: (f64, f64),
+        rhs_y: &mut [f64],
+        solved_y: &mut [f64],
+        beta_out: Option<&mut Vec<f64>>,
+    ) -> Result<GrmPairStatistic, String> {
+        let lower_dim = self.fixed_rank + 2;
+        if geometry.lower_chol.len() != lower_dim * lower_dim
+            || geometry.rhs_interaction.len() != lower_dim
+            || geometry.solved_interaction.len() != lower_dim
+            || rhs_y.len() < lower_dim
+            || solved_y.len() < lower_dim
+        {
+            return Err("eigen-space pair geometry dimension mismatch".to_string());
+        }
+        rhs_y[..lower_dim].fill(0.0);
+        rhs_y[..self.fixed_rank].copy_from_slice(&self.fixed_y_cross);
+        rhs_y[self.fixed_rank] = marker_y_cross.0;
+        rhs_y[self.fixed_rank + 1] = marker_y_cross.1;
+        solve_small_cholesky(
+            geometry.lower_chol,
+            lower_dim,
+            &rhs_y[..lower_dim],
+            &mut solved_y[..lower_dim],
+        )?;
+        let projected_covariance =
+            interaction_cross_y - dot(geometry.rhs_interaction, &solved_y[..lower_dim]);
+        let interaction_beta = projected_covariance / geometry.projected_variance;
+        let delta_q = (projected_covariance * interaction_beta).max(0.0);
+        let null_q = (self.y_vinv_y - dot(&rhs_y[..lower_dim], &solved_y[..lower_dim])).max(0.0);
+        let full_q = (null_q - delta_q).max(0.0);
+        if ![interaction_beta, delta_q, null_q, full_q]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Err("non-finite GLS interaction statistic".to_string());
+        }
+        if let Some(beta_out) = beta_out {
+            beta_out.clear();
+            beta_out.extend(
+                solved_y[..lower_dim]
+                    .iter()
+                    .zip(geometry.solved_interaction.iter())
+                    .map(|(null_beta, correction)| null_beta - correction * interaction_beta),
+            );
+            beta_out.push(interaction_beta);
+        }
+        Ok(GrmPairStatistic {
+            interaction_beta,
+            interaction_variance: geometry.projected_variance,
+            interaction_score: delta_q,
+            delta_q,
+            null_q,
+            full_q,
+            residual_df: self.n - self.fixed_rank - 3,
+        })
+    }
+
+    fn fit_pair_with_geometry(
+        &self,
+        geometry: PairGeometryView<'_>,
+        interaction_cross_y: f64,
+        marker_y_cross: (f64, f64),
+        workspace: &mut PairWorkspace,
+        beta_out: &mut Vec<f64>,
+    ) -> Result<GrmPairFit, String> {
+        let statistic = self.score_pair_from_geometry(
+            geometry,
+            interaction_cross_y,
+            marker_y_cross,
+            &mut workspace.rhs_y,
+            &mut workspace.solved_y,
+            Some(beta_out),
+        )?;
+        Ok(GrmPairFit {
+            beta: beta_out.clone(),
+            interaction_beta: statistic.interaction_beta,
+            interaction_variance: statistic.interaction_variance,
+            interaction_score: statistic.interaction_score,
+            delta_q: statistic.delta_q,
+            null_q: statistic.null_q,
+            full_q: statistic.full_q,
+            residual_df: statistic.residual_df,
+            fixed_rank: self.fixed_rank,
+            n_valid: self.n,
+            sigma_g2: self.sigma_g2,
+            sigma_e2: self.sigma_e2,
+        })
+    }
+}
+
+struct SelectedRangeResult {
+    interaction_score: Vec<f64>,
+    interaction_beta: Vec<f64>,
+    interaction_variance: Vec<f64>,
+    null_q: Vec<f64>,
+    full_q: Vec<f64>,
+    pairs_evaluated: usize,
+    pairs_skipped: usize,
+}
+
+/// Refine an explicitly supplied list of marker pairs with one reusable
+/// fixed-V eigen context.  This is deliberately separate from the all-pair
+/// scanner: the caller is responsible for proposal/selection, while this
+/// routine only computes the exact GRM-aware statistic for those pairs.
+fn refine_selected_pairs_eigen(
+    context: &EigenVContext,
+    genotypes: &[f64],
+    n_markers: usize,
+    pairs: &[(usize, usize)],
+    threads: usize,
+) -> Result<SelectedPairRefineResult, String> {
+    let expected_len = n_markers
+        .checked_mul(context.n)
+        .ok_or_else(|| "genotype matrix size overflow".to_string())?;
+    if genotypes.len() != expected_len {
+        return Err(format!(
+            "genotype length={} but expected {expected_len}",
+            genotypes.len()
+        ));
+    }
+    for marker in 0..n_markers {
+        let start = marker * context.n;
+        if genotypes[start..start + context.n]
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "genotype marker {marker} contains non-finite values"
+            ));
+        }
+    }
+    for (index, &(first, second)) in pairs.iter().enumerate() {
+        if first >= n_markers || second >= n_markers || first == second {
+            return Err(format!(
+                "pair {index} ({first}, {second}) is invalid for n_markers={n_markers}"
+            ));
+        }
+    }
+
+    let effective_threads = threads.max(1);
+    let q_markers = context.precompute_marker_q(genotypes, n_markers, effective_threads)?;
+    let marker_stats = context.marker_stats(&q_markers, n_markers)?;
+    let pair_count = pairs.len();
+    let mut interaction_score = vec![f64::NAN; pair_count];
+    let mut interaction_beta = vec![f64::NAN; pair_count];
+    let mut interaction_variance = vec![f64::NAN; pair_count];
+    let mut null_q = vec![f64::NAN; pair_count];
+    let mut full_q = vec![f64::NAN; pair_count];
+    if pair_count == 0 {
+        return Ok(SelectedPairRefineResult {
+            interaction_score,
+            interaction_beta,
+            interaction_variance,
+            null_q,
+            full_q,
+            pairs_evaluated: 0,
+            pairs_skipped: 0,
+        });
+    }
+
+    let block_capacity = grm_interaction_block_size().max(1);
+    let ranges = (0..pair_count)
+        .step_by(block_capacity)
+        .map(|start| start..(start + block_capacity).min(pair_count))
+        .collect::<Vec<_>>();
+    let process_range = |range: std::ops::Range<usize>| -> Result<SelectedRangeResult, String> {
+        let width = range.len();
+        let mut local_score = vec![f64::NAN; width];
+        let mut local_beta = vec![f64::NAN; width];
+        let mut local_variance = vec![f64::NAN; width];
+        let mut local_null_q = vec![f64::NAN; width];
+        let mut local_full_q = vec![f64::NAN; width];
+        let mut pairs_evaluated = 0usize;
+        let mut pairs_skipped = 0usize;
+        let mut workspace = PairWorkspace::new(context.n, context.fixed_rank + 2);
+        let mut block_interaction = vec![0.0; context.n * width];
+        let mut block_q_interaction = vec![0.0; context.n * width];
+        for (local, pair_index) in range.clone().enumerate() {
+            let (first, second) = pairs[pair_index];
+            let first_values = &genotypes[first * context.n..(first + 1) * context.n];
+            let second_values = &genotypes[second * context.n..(second + 1) * context.n];
+            let block_column = local * context.n;
+            for row in 0..context.n {
+                block_interaction[block_column + row] = first_values[row] * second_values[row];
+            }
+        }
+        let n_blas = CblasInt::try_from(context.n)
+            .map_err(|_| "eigen-space dimension exceeds CBLAS integer range".to_string())?;
+        let width_blas = CblasInt::try_from(width)
+            .map_err(|_| "selected pair block exceeds CBLAS integer range".to_string())?;
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_COL_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_NO_TRANS,
+                n_blas,
+                width_blas,
+                n_blas,
+                1.0,
+                context.eigenvectors_col_major.as_ptr(),
+                n_blas,
+                block_interaction.as_ptr(),
+                n_blas,
+                0.0,
+                block_q_interaction.as_mut_ptr(),
+                n_blas,
+            );
+        }
+        if block_q_interaction.iter().any(|value| !value.is_finite()) {
+            return Err("non-finite eigen-space interaction transform".to_string());
+        }
+        let fixed_rank = context.fixed_rank;
+        let lower_dim = fixed_rank + 2;
+        for (local, pair_index) in range.enumerate() {
+            let (first, second) = pairs[pair_index];
+            let q_first = &q_markers[first * context.n..(first + 1) * context.n];
+            let q_second = &q_markers[second * context.n..(second + 1) * context.n];
+            let pair_stats = MarkerPairVinvStats {
+                first_fixed_cross: &marker_stats.fixed_cross
+                    [first * fixed_rank..(first + 1) * fixed_rank],
+                second_fixed_cross: &marker_stats.fixed_cross
+                    [second * fixed_rank..(second + 1) * fixed_rank],
+                first_self_cross: marker_stats.self_cross[first],
+                cross: weighted_eigen_dot(q_first, q_second, &context.inverse_eigenvalues),
+                second_self_cross: marker_stats.self_cross[second],
+            };
+            let q_interaction = &block_q_interaction[local * context.n..(local + 1) * context.n];
+            let interaction_raw_q =
+                weighted_eigen_dot(q_interaction, q_interaction, &context.inverse_eigenvalues);
+            let projected_variance = context.build_pair_geometry_from_q_in_place(
+                q_first,
+                q_second,
+                pair_stats,
+                q_interaction,
+                interaction_raw_q,
+                &mut workspace.lower_gram,
+                &mut workspace.rhs_interaction,
+                &mut workspace.solved_interaction,
+            );
+            let projected_variance = match projected_variance {
+                Ok(value) => value,
+                Err(error) if error.contains("unidentifiable") => {
+                    pairs_skipped = pairs_skipped.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let statistic = context.score_pair_from_geometry(
+                PairGeometryView {
+                    lower_chol: &workspace.lower_gram[..lower_dim * lower_dim],
+                    rhs_interaction: &workspace.rhs_interaction[..lower_dim],
+                    solved_interaction: &workspace.solved_interaction[..lower_dim],
+                    projected_variance,
+                },
+                weighted_eigen_dot(q_interaction, &context.q_y, &context.inverse_eigenvalues),
+                (marker_stats.y_cross[first], marker_stats.y_cross[second]),
+                &mut workspace.rhs_y,
+                &mut workspace.solved_y,
+                None,
+            );
+            let statistic = match statistic {
+                Ok(value) => value,
+                Err(error) if error.contains("unidentifiable") => {
+                    pairs_skipped = pairs_skipped.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            local_score[local] = statistic.interaction_score;
+            local_beta[local] = statistic.interaction_beta;
+            local_variance[local] = statistic.interaction_variance;
+            local_null_q[local] = statistic.null_q;
+            local_full_q[local] = statistic.full_q;
+            pairs_evaluated = pairs_evaluated.saturating_add(1);
+        }
+        Ok(SelectedRangeResult {
+            interaction_score: local_score,
+            interaction_beta: local_beta,
+            interaction_variance: local_variance,
+            null_q: local_null_q,
+            full_q: local_full_q,
+            pairs_evaluated,
+            pairs_skipped,
+        })
+    };
+
+    let _blas_guard = BlasThreadGuard::enter(grm_blas_threads(1));
+    let partials = if effective_threads <= 1 || ranges.len() <= 1 {
+        ranges
+            .into_iter()
+            .map(process_range)
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        ThreadPoolBuilder::new()
+            .num_threads(effective_threads)
+            .build()
+            .map_err(|error| format!("failed to build GRM dosage Rayon pool: {error}"))?
+            .install(|| {
+                ranges
+                    .par_iter()
+                    .map(|range| process_range(range.clone()))
+                    .collect::<Result<Vec<_>, String>>()
+            })?
+    };
+    let mut pairs_evaluated = 0usize;
+    let mut pairs_skipped = 0usize;
+    let mut offset = 0usize;
+    for partial in partials {
+        let end = offset + partial.interaction_score.len();
+        interaction_score[offset..end].copy_from_slice(&partial.interaction_score);
+        interaction_beta[offset..end].copy_from_slice(&partial.interaction_beta);
+        interaction_variance[offset..end].copy_from_slice(&partial.interaction_variance);
+        null_q[offset..end].copy_from_slice(&partial.null_q);
+        full_q[offset..end].copy_from_slice(&partial.full_q);
+        offset = end;
+        pairs_evaluated = pairs_evaluated.saturating_add(partial.pairs_evaluated);
+        pairs_skipped = pairs_skipped.saturating_add(partial.pairs_skipped);
+    }
+    Ok(SelectedPairRefineResult {
+        interaction_score,
+        interaction_beta,
+        interaction_variance,
+        null_q,
+        full_q,
+        pairs_evaluated,
+        pairs_skipped,
+    })
+}
+
+#[inline]
+fn weighted_eigen_dot(left: &[f64], right: &[f64], inverse_eigenvalues: &[f64]) -> f64 {
+    debug_assert_eq!(left.len(), right.len());
+    debug_assert_eq!(left.len(), inverse_eigenvalues.len());
+    left.iter()
+        .zip(right.iter())
+        .zip(inverse_eigenvalues.iter())
+        .map(|((left, right), weight)| left * right * weight)
+        .sum()
+}
+
+fn transform_columns_to_eigen_space(
+    eigenvectors_col_major: &[f64],
+    columns: &[f64],
+    n: usize,
+    n_columns: usize,
+    blas_threads: usize,
+) -> Result<Vec<f64>, String> {
+    if eigenvectors_col_major.len() != n.saturating_mul(n)
+        || columns.len() != n.saturating_mul(n_columns)
+    {
+        return Err("eigen-space transform dimension mismatch".to_string());
+    }
+    let n_blas = CblasInt::try_from(n)
+        .map_err(|_| "eigen-space dimension exceeds CBLAS integer range".to_string())?;
+    let n_columns_blas = CblasInt::try_from(n_columns)
+        .map_err(|_| "eigen-space column count exceeds CBLAS integer range".to_string())?;
+    let mut transformed = vec![0.0; n * n_columns];
+    let _blas_guard = BlasThreadGuard::enter(blas_threads.max(1));
+    unsafe {
+        cblas_dgemm_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            n_blas,
+            n_columns_blas,
+            n_blas,
+            1.0,
+            eigenvectors_col_major.as_ptr(),
+            n_blas,
+            columns.as_ptr(),
+            n_blas,
+            0.0,
+            transformed.as_mut_ptr(),
+            n_blas,
+        );
+    }
+    if transformed.iter().any(|value| !value.is_finite()) {
+        Err("non-finite eigen-space transform".to_string())
+    } else {
+        Ok(transformed)
+    }
+}
+
 fn check_full_rank(matrix: &DMatrix<f64>, name: &str) -> Result<(), String> {
     let qr = matrix.clone().col_piv_qr();
     let r = qr.r();
@@ -1530,6 +2273,309 @@ fn fit_grm_pair(
     context.fit_pair(g1, g2)
 }
 
+/// Scan all marker pairs with the opt-in eigen-space interaction path.
+///
+/// Marker columns are transformed once to `U^T G`.  Each interaction block is
+/// formed in the original genotype space and transformed with one DGEMM; no
+/// interaction `V^-1 H` block is ever materialized.  The returned candidates
+/// use the same accumulator, ordering, and final-fit semantics as the
+/// Cholesky scanner.
+#[allow(clippy::too_many_arguments)]
+fn scan_grm_pairs_eigen(
+    genotypes: &[f64],
+    n_markers: usize,
+    n_samples: usize,
+    y: &[f64],
+    grm: &[f64],
+    sigma_g2: f64,
+    sigma_e2: f64,
+    top_k: usize,
+    threads: usize,
+    covariates: &[f64],
+    n_covariates: usize,
+) -> Result<(Vec<GrmPairCandidate>, usize, usize), String> {
+    let profile = grm_profile_enabled();
+    let scan_started = profile.then(Instant::now);
+    validate_scan_inputs(genotypes, n_markers, n_samples, y, grm)?;
+    let context_started = profile.then(Instant::now);
+    let context = EigenVContext::new(
+        y,
+        grm,
+        n_samples,
+        sigma_g2,
+        sigma_e2,
+        covariates,
+        n_covariates,
+    )?;
+    let context_elapsed = context_started.map_or(Duration::ZERO, |started| started.elapsed());
+    let marker_started = profile.then(Instant::now);
+    let q_markers = context.precompute_marker_q(genotypes, n_markers, threads)?;
+    let marker_stats = context.marker_stats(&q_markers, n_markers)?;
+    let marker_elapsed = marker_started.map_or(Duration::ZERO, |started| started.elapsed());
+    let _blas_guard = BlasThreadGuard::enter(grm_blas_threads(1));
+    let first_count = n_markers.saturating_sub(1);
+    let scan_range = |range: std::ops::Range<usize>| -> Result<GrmScanRangeResult, String> {
+        let mut accumulator = GrmPairAccumulator::default();
+        let mut timing = GrmScanTiming::default();
+        let mut workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
+        let block_capacity = grm_interaction_block_size();
+        let mut block_interaction = vec![0.0; n_samples * block_capacity];
+        let mut block_q_interaction = vec![0.0; n_samples * block_capacity];
+        let n_blas = CblasInt::try_from(n_samples)
+            .map_err(|_| "eigen-space dimension exceeds CBLAS integer range".to_string())?;
+        for first in range {
+            let first_start = first * n_samples;
+            let first_values = &genotypes[first_start..first_start + n_samples];
+            let q_first = &q_markers[first_start..first_start + n_samples];
+            let mut second_start = first + 1;
+            while second_start < n_markers {
+                let block_width = (n_markers - second_start).min(block_capacity);
+                let interaction_build_started = profile.then(Instant::now);
+                for local in 0..block_width {
+                    let second = second_start + local;
+                    let block_column = local * n_samples;
+                    let second_values = &genotypes[second * n_samples..(second + 1) * n_samples];
+                    for row in 0..n_samples {
+                        block_interaction[block_column + row] =
+                            first_values[row] * second_values[row];
+                    }
+                }
+                if let Some(started) = interaction_build_started {
+                    timing.interaction_build += started.elapsed();
+                }
+                timing.blocks = timing.blocks.saturating_add(1);
+                let interaction_solve_started = profile.then(Instant::now);
+                let block_width_blas = CblasInt::try_from(block_width).map_err(|_| {
+                    "interaction block width exceeds CBLAS integer range".to_string()
+                })?;
+                unsafe {
+                    cblas_dgemm_dispatch(
+                        CBLAS_COL_MAJOR,
+                        CBLAS_TRANS,
+                        CBLAS_NO_TRANS,
+                        n_blas,
+                        block_width_blas,
+                        n_blas,
+                        1.0,
+                        context.eigenvectors_col_major.as_ptr(),
+                        n_blas,
+                        block_interaction.as_ptr(),
+                        n_blas,
+                        0.0,
+                        block_q_interaction.as_mut_ptr(),
+                        n_blas,
+                    );
+                }
+                if block_q_interaction[..n_samples * block_width]
+                    .iter()
+                    .any(|value| !value.is_finite())
+                {
+                    return Err("non-finite eigen-space interaction transform".to_string());
+                }
+                if let Some(started) = interaction_solve_started {
+                    timing.interaction_solve += started.elapsed();
+                }
+                let pair_geometry_started = profile.then(Instant::now);
+                for local in 0..block_width {
+                    let second = second_start + local;
+                    let second_start_offset = second * n_samples;
+                    let q_second = &q_markers[second_start_offset..second_start_offset + n_samples];
+                    let fixed_rank = context.fixed_rank;
+                    let pair_stats = MarkerPairVinvStats {
+                        first_fixed_cross: &marker_stats.fixed_cross
+                            [first * fixed_rank..(first + 1) * fixed_rank],
+                        second_fixed_cross: &marker_stats.fixed_cross
+                            [second * fixed_rank..(second + 1) * fixed_rank],
+                        first_self_cross: marker_stats.self_cross[first],
+                        cross: weighted_eigen_dot(q_first, q_second, &context.inverse_eigenvalues),
+                        second_self_cross: marker_stats.self_cross[second],
+                    };
+                    let interaction_offset = local * n_samples;
+                    let q_interaction =
+                        &block_q_interaction[interaction_offset..interaction_offset + n_samples];
+                    let interaction_raw_q = weighted_eigen_dot(
+                        q_interaction,
+                        q_interaction,
+                        &context.inverse_eigenvalues,
+                    );
+                    let projected_variance = context.build_pair_geometry_from_q_in_place(
+                        q_first,
+                        q_second,
+                        pair_stats,
+                        q_interaction,
+                        interaction_raw_q,
+                        &mut workspace.lower_gram,
+                        &mut workspace.rhs_interaction,
+                        &mut workspace.solved_interaction,
+                    );
+                    match projected_variance {
+                        Ok(projected_variance) => {
+                            let lower_dim = context.fixed_rank + 2;
+                            let interaction_cross_y = weighted_eigen_dot(
+                                q_interaction,
+                                &context.q_y,
+                                &context.inverse_eigenvalues,
+                            );
+                            let statistic = context.score_pair_from_geometry(
+                                PairGeometryView {
+                                    lower_chol: &workspace.lower_gram[..lower_dim * lower_dim],
+                                    rhs_interaction: &workspace.rhs_interaction[..lower_dim],
+                                    solved_interaction: &workspace.solved_interaction[..lower_dim],
+                                    projected_variance,
+                                },
+                                interaction_cross_y,
+                                (marker_stats.y_cross[first], marker_stats.y_cross[second]),
+                                &mut workspace.rhs_y,
+                                &mut workspace.solved_y,
+                                None,
+                            );
+                            match statistic {
+                                Ok(statistic) => {
+                                    accumulator.pairs_evaluated =
+                                        accumulator.pairs_evaluated.saturating_add(1);
+                                    accumulator.push_with_geometry(
+                                        pair_index(n_markers, first, second),
+                                        first,
+                                        second,
+                                        statistic,
+                                        PairGeometryView {
+                                            lower_chol: &workspace.lower_gram
+                                                [..lower_dim * lower_dim],
+                                            rhs_interaction: &workspace.rhs_interaction
+                                                [..lower_dim],
+                                            solved_interaction: &workspace.solved_interaction
+                                                [..lower_dim],
+                                            projected_variance,
+                                        },
+                                        interaction_cross_y,
+                                        top_k,
+                                    );
+                                }
+                                Err(error) if error.contains("unidentifiable") => {
+                                    accumulator.pairs_skipped =
+                                        accumulator.pairs_skipped.saturating_add(1);
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(error) if error.contains("unidentifiable") => {
+                            accumulator.pairs_skipped = accumulator.pairs_skipped.saturating_add(1);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if let Some(started) = pair_geometry_started {
+                    timing.pair_geometry_score += started.elapsed();
+                }
+                second_start += block_width;
+            }
+        }
+        Ok(GrmScanRangeResult {
+            accumulator,
+            timing,
+        })
+    };
+
+    let (accumulator, mut timing) = if threads <= 1 || first_count <= 1 {
+        let result = scan_range(0..first_count)?;
+        (result.accumulator, result.timing)
+    } else {
+        let chunk_count = threads.saturating_mul(4).max(1);
+        let chunk_len = (first_count + chunk_count - 1) / chunk_count;
+        let ranges = (0..first_count)
+            .step_by(chunk_len.max(1))
+            .map(|start| start..(start + chunk_len).min(first_count))
+            .collect::<Vec<_>>();
+        let partials = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|error| format!("failed to build GRM dosage Rayon pool: {error}"))?
+            .install(|| {
+                ranges
+                    .par_iter()
+                    .map(|range| scan_range(range.clone()))
+                    .collect::<Result<Vec<_>, String>>()
+            })?;
+        let mut merged = GrmPairAccumulator::default();
+        let mut timing = GrmScanTiming::default();
+        for partial in partials {
+            timing += partial.timing;
+            merged.merge(partial.accumulator, top_k);
+        }
+        (merged, timing)
+    };
+
+    let mut entries = accumulator
+        .heap
+        .into_iter()
+        .map(|Reverse(entry)| entry)
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| candidate_cmp(right, left));
+    let mut candidates = Vec::with_capacity(entries.len());
+    let mut final_workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
+    let mut final_beta = Vec::new();
+    let final_fit_started = profile.then(Instant::now);
+    for entry in entries {
+        let lower_dim = context.fixed_rank + 2;
+        let geometry = entry
+            .geometry
+            .as_ref()
+            .ok_or_else(|| "eigen scan winner is missing pair geometry".to_string())?;
+        let fit = context.fit_pair_with_geometry(
+            PairGeometryView {
+                lower_chol: &geometry.lower_chol,
+                rhs_interaction: &geometry.rhs_interaction,
+                solved_interaction: &geometry.solved_interaction,
+                projected_variance: geometry.projected_variance,
+            },
+            entry.interaction_cross_y.ok_or_else(|| {
+                "eigen scan winner is missing interaction cross-product".to_string()
+            })?,
+            (
+                marker_stats.y_cross[entry.first],
+                marker_stats.y_cross[entry.second],
+            ),
+            &mut final_workspace,
+            &mut final_beta,
+        )?;
+        debug_assert_eq!(geometry.lower_chol.len(), lower_dim * lower_dim);
+        candidates.push(GrmPairCandidate {
+            first: entry.first,
+            second: entry.second,
+            fit,
+        });
+    }
+    if let Some(started) = final_fit_started {
+        timing.final_fit += started.elapsed();
+    }
+    if let Some(started) = scan_started {
+        let total = started.elapsed();
+        eprintln!(
+            "[grm-profile] n={} m={} threads={} blas_threads={} block={} mode=eigen total={:.6}s context={:.6}s marker_vinv={:.6}s interaction_build={:.6}s interaction_solve={:.6}s pair_geometry_score={:.6}s final_fit={:.6}s blocks={} pairs={} skipped={}",
+            n_samples,
+            n_markers,
+            threads,
+            grm_blas_threads(1),
+            grm_interaction_block_size(),
+            total.as_secs_f64(),
+            context_elapsed.as_secs_f64(),
+            marker_elapsed.as_secs_f64(),
+            timing.interaction_build.as_secs_f64(),
+            timing.interaction_solve.as_secs_f64(),
+            timing.pair_geometry_score.as_secs_f64(),
+            timing.final_fit.as_secs_f64(),
+            timing.blocks,
+            accumulator.pairs_evaluated,
+            accumulator.pairs_skipped,
+        );
+    }
+    Ok((
+        candidates,
+        accumulator.pairs_evaluated,
+        accumulator.pairs_skipped,
+    ))
+}
+
 pub(crate) fn scan_grm_pairs(
     genotypes: &[f64],
     n_markers: usize,
@@ -1543,6 +2589,21 @@ pub(crate) fn scan_grm_pairs(
     covariates: &[f64],
     n_covariates: usize,
 ) -> Result<(Vec<GrmPairCandidate>, usize, usize), String> {
+    if grm_eigen_geometry_enabled() {
+        return scan_grm_pairs_eigen(
+            genotypes,
+            n_markers,
+            n_samples,
+            y,
+            grm,
+            sigma_g2,
+            sigma_e2,
+            top_k,
+            threads,
+            covariates,
+            n_covariates,
+        );
+    }
     let profile = grm_profile_enabled();
     let scan_started = profile.then(Instant::now);
     validate_scan_inputs(genotypes, n_markers, n_samples, y, grm)?;
@@ -1564,13 +2625,13 @@ pub(crate) fn scan_grm_pairs(
     let marker_elapsed = marker_started.map_or(Duration::ZERO, |started| started.elapsed());
     // The outer Rayon scanner owns the parallelism; keep each BLAS triangular
     // solve single-threaded to avoid Rayon × BLAS oversubscription.
-    let _blas_guard = BlasThreadGuard::enter(1);
+    let _blas_guard = BlasThreadGuard::enter(grm_blas_threads(1));
     let first_count = n_markers.saturating_sub(1);
     let scan_range = |range: std::ops::Range<usize>| -> Result<GrmScanRangeResult, String> {
         let mut accumulator = GrmPairAccumulator::default();
         let mut timing = GrmScanTiming::default();
         let mut workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
-        let block_capacity = GRM_INTERACTION_BLOCK_SIZE;
+        let block_capacity = grm_interaction_block_size();
         let mut block_interaction = vec![0.0; n_samples * block_capacity];
         let mut block_interaction_cross_y = vec![0.0; block_capacity];
         for first in range {
@@ -1817,10 +2878,12 @@ pub(crate) fn scan_grm_pairs(
     if let Some(started) = scan_started {
         let total = started.elapsed();
         eprintln!(
-            "[grm-profile] n={} m={} threads={} total={:.6}s context={:.6}s marker_vinv={:.6}s interaction_build={:.6}s interaction_solve={:.6}s pair_geometry_score={:.6}s final_fit={:.6}s blocks={} pairs={} skipped={}",
+            "[grm-profile] n={} m={} threads={} blas_threads={} block={} mode=cholesky total={:.6}s context={:.6}s marker_vinv={:.6}s interaction_build={:.6}s interaction_solve={:.6}s pair_geometry_score={:.6}s final_fit={:.6}s blocks={} pairs={} skipped={}",
             n_samples,
             n_markers,
             threads,
+            grm_blas_threads(1),
+            grm_interaction_block_size(),
             total.as_secs_f64(),
             context_elapsed.as_secs_f64(),
             marker_elapsed.as_secs_f64(),
@@ -1957,7 +3020,7 @@ impl PreparedGrmScan {
             context.precompute_marker_vinv_with_threads(genotypes, n_markers, threads)?;
         let marker_stats =
             context.precompute_marker_vinv_stats(genotypes, &vinv_markers, n_markers)?;
-        let _blas_guard = BlasThreadGuard::enter(1);
+        let _blas_guard = BlasThreadGuard::enter(grm_blas_threads(1));
         let first_count = n_markers.saturating_sub(1);
         let geometry_dim = context.fixed_rank + 2;
         let build_range = |range: std::ops::Range<usize>| -> Result<PreparedRangeResult, String> {
@@ -1970,7 +3033,7 @@ impl PreparedGrmScan {
                 pairs_skipped: 0,
             };
             let mut workspace = PairWorkspace::new(n_samples, context.fixed_rank + 2);
-            let block_capacity = GRM_INTERACTION_BLOCK_SIZE;
+            let block_capacity = grm_interaction_block_size();
             let mut block_interaction = vec![0.0; n_samples * block_capacity];
             for first in range {
                 let first_start = first * n_samples;
@@ -2260,6 +3323,147 @@ impl PreparedGrmScan {
             });
         }
         Ok((candidates, accumulator.pairs_evaluated, self.pairs_skipped))
+    }
+}
+
+/// Reusable exact GRM context for experimental screen/refine workflows.
+///
+/// The context owns the eigendecomposition and fixed-response quantities, so
+/// callers can submit many small genotype/pair blocks without rebuilding the
+/// covariance factor for every window. This class is intentionally not used
+/// by the production GARFIELD dispatcher yet.
+#[pyclass(name = "GarfieldDosageGrmContext")]
+pub struct GarfieldDosageGrmContext {
+    context: EigenVContext,
+}
+
+#[pymethods]
+impl GarfieldDosageGrmContext {
+    #[new]
+    #[pyo3(signature = (y, grm, sigma_g2, sigma_e2, covariates=None))]
+    fn new(
+        y: PyReadonlyArray1<'_, f64>,
+        grm: PyReadonlyArray2<'_, f64>,
+        sigma_g2: f64,
+        sigma_e2: f64,
+        covariates: Option<PyReadonlyArray2<'_, f64>>,
+    ) -> PyResult<Self> {
+        let y_vec = array1_to_vec(&y);
+        let grm_shape = grm.shape();
+        if grm_shape.len() != 2 || grm_shape[0] != grm_shape[1] || grm_shape[0] != y_vec.len() {
+            return Err(PyValueError::new_err(format!(
+                "grm must have shape ({}, {}); got {:?}",
+                y_vec.len(),
+                y_vec.len(),
+                grm_shape
+            )));
+        }
+        let grm_vec = array2_to_vec(&grm);
+        let (covariate_vec, n_covariates) = if let Some(covariates) = covariates {
+            let shape = covariates.shape();
+            if shape.len() != 2 || shape[0] != y_vec.len() {
+                return Err(PyValueError::new_err(format!(
+                    "covariates must have shape (n_samples, n_covariates); got {:?}, expected first dimension {}",
+                    shape,
+                    y_vec.len()
+                )));
+            }
+            (array2_to_vec(&covariates), shape[1])
+        } else {
+            (Vec::new(), 0)
+        };
+        let context = EigenVContext::new(
+            &y_vec,
+            &grm_vec,
+            y_vec.len(),
+            sigma_g2,
+            sigma_e2,
+            &covariate_vec,
+            n_covariates,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(Self { context })
+    }
+
+    #[pyo3(signature = (genotypes, pairs, threads=0))]
+    fn refine<'py>(
+        &self,
+        py: Python<'py>,
+        genotypes: PyReadonlyArray2<'py, f64>,
+        pairs: PyReadonlyArray2<'py, i64>,
+        threads: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let genotype_shape = genotypes.shape();
+        if genotype_shape.len() != 2 {
+            return Err(PyValueError::new_err(
+                "genotypes must be a 2D marker-major array",
+            ));
+        }
+        let n_markers = genotype_shape[0];
+        let n_samples = genotype_shape[1];
+        if n_samples != self.context.n {
+            return Err(PyValueError::new_err(format!(
+                "genotypes has {} samples but context expects {}",
+                n_samples, self.context.n
+            )));
+        }
+        let pair_shape = pairs.shape();
+        if pair_shape.len() != 2 || pair_shape[1] != 2 {
+            return Err(PyValueError::new_err(format!(
+                "pairs must have shape (n_pairs, 2); got {:?}",
+                pair_shape
+            )));
+        }
+        let pair_view = pairs.as_array();
+        let mut pair_values = Vec::with_capacity(pair_shape[0]);
+        for row in 0..pair_shape[0] {
+            let first = pair_view[[row, 0]];
+            let second = pair_view[[row, 1]];
+            if first < 0 || second < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "pair {row} contains a negative marker index"
+                )));
+            }
+            pair_values.push((first as usize, second as usize));
+        }
+        let genotype_vec = array2_to_vec(&genotypes);
+        let effective_threads = if threads == 0 {
+            rayon::current_num_threads().max(1)
+        } else {
+            threads.max(1)
+        };
+        let result = refine_selected_pairs_eigen(
+            &self.context,
+            &genotype_vec,
+            n_markers,
+            &pair_values,
+            effective_threads,
+        )
+        .map_err(PyValueError::new_err)?;
+        let out = PyDict::new(py);
+        out.set_item(
+            "interaction_score",
+            PyArray1::from_vec(py, result.interaction_score),
+        )?;
+        out.set_item(
+            "interaction_beta",
+            PyArray1::from_vec(py, result.interaction_beta),
+        )?;
+        out.set_item(
+            "interaction_variance",
+            PyArray1::from_vec(py, result.interaction_variance),
+        )?;
+        out.set_item("null_q", PyArray1::from_vec(py, result.null_q))?;
+        out.set_item("full_q", PyArray1::from_vec(py, result.full_q))?;
+        out.set_item("pairs_evaluated", result.pairs_evaluated)?;
+        out.set_item("pairs_skipped", result.pairs_skipped)?;
+        out.set_item("n_pairs", pair_values.len())?;
+        out.set_item("n_markers", n_markers)?;
+        out.set_item("n_samples", n_samples)?;
+        out.set_item("threads", effective_threads)?;
+        out.set_item("sigma_g2", self.context.sigma_g2)?;
+        out.set_item("sigma_e2", self.context.sigma_e2)?;
+        Ok(out)
     }
 }
 
@@ -2680,13 +3884,13 @@ mod tests {
         let g1 = [0.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0];
         let g2 = [1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0];
         let y = [1.2, 0.4, 2.1, 3.7, 1.5, 0.8, 2.4, 2.9];
+        let covariates = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75];
         let grm = [
             1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             0.1, 1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0,
             0.0, 0.1, 1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0, 0.1, 0.0, 0.0, 0.0, 0.0,
             0.0, 0.0, 0.1, 1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0,
         ];
-        let covariates = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75];
         let fit = fit_grm_pair(&g1, &g2, &y, &grm, 8, 0.7, 0.3, &covariates, 1)
             .expect("fixed-V pair should be identifiable");
         let v = DMatrix::from_row_slice(
@@ -3057,5 +4261,105 @@ mod tests {
             .iter()
             .zip(copied.iter())
             .all(|(left, right)| (left - right).abs() < 1.0e-14));
+    }
+
+    #[test]
+    fn grm_scan_option_parser_accepts_only_positive_values() {
+        assert_eq!(parse_positive_usize(Some("1024"), 256), 1024);
+        assert_eq!(parse_positive_usize(Some(" 512 "), 256), 512);
+        assert_eq!(parse_positive_usize(Some("0"), 256), 256);
+        assert_eq!(parse_positive_usize(Some("-1"), 256), 256);
+        assert_eq!(parse_positive_usize(Some("not-a-number"), 256), 256);
+        assert_eq!(parse_positive_usize(None, 256), 256);
+    }
+
+    #[test]
+    fn eigen_space_scan_matches_cholesky_scan() {
+        let genotypes = [
+            0.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+            2.0, 1.0, 1.0, 0.0, 1.0, 2.0, 0.0,
+        ];
+        let y = [1.2, 0.4, 2.1, 3.7, 1.5, 0.8, 2.4, 2.9];
+        let covariates = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75];
+        let grm = (0..64)
+            .map(|index| {
+                let row: usize = index / 8;
+                let column: usize = index % 8;
+                if row == column {
+                    1.0
+                } else if row.abs_diff(column) == 1 {
+                    0.1
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let chol = scan_grm_pairs(&genotypes, 3, 8, &y, &grm, 0.4, 0.6, 10, 1, &covariates, 1)
+            .expect("Cholesky scan should succeed");
+        let eigen =
+            scan_grm_pairs_eigen(&genotypes, 3, 8, &y, &grm, 0.4, 0.6, 10, 1, &covariates, 1)
+                .expect("eigen-space scan should succeed");
+        assert_eq!(chol.1, eigen.1);
+        assert_eq!(chol.2, eigen.2);
+        assert_eq!(chol.0.len(), eigen.0.len());
+        for (left, right) in chol.0.iter().zip(eigen.0.iter()) {
+            assert_eq!((left.first, left.second), (right.first, right.second));
+            assert!((left.fit.interaction_score - right.fit.interaction_score).abs() < 1.0e-9);
+            assert!((left.fit.interaction_beta - right.fit.interaction_beta).abs() < 1.0e-9);
+            assert!(
+                (left.fit.interaction_variance - right.fit.interaction_variance).abs() < 1.0e-9
+            );
+            assert!((left.fit.null_q - right.fit.null_q).abs() < 1.0e-9);
+            assert!((left.fit.full_q - right.fit.full_q).abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn selected_eigen_refine_matches_direct_fixed_v_fits() {
+        let genotypes = [
+            0.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+            2.0, 1.0, 1.0, 0.0, 1.0, 2.0, 0.0,
+        ];
+        let y = [1.2, 0.4, 2.1, 3.7, 1.5, 0.8, 2.4, 2.9];
+        let grm = (0..64)
+            .map(|index| {
+                let row: usize = index / 8;
+                let column: usize = index % 8;
+                if row == column {
+                    1.0
+                } else if row.abs_diff(column) == 1 {
+                    0.1
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let eigen_context = EigenVContext::new(&y, &grm, 8, 0.4, 0.6, &[], 0)
+            .expect("eigen context should be valid");
+        let pairs = [(0, 1), (1, 2)];
+        let refined = refine_selected_pairs_eigen(&eigen_context, &genotypes, 3, &pairs, 2)
+            .expect("selected refinement should succeed");
+        assert_eq!(refined.pairs_evaluated, pairs.len());
+        assert_eq!(refined.pairs_skipped, 0);
+        let fixed_context = FixedVContext::new(&y, &grm, 8, 0.4, 0.6, &[], 0)
+            .expect("fixed-V context should be valid");
+        for (index, &(first, second)) in pairs.iter().enumerate() {
+            let reference = fixed_context
+                .fit_pair(
+                    &genotypes[first * 8..(first + 1) * 8],
+                    &genotypes[second * 8..(second + 1) * 8],
+                )
+                .expect("direct fit should succeed");
+            assert!(
+                (refined.interaction_score[index] - reference.interaction_score).abs() < 1.0e-9
+            );
+            assert!((refined.interaction_beta[index] - reference.interaction_beta).abs() < 1.0e-9);
+            assert!(
+                (refined.interaction_variance[index] - reference.interaction_variance).abs()
+                    < 1.0e-9
+            );
+            assert!((refined.null_q[index] - reference.null_q).abs() < 1.0e-9);
+            assert!((refined.full_q[index] - reference.full_q).abs() < 1.0e-9);
+        }
     }
 }
