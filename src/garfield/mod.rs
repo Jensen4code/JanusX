@@ -4,6 +4,8 @@ mod dosage;
 mod dosage_bed;
 mod dosage_random;
 mod dosage_screen;
+mod logic_classifier;
+mod logic_residual_screen;
 mod pair_triple;
 mod permutation;
 mod proposal;
@@ -119,7 +121,10 @@ use std::time::Instant;
 
 use self::bs::cmp_candidate;
 use self::bs::{take_garfield_frontier_trace, BeamFrontierTraceRecord};
-pub use all_pair::{garfield_all_pair_scan_bin_py, garfield_all_pair_scan_bin_xor_py};
+pub use all_pair::{
+    garfield_all_pair_scan_bin_py, garfield_all_pair_scan_bin_with_cells_py,
+    garfield_all_pair_scan_bin_xor_py,
+};
 #[allow(unused_imports)]
 pub use bs::{
     beam_search_train_test_continuous, evaluate_rule_continuous, materialize_rule_bits,
@@ -141,6 +146,8 @@ pub use dosage_screen::{
     garfield_dosage_lowrank_grm_screen_scan_py, GarfieldDosageCanonicalTopK,
     GarfieldDosageLowrankScreenContext,
 };
+pub use logic_classifier::garfield_logic_pair_cell_summary_py;
+pub use logic_residual_screen::garfield_logic_residual_screen_bin_py;
 pub use pair_triple::garfield_pair_triple_refine_bin_py;
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
 use residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult};

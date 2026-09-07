@@ -9,14 +9,19 @@
 
 use crate::breader::load_bin01_as_u64_words;
 use crate::bstats::{tail_mask, words_for_samples};
-use numpy::PyReadonlyArray1;
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use super::logic_classifier::{
+    array2_to_vec, bool_array2_to_vec, summaries_to_py_dict, summarize_binary_pairs_marker_major,
+    BinaryEncoding,
+};
 use super::score::{
     score_cont_centered_gain_from_sum_and_n_hit, validate_continuous_y, PackedYSumLookup,
 };
@@ -525,6 +530,104 @@ pub fn garfield_all_pair_scan_bin_xor_py(
         result.n_rows,
         result.n_samples,
     ))
+}
+
+/// Run the unchanged Logic5 all-pair discovery and post-process only its
+/// bounded Top-K pairs into four-cell summaries/classifications.
+///
+/// The returned dictionary keeps the discovery candidates and counters while
+/// adding the columns produced by `garfield_logic_pair_cell_summary`.  The
+/// existing `garfield_all_pair_scan_bin` and `_xor` tuple APIs are intentionally
+/// untouched for regression compatibility.
+#[pyfunction(name = "garfield_all_pair_scan_bin_with_cells")]
+#[pyo3(signature = (bin_path, y, genotypes, top_k=100, valid_mask=None, encoding="auto", min_cell_count=1, xor_search=true))]
+pub fn garfield_all_pair_scan_bin_with_cells_py<'py>(
+    py: Python<'py>,
+    bin_path: String,
+    y: PyReadonlyArray1<'py, f64>,
+    genotypes: PyReadonlyArray2<'py, f64>,
+    top_k: usize,
+    valid_mask: Option<PyReadonlyArray2<'py, bool>>,
+    encoding: &str,
+    min_cell_count: usize,
+    xor_search: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = scan_all_pair_bin_py_impl(&bin_path, y.clone(), top_k, xor_search)?;
+    let genotype_shape = genotypes.shape();
+    if genotype_shape.len() != 2 {
+        return Err(PyValueError::new_err(
+            "genotypes must be a 2D marker-major array",
+        ));
+    }
+    let n_markers = genotype_shape[0];
+    let n_samples = genotype_shape[1];
+    if n_markers != result.n_rows || n_samples != result.n_samples {
+        return Err(PyValueError::new_err(format!(
+            "genotypes shape=({n_markers}, {n_samples}) does not match BIN shape=({}, {})",
+            result.n_rows, result.n_samples
+        )));
+    }
+    let genotype_vec = array2_to_vec(&genotypes);
+    let mask_vec = valid_mask.as_ref().map(bool_array2_to_vec);
+    if let Some(mask) = mask_vec.as_ref() {
+        if valid_mask.as_ref().map(|array| array.shape()) != Some(&genotype_shape[..]) {
+            return Err(PyValueError::new_err(
+                "valid_mask must have the same shape as genotypes",
+            ));
+        }
+        if mask.len() != genotype_vec.len() {
+            return Err(PyValueError::new_err(
+                "valid_mask size does not match genotypes",
+            ));
+        }
+    }
+    let encoding = BinaryEncoding::parse(encoding).map_err(PyValueError::new_err)?;
+    let pairs = result
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.first, candidate.second))
+        .collect::<Vec<_>>();
+    let y_vec = y
+        .as_array()
+        .iter()
+        .take(n_samples)
+        .copied()
+        .collect::<Vec<_>>();
+    let summaries = summarize_binary_pairs_marker_major(
+        genotype_vec.as_slice(),
+        n_markers,
+        n_samples,
+        y_vec.as_slice(),
+        pairs.as_slice(),
+        mask_vec.as_deref(),
+        encoding,
+        min_cell_count,
+    )
+    .map_err(PyValueError::new_err)?;
+    let out = summaries_to_py_dict(py, pairs.as_slice(), summaries.as_slice())?;
+    let candidates = result
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.first,
+                candidate.second,
+                match candidate.gate {
+                    AllPairGate::And => "AND",
+                    AllPairGate::Xor => "XOR",
+                },
+                candidate.polarity,
+                candidate.raw_score,
+                candidate.support,
+            )
+        })
+        .collect::<Vec<_>>();
+    out.set_item("candidates", candidates)?;
+    out.set_item("pairs_evaluated", result.pairs_evaluated)?;
+    out.set_item("polarity_evaluated", result.polarity_evaluated)?;
+    out.set_item("n_rows", result.n_rows)?;
+    out.set_item("n_samples", result.n_samples)?;
+    Ok(out)
 }
 
 #[cfg(test)]
